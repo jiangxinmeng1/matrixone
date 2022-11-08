@@ -16,6 +16,7 @@ package tables
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -377,7 +378,11 @@ func (blk *dataBlock) FillColumnDeletes(view *model.ColumnView, rwlocker *sync.R
 	}
 	dnode := n.(*updates.DeleteNode)
 	if dnode != nil {
-		view.DeleteMask = dnode.GetDeleteMaskLocked()
+		if view.DeleteMask == nil {
+			view.DeleteMask = dnode.GetDeleteMaskLocked()
+		} else {
+			view.DeleteMask.Or(dnode.GetDeleteMaskLocked())
+		}
 	}
 	return
 }
@@ -533,7 +538,44 @@ func (blk *dataBlock) LoadColumnData(
 	id.Idx = uint16(colIdx)
 	return evictable.FetchColumnData(buffer, blk.bufMgr, id, blk.fs, uint16(colIdx), metaLoc, def)
 }
-
+func (blk *dataBlock) LoadCommitTS() containers.Vector {
+	if !blk.GetMeta().(*catalog.BlockEntry).IsAppendable() {
+		return nil
+	}
+	metaloc := blk.GetMeta().(*catalog.BlockEntry).GetMetaLoc()
+	if metaloc == "" {
+		return nil
+	}
+	reader, _ := blockio.NewReader(context.Background(), blk.fs, metaloc)
+	meta, _ := reader.ReadMeta(nil)
+	bat, _ := reader.LoadBlkColumnsByMetaAndIdx(
+		[]types.Type{types.T_TS.ToType()},
+		[]string{catalog.AttrCommitTs},
+		[]bool{false},
+		meta,
+		len(blk.meta.GetSchema().NameIndex),
+	)
+	return bat.Vecs[0]
+}
+func (blk *dataBlock) LoadDeleteCommitTS() containers.Vector {
+	if !blk.GetMeta().(*catalog.BlockEntry).IsAppendable() {
+		return nil
+	}
+	deltaloc := blk.GetMeta().(*catalog.BlockEntry).GetDeltaLoc()
+	if deltaloc == "" {
+		return nil
+	}
+	reader, _ := blockio.NewReader(context.Background(), blk.fs, deltaloc)
+	meta, _ := reader.ReadMeta(nil)
+	bat, _ := reader.LoadBlkColumnsByMetaAndIdx(
+		[]types.Type{types.T_TS.ToType()},
+		[]string{catalog.AttrCommitTs},
+		[]bool{false},
+		meta,
+		1,
+	)
+	return bat.Vecs[0]
+}
 func (blk *dataBlock) ResolveDelta(ts types.TS) (bat *containers.Batch, err error) {
 	deltaloc := blk.meta.GetDeltaLoc()
 	if deltaloc == "" {

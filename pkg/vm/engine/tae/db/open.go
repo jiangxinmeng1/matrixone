@@ -22,6 +22,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logtail"
 
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/buffer"
@@ -135,6 +136,38 @@ func Open(dirname string, opts *options.Options) (db *DB, err error) {
 	db.BGScanner.Start()
 
 	// For debug or test
-	// logutil.Info(db.Catalog.SimplePPString(common.PPL2))
+	txn, _ := db.StartTxn(nil)
+	logutil.Info(db.Catalog.SimplePPString(common.PPL2))
+	database, _ := db.Catalog.GetDatabaseByID(1)
+	tbl, _ := database.GetTableEntryByID(272389)
+	schema := tbl.GetSchema()
+	seg, _ := tbl.GetSegmentByID(1002)
+
+	blkIDs := []uint64{1002, 1602, 3911, 3935}
+	logutil.Infof("attr %v", schema.AllNames())
+	for _, id := range blkIDs {
+		logutil.Infof("******************************************")
+		logutil.Infof("blk %d", id)
+		blk, _ := seg.GetBlockEntryByID(id)
+		for name := range schema.NameIndex {
+			if name == "name" {
+				view, _ := blk.GetBlockData().GetColumnDataByName(txn, name, nil)
+				commitVec := blk.GetBlockData().LoadCommitTS()
+				dataTSstr := "compacted"
+				if commitVec != nil {
+					dataTSstr = logtail.VectorToString(commitVec)
+				}
+				deleteCommitVec := blk.GetBlockData().LoadDeleteCommitTS()
+				deleteTSStr := "compacted or no deletes"
+				if deleteCommitVec != nil {
+					deleteTSStr = logtail.VectorToString(deleteCommitVec)
+				}
+				logutil.Infof("attr %v\ndata %v\n%v\ndeletes %v\n%v", name, logtail.VectorToString(view.GetData()), dataTSstr, view.DeleteMask, deleteTSStr)
+				view.ApplyDeletes()
+				logutil.Infof("after apply %v", logtail.VectorToString(view.GetData()))
+			}
+		}
+	}
+	panic("debug")
 	return
 }
