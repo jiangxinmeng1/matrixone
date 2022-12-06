@@ -44,7 +44,8 @@ Checkpoint entry is in the form of batches。There three kinds of batch in check
 
 #### Generate checkpoint
 
-Checkpoint is scheduled by checkpoint runner. Checkpoint runner try schedule checkpoint each `scan-interval`. 
+Checkpoint is scheduled by checkpoint runner. Checkpoint runner try schedule checkpoint each `scan-interval`.
+![](./3.PNG)
 * Start a checkpoint requires：
   1. Time since previous checkpoint is longer than intervel in config (e.i. `global-interval` and `incremental-interval`).
   2. Write transactions are more than `min-count` since last checkpoint.
