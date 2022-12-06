@@ -77,7 +77,7 @@ Checkpoint is scheduled by checkpoint runner. Checkpoint runner try schedule che
 1. replay in CN
 
    1. collect checkpoint
-      It choose all checkpoints overlaping with (cn have, cn want]. e.g. If CN requires [35,45], checkpoint[30,40]，checkpoint[40,50], checkpoint[50,60] are choosen.
+      It choose all checkpoints overlaping with (cn have, cn want]. e.g. If CN requires [35,45], checkpoint[30,40][40,50][50,60] are choosen.
    2. send to CN
       Locations of checkpoints are sent to CN through RPC as `CkpLocation`.
    3. load checkpoint entry
