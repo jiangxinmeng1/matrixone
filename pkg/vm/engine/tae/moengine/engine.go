@@ -250,6 +250,10 @@ func (e *txnEngine) ForceCheckpoint(ctx context.Context, ts types.TS) error {
 	if err != nil {
 		return err
 	}
+	err = e.impl.BGCheckpointRunner.ForceGlobalCheckpoint(ts,time.Millisecond)
+	if err != nil {
+		return err
+	}
 	lsn := e.impl.BGCheckpointRunner.MaxLSNInRange(ts)
 	_, err = e.impl.Wal.RangeCheckpoint(1, lsn)
 	logutil.Debugf("[Force Checkpoint] takes %v", time.Since(t0))
