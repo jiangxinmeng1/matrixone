@@ -65,10 +65,30 @@ func (appender *blockAppender) PrepareAppend(
 	appender.placeholder += n
 	appender.blk.Lock()
 	defer appender.blk.Unlock()
-	node, created = appender.blk.mvcc.AddAppendNodeLocked(
+	node, created = appender.addAppendNodeLocked(
 		txn,
 		appender.rows,
 		appender.placeholder+appender.rows)
+	return
+}
+func (appender *blockAppender) ReplayAppendNode(
+	txn txnif.AsyncTxn,
+	start uint32,
+	end uint32) (node txnif.AppendNode, created bool) {
+	node, created = appender.blk.mvcc.AddAppendNodeLocked(
+		txn,
+		start,
+		end)
+	return
+}
+func (appender *blockAppender) addAppendNodeLocked(
+	txn txnif.AsyncTxn,
+	start uint32,
+	end uint32) (node txnif.AppendNode, created bool) {
+	node, created = appender.blk.mvcc.AddAppendNodeLocked(
+		txn,
+		start,
+		end)
 	return
 }
 func (appender *blockAppender) ReplayAppend(
