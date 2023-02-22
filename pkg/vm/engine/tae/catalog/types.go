@@ -182,6 +182,10 @@ func containersBatchToProtoBatch(bat *containers.Batch) (*api.Batch, error) {
 	mobat := containers.CopyToMoBatch(bat)
 	return batch.BatchToProtoBatch(mobat)
 }
+func ContainersBatchToProtoBatch(bat *containers.Batch) (*api.Batch, error) {
+	mobat := containers.CopyToMoBatch(bat)
+	return batch.BatchToProtoBatch(mobat)
+}
 
 func protoBatchToContainersBatch(bat *api.Batch) (*containers.Batch, error) {
 	mobat, err := batch.ProtoBatchToBatch(bat)

@@ -99,7 +99,7 @@ func (info *appendInfo) Desc() string {
 	return info.dest.BlockString()
 }
 func (info *appendInfo) String() string {
-	s := fmt.Sprintf("[From=[%d:%d];To=%s[%d:%d]]",
+	s := fmt.Sprintf("%d[From=[%d:%d];To=%s[%d:%d]]",info.seq,
 		info.srcOff, info.srcLen+info.srcOff, info.dest.BlockString(), info.destOff, info.destLen+info.destOff)
 	return s
 }

@@ -16,7 +16,9 @@ package txnimpl
 
 import (
 	"bytes"
+
 	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/buffer/base"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
@@ -75,7 +77,21 @@ func (n *anode) MakeCommand(id uint32) (cmd txnif.TxnCmd, err error) {
 	}
 	composedCmd := NewAppendCmd(id, n)
 	batCmd := txnbase.NewBatchCmd(n.storage.mnode.data)
+	bat, err := catalog.ContainersBatchToProtoBatch(n.storage.mnode.data)
+	if err != nil {
+		panic(err)
+	}
 	composedCmd.AddCmd(batCmd)
+	logtailEntry:=&api.Entry{
+		EntryType:    api.Entry_Insert,
+		TableId:      n.table.entry.ID,
+		TableName:    n.table.schema.Name,
+		DatabaseId:   n.table.entry.GetDB().GetID(),
+		DatabaseName: n.table.entry.GetDB().GetName(),
+		Bat:          bat,
+
+	}
+	composedCmd.entries = append(composedCmd.entries, logtailEntry)
 	return composedCmd, nil
 }
 

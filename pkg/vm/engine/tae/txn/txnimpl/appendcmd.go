@@ -22,6 +22,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/api"
 
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
@@ -64,6 +65,7 @@ func NewAppendCmd(id uint32, node InsertNode) *AppendCmd {
 		ComposedCmd: txnbase.NewComposedCmd(),
 		Node:        node,
 		Infos:       node.GetAppends(),
+		entries:     make([]*api.Entry, 0),
 	}
 	impl.BaseCustomizedCmd = txnbase.NewBaseCustomizedCmd(id, impl)
 	return impl
@@ -121,6 +123,7 @@ func (c *AppendCmd) WriteTo(w io.Writer) (n int64, err error) {
 		return
 	}
 	n += 16
+	c.CheckInfos()
 	return
 }
 
@@ -184,7 +187,8 @@ func (c *AppendCmd) GenerateInfos() (infos []*appendInfo) {
 		tid := entry.TableId
 		var info *appendInfo
 		preBlkID := uint64(0)
-		for i := 1; i < containersBatch.Length(); i++ {
+		preOffset := uint32(0)
+		for i := 0; i < containersBatch.Length(); i++ {
 			rowid := containersBatch.GetVectorByName(catalog.AttrRowID).Get(i).(types.Rowid)
 			sid, blkID, offset := model.DecodePhyAddrKey(rowid)
 			if blkID == 0 {
@@ -193,10 +197,9 @@ func (c *AppendCmd) GenerateInfos() (infos []*appendInfo) {
 			if blkID != preBlkID {
 				if info != nil {
 					info.srcLen = uint32(i) - info.srcOff
-					info.destOff = uint32(offset) - info.destOff
+					info.destLen = uint32(preOffset) - info.destOff + 1
 					infos = append(infos, info)
 				}
-				seq++
 				info = &appendInfo{
 					seq:    seq,
 					srcOff: uint32(i),
@@ -208,11 +211,59 @@ func (c *AppendCmd) GenerateInfos() (infos []*appendInfo) {
 					},
 					destOff: offset,
 				}
+				seq++
 				preBlkID = blkID
 			}
+			preOffset = offset
 		}
+		info.srcLen = uint32(containersBatch.Length()) - info.srcOff
+		info.destLen = uint32(preOffset) - info.destOff + 1
+		infos = append(infos, info)
 	}
 	return
+}
+
+func (c *AppendCmd) CheckInfos() {
+	generatedInfos := c.GenerateInfos()
+	for _, info := range generatedInfos {
+		logutil.Debugf("ginfo %v", info)
+	}
+	for _, info := range c.Infos {
+		logutil.Debugf("info %v", info.String())
+	}
+	if len(generatedInfos) != len(c.Infos) {
+		panic("wrong info")
+	}
+	for i, info := range c.Infos {
+		ginfo := generatedInfos[i]
+		if info.seq != ginfo.seq {
+			panic("wrong info")
+		}
+		if info.destLen != ginfo.destLen {
+			panic("wrong info")
+		}
+		if info.destOff != ginfo.destOff {
+			panic("wrong info")
+		}
+		if info.dbid != ginfo.dbid {
+			panic("wrong info")
+		}
+		if info.srcOff != ginfo.srcOff {
+			panic("wrong info")
+		}
+		if info.srcLen != ginfo.srcLen {
+			panic("wrong info")
+		}
+		if info.dest.TableID != ginfo.dest.TableID {
+			panic("wrong info")
+		}
+		if info.dest.SegmentID != ginfo.dest.SegmentID {
+			panic("wrong info")
+		}
+		if info.dest.BlockID != ginfo.dest.BlockID {
+			panic("wrong info")
+		}
+	}
 }
 
 func protoBatchToContainersBatch(bat *api.Batch) (*containers.Batch, error) {
