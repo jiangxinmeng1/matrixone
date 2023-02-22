@@ -156,8 +156,8 @@ func (cmd *EntryCommand) SetReplayTxn(txn txnif.AsyncTxn) {
 }
 func (cmd *EntryCommand) ApplyCommit() {
 	switch cmd.cmdType {
-	case CmdUpdateSegment,CmdUpdateBlock,CmdUpdateTable:
-	case  CmdUpdateDatabase:
+	case CmdUpdateSegment, CmdUpdateBlock, CmdUpdateTable:
+	case CmdUpdateDatabase:
 		node := cmd.entry.GetLatestNodeLocked()
 		if node.Is1PC() {
 			return
@@ -183,8 +183,8 @@ func (cmd *EntryCommand) ApplyRollback() {
 }
 func (cmd *EntryCommand) GetTs() types.TS {
 	return types.TS{}
-	switch cmd.cmdType{
-	case CmdUpdateBlock,CmdUpdateSegment:
+	switch cmd.cmdType {
+	case CmdUpdateBlock, CmdUpdateSegment:
 		return types.TS{}
 	}
 	ts := cmd.entry.GetLatestNodeLocked().GetPrepare()
@@ -294,7 +294,7 @@ func (cmd *EntryCommand) WriteTo(w io.Writer) (n int64, err error) {
 			return
 		}
 		n += 8
-		for _,entry := range entries {
+		for _, entry := range entries {
 			buf := new(bytes.Buffer)
 			if err := gob.NewEncoder(buf).Encode(entry); err != nil {
 				return n, err
@@ -316,7 +316,7 @@ func (cmd *EntryCommand) WriteTo(w io.Writer) (n int64, err error) {
 			return
 		}
 		n += 8
-		for _,entry := range entries {
+		for _, entry := range entries {
 			buf := new(bytes.Buffer)
 			if err := gob.NewEncoder(buf).Encode(entry); err != nil {
 				return n, err
@@ -338,7 +338,7 @@ func (cmd *EntryCommand) WriteTo(w io.Writer) (n int64, err error) {
 			return
 		}
 		n += 8
-		for _,entry := range entries {
+		for _, entry := range entries {
 			buf := new(bytes.Buffer)
 			if err := gob.NewEncoder(buf).Encode(entry); err != nil {
 				return n, err
@@ -404,7 +404,7 @@ func (cmd *EntryCommand) ReadFrom(r io.Reader) (n int64, err error) {
 			return
 		}
 		n += 8
-		entries:=make([]*api.Entry,entriesLength)
+		entries := make([]*api.Entry, entriesLength)
 		for i := 0; i < int(entriesLength); i++ {
 			length := uint64(0)
 			if err = binary.Read(r, binary.BigEndian, &length); err != nil {
@@ -416,7 +416,7 @@ func (cmd *EntryCommand) ReadFrom(r io.Reader) (n int64, err error) {
 			r2 := bytes.NewBuffer(buf)
 			entry := &api.Entry{}
 			gob.NewDecoder(r2).Decode(entry)
-			entries[i]=entry
+			entries[i] = entry
 		}
 		cmd.Table = &TableEntry{}
 		cmd.Table.logentries = entries
@@ -431,7 +431,7 @@ func (cmd *EntryCommand) ReadFrom(r io.Reader) (n int64, err error) {
 			return
 		}
 		n += 8
-		entries:=make([]*api.Entry,entriesLength)
+		entries := make([]*api.Entry, entriesLength)
 		for i := 0; i < int(entriesLength); i++ {
 			length := uint64(0)
 			if err = binary.Read(r, binary.BigEndian, &length); err != nil {
@@ -443,7 +443,7 @@ func (cmd *EntryCommand) ReadFrom(r io.Reader) (n int64, err error) {
 			r2 := bytes.NewBuffer(buf)
 			entry := &api.Entry{}
 			gob.NewDecoder(r2).Decode(entry)
-			entries[i]=entry
+			entries[i] = entry
 		}
 		cmd.Segment = &SegmentEntry{}
 		cmd.Segment.logentries = entries
@@ -458,7 +458,7 @@ func (cmd *EntryCommand) ReadFrom(r io.Reader) (n int64, err error) {
 			return
 		}
 		n += 8
-		entries:=make([]*api.Entry,entriesLength)
+		entries := make([]*api.Entry, entriesLength)
 		for i := 0; i < int(entriesLength); i++ {
 			length := uint64(0)
 			if err = binary.Read(r, binary.BigEndian, &length); err != nil {
@@ -470,7 +470,7 @@ func (cmd *EntryCommand) ReadFrom(r io.Reader) (n int64, err error) {
 			r2 := bytes.NewBuffer(buf)
 			entry := &api.Entry{}
 			gob.NewDecoder(r2).Decode(entry)
-			entries[i]=entry
+			entries[i] = entry
 		}
 		cmd.Block = &BlockEntry{}
 		cmd.Block.entries = entries

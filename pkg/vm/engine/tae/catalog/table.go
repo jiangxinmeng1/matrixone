@@ -231,11 +231,11 @@ func (entry *TableEntry) appendTable(create bool) (bat *containers.Batch) {
 	node := entry.GetLatestNodeLocked().(*TableMVCCNode)
 	if create {
 		bat = makeRespBatchFromSchema(SystemTableSchemaLog)
-		catalogEntry2Batch(bat, entry, SystemTableSchemaLog, FillTableRow, u64ToRowID(entry.GetID()), node.GetEnd())
+		catalogEntry2Batch(bat, entry, SystemTableSchemaLog, FillTableRow, u64ToRowID(entry.GetID()), node.GetStart())
 
 	} else {
 		bat = makeRespBatchFromSchema(DelTableSchema)
-		catalogEntry2Batch(bat, entry, DelSchema, FillTableRow, u64ToRowID(entry.GetID()), node.GetEnd())
+		catalogEntry2Batch(bat, entry, DelSchema, FillTableRow, u64ToRowID(entry.GetID()), node.GetStart())
 		bat.GetVectorByName(pkgcatalog.SystemRelAttr_DBID).Append(entry.db.ID)
 
 	}

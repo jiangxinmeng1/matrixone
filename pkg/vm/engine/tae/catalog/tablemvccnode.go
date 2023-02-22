@@ -77,8 +77,8 @@ func (e *TableMVCCNode) Update(vun txnif.MVCCNode) {
 
 func (e *TableMVCCNode) ApplyCommit(index *wal.Index) (err error) {
 	var commitTS types.TS
-	if e.EntryMVCCNode.CreatedAt.Equal(txnif.UncommitTS)&&e.EntryMVCCNode.DeletedAt.Equal(txnif.UncommitTS){
-		e.EntryMVCCNode.CreatedAt=e.Txn.GetCommitTS()
+	if e.EntryMVCCNode.CreatedAt.Equal(txnif.UncommitTS) && e.EntryMVCCNode.DeletedAt.Equal(txnif.UncommitTS) {
+		e.EntryMVCCNode.CreatedAt = e.Txn.GetCommitTS()
 		return
 	}
 	commitTS, err = e.TxnMVCCNode.ApplyCommit(index)

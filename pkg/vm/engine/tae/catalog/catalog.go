@@ -317,7 +317,7 @@ func (catalog *Catalog) onReplayDeleteDB(dbid uint64, txnNode *txnbase.TxnMVCCNo
 	}
 	db.Insert(un)
 }
-func (catalog *Catalog) onReplayUpdateTable(cmd *EntryCommand, dataFactory DataFactory, idx *wal.Index,txnNode *txnbase.TxnMVCCNode, observer wal.ReplayObserver) {
+func (catalog *Catalog) onReplayUpdateTable(cmd *EntryCommand, dataFactory DataFactory, idx *wal.Index, txnNode *txnbase.TxnMVCCNode, observer wal.ReplayObserver) {
 	entries := cmd.Table.logentries
 	bat0 := entries[0].Bat
 	containersBatch0, err := protoBatchToContainersBatch(bat0)
@@ -329,7 +329,7 @@ func (catalog *Catalog) onReplayUpdateTable(cmd *EntryCommand, dataFactory DataF
 	if err != nil {
 		panic(err)
 	}
-	catalog.OnReplayTableBatch2(containersBatch0, containersBatch1,  txnNode, dataFactory)
+	catalog.OnReplayTableBatch2(containersBatch0, containersBatch1, txnNode, dataFactory)
 }
 
 func (catalog *Catalog) OnReplayTableBatch(ins, insTxn, insCol, del, delTxn *containers.Batch, dataFactory DataFactory) {

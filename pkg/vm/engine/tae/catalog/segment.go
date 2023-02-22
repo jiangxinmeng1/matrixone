@@ -43,10 +43,10 @@ type SegmentEntry struct {
 	table   *TableEntry
 	entries map[uint64]*common.GenericDLNode[*BlockEntry]
 	//link.head and tail is nil when new a segmentEntry object.
-	link    *common.GenericSortedDList[*BlockEntry]
-	state   EntryState
-	sorted  bool
-	segData data.Segment
+	link       *common.GenericSortedDList[*BlockEntry]
+	state      EntryState
+	sorted     bool
+	segData    data.Segment
 	logentries []*api.Entry
 }
 
@@ -212,7 +212,7 @@ func (entry *SegmentEntry) SetSorted() {
 	entry.sorted = true
 }
 
-func(entry *SegmentEntry) MakeLogtailEntries()(logtailEntries []*api.Entry){
+func (entry *SegmentEntry) MakeLogtailEntries() (logtailEntries []*api.Entry) {
 	entry.RLock()
 	defer entry.RUnlock()
 	logtailEntries = make([]*api.Entry, 0)
