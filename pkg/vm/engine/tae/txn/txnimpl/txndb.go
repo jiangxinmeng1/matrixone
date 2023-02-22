@@ -231,7 +231,7 @@ func (db *txnDB) CreateRelationWithTableId(tableId uint64, def any) (relation ha
 }
 
 func (db *txnDB) DropRelationByName(name string) (relation handle.Relation, err error) {
-	hasNewTxnEntry, meta, err := db.entry.DropTableEntry(name, db.store.txn)
+	_, meta, err := db.entry.DropTableEntry(name, db.store.txn)
 	if err != nil {
 		return nil, err
 	}
@@ -240,14 +240,12 @@ func (db *txnDB) DropRelationByName(name string) (relation handle.Relation, err 
 		return nil, err
 	}
 	relation = newRelation(table)
-	if hasNewTxnEntry {
-		err = table.SetDropEntry(meta)
-	}
+	err = table.SetDropEntry(meta)
 	return
 }
 
 func (db *txnDB) DropRelationByID(id uint64) (relation handle.Relation, err error) {
-	hasNewTxnEntry, meta, err := db.entry.DropTableEntryByID(id, db.store.txn)
+	_, meta, err := db.entry.DropTableEntryByID(id, db.store.txn)
 	if err != nil {
 		return nil, err
 	}
@@ -256,9 +254,7 @@ func (db *txnDB) DropRelationByID(id uint64) (relation handle.Relation, err erro
 		return nil, err
 	}
 	relation = newRelation(table)
-	if hasNewTxnEntry {
-		err = table.SetDropEntry(meta)
-	}
+	err = table.SetDropEntry(meta)
 	return
 }
 

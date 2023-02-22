@@ -821,7 +821,7 @@ func (tbl *txnTable) UncommittedRows() uint32 {
 	return tbl.localSegment.Rows()
 }
 func (tbl *txnTable) NeedRollback() bool {
-	return tbl.createEntry != nil && tbl.dropEntry != nil
+	return false
 }
 
 // PrePrepareDedup do deduplication check for 1PC Commit or 2PC Prepare

@@ -49,8 +49,10 @@ type TableEntry struct {
 	tableData data.Table
 	rows      atomic.Uint64
 	// fullname is format as 'tenantID-tableName', the tenantID prefix is only used 'mo_catalog' database
-	fullName string
+	fullName   string
 	logentries []*api.Entry
+
+	isCreateLogCollectted bool
 }
 
 func genTblFullName(tenantID uint32, name string) string {
@@ -173,17 +175,30 @@ func (entry *TableEntry) CreateSegment(txn txnif.AsyncTxn, state EntryState, dat
 	return
 }
 
-func (entry *TableEntry) MakeLogtailEntries() (logtailEntries []*api.Entry){
+func (entry *TableEntry) MakeLogtailEntries() (logtailEntries []*api.Entry) {
 	entry.RLock()
 	defer entry.RUnlock()
-	
-	entryType:=api.Entry_Insert
-	node:=entry.GetLatestNodeLocked().(*TableMVCCNode)
-	if !node.DeletedAt.IsEmpty(){
-		entryType=api.Entry_Delete
+
+	entryType := api.Entry_Insert
+	node := entry.GetLatestNodeLocked().(*TableMVCCNode)
+	create := true
+	if !node.DeletedAt.IsEmpty() {
+		create = false
+	}
+	if node.CreatedAt.Equal(txnif.UncommitTS) && node.DeletedAt.Equal(txnif.UncommitTS) {
+		if !entry.isCreateLogCollectted {
+			entry.isCreateLogCollectted = true
+			create = true
+		} else {
+			entry.isCreateLogCollectted = false
+			create = false
+		}
+	}
+	if !create {
+		entryType = api.Entry_Delete
 	}
 
-	bat, err := containersBatchToProtoBatch(entry.appendTable())
+	bat, err := containersBatchToProtoBatch(entry.appendTable(create))
 	if err != nil {
 		panic(err)
 	}
@@ -196,8 +211,8 @@ func (entry *TableEntry) MakeLogtailEntries() (logtailEntries []*api.Entry){
 		Bat:          bat,
 	}
 	logtailEntries = append(logtailEntries, logtailEntry)
-	
-	bat, err = containersBatchToProtoBatch(entry.appendColumn())
+
+	bat, err = containersBatchToProtoBatch(entry.appendColumn(create))
 	if err != nil {
 		panic(err)
 	}
@@ -212,13 +227,13 @@ func (entry *TableEntry) MakeLogtailEntries() (logtailEntries []*api.Entry){
 	logtailEntries = append(logtailEntries, logtailEntry)
 	return
 }
-func (entry *TableEntry) appendTable() (bat *containers.Batch) {
+func (entry *TableEntry) appendTable(create bool) (bat *containers.Batch) {
 	node := entry.GetLatestNodeLocked().(*TableMVCCNode)
-	if node.DeletedAt.IsEmpty(){
-	bat = makeRespBatchFromSchema(SystemTableSchemaLog)
-	catalogEntry2Batch(bat, entry, SystemTableSchemaLog, FillTableRow, u64ToRowID(entry.GetID()), node.GetEnd())
+	if create {
+		bat = makeRespBatchFromSchema(SystemTableSchemaLog)
+		catalogEntry2Batch(bat, entry, SystemTableSchemaLog, FillTableRow, u64ToRowID(entry.GetID()), node.GetEnd())
 
-	}else {
+	} else {
 		bat = makeRespBatchFromSchema(DelTableSchema)
 		catalogEntry2Batch(bat, entry, DelSchema, FillTableRow, u64ToRowID(entry.GetID()), node.GetEnd())
 		bat.GetVectorByName(pkgcatalog.SystemRelAttr_DBID).Append(entry.db.ID)
@@ -227,9 +242,9 @@ func (entry *TableEntry) appendTable() (bat *containers.Batch) {
 	return bat
 }
 
-func (entry *TableEntry) appendColumn() (bat *containers.Batch) {
+func (entry *TableEntry) appendColumn(create bool) (bat *containers.Batch) {
 	node := entry.GetLatestNodeLocked().(*TableMVCCNode)
-	if node.DeletedAt.IsEmpty() {
+	if create {
 		bat = makeRespBatchFromSchema(SystemColumnSchema)
 		for _, col := range SystemColumnSchema.ColDefs {
 			FillColumnRow(entry, col.Name, bat.GetVectorByName(col.Name))
