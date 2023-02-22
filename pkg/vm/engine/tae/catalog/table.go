@@ -24,7 +24,9 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 )
@@ -48,6 +50,7 @@ type TableEntry struct {
 	rows      atomic.Uint64
 	// fullname is format as 'tenantID-tableName', the tenantID prefix is only used 'mo_catalog' database
 	fullName string
+	logentries []*api.Entry
 }
 
 func genTblFullName(tenantID uint32, name string) string {
@@ -168,6 +171,79 @@ func (entry *TableEntry) CreateSegment(txn txnif.AsyncTxn, state EntryState, dat
 	created = NewSegmentEntry(entry, txn, state, dataFactory)
 	entry.AddEntryLocked(created)
 	return
+}
+
+func (entry *TableEntry) MakeLogtailEntries() (logtailEntries []*api.Entry){
+	entry.RLock()
+	defer entry.RUnlock()
+	
+	entryType:=api.Entry_Insert
+	node:=entry.GetLatestNodeLocked().(*TableMVCCNode)
+	if !node.DeletedAt.IsEmpty(){
+		entryType=api.Entry_Delete
+	}
+
+	bat, err := containersBatchToProtoBatch(entry.appendTable())
+	if err != nil {
+		panic(err)
+	}
+	logtailEntry := &api.Entry{
+		EntryType:    entryType,
+		TableId:      pkgcatalog.MO_TABLES_ID,
+		TableName:    pkgcatalog.MO_TABLES,
+		DatabaseId:   pkgcatalog.MO_CATALOG_ID,
+		DatabaseName: pkgcatalog.MO_CATALOG,
+		Bat:          bat,
+	}
+	logtailEntries = append(logtailEntries, logtailEntry)
+	
+	bat, err = containersBatchToProtoBatch(entry.appendColumn())
+	if err != nil {
+		panic(err)
+	}
+	logtailEntry = &api.Entry{
+		EntryType:    entryType,
+		TableId:      pkgcatalog.MO_COLUMNS_ID,
+		TableName:    pkgcatalog.MO_COLUMNS,
+		DatabaseId:   pkgcatalog.MO_CATALOG_ID,
+		DatabaseName: pkgcatalog.MO_CATALOG,
+		Bat:          bat,
+	}
+	logtailEntries = append(logtailEntries, logtailEntry)
+	return
+}
+func (entry *TableEntry) appendTable() (bat *containers.Batch) {
+	node := entry.GetLatestNodeLocked().(*TableMVCCNode)
+	if node.DeletedAt.IsEmpty(){
+	bat = makeRespBatchFromSchema(SystemTableSchemaLog)
+	catalogEntry2Batch(bat, entry, SystemTableSchemaLog, FillTableRow, u64ToRowID(entry.GetID()), node.GetEnd())
+
+	}else {
+		bat = makeRespBatchFromSchema(DelTableSchema)
+		catalogEntry2Batch(bat, entry, DelSchema, FillTableRow, u64ToRowID(entry.GetID()), node.GetEnd())
+		bat.GetVectorByName(pkgcatalog.SystemRelAttr_DBID).Append(entry.db.ID)
+
+	}
+	return bat
+}
+
+func (entry *TableEntry) appendColumn() (bat *containers.Batch) {
+	node := entry.GetLatestNodeLocked().(*TableMVCCNode)
+	if node.DeletedAt.IsEmpty() {
+		bat = makeRespBatchFromSchema(SystemColumnSchema)
+		for _, col := range SystemColumnSchema.ColDefs {
+			FillColumnRow(entry, col.Name, bat.GetVectorByName(col.Name))
+			bat.GetVectorByName(AttrRowID).Append(bytesToRowID([]byte(fmt.Sprintf("%d-%s", entry.ID, col.Name))))
+			bat.GetVectorByName(AttrCommitTs).Append(node.End)
+		}
+	} else {
+		for _, col := range SystemColumnSchema.ColDefs {
+			bat = makeRespBatchFromSchema(DelSchema)
+			bat.GetVectorByName(AttrRowID).Append(bytesToRowID([]byte(fmt.Sprintf("%d-%s", entry.ID, col.Name))))
+			bat.GetVectorByName(AttrCommitTs).Append(node.End)
+		}
+	}
+	return bat
 }
 
 func (entry *TableEntry) MakeCommand(id uint32) (cmd txnif.TxnCmd, err error) {

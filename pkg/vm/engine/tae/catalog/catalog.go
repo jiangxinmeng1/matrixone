@@ -196,10 +196,10 @@ func (catalog *Catalog) ReplayCmd(
 		catalog.onReplayUpdateDatabase(cmd, idxCtx, observer)
 	case CmdUpdateTable:
 		cmd := txncmd.(*EntryCommand)
-		catalog.onReplayUpdateTable(cmd, dataFactory, idxCtx, observer)
+		catalog.onReplayUpdateTable(cmd, dataFactory, idxCtx, txnNode, observer)
 	case CmdUpdateSegment:
 		cmd := txncmd.(*EntryCommand)
-		catalog.onReplayUpdateSegment(cmd, dataFactory, idxCtx,txnNode, observer)
+		catalog.onReplayUpdateSegment(cmd, dataFactory, idxCtx, txnNode, observer)
 	case CmdUpdateBlock:
 		cmd := txncmd.(*EntryCommand)
 		txnNode := &txnbase.TxnMVCCNode{
@@ -317,44 +317,19 @@ func (catalog *Catalog) onReplayDeleteDB(dbid uint64, txnNode *txnbase.TxnMVCCNo
 	}
 	db.Insert(un)
 }
-func (catalog *Catalog) onReplayUpdateTable(cmd *EntryCommand, dataFactory DataFactory, idx *wal.Index, observer wal.ReplayObserver) {
-	catalog.OnReplayTableID(cmd.Table.ID)
-	// prepareTS := cmd.GetTs()
-	// if prepareTS.LessEq(catalog.GetCheckpointed().MaxTS) {
-	// 	if observer != nil {
-	// 		observer.OnStaleIndex(idx)
-	// 	}
-	// 	return
-	// }
-	db, err := catalog.GetDatabaseByID(cmd.DBID)
+func (catalog *Catalog) onReplayUpdateTable(cmd *EntryCommand, dataFactory DataFactory, idx *wal.Index,txnNode *txnbase.TxnMVCCNode, observer wal.ReplayObserver) {
+	entries := cmd.Table.logentries
+	bat0 := entries[0].Bat
+	containersBatch0, err := protoBatchToContainersBatch(bat0)
 	if err != nil {
 		panic(err)
 	}
-	tbl, err := db.GetTableEntryByID(cmd.Table.ID)
-
-	un := cmd.entry.GetLatestNodeLocked().(*TableMVCCNode)
-	un.SetLogIndex(idx)
-	if un.Is1PC() {
-		if err := un.ApplyCommit(nil); err != nil {
-			panic(err)
-		}
-	}
-
+	bat1 := entries[1].Bat
+	containersBatch1, err := protoBatchToContainersBatch(bat1)
 	if err != nil {
-		cmd.Table.db = db
-		cmd.Table.tableData = dataFactory.MakeTableFactory()(cmd.Table)
-		err = db.AddEntryLocked(cmd.Table, un.GetTxn(), false)
-		if err != nil {
-			logutil.Warn(catalog.SimplePPString(common.PPL3))
-			panic(err)
-		}
-		return
+		panic(err)
 	}
-	tblun := tbl.SearchNode(un)
-	if tblun == nil {
-		tbl.Insert(un) //TODO isvalid
-	}
-
+	catalog.OnReplayTableBatch2(containersBatch0, containersBatch1,  txnNode, dataFactory)
 }
 
 func (catalog *Catalog) OnReplayTableBatch(ins, insTxn, insCol, del, delTxn *containers.Batch, dataFactory DataFactory) {
@@ -388,6 +363,39 @@ func (catalog *Catalog) OnReplayTableBatch(ins, insTxn, insCol, del, delTxn *con
 		tid := delTxn.GetVectorByName(SnapshotAttr_TID).Get(i).(uint64)
 		txnNode := txnbase.ReadTuple(delTxn, i)
 		catalog.onReplayDeleteTable(dbid, tid, txnNode)
+	}
+}
+func (catalog *Catalog) OnReplayTableBatch2(tablebat, colbat *containers.Batch, txnNode *txnbase.TxnMVCCNode, dataFactory DataFactory) {
+	if !isDeleteTableBatch(tablebat) {
+		i := 0
+		tid := tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_ID).Get(i).(uint64)
+		catalog.OnReplayTableID(tid)
+		dbid := tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_DBID).Get(i).(uint64)
+		name := string(tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_Name).Get(i).([]byte))
+		schema := NewEmptySchema(name)
+		schema.ReadFromBatch(colbat, 0, tid)
+		schema.Comment = string(tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_Comment).Get(i).([]byte))
+		schema.Partition = string(tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_Partition).Get(i).([]byte))
+		schema.Relkind = string(tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_Kind).Get(i).([]byte))
+		schema.Createsql = string(tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_CreateSQL).Get(i).([]byte))
+		schema.View = string(tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_ViewDef).Get(i).([]byte))
+		buf := tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_Constraint).Get(i).([]byte)
+		schema.Constraint = make([]byte, len(buf))
+		copy(schema.Constraint, buf)
+		schema.AcInfo = accessInfo{}
+		schema.AcInfo.RoleID = tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_Owner).Get(i).(uint32)
+		schema.AcInfo.UserID = tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_Creator).Get(i).(uint32)
+		schema.AcInfo.CreateAt = tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_CreateAt).Get(i).(types.Timestamp)
+		schema.AcInfo.TenantID = tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_AccID).Get(i).(uint32)
+		schema.BlockMaxRows = tablebat.GetVectorByName(SnapshotAttr_BlockMaxRow).Get(i).(uint32)
+		schema.SegmentMaxBlocks = tablebat.GetVectorByName(SnapshotAttr_SegmentMaxBlock).Get(i).(uint16)
+		catalog.onReplayCreateTable(dbid, tid, schema, txnNode, dataFactory)
+	} else {
+		i := 0
+		dbid := tablebat.GetVectorByName(pkgcatalog.SystemRelAttr_DBID).Get(i).(uint64)
+		tid := rowIDToU64(tablebat.GetVectorByName(AttrRowID).Get(i).(types.Rowid))
+		catalog.onReplayDeleteTable(dbid, tid, txnNode)
+
 	}
 }
 

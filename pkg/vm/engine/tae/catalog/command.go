@@ -148,7 +148,6 @@ func (cmd *EntryCommand) SetReplayTxn(txn txnif.AsyncTxn) {
 	case CmdUpdateBlock:
 	case CmdUpdateSegment:
 	case CmdUpdateTable:
-		cmd.entry.GetLatestNodeLocked().(*TableMVCCNode).Txn = txn
 	case CmdUpdateDatabase:
 		cmd.entry.GetLatestNodeLocked().(*DBMVCCNode).Txn = txn
 	default:
@@ -157,8 +156,8 @@ func (cmd *EntryCommand) SetReplayTxn(txn txnif.AsyncTxn) {
 }
 func (cmd *EntryCommand) ApplyCommit() {
 	switch cmd.cmdType {
-	case CmdUpdateSegment,CmdUpdateBlock:
-	case  CmdUpdateTable, CmdUpdateDatabase:
+	case CmdUpdateSegment,CmdUpdateBlock,CmdUpdateTable:
+	case  CmdUpdateDatabase:
 		node := cmd.entry.GetLatestNodeLocked()
 		if node.Is1PC() {
 			return
@@ -183,6 +182,7 @@ func (cmd *EntryCommand) ApplyRollback() {
 	}
 }
 func (cmd *EntryCommand) GetTs() types.TS {
+	return types.TS{}
 	switch cmd.cmdType{
 	case CmdUpdateBlock,CmdUpdateSegment:
 		return types.TS{}
@@ -210,15 +210,15 @@ func (cmd *EntryCommand) GetID() (uint64, *common.ID) {
 	dbid := uint64(0)
 	switch cmd.cmdType {
 	case CmdUpdateDatabase:
-		dbid = cmd.entry.GetID()
+		// dbid = cmd.entry.GetID()
 	case CmdUpdateTable:
-		if cmd.DBID != 0 {
-			dbid = cmd.DBID
-			id.TableID = cmd.Table.ID
-		} else {
-			dbid = cmd.Table.db.ID
-			id.TableID = cmd.entry.GetID()
-		}
+		// if cmd.DBID != 0 {
+		// 	dbid = cmd.DBID
+		// 	id.TableID = cmd.Table.ID
+		// } else {
+		// 	dbid = cmd.Table.db.ID
+		// 	id.TableID = cmd.entry.GetID()
+		// }
 	case CmdUpdateSegment:
 		// if cmd.DBID != 0 {
 		// 	dbid = cmd.DBID
@@ -289,22 +289,27 @@ func (cmd *EntryCommand) WriteTo(w io.Writer) (n int64, err error) {
 		}
 		n += sn
 	case CmdUpdateTable:
-		if err = binary.Write(w, binary.BigEndian, cmd.Table.db.ID); err != nil {
+		entries := cmd.Table.MakeLogtailEntries()
+		if err = binary.Write(w, binary.BigEndian, uint64(len(entries))); err != nil {
 			return
 		}
 		n += 8
-		if sn, err = cmd.Table.WriteOneNodeTo(w); err != nil {
-			return
+		for _,entry := range entries {
+			buf := new(bytes.Buffer)
+			if err := gob.NewEncoder(buf).Encode(entry); err != nil {
+				return n, err
+			}
+			length := uint64(buf.Len())
+			if err := binary.Write(w, binary.BigEndian, length); err != nil {
+				panic(err)
+			}
+			n += 8
+			sn, err := w.Write(buf.Bytes())
+			if err != nil {
+				panic(err)
+			}
+			n += int64(sn)
 		}
-		n += sn
-		var schemaBuf []byte
-		if schemaBuf, err = cmd.Table.schema.Marshal(); err != nil {
-			return
-		}
-		if _, err = w.Write(schemaBuf); err != nil {
-			return
-		}
-		n += int64(len(schemaBuf))
 	case CmdUpdateSegment:
 		entries := cmd.Segment.MakeLogtailEntries()
 		if err = binary.Write(w, binary.BigEndian, uint64(len(entries))); err != nil {
@@ -389,28 +394,32 @@ func (cmd *EntryCommand) ReadFrom(r io.Reader) (n int64, err error) {
 		n += sn
 		cmd.DB.DBBaseEntry = cmd.entry.(*DBBaseEntry)
 	case CmdUpdateTable:
-		entry := NewReplayTableBaseEntry()
-		if err = binary.Read(r, binary.BigEndian, &entry.ID); err != nil {
+		id := uint64(0)
+		if err = binary.Read(r, binary.BigEndian, &id); err != nil {
 			return
 		}
 		n += 8
-		cmd.entry = entry
-		if err = binary.Read(r, binary.BigEndian, &cmd.DBID); err != nil {
+		entriesLength := uint64(0)
+		if err = binary.Read(r, binary.BigEndian, &entriesLength); err != nil {
 			return
 		}
-
 		n += 8
-		if sn, err = cmd.entry.ReadOneNodeFrom(r); err != nil {
-			return
+		entries:=make([]*api.Entry,entriesLength)
+		for i := 0; i < int(entriesLength); i++ {
+			length := uint64(0)
+			if err = binary.Read(r, binary.BigEndian, &length); err != nil {
+				return
+			}
+			n += 8
+			buf := make([]byte, length)
+			r.Read(buf)
+			r2 := bytes.NewBuffer(buf)
+			entry := &api.Entry{}
+			gob.NewDecoder(r2).Decode(entry)
+			entries[i]=entry
 		}
-		n += sn
-		cmd.Table = NewReplayTableEntry()
-		cmd.Table.TableBaseEntry = cmd.entry.(*TableBaseEntry)
-		cmd.Table.schema = NewEmptySchema("")
-		if sn, err = cmd.Table.schema.ReadFrom(r); err != nil {
-			return
-		}
-		n += sn
+		cmd.Table = &TableEntry{}
+		cmd.Table.logentries = entries
 	case CmdUpdateSegment:
 		id := uint64(0)
 		if err = binary.Read(r, binary.BigEndian, &id); err != nil {
