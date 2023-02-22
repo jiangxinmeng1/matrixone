@@ -187,6 +187,7 @@ message Entry {
         Insert = 0;
         Delete = 1;
         Update = 2;
+        DN = 3;
     }
     EntryType entry_type = 1;
     uint64    table_id = 2;
@@ -195,6 +196,7 @@ message Entry {
     string    database_name = 5;
     string    file_name = 6;
     Batch     bat = 8;
+    string log_index =9;
 };
 
 // There are two kinds of checkpoint: delta checkpoint and base checkpoint,

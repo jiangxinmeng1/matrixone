@@ -14,6 +14,15 @@
 
 package catalog
 
+import (
+	pkgcatalog "github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
+
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
+)
+
 type EntryState int8
 
 const (
@@ -32,4 +41,94 @@ func (es EntryState) Repr() string {
 		return "F"
 	}
 	panic("not supported")
+}
+
+// +--------+---------+----------+----------+------------+
+// |   ID   |  Name   | CreateAt | DeleteAt | CommitInfo |
+// +--------+---------+----------+----------+------------+
+// |(uint64)|(varchar)| (uint64) | (uint64) |  (varchar) |
+// +--------+---------+----------+----------+------------+
+const (
+	SnapshotAttr_SegID           = "segment_id"
+	SnapshotAttr_TID             = "table_id"
+	SnapshotAttr_DBID            = "db_id"
+	SegmentAttr_ID               = "id"
+	SegmentAttr_CreateAt         = "create_at"
+	SegmentAttr_State            = "state"
+	SegmentAttr_Sorted           = "sorted"
+	SnapshotAttr_BlockMaxRow     = "block_max_row"
+	SnapshotAttr_SegmentMaxBlock = "segment_max_block"
+)
+
+// make batch, append necessary field like commit ts
+func makeRespBatchFromSchema(schema *Schema) *containers.Batch {
+	bat := containers.NewBatch()
+
+	bat.AddVector(AttrRowID, containers.MakeVector(types.T_Rowid.ToType(), false))
+	bat.AddVector(AttrCommitTs, containers.MakeVector(types.T_TS.ToType(), false))
+	// Types() is not used, then empty schema can also be handled here
+	typs := schema.AllTypes()
+	attrs := schema.AllNames()
+	nullables := schema.AllNullables()
+	for i, attr := range attrs {
+		if attr == PhyAddrColumnName {
+			continue
+		}
+		bat.AddVector(attr, containers.MakeVector(typs[i], nullables[i]))
+	}
+	return bat
+}
+
+var (
+	BlkMetaSchema *Schema
+	DelBlockSchema     *Schema
+)
+
+func init() {
+	BlkMetaSchema = NewEmptySchema("blkMeta")
+	DelBlockSchema = NewEmptySchema("deleteBlock")
+
+	for i, colname := range pkgcatalog.MoTableMetaSchema {
+		if i == 0 {
+			if err := BlkMetaSchema.AppendPKCol(colname, pkgcatalog.MoTableMetaTypes[i], 0); err != nil {
+				panic(err)
+			}
+		} else {
+			if err := BlkMetaSchema.AppendCol(colname, pkgcatalog.MoTableMetaTypes[i]); err != nil {
+				panic(err)
+			}
+		}
+	}
+	if err := BlkMetaSchema.Finalize(true); err != nil { // no phyaddr column
+		panic(err)
+	}
+
+	if err := DelBlockSchema.AppendCol(pkgcatalog.BlockMeta_SegmentID, types.New(types.T_uint64, 0, 0, 0)); err != nil {
+		panic(err)
+	}
+	
+}
+
+func u64ToRowID(v uint64) types.Rowid {
+	var rowid types.Rowid
+	bs := types.EncodeUint64(&v)
+	copy(rowid[0:], bs)
+	return rowid
+}
+
+func containersBatchToProtoBatch(bat *containers.Batch) (*api.Batch, error) {
+	mobat := containers.CopyToMoBatch(bat)
+	return batch.BatchToProtoBatch(mobat)
+}
+
+func protoBatchToContainersBatch(bat *api.Batch) (*containers.Batch, error) {
+	mobat, err := batch.ProtoBatchToBatch(bat)
+	if err != nil {
+		panic(err)
+	}
+	containerBatch := containers.NewBatch()
+	for i, vec := range mobat.Vecs {
+		containerBatch.AddVector(mobat.Attrs[i], containers.NewVectorWithSharedMemory(vec, false))
+	}
+	return containerBatch, nil
 }

@@ -114,7 +114,13 @@ func (store *replayTxnStore) prepareCmd(txncmd txnif.TxnCmd, idxCtx *wal.Index, 
 	var err error
 	switch cmd := txncmd.(type) {
 	case *catalog.EntryCommand:
-		store.catalog.ReplayCmd(txncmd, store.dataFactory, idxCtx, store.Observer)
+		txnNode:=&txnbase.TxnMVCCNode{
+			Start: txn.GetStartTS(),
+			Prepare: txn.GetPrepareTS(),
+			End: txn.GetPrepareTS(),
+			LogIndex: idxCtx,
+		}
+		store.catalog.ReplayCmd(txncmd, store.dataFactory, idxCtx,txnNode, store.Observer)
 	case *AppendCmd:
 		store.replayAppendData(cmd, store.Observer, txn)
 	case *updates.UpdateCmd:

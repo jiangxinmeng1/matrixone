@@ -19,8 +19,13 @@ import (
 	"fmt"
 	"io"
 
+	pkgcatalog "github.com/matrixorigin/matrixone/pkg/catalog"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
@@ -37,6 +42,7 @@ type BlockEntry struct {
 	segment *SegmentEntry
 	state   EntryState
 	blkData data.Block
+	entries []*api.Entry
 }
 
 func NewReplayBlockEntry() *BlockEntry {
@@ -129,6 +135,77 @@ func (entry *BlockEntry) MakeCommand(id uint32) (cmd txnif.TxnCmd, err error) {
 	entry.RLock()
 	defer entry.RUnlock()
 	return newBlockCmd(id, cmdType, entry), nil
+}
+func (entry *BlockEntry) MakeLogtailEntries() (logtailEntries []*api.Entry) {
+	entry.RLock()
+	defer entry.RUnlock()
+	node := entry.GetLatestNodeLocked().(*MetadataMVCCNode)
+	logtailEntries = make([]*api.Entry, 0)
+
+	entryType := api.Entry_Insert
+	if node.MetaLoc == "" {
+		entryType = api.Entry_DN
+	}
+	bat, err := containersBatchToProtoBatch(entry.appendBlkMeta(false))
+	if err != nil {
+		panic(err)
+	}
+	logtailEntry := &api.Entry{
+		EntryType:    entryType,
+		TableId:      entry.segment.table.ID,
+		TableName:    fmt.Sprintf("_%d_meta", entry.segment.table.ID),
+		DatabaseId:   entry.segment.table.db.ID,
+		DatabaseName: entry.segment.table.db.GetName(),
+		Bat:          bat,
+	}
+	logtailEntries = append(logtailEntries, logtailEntry)
+
+	if !node.DeletedAt.IsEmpty() {
+		entryType = api.Entry_Delete
+		bat, err := containersBatchToProtoBatch(entry.appendBlkMeta(true))
+		if err != nil {
+			panic(err)
+		}
+		logtailEntry := &api.Entry{
+			EntryType:    entryType,
+			TableId:      entry.segment.table.ID,
+			TableName:    fmt.Sprintf("_%d_meta", entry.segment.table.ID),
+			DatabaseId:   entry.segment.table.db.ID,
+			DatabaseName: entry.segment.table.db.GetName(),
+			Bat:          bat,
+		}
+		logtailEntries = append(logtailEntries, logtailEntry)
+	}
+
+	return logtailEntries
+}
+func (entry *BlockEntry) appendBlkMeta(delete bool) *containers.Batch {
+	metaNode := entry.GetLatestNodeLocked().(*MetadataMVCCNode)
+	is_sorted := false
+	if !entry.IsAppendable() && entry.GetSchema().HasSortKey() {
+		is_sorted = true
+	}
+	if delete {
+		if metaNode.DeletedAt.IsEmpty() {
+			panic(moerr.NewInternalErrorNoCtx("no delete at time in a dropped entry"))
+		}
+		delBatch := makeRespBatchFromSchema(DelBlockSchema)
+		delBatch.GetVectorByName(AttrCommitTs).Append(metaNode.DeletedAt)
+		delBatch.GetVectorByName(AttrRowID).Append(u64ToRowID(entry.ID))
+		delBatch.GetVectorByName(pkgcatalog.BlockMeta_SegmentID).Append(entry.GetSegment().ID)
+		return delBatch
+	}
+	insBatch := makeRespBatchFromSchema(BlkMetaSchema)
+	insBatch.GetVectorByName(pkgcatalog.BlockMeta_ID).Append(entry.ID)
+	insBatch.GetVectorByName(pkgcatalog.BlockMeta_EntryState).Append(entry.IsAppendable())
+	insBatch.GetVectorByName(pkgcatalog.BlockMeta_Sorted).Append(is_sorted)
+	insBatch.GetVectorByName(pkgcatalog.BlockMeta_MetaLoc).Append([]byte(metaNode.MetaLoc))
+	insBatch.GetVectorByName(pkgcatalog.BlockMeta_DeltaLoc).Append([]byte(metaNode.DeltaLoc))
+	insBatch.GetVectorByName(pkgcatalog.BlockMeta_CommitTs).Append(metaNode.GetEnd())
+	insBatch.GetVectorByName(pkgcatalog.BlockMeta_SegmentID).Append(entry.GetSegment().ID)
+	insBatch.GetVectorByName(AttrCommitTs).Append(metaNode.CreatedAt)
+	insBatch.GetVectorByName(AttrRowID).Append(u64ToRowID(entry.ID))
+	return insBatch
 }
 
 func (entry *BlockEntry) Set1PC() {
