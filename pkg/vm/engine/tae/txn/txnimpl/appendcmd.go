@@ -20,10 +20,15 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 )
 
@@ -40,9 +45,10 @@ func init() {
 type AppendCmd struct {
 	*txnbase.BaseCustomizedCmd
 	*txnbase.ComposedCmd
-	Infos []*appendInfo
-	Ts    types.TS
-	Node  InsertNode
+	Infos   []*appendInfo
+	Ts      types.TS
+	Node    InsertNode
+	entries []*api.Entry
 }
 
 func NewEmptyAppendCmd() *AppendCmd {
@@ -148,7 +154,9 @@ func (c *AppendCmd) ReadFrom(r io.Reader) (n int64, err error) {
 	n += 16
 	return
 }
-
+func (c *AppendCmd) AddCmd(cmd txnif.TxnCmd) {
+	c.ComposedCmd.AddCmd(cmd)
+}
 func (c *AppendCmd) Marshal() (buf []byte, err error) {
 	var bbuf bytes.Buffer
 	if _, err = c.WriteTo(&bbuf); err != nil {
@@ -162,4 +170,59 @@ func (c *AppendCmd) Unmarshal(buf []byte) error {
 	bbuf := bytes.NewBuffer(buf)
 	_, err := c.ReadFrom(bbuf)
 	return err
+}
+
+func (c *AppendCmd) GenerateInfos() (infos []*appendInfo) {
+	infos = make([]*appendInfo, 0)
+	for _, entry := range c.entries {
+		containersBatch, err := protoBatchToContainersBatch(entry.Bat)
+		if err != nil {
+			panic(err)
+		}
+		seq := uint32(0)
+		dbid := entry.DatabaseId
+		tid := entry.TableId
+		var info *appendInfo
+		preBlkID := uint64(0)
+		for i := 1; i < containersBatch.Length(); i++ {
+			rowid := containersBatch.GetVectorByName(catalog.AttrRowID).Get(i).(types.Rowid)
+			sid, blkID, offset := model.DecodePhyAddrKey(rowid)
+			if blkID == 0 {
+				continue
+			}
+			if blkID != preBlkID {
+				if info != nil {
+					info.srcLen = uint32(i) - info.srcOff
+					info.destOff = uint32(offset) - info.destOff
+					infos = append(infos, info)
+				}
+				seq++
+				info = &appendInfo{
+					seq:    seq,
+					srcOff: uint32(i),
+					dbid:   dbid,
+					dest: &common.ID{
+						TableID:   tid,
+						SegmentID: sid,
+						BlockID:   blkID,
+					},
+					destOff: offset,
+				}
+				preBlkID = blkID
+			}
+		}
+	}
+	return
+}
+
+func protoBatchToContainersBatch(bat *api.Batch) (*containers.Batch, error) {
+	mobat, err := batch.ProtoBatchToBatch(bat)
+	if err != nil {
+		panic(err)
+	}
+	containerBatch := containers.NewBatch()
+	for i, vec := range mobat.Vecs {
+		containerBatch.AddVector(mobat.Attrs[i], containers.NewVectorWithSharedMemory(vec, false))
+	}
+	return containerBatch, nil
 }
