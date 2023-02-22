@@ -80,13 +80,26 @@ func makeRespBatchFromSchema(schema *Schema) *containers.Batch {
 }
 
 var (
-	BlkMetaSchema *Schema
-	DelBlockSchema     *Schema
+	BlkMetaSchema  *Schema
+	DelBlockSchema *Schema
+	SegmentSchema  *Schema
+	DelSchema      *Schema
+
+	SegmentAttr = []string{
+		SegmentAttr_State,
+		SegmentAttr_Sorted,
+	}
+	SegmentTypes = []types.Type{
+		types.New(types.T_bool, 0, 0, 0),
+		types.New(types.T_bool, 0, 0, 0),
+	}
 )
 
 func init() {
 	BlkMetaSchema = NewEmptySchema("blkMeta")
 	DelBlockSchema = NewEmptySchema("deleteBlock")
+	SegmentSchema = NewEmptySchema("segment")
+	DelSchema = NewEmptySchema("del")
 
 	for i, colname := range pkgcatalog.MoTableMetaSchema {
 		if i == 0 {
@@ -106,7 +119,24 @@ func init() {
 	if err := DelBlockSchema.AppendCol(pkgcatalog.BlockMeta_SegmentID, types.New(types.T_uint64, 0, 0, 0)); err != nil {
 		panic(err)
 	}
-	
+	if err := DelBlockSchema.Finalize(true); err != nil { // no phyaddr column
+		panic(err)
+	}
+
+	for i, colname := range SegmentAttr {
+		if i == 0 {
+			if err := SegmentSchema.AppendPKCol(colname, SegmentTypes[i], 0); err != nil {
+				panic(err)
+			}
+		} else {
+			if err := SegmentSchema.AppendCol(colname, SegmentTypes[i]); err != nil {
+				panic(err)
+			}
+		}
+	}
+	if err := SegmentSchema.Finalize(true); err != nil { // no phyaddr column
+		panic(err)
+	}
 }
 
 func u64ToRowID(v uint64) types.Rowid {
@@ -131,4 +161,8 @@ func protoBatchToContainersBatch(bat *api.Batch) (*containers.Batch, error) {
 		containerBatch.AddVector(mobat.Attrs[i], containers.NewVectorWithSharedMemory(vec, false))
 	}
 	return containerBatch, nil
+}
+
+func isDeleteBatch(bat *containers.Batch)bool{
+	return len(bat.Attrs)==2
 }

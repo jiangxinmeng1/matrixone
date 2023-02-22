@@ -147,7 +147,6 @@ func (cmd *EntryCommand) SetReplayTxn(txn txnif.AsyncTxn) {
 	switch cmd.cmdType {
 	case CmdUpdateBlock:
 	case CmdUpdateSegment:
-		cmd.entry.GetLatestNodeLocked().(*MetadataMVCCNode).Txn = txn
 	case CmdUpdateTable:
 		cmd.entry.GetLatestNodeLocked().(*TableMVCCNode).Txn = txn
 	case CmdUpdateDatabase:
@@ -158,8 +157,8 @@ func (cmd *EntryCommand) SetReplayTxn(txn txnif.AsyncTxn) {
 }
 func (cmd *EntryCommand) ApplyCommit() {
 	switch cmd.cmdType {
-	case CmdUpdateBlock:
-	case CmdUpdateSegment, CmdUpdateTable, CmdUpdateDatabase:
+	case CmdUpdateSegment,CmdUpdateBlock:
+	case  CmdUpdateTable, CmdUpdateDatabase:
 		node := cmd.entry.GetLatestNodeLocked()
 		if node.Is1PC() {
 			return
@@ -184,7 +183,8 @@ func (cmd *EntryCommand) ApplyRollback() {
 	}
 }
 func (cmd *EntryCommand) GetTs() types.TS {
-	if cmd.cmdType == CmdUpdateBlock {
+	switch cmd.cmdType{
+	case CmdUpdateBlock,CmdUpdateSegment:
 		return types.TS{}
 	}
 	ts := cmd.entry.GetLatestNodeLocked().GetPrepare()
@@ -220,15 +220,15 @@ func (cmd *EntryCommand) GetID() (uint64, *common.ID) {
 			id.TableID = cmd.entry.GetID()
 		}
 	case CmdUpdateSegment:
-		if cmd.DBID != 0 {
-			dbid = cmd.DBID
-			id.TableID = cmd.TableID
-			id.SegmentID = cmd.entry.GetID()
-		} else {
-			dbid = cmd.DB.ID
-			id.TableID = cmd.Table.ID
-			id.SegmentID = cmd.Segment.ID
-		}
+		// if cmd.DBID != 0 {
+		// 	dbid = cmd.DBID
+		// 	id.TableID = cmd.TableID
+		// 	id.SegmentID = cmd.entry.GetID()
+		// } else {
+		// 	dbid = cmd.DB.ID
+		// 	id.TableID = cmd.Table.ID
+		// 	id.SegmentID = cmd.Segment.ID
+		// }
 	case CmdUpdateBlock:
 		// if cmd.DBID != 0 {
 		// 	dbid = cmd.DBID
@@ -306,25 +306,27 @@ func (cmd *EntryCommand) WriteTo(w io.Writer) (n int64, err error) {
 		}
 		n += int64(len(schemaBuf))
 	case CmdUpdateSegment:
-		if err = binary.Write(w, binary.BigEndian, cmd.DB.ID); err != nil {
+		entries := cmd.Segment.MakeLogtailEntries()
+		if err = binary.Write(w, binary.BigEndian, uint64(len(entries))); err != nil {
 			return
 		}
-		if err = binary.Write(w, binary.BigEndian, cmd.Table.ID); err != nil {
-			return
+		n += 8
+		for _,entry := range entries {
+			buf := new(bytes.Buffer)
+			if err := gob.NewEncoder(buf).Encode(entry); err != nil {
+				return n, err
+			}
+			length := uint64(buf.Len())
+			if err := binary.Write(w, binary.BigEndian, length); err != nil {
+				panic(err)
+			}
+			n += 8
+			sn, err := w.Write(buf.Bytes())
+			if err != nil {
+				panic(err)
+			}
+			n += int64(sn)
 		}
-		if err = binary.Write(w, binary.BigEndian, cmd.Segment.state); err != nil {
-			return
-		}
-		if err = binary.Write(w, binary.BigEndian, cmd.Segment.sorted); err != nil {
-			return
-		}
-		n += 8 + 8 + 1 + 1
-		var n2 int64
-		n2, err = cmd.entry.WriteOneNodeTo(w)
-		if err != nil {
-			return
-		}
-		n += n2
 	case CmdUpdateBlock:
 		entries := cmd.Block.MakeLogtailEntries()
 		if err = binary.Write(w, binary.BigEndian, uint64(len(entries))); err != nil {
@@ -410,38 +412,32 @@ func (cmd *EntryCommand) ReadFrom(r io.Reader) (n int64, err error) {
 		}
 		n += sn
 	case CmdUpdateSegment:
-		entry := NewReplayMetaBaseEntry()
-		if err = binary.Read(r, binary.BigEndian, &entry.ID); err != nil {
+		id := uint64(0)
+		if err = binary.Read(r, binary.BigEndian, &id); err != nil {
 			return
 		}
 		n += 8
-		cmd.entry = entry
-		if err = binary.Read(r, binary.BigEndian, &cmd.DBID); err != nil {
+		entriesLength := uint64(0)
+		if err = binary.Read(r, binary.BigEndian, &entriesLength); err != nil {
 			return
 		}
 		n += 8
-		if err = binary.Read(r, binary.BigEndian, &cmd.TableID); err != nil {
-			return
+		entries:=make([]*api.Entry,entriesLength)
+		for i := 0; i < int(entriesLength); i++ {
+			length := uint64(0)
+			if err = binary.Read(r, binary.BigEndian, &length); err != nil {
+				return
+			}
+			n += 8
+			buf := make([]byte, length)
+			r.Read(buf)
+			r2 := bytes.NewBuffer(buf)
+			entry := &api.Entry{}
+			gob.NewDecoder(r2).Decode(entry)
+			entries[i]=entry
 		}
-		n += 8
-		var state EntryState
-		if err = binary.Read(r, binary.BigEndian, &state); err != nil {
-			return
-		}
-		n += 1
-		var sorted bool
-		if err = binary.Read(r, binary.BigEndian, &sorted); err != nil {
-			return
-		}
-		n += 1
-		if sn, err = cmd.entry.ReadOneNodeFrom(r); err != nil {
-			return
-		}
-		n += sn
-		cmd.Segment = NewReplaySegmentEntry()
-		cmd.Segment.MetaBaseEntry = cmd.entry.(*MetaBaseEntry)
-		cmd.Segment.state = state
-		cmd.Segment.sorted = sorted
+		cmd.Segment = &SegmentEntry{}
+		cmd.Segment.logentries = entries
 	case CmdUpdateBlock:
 		id := uint64(0)
 		if err = binary.Read(r, binary.BigEndian, &id); err != nil {

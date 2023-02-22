@@ -22,9 +22,11 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tasks"
@@ -45,6 +47,7 @@ type SegmentEntry struct {
 	state   EntryState
 	sorted  bool
 	segData data.Segment
+	logentries []*api.Entry
 }
 
 func NewSegmentEntry(table *TableEntry, txn txnif.AsyncTxn, state EntryState, dataFactory SegmentDataFactory) *SegmentEntry {
@@ -207,6 +210,42 @@ func (entry *SegmentEntry) SetSorted() {
 	entry.Lock()
 	defer entry.Unlock()
 	entry.sorted = true
+}
+
+func(entry *SegmentEntry) MakeLogtailEntries()(logtailEntries []*api.Entry){
+	entry.RLock()
+	defer entry.RUnlock()
+	logtailEntries = make([]*api.Entry, 0)
+	bat, err := containersBatchToProtoBatch(entry.appendSegment())
+	if err != nil {
+		panic(err)
+	}
+	logtailEntry := &api.Entry{
+		EntryType:    api.Entry_DN,
+		TableId:      entry.table.ID,
+		TableName:    entry.table.schema.Name,
+		DatabaseId:   entry.table.db.ID,
+		DatabaseName: entry.table.db.GetName(),
+		Bat:          bat,
+	}
+	logtailEntries = append(logtailEntries, logtailEntry)
+	return
+}
+
+func (entry *SegmentEntry) appendSegment() (bat *containers.Batch) {
+	node := entry.GetLatestNodeLocked().(*MetadataMVCCNode)
+	if !node.DeletedAt.IsEmpty() {
+		bat = makeRespBatchFromSchema(DelSchema)
+		bat.GetVectorByName(AttrRowID).Append(u64ToRowID(entry.ID))
+		bat.GetVectorByName(AttrCommitTs).Append(node.GetEnd())
+	} else {
+		bat = makeRespBatchFromSchema(SegmentSchema)
+		bat.GetVectorByName(AttrRowID).Append(u64ToRowID(entry.ID))
+		bat.GetVectorByName(AttrCommitTs).Append(node.GetEnd())
+		bat.GetVectorByName(SegmentAttr_State).Append(entry.IsAppendable())
+		bat.GetVectorByName(SegmentAttr_Sorted).Append(entry.IsSorted())
+	}
+	return
 }
 
 func (entry *SegmentEntry) IsSorted() bool {
