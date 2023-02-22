@@ -25,7 +25,9 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 )
 
@@ -80,6 +82,10 @@ type DBEntry struct {
 	link      *common.GenericSortedDList[*TableEntry]
 
 	nodesMu sync.RWMutex
+
+	logentries []*api.Entry
+
+	isCreateLogCollectted bool
 }
 
 func compareTableFn(a, b *TableEntry) int {
@@ -266,6 +272,56 @@ func (e *DBEntry) GetTableEntryByID(id uint64) (table *TableEntry, err error) {
 	return
 }
 
+func (e *DBEntry) MakeLogtailEntries() (logtailEntries []*api.Entry) {
+	e.RLock()
+	defer e.RUnlock()
+
+	entryType := api.Entry_Insert
+	node := e.GetLatestNodeLocked().(*DBMVCCNode)
+	create := true
+	if !node.DeletedAt.IsEmpty() {
+		create = false
+	}
+	if node.CreatedAt.Equal(txnif.UncommitTS) && node.DeletedAt.Equal(txnif.UncommitTS) {
+		if !e.isCreateLogCollectted {
+			e.isCreateLogCollectted = true
+			create = true
+		} else {
+			e.isCreateLogCollectted = false
+			create = false
+		}
+	}
+	if !create {
+		entryType = api.Entry_Delete
+	}
+
+	bat, err := containersBatchToProtoBatch(e.appendDatabase(create))
+	if err != nil {
+		panic(err)
+	}
+	logtailEntry := &api.Entry{
+		EntryType:    entryType,
+		TableId:      pkgcatalog.MO_DATABASE_ID,
+		TableName:    pkgcatalog.MO_DATABASE,
+		DatabaseId:   pkgcatalog.MO_CATALOG_ID,
+		DatabaseName: pkgcatalog.MO_CATALOG,
+		Bat:          bat,
+	}
+	logtailEntries = append(logtailEntries, logtailEntry)
+	return
+}
+func (e *DBEntry) appendDatabase(create bool) (bat *containers.Batch) {
+	node := e.GetLatestNodeLocked().(*DBMVCCNode)
+	if !create {
+		// delScehma is empty, it will just fill rowid / commit ts
+		bat = makeRespBatchFromSchema(DelSchema)
+		catalogEntry2Batch(bat, e, DelSchema, FillDBRow, u64ToRowID(e.GetID()), node.GetEnd())
+	} else {
+		bat = makeRespBatchFromSchema(SystemDBSchema)
+		catalogEntry2Batch(bat, e, SystemDBSchema, FillDBRow, u64ToRowID(e.GetID()), node.GetEnd())
+	}
+	return
+}
 func (e *DBEntry) txnGetNodeByName(
 	tenantID uint32,
 	name string,

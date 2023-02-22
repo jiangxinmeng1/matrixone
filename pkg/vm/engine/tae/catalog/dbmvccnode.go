@@ -71,6 +71,10 @@ func (e *DBMVCCNode) Update(vun txnif.MVCCNode) {
 
 func (e *DBMVCCNode) ApplyCommit(index *wal.Index) (err error) {
 	var commitTS types.TS
+	if e.EntryMVCCNode.CreatedAt.Equal(txnif.UncommitTS) && e.EntryMVCCNode.DeletedAt.Equal(txnif.UncommitTS) {
+		e.EntryMVCCNode.CreatedAt = e.Txn.GetCommitTS()
+		return
+	}
 	commitTS, err = e.TxnMVCCNode.ApplyCommit(index)
 	if err != nil {
 		return

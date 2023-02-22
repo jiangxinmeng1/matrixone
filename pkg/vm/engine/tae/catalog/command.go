@@ -149,7 +149,7 @@ func (cmd *EntryCommand) SetReplayTxn(txn txnif.AsyncTxn) {
 	case CmdUpdateSegment:
 	case CmdUpdateTable:
 	case CmdUpdateDatabase:
-		cmd.entry.GetLatestNodeLocked().(*DBMVCCNode).Txn = txn
+		// cmd.entry.GetLatestNodeLocked().(*DBMVCCNode).Txn = txn
 	default:
 		panic(fmt.Sprintf("invalid command type %d", cmd.cmdType))
 	}
@@ -158,25 +158,27 @@ func (cmd *EntryCommand) ApplyCommit() {
 	switch cmd.cmdType {
 	case CmdUpdateSegment, CmdUpdateBlock, CmdUpdateTable:
 	case CmdUpdateDatabase:
-		node := cmd.entry.GetLatestNodeLocked()
-		if node.Is1PC() {
-			return
-		}
-		if err := node.ApplyCommit(nil); err != nil {
-			panic(err)
-		}
+		// node := cmd.entry.GetLatestNodeLocked()
+		// if node.Is1PC() {
+		// 	return
+		// }
+		// if err := node.ApplyCommit(nil); err != nil {
+		// 	panic(err)
+		// }
 	default:
 		panic(fmt.Sprintf("invalid command type %d", cmd.cmdType))
 	}
 }
+
+// TODO
 func (cmd *EntryCommand) ApplyRollback() {
 	switch cmd.cmdType {
 	case CmdUpdateBlock, CmdUpdateSegment, CmdUpdateTable, CmdUpdateDatabase:
-		node := cmd.entry.GetLatestNodeLocked().(*MetadataMVCCNode)
-		if node.Is1PC() {
-			return
-		}
-		node.ApplyRollback(nil)
+		// node := cmd.entry.GetLatestNodeLocked().(*MetadataMVCCNode)
+		// if node.Is1PC() {
+		// 	return
+		// }
+		// node.ApplyRollback(nil)
 	default:
 		panic(fmt.Sprintf("invalid command type %d", cmd.cmdType))
 	}
@@ -267,7 +269,6 @@ func (cmd *EntryCommand) WriteTo(w io.Writer) (n int64, err error) {
 	if err = binary.Write(w, binary.BigEndian, cmd.ID); err != nil {
 		return
 	}
-	var sn int64
 	n = 4 + 2
 
 	if err = binary.Write(w, binary.BigEndian, cmd.entry.GetID()); err != nil {
@@ -276,18 +277,27 @@ func (cmd *EntryCommand) WriteTo(w io.Writer) (n int64, err error) {
 	n += 4
 	switch cmd.GetType() {
 	case CmdUpdateDatabase:
-		if sn, err = common.WriteString(cmd.DB.name, w); err != nil {
+		entries := cmd.DB.MakeLogtailEntries()
+		if err = binary.Write(w, binary.BigEndian, uint64(len(entries))); err != nil {
 			return
 		}
-		n += sn
-		if sn, err = cmd.DB.acInfo.WriteTo(w); err != nil {
-			return
+		n += 8
+		for _, entry := range entries {
+			buf := new(bytes.Buffer)
+			if err := gob.NewEncoder(buf).Encode(entry); err != nil {
+				return n, err
+			}
+			length := uint64(buf.Len())
+			if err := binary.Write(w, binary.BigEndian, length); err != nil {
+				panic(err)
+			}
+			n += 8
+			sn, err := w.Write(buf.Bytes())
+			if err != nil {
+				panic(err)
+			}
+			n += int64(sn)
 		}
-		n += sn
-		if sn, err = cmd.DB.WriteOneNodeTo(w); err != nil {
-			return
-		}
-		n += sn
 	case CmdUpdateTable:
 		entries := cmd.Table.MakeLogtailEntries()
 		if err = binary.Write(w, binary.BigEndian, uint64(len(entries))); err != nil {
@@ -370,29 +380,34 @@ func (cmd *EntryCommand) ReadFrom(r io.Reader) (n int64, err error) {
 		return
 	}
 	n += 4
-	var sn int64
 	switch cmd.GetType() {
 	case CmdUpdateDatabase:
-		entry := NewReplayDBBaseEntry()
-		if err = binary.Read(r, binary.BigEndian, &entry.ID); err != nil {
+		id := uint64(0)
+		if err = binary.Read(r, binary.BigEndian, &id); err != nil {
 			return
 		}
 		n += 8
-		cmd.entry = entry
-		cmd.DB = NewReplayDBEntry()
-		if cmd.DB.name, sn, err = common.ReadString(r); err != nil {
+		entriesLength := uint64(0)
+		if err = binary.Read(r, binary.BigEndian, &entriesLength); err != nil {
 			return
 		}
-		n += sn
-		if sn, err = cmd.DB.acInfo.ReadFrom(r); err != nil {
-			return
+		n += 8
+		entries := make([]*api.Entry, entriesLength)
+		for i := 0; i < int(entriesLength); i++ {
+			length := uint64(0)
+			if err = binary.Read(r, binary.BigEndian, &length); err != nil {
+				return
+			}
+			n += 8
+			buf := make([]byte, length)
+			r.Read(buf)
+			r2 := bytes.NewBuffer(buf)
+			entry := &api.Entry{}
+			gob.NewDecoder(r2).Decode(entry)
+			entries[i] = entry
 		}
-		n += sn
-		if sn, err = cmd.entry.ReadOneNodeFrom(r); err != nil {
-			return
-		}
-		n += sn
-		cmd.DB.DBBaseEntry = cmd.entry.(*DBBaseEntry)
+		cmd.DB = &DBEntry{}
+		cmd.DB.logentries = entries
 	case CmdUpdateTable:
 		id := uint64(0)
 		if err = binary.Read(r, binary.BigEndian, &id); err != nil {

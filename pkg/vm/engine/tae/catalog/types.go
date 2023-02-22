@@ -350,3 +350,26 @@ func FillTableRow(table *TableEntry, attr string, colData containers.Vector, ts 
 		panic("unexpected colname. if add new catalog def, fill it in this switch")
 	}
 }
+
+func FillDBRow(db *DBEntry, attr string, colData containers.Vector, _ types.TS) {
+	switch attr {
+	case pkgcatalog.SystemDBAttr_ID:
+		colData.Append(db.GetID())
+	case pkgcatalog.SystemDBAttr_Name:
+		colData.Append([]byte(db.GetName()))
+	case pkgcatalog.SystemDBAttr_CatalogName:
+		colData.Append([]byte(pkgcatalog.SystemCatalogName))
+	case pkgcatalog.SystemDBAttr_CreateSQL:
+		colData.Append([]byte(db.GetCreateSql()))
+	case pkgcatalog.SystemDBAttr_Owner:
+		colData.Append(db.GetRoleID())
+	case pkgcatalog.SystemDBAttr_Creator:
+		colData.Append(db.GetUserID())
+	case pkgcatalog.SystemDBAttr_CreateAt:
+		colData.Append(db.GetCreateAt())
+	case pkgcatalog.SystemDBAttr_AccID:
+		colData.Append(db.GetTenantID())
+	default:
+		panic("unexpected colname. if add new catalog def, fill it in this switch")
+	}
+}

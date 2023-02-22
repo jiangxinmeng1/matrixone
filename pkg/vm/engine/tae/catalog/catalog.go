@@ -193,7 +193,7 @@ func (catalog *Catalog) ReplayCmd(
 		}
 	case CmdUpdateDatabase:
 		cmd := txncmd.(*EntryCommand)
-		catalog.onReplayUpdateDatabase(cmd, idxCtx, observer)
+		catalog.onReplayUpdateDatabase(cmd, idxCtx, txnNode, observer)
 	case CmdUpdateTable:
 		cmd := txncmd.(*EntryCommand)
 		catalog.onReplayUpdateTable(cmd, dataFactory, idxCtx, txnNode, observer)
@@ -214,36 +214,14 @@ func (catalog *Catalog) ReplayCmd(
 	}
 }
 
-func (catalog *Catalog) onReplayUpdateDatabase(cmd *EntryCommand, idx *wal.Index, observer wal.ReplayObserver) {
-	catalog.OnReplayDBID(cmd.DB.ID)
-	var err error
-	un := cmd.entry.GetLatestNodeLocked().(*DBMVCCNode)
-	un.SetLogIndex(idx)
-	if un.Is1PC() {
-		if err := un.ApplyCommit(nil); err != nil {
-			panic(err)
-		}
-	}
-
-	db, err := catalog.GetDatabaseByID(cmd.entry.GetID())
+func (catalog *Catalog) onReplayUpdateDatabase(cmd *EntryCommand, idx *wal.Index, txnNode *txnbase.TxnMVCCNode, observer wal.ReplayObserver) {
+	entries := cmd.DB.logentries
+	bat0 := entries[0].Bat
+	containersBatch0, err := protoBatchToContainersBatch(bat0)
 	if err != nil {
-		cmd.DB.RWMutex = new(sync.RWMutex)
-		cmd.DB.catalog = catalog
-		cmd.entry.GetLatestNodeLocked().SetLogIndex(idx)
-		err = catalog.AddEntryLocked(cmd.DB, un.GetTxn(), false)
-		if err != nil {
-			panic(err)
-		}
-		return
+		panic(err)
 	}
-
-	dbun := db.SearchNode(un)
-	if dbun == nil {
-		db.Insert(un)
-	} else {
-		return
-		// panic(fmt.Sprintf("logic err: duplicate node %v and %v", dbun.String(), un.String()))
-	}
+	catalog.OnReplayDatabaseBatch2(containersBatch0, txnNode)
 }
 
 func (catalog *Catalog) OnReplayDatabaseBatch(ins, insTxn, del, delTxn *containers.Batch) {
@@ -263,7 +241,21 @@ func (catalog *Catalog) OnReplayDatabaseBatch(ins, insTxn, del, delTxn *containe
 		catalog.onReplayDeleteDB(dbid, txnNode)
 	}
 }
-
+func (catalog *Catalog) OnReplayDatabaseBatch2(bat *containers.Batch, txnNode *txnbase.TxnMVCCNode) {
+	i := 0
+	if !isDeleteBatch(bat) {
+		dbid := bat.GetVectorByName(pkgcatalog.SystemDBAttr_ID).Get(i).(uint64)
+		name := string(bat.GetVectorByName(pkgcatalog.SystemDBAttr_Name).Get(i).([]byte))
+		tenantID := bat.GetVectorByName(pkgcatalog.SystemDBAttr_AccID).Get(i).(uint32)
+		userID := bat.GetVectorByName(pkgcatalog.SystemDBAttr_Creator).Get(i).(uint32)
+		roleID := bat.GetVectorByName(pkgcatalog.SystemDBAttr_Owner).Get(i).(uint32)
+		createAt := bat.GetVectorByName(pkgcatalog.SystemDBAttr_CreateAt).Get(i).(types.Timestamp)
+		catalog.onReplayCreateDB(dbid, name, txnNode, tenantID, userID, roleID, createAt)
+	} else {
+		dbid := rowIDToU64(bat.GetVectorByName(AttrRowID).Get(i).(types.Rowid))
+		catalog.onReplayDeleteDB(dbid, txnNode)
+	}
+}
 func (catalog *Catalog) onReplayCreateDB(dbid uint64, name string, txnNode *txnbase.TxnMVCCNode, tenantID, userID, roleID uint32, createAt types.Timestamp) {
 	catalog.OnReplayDBID(dbid)
 	db, _ := catalog.GetDatabaseByID(dbid)

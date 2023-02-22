@@ -411,7 +411,7 @@ func (db *txnDB) SoftDeleteSegment(id *common.ID) (err error) {
 	return table.SoftDeleteSegment(id.SegmentID)
 }
 func (db *txnDB) NeedRollback() bool {
-	return db.createEntry != nil && db.dropEntry != nil
+	return false
 }
 func (db *txnDB) ApplyRollback() (err error) {
 	if db.createEntry != nil {

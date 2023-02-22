@@ -338,7 +338,7 @@ func (store *txnStore) CreateDatabaseWithID(name, createSql string, id uint64) (
 }
 
 func (store *txnStore) DropDatabase(name string) (h handle.Database, err error) {
-	hasNewEntry, meta, err := store.catalog.DropDBEntry(name, store.txn)
+	_, meta, err := store.catalog.DropDBEntry(name, store.txn)
 	if err != nil {
 		return
 	}
@@ -346,17 +346,15 @@ func (store *txnStore) DropDatabase(name string) (h handle.Database, err error) 
 	if err != nil {
 		return
 	}
-	if hasNewEntry {
-		if err = db.SetDropEntry(meta); err != nil {
-			return
-		}
+	if err = db.SetDropEntry(meta); err != nil {
+		return
 	}
 	h = buildDB(db)
 	return
 }
 
 func (store *txnStore) DropDatabaseByID(id uint64) (h handle.Database, err error) {
-	hasNewEntry, meta, err := store.catalog.DropDBEntryByID(id, store.txn)
+	_, meta, err := store.catalog.DropDBEntryByID(id, store.txn)
 	if err != nil {
 		return
 	}
@@ -364,10 +362,8 @@ func (store *txnStore) DropDatabaseByID(id uint64) (h handle.Database, err error
 	if err != nil {
 		return
 	}
-	if hasNewEntry {
-		if err = db.SetDropEntry(meta); err != nil {
-			return
-		}
+	if err = db.SetDropEntry(meta); err != nil {
+		return
 	}
 	h = buildDB(db)
 	return
