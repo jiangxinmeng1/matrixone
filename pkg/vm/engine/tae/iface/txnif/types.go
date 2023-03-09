@@ -282,16 +282,4 @@ type TxnEntry interface {
 	MakeCommand(uint32) (TxnCmd, error)
 	Is1PC() bool
 	Set1PC()
-	GetTxnEntryType() TxnEntryType
 }
-
-const (
-	TxnEntryDatabase TxnEntryType = iota
-	TxnEntryTable
-	TxnEntrySegment
-	TxnEntryBlock
-	TxnEntryAppend
-	TxnEntryDelete
-	TxnEntryCompact
-	TxnEntryMerge
-)
