@@ -104,12 +104,25 @@ func (be *MVCCSlice) SearchNode(o txnif.MVCCNode) (node txnif.MVCCNode) {
 	return
 }
 
-func (be *MVCCSlice) GetVisibleNode(ts types.TS) (node txnif.MVCCNode) {
+func (be *MVCCSlice) GetVisibleNode(txn txnif.TxnReader) (node txnif.MVCCNode) {
 	length := len(be.MVCC)
 	for i := length - 1; i >= 0; i-- {
 		un := be.MVCC[i]
 		var visible bool
-		if visible = un.IsVisible(ts); visible {
+		if visible = un.IsVisible(txn); visible {
+			node = un
+			break
+		}
+	}
+	return
+}
+
+func (be *MVCCSlice) GetVisibleNodeByTS(ts types.TS) (node txnif.MVCCNode) {
+	length := len(be.MVCC)
+	for i := length - 1; i >= 0; i-- {
+		un := be.MVCC[i]
+		var visible bool
+		if visible = un.IsVisibleByTS(ts); visible {
 			node = un
 			break
 		}

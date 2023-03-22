@@ -71,18 +71,18 @@ func (chain *DeleteChain) StringLocked() string {
 
 func (chain *DeleteChain) GetController() *MVCCHandle { return chain.mvcc }
 
-func (chain *DeleteChain) IsDeleted(row uint32, ts types.TS, rwlocker *sync.RWMutex) (deleted bool, err error) {
+func (chain *DeleteChain) IsDeleted(row uint32, txn txnif.TxnReader, rwlocker *sync.RWMutex) (deleted bool, err error) {
 	deleteNode := chain.GetDeleteNodeByRow(row)
 	if deleteNode == nil {
 		return false, nil
 	}
-	needWait, txn := deleteNode.NeedWaitCommitting(ts)
+	needWait, txn := deleteNode.NeedWaitCommitting(txn.GetStartTS())
 	if needWait {
 		rwlocker.RUnlock()
 		txn.GetTxnState(true)
 		rwlocker.RLock()
 	}
-	return deleteNode.IsVisible(ts), nil
+	return deleteNode.IsVisible(txn), nil
 }
 
 func (chain *DeleteChain) PrepareRangeDelete(start, end uint32, ts types.TS) (err error) {
@@ -232,7 +232,7 @@ func (chain *DeleteChain) HasDeleteIntentsPreparedInLocked(from, to types.TS) (f
 }
 
 func (chain *DeleteChain) CollectDeletesLocked(
-	ts types.TS,
+	txn txnif.TxnReader,
 	collectIndex bool,
 	rwlocker *sync.RWMutex) (txnif.DeleteNode, error) {
 	var merged *DeleteNode
@@ -241,7 +241,7 @@ func (chain *DeleteChain) CollectDeletesLocked(
 		n := vn.(*DeleteNode)
 		// Merged node is a loop breaker
 		if n.IsMerged() {
-			if n.GetCommitTSLocked().Greater(ts) {
+			if n.GetCommitTSLocked().Greater(txn.GetStartTS()) {
 				return true
 			}
 			if merged == nil {
@@ -250,13 +250,13 @@ func (chain *DeleteChain) CollectDeletesLocked(
 			merged.MergeLocked(n, collectIndex)
 			return false
 		}
-		needWait, txnToWait := n.NeedWaitCommitting(ts)
+		needWait, txnToWait := n.NeedWaitCommitting(txn.GetStartTS())
 		if needWait {
 			rwlocker.RUnlock()
 			txnToWait.GetTxnState(true)
 			rwlocker.RLock()
 		}
-		if n.IsVisible(ts) {
+		if n.IsVisible(txn) {
 			if merged == nil {
 				merged = NewMergedNode(n.GetCommitTSLocked())
 			}

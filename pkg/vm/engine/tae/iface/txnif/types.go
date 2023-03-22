@@ -163,14 +163,15 @@ type DeleteChain interface {
 type MVCCNode interface {
 	String() string
 
-	IsVisible(ts types.TS) (visible bool)
-	CheckConflict(ts types.TS) error
+	IsVisible(txn TxnReader) (visible bool)
+	CheckConflict(txn TxnReader) error
+	IsVisibleByTS(ts types.TS)(visible bool)
 	Update(o MVCCNode)
 
 	PreparedIn(minTS, maxTS types.TS) (in, before bool)
 	CommittedIn(minTS, maxTS types.TS) (in, before bool)
 	NeedWaitCommitting(ts types.TS) (bool, TxnReader)
-	IsSameTxn(ts types.TS) bool
+	IsSameTxn(txn TxnReader) bool
 	IsActive() bool
 	IsCommitting() bool
 	IsCommitted() bool

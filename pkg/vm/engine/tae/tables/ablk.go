@@ -424,7 +424,7 @@ func (blk *ablock) getPersistedRowByFilter(
 // With PinNode Context
 func (blk *ablock) getInMemoryRowByFilter(
 	mnode *memoryNode,
-	ts types.TS,
+	txn txnif.TxnReader,
 	filter *handle.Filter) (row uint32, err error) {
 	blk.RLock()
 	defer blk.RUnlock()
@@ -442,7 +442,7 @@ func (blk *ablock) getInMemoryRowByFilter(
 		}
 	}
 	if anyWaitable := blk.mvcc.CollectUncommittedANodesPreparedBefore(
-		ts,
+		txn,
 		waitFn); anyWaitable {
 		rows, err = mnode.GetRowsByKey(filter.Val)
 		if err != nil {
@@ -453,17 +453,17 @@ func (blk *ablock) getInMemoryRowByFilter(
 	for i := len(rows) - 1; i >= 0; i-- {
 		row = rows[i]
 		appendnode := blk.mvcc.GetAppendNodeByRow(row)
-		needWait, txn := appendnode.NeedWaitCommitting(ts)
+		needWait, txn := appendnode.NeedWaitCommitting(txn.GetStartTS())
 		if needWait {
 			blk.RUnlock()
 			txn.GetTxnState(true)
 			blk.RLock()
 		}
-		if appendnode.IsAborted() || !appendnode.IsVisible(ts) {
+		if appendnode.IsAborted() || !appendnode.IsVisible(txn) {
 			continue
 		}
 		var deleted bool
-		deleted, err = blk.mvcc.IsDeletedLocked(row, ts, blk.mvcc.RWMutex)
+		deleted, err = blk.mvcc.IsDeletedLocked(row, txn, blk.mvcc.RWMutex)
 		if err != nil {
 			return
 		}
@@ -475,8 +475,8 @@ func (blk *ablock) getInMemoryRowByFilter(
 }
 
 func (blk *ablock) checkConflictAndDupClosure(
-	dedupTS types.TS,
-	conflictTS types.TS,
+	isPrePrepare bool,
+	txn txnif.TxnReader,
 	dupRow *uint32,
 	rowmask *roaring.Bitmap) func(row uint32) error {
 	return func(row uint32) (err error) {
@@ -484,13 +484,18 @@ func (blk *ablock) checkConflictAndDupClosure(
 			return nil
 		}
 		appendnode := blk.mvcc.GetAppendNodeByRow(row)
-		needWait, txn := appendnode.NeedWaitCommitting(dedupTS)
+		if isPrePrepare{
+			needWait:=appendnode.IsCommitting()
+			txn:=appendnode.GetTxn()
+		}else {
+		needWait, txn := appendnode.NeedWaitCommitting(txn.GetStartTS())
 		if needWait {
 			blk.mvcc.RUnlock()
 			txn.GetTxnState(true)
 			blk.mvcc.RLock()
 		}
-		if err = appendnode.CheckConflict(conflictTS); err != nil {
+		}
+		if err = appendnode.CheckConflict(txn); err != nil {
 			return
 		}
 		if appendnode.IsAborted() || !appendnode.IsVisible(dedupTS) {

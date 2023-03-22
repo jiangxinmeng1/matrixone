@@ -146,13 +146,13 @@ func (n *MVCCHandle) DeleteAppendNodeLocked(node *AppendNode) {
 	n.appends.DeleteNode(node)
 }
 
-func (n *MVCCHandle) IsVisibleLocked(row uint32, ts types.TS) (bool, error) {
+func (n *MVCCHandle) IsVisibleLocked(row uint32, txn txnif.TxnReader) (bool, error) {
 	an := n.GetAppendNodeByRow(row)
-	return an.IsVisible(ts), nil
+	return an.IsVisible(txn), nil
 }
 
-func (n *MVCCHandle) IsDeletedLocked(row uint32, ts types.TS, rwlocker *sync.RWMutex) (bool, error) {
-	return n.deletes.IsDeleted(row, ts, rwlocker)
+func (n *MVCCHandle) IsDeletedLocked(row uint32, txn txnif.TxnReader, rwlocker *sync.RWMutex) (bool, error) {
+	return n.deletes.IsDeleted(row, txn, rwlocker)
 }
 
 //	  1         2        3       4      5       6
@@ -162,14 +162,14 @@ func (n *MVCCHandle) IsDeletedLocked(row uint32, ts types.TS, rwlocker *sync.RWM
 //
 //	start               end
 func (n *MVCCHandle) CollectUncommittedANodesPreparedBefore(
-	ts types.TS,
+	txn txnif.TxnReader,
 	fn func(*AppendNode)) (anyWaitable bool) {
 	if n.appends.IsEmpty() {
 		return
 	}
 	n.appends.ForEach(func(un txnif.MVCCNode) bool {
 		an := un.(*AppendNode)
-		needWait, txn := an.NeedWaitCommitting(ts)
+		needWait, txn := an.NeedWaitCommitting(txn.GetStartTS())
 		if txn == nil {
 			return false
 		}
@@ -207,18 +207,18 @@ func (n *MVCCHandle) CollectAppendLogIndexesLocked(startTs, endTs types.TS) (ind
 	return
 }
 
-func (n *MVCCHandle) GetVisibleRowLocked(ts types.TS) (maxrow uint32, visible bool, holes *roaring.Bitmap, err error) {
+func (n *MVCCHandle) GetVisibleRowLocked(txn txnif.TxnReader) (maxrow uint32, visible bool, holes *roaring.Bitmap, err error) {
 	anToWait := make([]*AppendNode, 0)
 	txnToWait := make([]txnif.TxnReader, 0)
 	n.appends.ForEach(func(un txnif.MVCCNode) bool {
 		an := un.(*AppendNode)
-		needWait, txn := an.NeedWaitCommitting(ts)
+		needWait, txn := an.NeedWaitCommitting(txn.GetStartTS())
 		if needWait {
 			anToWait = append(anToWait, an)
 			txnToWait = append(txnToWait, txn)
 			return true
 		}
-		if an.IsVisible(ts) {
+		if an.IsVisible(txn) {
 			visible = true
 			maxrow = an.maxRow
 		} else {
@@ -227,7 +227,7 @@ func (n *MVCCHandle) GetVisibleRowLocked(ts types.TS) (maxrow uint32, visible bo
 			}
 			holes.AddRange(uint64(an.startRow), uint64(an.maxRow))
 		}
-		return !an.Prepare.Greater(ts)
+		return !an.Prepare.Greater(txn.GetStartTS())
 	}, true)
 	if len(anToWait) != 0 {
 		n.RUnlock()
@@ -237,7 +237,7 @@ func (n *MVCCHandle) GetVisibleRowLocked(ts types.TS) (maxrow uint32, visible bo
 		n.RLock()
 	}
 	for _, an := range anToWait {
-		if an.IsVisible(ts) {
+		if an.IsVisible(txn) {
 			visible = true
 			if maxrow < an.maxRow {
 				maxrow = an.maxRow

@@ -273,7 +273,7 @@ func (be *BaseEntryImpl[T]) CreateWithTxnAndMeta(txn txnif.AsyncTxn, metaLoc str
 
 func (be *BaseEntryImpl[T]) getOrSetUpdateNode(txn txnif.TxnReader) (newNode bool, node *MVCCNode[T]) {
 	entry := be.GetLatestNodeLocked()
-	if entry.IsSameTxn(txn.GetStartTS()) {
+	if entry.IsSameTxn(txn) {
 		return false, entry.(*MVCCNode[T])
 	} else {
 		node := entry.CloneData().(*MVCCNode[T])
@@ -380,13 +380,13 @@ func (be *BaseEntryImpl[T]) ensureVisibleAndNotDropped(ts types.TS) bool {
 	return !dropped
 }
 
-func (be *BaseEntryImpl[T]) GetVisibilityLocked(ts types.TS) (visible, dropped bool) {
-	un := be.GetVisibleNode(ts)
+func (be *BaseEntryImpl[T]) GetVisibilityLocked(txn txnif.TxnReader) (visible, dropped bool) {
+	un := be.GetVisibleNode(txn)
 	if un == nil {
 		return
 	}
 	visible = true
-	if un.IsSameTxn(ts) {
+	if un.IsSameTxn(txn) {
 		dropped = un.(*MVCCNode[T]).HasDropIntent()
 	} else {
 		dropped = un.(*MVCCNode[T]).HasDropCommitted()
