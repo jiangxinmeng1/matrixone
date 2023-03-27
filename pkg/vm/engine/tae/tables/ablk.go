@@ -141,7 +141,7 @@ func (blk *ablock) GetColumnDataByIds(
 	colIdxes []int,
 ) (view *model.BlockView, err error) {
 	return blk.resolveColumnDatas(
-		txn.GetStartTS(),
+		txn,
 		colIdxes,
 		false)
 }
@@ -151,13 +151,13 @@ func (blk *ablock) GetColumnDataById(
 	colIdx int,
 ) (view *model.ColumnView, err error) {
 	return blk.resolveColumnData(
-		txn.GetStartTS(),
+		txn,
 		colIdx,
 		false)
 }
 
 func (blk *ablock) resolveColumnDatas(
-	ts types.TS,
+	txn txnif.TxnReader,
 	colIdxes []int,
 	skipDeletes bool) (view *model.BlockView, err error) {
 	node := blk.PinNode()
@@ -166,13 +166,13 @@ func (blk *ablock) resolveColumnDatas(
 	if !node.IsPersisted() {
 		return blk.resolveInMemoryColumnDatas(
 			node.MustMNode(),
-			ts,
+			txn,
 			colIdxes,
 			skipDeletes)
 	} else {
 		return blk.ResolvePersistedColumnDatas(
 			node.MustPNode(),
-			ts,
+			txn,
 			colIdxes,
 			skipDeletes,
 		)
@@ -180,7 +180,7 @@ func (blk *ablock) resolveColumnDatas(
 }
 
 func (blk *ablock) resolveColumnData(
-	ts types.TS,
+	txn txnif.TxnReader,
 	colIdx int,
 	skipDeletes bool) (view *model.ColumnView, err error) {
 	node := blk.PinNode()
@@ -189,13 +189,13 @@ func (blk *ablock) resolveColumnData(
 	if !node.IsPersisted() {
 		return blk.resolveInMemoryColumnData(
 			node.MustMNode(),
-			ts,
+			txn,
 			colIdx,
 			skipDeletes)
 	} else {
 		return blk.ResolvePersistedColumnData(
 			node.MustPNode(),
-			ts,
+			txn,
 			colIdx,
 			skipDeletes,
 		)
@@ -205,12 +205,12 @@ func (blk *ablock) resolveColumnData(
 // Note: With PinNode Context
 func (blk *ablock) resolveInMemoryColumnDatas(
 	mnode *memoryNode,
-	ts types.TS,
+	txn txnif.TxnReader,
 	colIdxes []int,
 	skipDeletes bool) (view *model.BlockView, err error) {
 	blk.RLock()
 	defer blk.RUnlock()
-	maxRow, visible, deSels, err := blk.mvcc.GetVisibleRowLocked(ts)
+	maxRow, visible, deSels, err := blk.mvcc.GetVisibleRowLocked(txn)
 	if !visible || err != nil {
 		// blk.RUnlock()
 		return
@@ -220,7 +220,7 @@ func (blk *ablock) resolveInMemoryColumnDatas(
 	if err != nil {
 		return
 	}
-	view = model.NewBlockView(ts)
+	view = model.NewBlockView(txn.GetStartTS())
 	for _, colIdx := range colIdxes {
 		view.SetData(colIdx, data.Vecs[colIdx])
 	}
@@ -229,7 +229,7 @@ func (blk *ablock) resolveInMemoryColumnDatas(
 		return
 	}
 
-	err = blk.FillInMemoryDeletesLocked(view.BaseView, blk.RWMutex)
+	err = blk.FillInMemoryDeletesLocked(txn,view.BaseView, blk.RWMutex)
 	// blk.RUnlock()
 	if err != nil {
 		return
@@ -247,18 +247,18 @@ func (blk *ablock) resolveInMemoryColumnDatas(
 // Note: With PinNode Context
 func (blk *ablock) resolveInMemoryColumnData(
 	mnode *memoryNode,
-	ts types.TS,
+	txn txnif.TxnReader,
 	colIdx int,
 	skipDeletes bool) (view *model.ColumnView, err error) {
 	blk.RLock()
 	defer blk.RUnlock()
-	maxRow, visible, deSels, err := blk.mvcc.GetVisibleRowLocked(ts)
+	maxRow, visible, deSels, err := blk.mvcc.GetVisibleRowLocked(txn)
 	if !visible || err != nil {
 		// blk.RUnlock()
 		return
 	}
 
-	view = model.NewColumnView(ts, colIdx)
+	view = model.NewColumnView(txn.GetStartTS(), colIdx)
 	var data containers.Vector
 	data, err = mnode.GetColumnDataWindow(
 		0,
@@ -274,7 +274,7 @@ func (blk *ablock) resolveInMemoryColumnData(
 		return
 	}
 
-	err = blk.FillInMemoryDeletesLocked(view.BaseView, blk.RWMutex)
+	err = blk.FillInMemoryDeletesLocked(txn,view.BaseView, blk.RWMutex)
 	// blk.RUnlock()
 	if err != nil {
 		return
@@ -293,15 +293,14 @@ func (blk *ablock) resolveInMemoryColumnData(
 func (blk *ablock) GetValue(
 	txn txnif.AsyncTxn,
 	row, col int) (v any, err error) {
-	ts := txn.GetStartTS()
 	node := blk.PinNode()
 	defer node.Unref()
 	if !node.IsPersisted() {
-		return blk.getInMemoryValue(node.MustMNode(), ts, row, col)
+		return blk.getInMemoryValue(node.MustMNode(), txn, row, col)
 	} else {
 		return blk.getPersistedValue(
 			node.MustPNode(),
-			ts,
+			txn,
 			row,
 			col,
 			true)
@@ -311,10 +310,10 @@ func (blk *ablock) GetValue(
 // With PinNode Context
 func (blk *ablock) getInMemoryValue(
 	mnode *memoryNode,
-	ts types.TS,
+	txn txnif.TxnReader,
 	row, col int) (v any, err error) {
 	blk.RLock()
-	deleted, err := blk.mvcc.IsDeletedLocked(uint32(row), ts, blk.RWMutex)
+	deleted, err := blk.mvcc.IsDeletedLocked(uint32(row), txn, blk.RWMutex)
 	blk.RUnlock()
 	if err != nil {
 		return
@@ -323,7 +322,7 @@ func (blk *ablock) getInMemoryValue(
 		err = moerr.NewNotFoundNoCtx()
 		return
 	}
-	view, err := blk.resolveInMemoryColumnData(mnode, ts, col, true)
+	view, err := blk.resolveInMemoryColumnData(mnode, txn, col, true)
 	if err != nil {
 		return
 	}
@@ -347,7 +346,7 @@ func (blk *ablock) GetByFilter(
 	node := blk.PinNode()
 	defer node.Unref()
 	if !node.IsPersisted() {
-		return blk.getInMemoryRowByFilter(node.MustMNode(), ts, filter)
+		return blk.getInMemoryRowByFilter(node.MustMNode(), txn, filter)
 	} else {
 		return blk.getPersistedRowByFilter(node.MustPNode(), ts, filter)
 	}
@@ -474,6 +473,36 @@ func (blk *ablock) getInMemoryRowByFilter(
 	return 0, moerr.NewNotFoundNoCtx()
 }
 
+func (blk *ablock) checkConflictAndVisibility(node txnif.MVCCNode, isPrePrepare bool,txn txnif.TxnReader)(visible bool, err error){
+	// if isPrePrepare check all nodes commit before txn.CommitTS(PrepareTS)
+	// if not isPrePrepare check nodes commit before txn.StartTS
+	if isPrePrepare {
+		needWait := node.IsCommitting()
+		if needWait {
+			txn := node.GetTxn()
+			blk.mvcc.RUnlock()
+			txn.GetTxnState(true)
+			blk.mvcc.RLock()
+		}
+	} else {
+		needWait, txn := node.NeedWaitCommitting(txn.GetStartTS())
+		if needWait {
+			blk.mvcc.RUnlock()
+			txn.GetTxnState(true)
+			blk.mvcc.RLock()
+		}
+	}
+	if err = node.CheckConflict(txn); err != nil {
+		return
+	}
+	if  isPrePrepare{
+		visible = node.IsCommitted()
+	}else {
+		visible = node.IsVisible(txn)
+	}
+	return
+}
+
 func (blk *ablock) checkConflictAndDupClosure(
 	isPrePrepare bool,
 	txn txnif.TxnReader,
@@ -484,21 +513,9 @@ func (blk *ablock) checkConflictAndDupClosure(
 			return nil
 		}
 		appendnode := blk.mvcc.GetAppendNodeByRow(row)
-		if isPrePrepare{
-			needWait:=appendnode.IsCommitting()
-			txn:=appendnode.GetTxn()
-		}else {
-		needWait, txn := appendnode.NeedWaitCommitting(txn.GetStartTS())
-		if needWait {
-			blk.mvcc.RUnlock()
-			txn.GetTxnState(true)
-			blk.mvcc.RLock()
-		}
-		}
-		if err = appendnode.CheckConflict(txn); err != nil {
-			return
-		}
-		if appendnode.IsAborted() || !appendnode.IsVisible(dedupTS) {
+		var visible bool
+		visible,err = blk.checkConflictAndVisibility(appendnode,isPrePrepare,txn)
+		if appendnode.IsAborted() || !visible {
 			return nil
 		}
 		deleteNode := blk.mvcc.GetDeleteNodeByRow(row)
@@ -506,16 +523,8 @@ func (blk *ablock) checkConflictAndDupClosure(
 			*dupRow = row
 			return moerr.GetOkExpectedDup()
 		}
-		needWait, txn = deleteNode.NeedWaitCommitting(dedupTS)
-		if needWait {
-			blk.mvcc.RUnlock()
-			txn.GetTxnState(true)
-			blk.mvcc.RLock()
-		}
-		if err = deleteNode.CheckConflict(conflictTS); err != nil {
-			return
-		}
-		if deleteNode.IsAborted() || !deleteNode.IsVisible(dedupTS) {
+		visible,err = blk.checkConflictAndVisibility(deleteNode,isPrePrepare,txn)
+		if deleteNode.IsAborted() || !visible {
 			return moerr.GetOkExpectedDup()
 		}
 		return nil
@@ -524,8 +533,8 @@ func (blk *ablock) checkConflictAndDupClosure(
 
 func (blk *ablock) inMemoryBatchDedup(
 	mnode *memoryNode,
-	dedupTS types.TS,
-	conflictTS types.TS,
+	isPrePrepare bool,
+	txn txnif.TxnReader,
 	keys containers.Vector,
 	rowmask *roaring.Bitmap) (err error) {
 	var dupRow uint32
@@ -533,7 +542,7 @@ func (blk *ablock) inMemoryBatchDedup(
 	defer blk.RUnlock()
 	_, err = mnode.BatchDedup(
 		keys,
-		blk.checkConflictAndDupClosure(dedupTS, conflictTS, &dupRow, rowmask))
+		blk.checkConflictAndDupClosure(isPrePrepare, txn, &dupRow, rowmask))
 
 	// definitely no duplicate
 	if err == nil || !moerr.IsMoErrCode(err, moerr.OkExpectedDup) {
@@ -548,7 +557,7 @@ func (blk *ablock) inMemoryBatchDedup(
 
 func (blk *ablock) dedupClosure(
 	vec containers.Vector,
-	ts types.TS,
+	txn txnif.TxnReader,
 	mask *roaring.Bitmap,
 	def *catalog.ColDef) func(any, int) error {
 	return func(v1 any, _ int) (err error) {
@@ -563,7 +572,7 @@ func (blk *ablock) dedupClosure(
 				}
 				defer commitTSVec.Close()
 				commiTs := commitTSVec.Get(row).(types.TS)
-				if commiTs.Greater(ts) {
+				if commiTs.Greater(txn.GetStartTS()) {
 					return txnif.ErrTxnWWConflict
 				}
 				entry := common.TypeStringValue(vec.GetType(), v1)
@@ -584,18 +593,14 @@ func (blk *ablock) BatchDedup(
 			logutil.Infof("BatchDedup BLK-%d: %v", blk.meta.ID, err)
 		}
 	}()
-	dedupTS := txn.GetStartTS()
-	if precommit {
-		dedupTS = txn.GetPrepareTS()
-	}
 	node := blk.PinNode()
 	defer node.Unref()
 	if !node.IsPersisted() {
-		return blk.inMemoryBatchDedup(node.MustMNode(), dedupTS, txn.GetStartTS(), keys, rowmask)
+		return blk.inMemoryBatchDedup(node.MustMNode(), precommit, txn, keys, rowmask)
 	} else {
 		return blk.PersistedBatchDedup(
 			node.MustPNode(),
-			dedupTS,
+			txn,
 			keys,
 			rowmask,
 			blk.dedupClosure)

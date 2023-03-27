@@ -158,7 +158,7 @@ type DeleteChain interface {
 
 	PrepareRangeDelete(start, end uint32, ts types.TS) error
 	DepthLocked() int
-	CollectDeletesLocked(ts types.TS, collectIndex bool, rwlocker *sync.RWMutex) (DeleteNode, error)
+	CollectDeletesLocked(txn TxnReader, collectIndex bool, rwlocker *sync.RWMutex) (DeleteNode, error)
 }
 type MVCCNode interface {
 	String() string

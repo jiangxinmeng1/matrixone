@@ -89,10 +89,10 @@ func TestDeleteChain1(t *testing.T) {
 	assert.Nil(t, merged)
 	assert.Equal(t, 2, chain.Depth())
 
-	collected, err := chain.CollectDeletesLocked(txn1.GetStartTS(), false, nil)
+	collected, err := chain.CollectDeletesLocked(txn1, false, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, uint32(10), collected.GetCardinalityLocked())
-	collected, err = chain.CollectDeletesLocked(txn2.GetStartTS(), false, nil)
+	collected, err = chain.CollectDeletesLocked(txn2, false, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, uint32(11), collected.GetCardinalityLocked())
 
@@ -116,7 +116,7 @@ func TestDeleteChain1(t *testing.T) {
 	collected, err = chain.CollectDeletesLocked(types.NextGlobalTsForTest(), false, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, uint32(10), collected.GetCardinalityLocked())
-	collected, err = chain.CollectDeletesLocked(txn2.GetStartTS(), false, nil)
+	collected, err = chain.CollectDeletesLocked(txn2, false, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, uint32(11), collected.GetCardinalityLocked())
 
@@ -128,7 +128,7 @@ func TestDeleteChain1(t *testing.T) {
 	n3 := chain.AddNodeLocked(txn3, handle.DeleteType(handle.DT_Normal))
 	n3.RangeDeleteLocked(31, 33)
 
-	collected, err = chain.CollectDeletesLocked(txn3.GetStartTS(), false, nil)
+	collected, err = chain.CollectDeletesLocked(txn3, false, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, uint32(13), collected.GetCardinalityLocked())
 	t.Log(chain.StringLocked())
