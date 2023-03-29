@@ -22,6 +22,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
@@ -359,6 +360,7 @@ func (cc *CatalogCache) InsertColumns(bat *batch.Batch) {
 		}
 		item.Defs = defs
 		item.TableDef = getTableDef(item.Name, defs)
+		logutil.Infof("get table def for table %v",item.Name)
 	}
 }
 

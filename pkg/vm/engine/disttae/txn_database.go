@@ -21,6 +21,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae/cache"
 )
@@ -123,6 +124,9 @@ func (db *txnDatabase) Relation(ctx context.Context, name string) (engine.Relati
 		createSql:    item.CreateSql,
 		constraint:   item.Constraint,
 		parts:        db.txn.engine.getPartitions(db.databaseId, item.Id).Snapshot(),
+	}
+	if item.TableDef == nil {
+		logutil.Infof("table is %v", item.Name)
 	}
 	columnLength := len(item.TableDef.Cols) - 1 // we use this data to fetch zonemap, but row_id has no zonemap
 	meta, err := db.txn.getTableMeta(ctx, db.databaseId, item.Id,
