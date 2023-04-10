@@ -17,6 +17,7 @@ package db
 import (
 	"errors"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio/blockio"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -263,6 +264,12 @@ func (e *testEngine) incrementalCheckpoint(
 }
 func initDB(t *testing.T, opts *options.Options) *DB {
 	dir := testutils.InitTestEnv(ModuleName, t)
+	if os.Getenv("skipSync") == "true" {
+		if opts == nil {
+			opts = &options.Options{}
+		}
+		options.WithSkipSync()(opts)
+	}
 	db, _ := Open(dir, opts)
 	// only ut executes this checker
 	db.DiskCleaner.AddChecker(

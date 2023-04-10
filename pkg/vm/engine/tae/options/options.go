@@ -72,6 +72,12 @@ func WithCheckpointGlobalMinCount(count int64) func(*Options) {
 	}
 }
 
+func WithSkipSync() func(*Options) {
+	return func(opts *Options) {
+		opts.SkipSync = true
+	}
+}
+
 func WithGlobalVersionInterval(interval time.Duration) func(*Options) {
 	return func(opts *Options) {
 		if opts.CheckpointCfg == nil {

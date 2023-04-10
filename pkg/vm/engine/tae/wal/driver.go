@@ -34,6 +34,7 @@ type entryWithInfo struct {
 type DriverConfig struct {
 	BatchStoreConfig   *batchstoredriver.StoreCfg
 	CheckpointDuration time.Duration
+	SkipSync           bool
 }
 
 type walDriver struct {
@@ -62,7 +63,11 @@ func NewDriverWithBatchStore(dir, name string, cfg *DriverConfig) Driver {
 	ckpDuration := time.Second * 5
 	if cfg != nil {
 		batchStoreCfg = cfg.BatchStoreConfig
+		if batchStoreCfg == nil {
+			batchStoreCfg = &batchstoredriver.StoreCfg{}
+		}
 		ckpDuration = cfg.CheckpointDuration
+		batchStoreCfg.SkipSync = cfg.SkipSync
 	}
 	impl := store.NewStoreWithBatchStoreDriver(dir, name, batchStoreCfg)
 	driver := NewDriverWithStore(impl, true, ckpDuration)
