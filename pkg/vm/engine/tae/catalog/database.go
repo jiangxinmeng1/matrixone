@@ -73,10 +73,6 @@ type DBEntry struct {
 	nodesMu sync.RWMutex
 }
 
-func compareTableFn(a, b *TableEntry) int {
-	return CompareUint64(a.ID, b.ID)
-}
-
 func NewDBEntryWithID(catalog *Catalog, name string, createSql, datTyp string, id uint64, txn txnif.AsyncTxn) *DBEntry {
 	//id := catalog.NextDB()
 
@@ -92,7 +88,7 @@ func NewDBEntryWithID(catalog *Catalog, name string, createSql, datTyp string, i
 		},
 		entries:   make(map[uint64]*common.GenericDLNode[*TableEntry]),
 		nameNodes: make(map[string]*nodeList[*TableEntry]),
-		link:      common.NewGenericSortedDList(compareTableFn),
+		link:      common.NewGenericSortedDList((*TableEntry).Less),
 	}
 	if txn != nil {
 		// Only in unit test, txn can be nil
@@ -119,7 +115,7 @@ func NewDBEntry(catalog *Catalog, name, createSql, datTyp string, txn txnif.Asyn
 		},
 		entries:   make(map[uint64]*common.GenericDLNode[*TableEntry]),
 		nameNodes: make(map[string]*nodeList[*TableEntry]),
-		link:      common.NewGenericSortedDList(compareTableFn),
+		link:      common.NewGenericSortedDList((*TableEntry).Less),
 	}
 	if txn != nil {
 		// Only in unit test, txn can be nil
@@ -144,7 +140,7 @@ func NewDBEntryByTS(catalog *Catalog, name string, ts types.TS) *DBEntry {
 		},
 		entries:   make(map[uint64]*common.GenericDLNode[*TableEntry]),
 		nameNodes: make(map[string]*nodeList[*TableEntry]),
-		link:      common.NewGenericSortedDList(compareTableFn),
+		link:      common.NewGenericSortedDList((*TableEntry).Less),
 	}
 	e.CreateWithTS(ts, &EmptyMVCCNode{})
 	e.acInfo.CreateAt = types.CurrentTimestamp()
@@ -165,7 +161,7 @@ func NewSystemDBEntry(catalog *Catalog) *DBEntry {
 		},
 		entries:   make(map[uint64]*common.GenericDLNode[*TableEntry]),
 		nameNodes: make(map[string]*nodeList[*TableEntry]),
-		link:      common.NewGenericSortedDList(compareTableFn),
+		link:      common.NewGenericSortedDList((*TableEntry).Less),
 		isSys:     true,
 	}
 	entry.CreateWithTS(types.SystemDBTS, &EmptyMVCCNode{})
@@ -178,7 +174,7 @@ func NewReplayDBEntry() *DBEntry {
 			func() *EmptyMVCCNode { return &EmptyMVCCNode{} }),
 		entries:   make(map[uint64]*common.GenericDLNode[*TableEntry]),
 		nameNodes: make(map[string]*nodeList[*TableEntry]),
-		link:      common.NewGenericSortedDList(compareTableFn),
+		link:      common.NewGenericSortedDList((*TableEntry).Less),
 	}
 	return entry
 }
@@ -198,6 +194,9 @@ func (e *DBEntry) GetName() string              { return e.name }
 func (e *DBEntry) GetCreateSql() string         { return e.createSql }
 func (e *DBEntry) IsSubscription() bool {
 	return e.datType == pkgcatalog.SystemDBTypeSubscription
+}
+func (entry *DBEntry) Less(b *DBEntry) int {
+	return CompareUint64(entry.ID, b.ID)
 }
 func (e *DBEntry) GetDatType() string { return e.datType }
 func (e *DBEntry) GetFullName() string {

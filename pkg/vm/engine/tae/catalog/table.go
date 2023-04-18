@@ -79,7 +79,7 @@ func NewTableEntryWithTableId(db *DBEntry, schema *Schema, txnCtx txnif.AsyncTxn
 		TableNode: &TableNode{
 			schema: schema,
 		},
-		link:    common.NewGenericSortedDList(compareSegmentFn),
+		link:    common.NewGenericSortedDList((*SegmentEntry).Less),
 		entries: make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
 	}
 	if dataFactory != nil {
@@ -98,7 +98,7 @@ func NewSystemTableEntry(db *DBEntry, id uint64, schema *Schema) *TableEntry {
 		TableNode: &TableNode{
 			schema: schema,
 		},
-		link:    common.NewGenericSortedDList(compareSegmentFn),
+		link:    common.NewGenericSortedDList((*SegmentEntry).Less),
 		entries: make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
 	}
 	e.CreateWithTS(types.SystemDBTS, &TableMVCCNode{})
@@ -121,7 +121,7 @@ func NewReplayTableEntry() *TableEntry {
 	e := &TableEntry{
 		BaseEntryImpl: NewReplayBaseEntry(
 			func() *TableMVCCNode { return &TableMVCCNode{} }),
-		link:    common.NewGenericSortedDList(compareSegmentFn),
+		link:    common.NewGenericSortedDList((*SegmentEntry).Less),
 		entries: make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
 	}
 	return e
@@ -135,9 +135,13 @@ func MockStaloneTableEntry(id uint64, schema *Schema) *TableEntry {
 		TableNode: &TableNode{
 			schema: schema,
 		},
-		link:    common.NewGenericSortedDList(compareSegmentFn),
+		link:    common.NewGenericSortedDList((*SegmentEntry).Less),
 		entries: make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
 	}
+}
+
+func (entry *TableEntry) Less(b *TableEntry) int {
+	return CompareUint64(entry.ID, b.ID)
 }
 func (entry *TableEntry) GetID() uint64 { return entry.ID }
 func (entry *TableEntry) IsVirtual() bool {
