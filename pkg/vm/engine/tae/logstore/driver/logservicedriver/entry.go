@@ -42,7 +42,7 @@ func init() {
 			return record.(*baseEntry).Marshal()
 		},
 		func(b []byte) (any, error) {
-			record := new(baseEntry)
+			record := newBaseEntry()
 			err := record.Unmarshal(b)
 			return record, err
 		})
@@ -187,6 +187,12 @@ type baseEntry struct {
 	payload []byte
 }
 
+func newBaseEntry() *baseEntry {
+	return &baseEntry{
+		meta: &meta{},
+	}
+}
+
 func (r *baseEntry) append(e *entry.Entry) {
 	r.entries = append(r.entries, e)
 	r.meta.addr[e.Lsn] = uint64(r.payloadSize)
@@ -232,7 +238,7 @@ func (r *baseEntry) WriteTo(w io.Writer) (n int64, err error) {
 		return 0, err
 	}
 	n += 2
-	version := IOET_WALRecord
+	version := IOET_WALRecord_V1
 	if _, err = w.Write(types.EncodeUint16(&version)); err != nil {
 		return 0, err
 	}
@@ -300,7 +306,7 @@ func newEmptyRecordEntry(r logservice.LogRecord) *recordEntry {
 }
 
 func (r *recordEntry) replay(h driver.ApplyHandle) (addr *common.ClosedIntervals) {
-	bbuf := bytes.NewBuffer(r.payload)
+	bbuf := bytes.NewBuffer(r.baseEntry.payload)
 	lsns := make([]uint64, 0)
 	for lsn := range r.meta.addr {
 		lsns = append(lsns, lsn)
@@ -337,7 +343,7 @@ func (r *recordEntry) unmarshal() {
 			Type:    r.EntryType,
 			Version: r.EntryVersion})
 	var err error
-	entry, err := codec.DecFn(r.payload)
+	entry, err := codec.DecFn(r.payload[4:])
 	r.baseEntry = entry.(*baseEntry)
 	r.payload = nil
 	if err != nil {

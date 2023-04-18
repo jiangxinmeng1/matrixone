@@ -100,7 +100,6 @@ func NewLogServiceDriver(cfg *Config) *LogServiceDriver {
 
 func (d *LogServiceDriver) Close() error {
 	logutil.Infof("append%d,flush%d", d.appendtimes, d.flushtimes)
-	d.clientPool.Close()
 	d.closeCancel()
 	d.preAppendLoop.Stop()
 	d.appendedLoop.Stop()
@@ -109,6 +108,7 @@ func (d *LogServiceDriver) Close() error {
 	close(d.appendQueue)
 	close(d.appendedQueue)
 	close(d.postAppendQueue)
+	d.clientPool.Close()
 	return nil
 }
 
