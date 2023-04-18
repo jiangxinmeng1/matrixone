@@ -158,19 +158,19 @@ func (entry *SegmentEntry) Is1PC() bool {
 }
 func (entry *SegmentEntry) PPString(level common.PPLevel, depth int, prefix string) string {
 	var w bytes.Buffer
-	_, _ = w.WriteString(fmt.Sprintf("%s%s%s", common.RepeatStr("\t", depth), prefix, entry.StringWithLevel(level)))
-	if level == common.PPL0 {
-		return w.String()
-	}
-	it := entry.MakeBlockIt(true)
-	for it.Valid() {
-		block := it.Get().GetPayload()
-		block.RLock()
-		_ = w.WriteByte('\n')
-		_, _ = w.WriteString(block.PPString(level, depth+1, prefix))
-		block.RUnlock()
-		it.Next()
-	}
+	_, _ = w.WriteString(fmt.Sprintf("%s%s%s,blk count %d", common.RepeatStr("\t", depth), prefix, entry.StringWithLevel(level), len(entry.entries)))
+	// if level == common.PPL0 {
+	// 	return w.String()
+	// }
+	// it := entry.MakeBlockIt(true)
+	// for it.Valid() {
+	// 	block := it.Get().GetPayload()
+	// 	block.RLock()
+	// 	_ = w.WriteByte('\n')
+	// 	_, _ = w.WriteString(block.PPString(level, depth+1, prefix))
+	// 	block.RUnlock()
+	// 	it.Next()
+	// }
 	return w.String()
 }
 
