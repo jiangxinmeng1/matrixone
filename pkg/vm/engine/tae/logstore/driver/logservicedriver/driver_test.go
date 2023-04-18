@@ -17,14 +17,17 @@ package logservicedriver
 import (
 	"sync"
 	"testing"
+
 	"github.com/lni/vfs"
 	"github.com/matrixorigin/matrixone/pkg/logservice"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/entry"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
 	"github.com/panjf2000/ants/v2"
+
 	// "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
-	"github.com/stretchr/testify/assert"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/stretchr/testify/assert"
 )
 
 func init(){
@@ -138,7 +141,9 @@ func TestAppendRead(t *testing.T) {
 		e.Entry.Free()
 	}
 
+	logutil.Infof("before driver closed")
 	driver.Close()
+	logutil.Infof("driver is closed")
 }
 
 func TestTruncate(t *testing.T) {
