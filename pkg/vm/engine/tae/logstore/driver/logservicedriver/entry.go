@@ -31,18 +31,18 @@ import (
 )
 
 const (
-	IOET_WALRecord    = 1000
-	IOET_WALRecord_V1 = 1
+	IOET_WALRecord    uint16 = 1000
+	IOET_WALRecord_V1 uint16 = 1
 )
 
 func init() {
 	objectio.RegisterIOEnrtyCodec(
-		objectio.IOEntryHeader{IOET_WALRecord, IOET_WALRecord_V1},
+		objectio.IOEntryHeader{Type: IOET_WALRecord, Version: IOET_WALRecord_V1},
 		func(record any) ([]byte, error) {
-			return record.(*recordEntry).Marshal()
+			return record.(*baseEntry).Marshal()
 		},
 		func(b []byte) (any, error) {
-			record := new(recordEntry)
+			record := new(baseEntry)
 			err := record.Unmarshal(b)
 			return record, err
 		})
@@ -179,8 +179,6 @@ func (m *meta) Marshal() (buf []byte, err error) {
 }
 
 type baseEntry struct {
-	EntryVersion uint16
-	EntryType    uint16
 	*meta
 	// replay entry
 	cmd *ReplayCmd
@@ -196,10 +194,6 @@ func (r *baseEntry) append(e *entry.Entry) {
 }
 
 func (r *baseEntry) ReadFrom(reader io.Reader) (n int64, err error) {
-	if _, err = reader.Read(types.EncodeUint16(&r.EntryVersion)); err != nil {
-		return 0, err
-	}
-	n += 2
 	n1, err := r.meta.ReadFrom(reader)
 	if err != nil {
 		return 0, err
@@ -223,7 +217,7 @@ func (r *baseEntry) Unmarshal(buf []byte) error {
 	return err
 }
 
-func (r *recordEntry) Marshal() (buf []byte, err error) {
+func (r *baseEntry) Marshal() (buf []byte, err error) {
 	var bbuf bytes.Buffer
 	if _, err = r.WriteTo(&bbuf); err != nil {
 		return
@@ -232,8 +226,14 @@ func (r *recordEntry) Marshal() (buf []byte, err error) {
 	return
 }
 
-func (r *recordEntry) WriteTo(w io.Writer) (n int64, err error) {
-	if _, err = w.Write(types.EncodeUint16(&r.EntryVersion)); err != nil {
+func (r *baseEntry) WriteTo(w io.Writer) (n int64, err error) {
+	typ := IOET_WALRecord
+	if _, err = w.Write(types.EncodeUint16(&typ)); err != nil {
+		return 0, err
+	}
+	n += 2
+	version := IOET_WALRecord
+	if _, err = w.Write(types.EncodeUint16(&version)); err != nil {
 		return 0, err
 	}
 	n += 2
@@ -266,6 +266,8 @@ func (r *recordEntry) WriteTo(w io.Writer) (n int64, err error) {
 // read: logrecord -> meta+payload -> entry
 // write: entries+meta -> payload -> record
 type recordEntry struct {
+	EntryVersion uint16
+	EntryType    uint16
 	*baseEntry
 
 	payload     []byte
@@ -292,9 +294,8 @@ func newEmptyRecordEntry(r logservice.LogRecord) *recordEntry {
 	payload := make([]byte, len(r.Payload()))
 	copy(payload, r.Payload())
 	return &recordEntry{
-		baseEntry: &baseEntry{meta: newMeta()},
-		mashalMu:  sync.RWMutex{},
-		payload:   payload,
+		mashalMu: sync.RWMutex{},
+		payload:  payload,
 	}
 }
 
@@ -329,7 +330,15 @@ func (r *recordEntry) unmarshal() {
 	if r.unmarshaled.Load() == 1 {
 		return
 	}
-	err := r.baseEntry.Unmarshal(r.payload)
+	r.EntryType = types.DecodeUint16(r.payload[:2])
+	r.EntryVersion = types.DecodeUint16(r.payload[2:4])
+	codec := objectio.GetIOEntryCodec(
+		objectio.IOEntryHeader{
+			Type:    r.EntryType,
+			Version: r.EntryVersion})
+	var err error
+	entry, err := codec.DecFn(r.payload)
+	r.baseEntry = entry.(*baseEntry)
 	r.payload = nil
 	if err != nil {
 		panic(err)

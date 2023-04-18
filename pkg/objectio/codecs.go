@@ -42,18 +42,18 @@ type IODecodeFunc = func([]byte) (any, error)
 
 type ioEntryCodec struct {
 	// if encFn is nil, no need to encode
-	encFn IOEncodeFunc
+	EncFn IOEncodeFunc
 
 	// if decFn is nil, no need to decode
-	decFn IODecodeFunc
+	DecFn IODecodeFunc
 }
 
 func (codec ioEntryCodec) NoMarshal() bool {
-	return codec.encFn == nil
+	return codec.EncFn == nil
 }
 
 func (codec ioEntryCodec) NoUnmarshal() bool {
-	return codec.decFn == nil
+	return codec.DecFn == nil
 }
 
 var ioEntryCodecs = map[IOEntryHeader]ioEntryCodec{}
@@ -64,8 +64,8 @@ func RegisterIOEnrtyCodec(h IOEntryHeader, encFn IOEncodeFunc, decFn IODecodeFun
 		panic(fmt.Sprintf("duplicate io entry codec found: %s", h.String()))
 	}
 	ioEntryCodecs[h] = ioEntryCodec{
-		encFn: encFn,
-		decFn: decFn,
+		EncFn: encFn,
+		DecFn: decFn,
 	}
 }
 

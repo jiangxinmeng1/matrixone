@@ -66,7 +66,7 @@ func constructorFactory(size int64, algo uint8, noUnmarshalHint bool) CacheConst
 		if codec.NoUnmarshal() {
 			return buf[4:], size - 4, err
 		}
-		vec, err := codec.decFn(buf[4:])
+		vec, err := codec.DecFn(buf[4:])
 		if err != nil {
 			return nil, 0, err
 		}
