@@ -24,10 +24,29 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logservice"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/entry"
 )
+
+const (
+	IOET_WALRecord    = 1000
+	IOET_WALRecord_V1 = 1
+)
+
+func init() {
+	objectio.RegisterIOEnrtyCodec(
+		objectio.IOEntryHeader{IOET_WALRecord, IOET_WALRecord_V1},
+		func(record any) ([]byte, error) {
+			return record.(*recordEntry).Marshal()
+		},
+		func(b []byte) (any, error) {
+			record := new(recordEntry)
+			err := record.Unmarshal(b)
+			return record, err
+		})
+}
 
 type MetaType uint8
 
@@ -159,50 +178,62 @@ func (m *meta) Marshal() (buf []byte, err error) {
 	return
 }
 
-// read: logrecord -> meta+payload -> entry
-// write: entries+meta -> payload -> record
-type recordEntry struct {
-	EntryType uint16
+type baseEntry struct {
+	EntryVersion uint16
+	EntryType    uint16
 	*meta
+	// replay entry
+	cmd *ReplayCmd
+	// normal entry
 	entries []*entry.Entry
-	cmd     *ReplayCmd
-
-	payload     []byte
-	unmarshaled atomic.Uint32
-	mashalMu    sync.RWMutex
+	payload []byte
 }
 
-func newRecordEntry() *recordEntry {
-	return &recordEntry{entries: make([]*entry.Entry, 0), meta: newMeta()}
-}
-
-func newEmptyRecordEntry(r logservice.LogRecord) *recordEntry {
-	payload := make([]byte, len(r.Payload()))
-	copy(payload, r.Payload())
-	return &recordEntry{payload: payload, meta: newMeta(), mashalMu: sync.RWMutex{}}
-}
-
-func (r *recordEntry) replay(h driver.ApplyHandle) (addr *common.ClosedIntervals) {
-	bbuf := bytes.NewBuffer(r.payload)
-	lsns := make([]uint64, 0)
-	for lsn := range r.meta.addr {
-		lsns = append(lsns, lsn)
-		e := entry.NewEmptyEntry()
-		e.ReadFrom(bbuf)
-		h(e)
-		e.Entry.Free()
-	}
-	intervals := common.NewClosedIntervalsBySlice(lsns)
-	return intervals
-}
-func (r *recordEntry) append(e *entry.Entry) {
+func (r *baseEntry) append(e *entry.Entry) {
 	r.entries = append(r.entries, e)
 	r.meta.addr[e.Lsn] = uint64(r.payloadSize)
 	r.payloadSize += uint64(e.GetSize())
 }
 
+func (r *baseEntry) ReadFrom(reader io.Reader) (n int64, err error) {
+	if _, err = reader.Read(types.EncodeUint16(&r.EntryVersion)); err != nil {
+		return 0, err
+	}
+	n += 2
+	n1, err := r.meta.ReadFrom(reader)
+	if err != nil {
+		return 0, err
+	}
+	n += n1
+	payload := make([]byte, r.meta.payloadSize)
+	n2, err := reader.Read(payload)
+	if err != nil {
+		return 0, err
+	}
+	if n2 != int(r.meta.payloadSize) {
+		panic(moerr.NewInternalErrorNoCtx("logic err: err is %v, expect %d, get %d", err, r.meta.payloadSize, n2))
+	}
+	r.payload = payload
+	return
+}
+
+func (r *baseEntry) Unmarshal(buf []byte) error {
+	bbuf := bytes.NewBuffer(buf)
+	_, err := r.ReadFrom(bbuf)
+	return err
+}
+
+func (r *recordEntry) Marshal() (buf []byte, err error) {
+	var bbuf bytes.Buffer
+	if _, err = r.WriteTo(&bbuf); err != nil {
+		return
+	}
+	buf = bbuf.Bytes()
+	return
+}
+
 func (r *recordEntry) WriteTo(w io.Writer) (n int64, err error) {
-	if _, err = w.Write(types.EncodeUint16(&r.EntryType)); err != nil {
+	if _, err = w.Write(types.EncodeUint16(&r.EntryVersion)); err != nil {
 		return 0, err
 	}
 	n += 2
@@ -232,45 +263,57 @@ func (r *recordEntry) WriteTo(w io.Writer) (n int64, err error) {
 	return
 }
 
-func (r *recordEntry) ReadFrom(reader io.Reader) (n int64, err error) {
-	if _, err = reader.Read(types.EncodeUint16(&r.EntryType)); err != nil {
-		return 0, err
-	}
-	n += 2
-	n1, err := r.meta.ReadFrom(reader)
-	if err != nil {
-		return 0, err
-	}
-	n += n1
-	payload := make([]byte, r.meta.payloadSize)
-	n2, err := reader.Read(payload)
-	if err != nil {
-		return 0, err
-	}
-	if n2 != int(r.meta.payloadSize) {
-		panic(moerr.NewInternalErrorNoCtx("logic err: err is %v, expect %d, get %d", err, r.meta.payloadSize, n2))
-	}
-	r.payload = payload
-	return
+// read: logrecord -> meta+payload -> entry
+// write: entries+meta -> payload -> record
+type recordEntry struct {
+	*baseEntry
+
+	payload     []byte
+	unmarshaled atomic.Uint32
+	mashalMu    sync.RWMutex
 }
 
-func (r *recordEntry) Unmarshal(buf []byte) error {
-	bbuf := bytes.NewBuffer(buf)
-	_, err := r.ReadFrom(bbuf)
-	return err
+func newNomalRecordEntry() *recordEntry {
+	return &recordEntry{
+		baseEntry: &baseEntry{
+			meta:    newMeta(),
+			entries: make([]*entry.Entry, 0)},
+	}
 }
 
-func (r *recordEntry) Marshal() (buf []byte, err error) {
-	var bbuf bytes.Buffer
-	if _, err = r.WriteTo(&bbuf); err != nil {
-		return
+func newReplayRecordEntry() *recordEntry {
+	return &recordEntry{
+		baseEntry: &baseEntry{
+			meta: newMeta()},
 	}
-	buf = bbuf.Bytes()
-	return
+}
+
+func newEmptyRecordEntry(r logservice.LogRecord) *recordEntry {
+	payload := make([]byte, len(r.Payload()))
+	copy(payload, r.Payload())
+	return &recordEntry{
+		baseEntry: &baseEntry{meta: newMeta()},
+		mashalMu:  sync.RWMutex{},
+		payload:   payload,
+	}
+}
+
+func (r *recordEntry) replay(h driver.ApplyHandle) (addr *common.ClosedIntervals) {
+	bbuf := bytes.NewBuffer(r.payload)
+	lsns := make([]uint64, 0)
+	for lsn := range r.meta.addr {
+		lsns = append(lsns, lsn)
+		e := entry.NewEmptyEntry()
+		e.ReadFrom(bbuf)
+		h(e)
+		e.Entry.Free()
+	}
+	intervals := common.NewClosedIntervalsBySlice(lsns)
+	return intervals
 }
 func (r *recordEntry) prepareRecord() (size int) {
 	var err error
-	r.payload, err = r.Marshal()
+	r.payload, err = r.Marshal() //record payload
 	if err != nil {
 		panic(err)
 	}
@@ -286,9 +329,8 @@ func (r *recordEntry) unmarshal() {
 	if r.unmarshaled.Load() == 1 {
 		return
 	}
-	buf := r.payload
+	err := r.baseEntry.Unmarshal(r.payload)
 	r.payload = nil
-	err := r.Unmarshal(buf)
 	if err != nil {
 		panic(err)
 	}
@@ -298,7 +340,7 @@ func (r *recordEntry) unmarshal() {
 func (r *recordEntry) readEntry(lsn uint64) *entry.Entry {
 	r.unmarshal()
 	offset := r.meta.addr[lsn]
-	bbuf := bytes.NewBuffer(r.payload[offset:])
+	bbuf := bytes.NewBuffer(r.baseEntry.payload[offset:])
 	e := entry.NewEmptyEntry()
 	e.ReadFrom(bbuf)
 	e.Lsn = lsn

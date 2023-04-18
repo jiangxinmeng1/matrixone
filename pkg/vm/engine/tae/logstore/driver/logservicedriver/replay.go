@@ -154,7 +154,7 @@ func (r *replayer) replayLogserviceEntry(lsn uint64, safe bool) error {
 
 func (r *replayer) AppendSkipCmd(skipMap map[uint64]uint64) {
 	cmd := NewReplayCmd(skipMap)
-	recordEntry := newRecordEntry()
+	recordEntry := newReplayRecordEntry()
 	recordEntry.meta.metaType = TReplay
 	recordEntry.cmd = cmd
 	size := recordEntry.prepareRecord()

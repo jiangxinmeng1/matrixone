@@ -34,7 +34,7 @@ type driverAppender struct {
 
 func newDriverAppender() *driverAppender {
 	return &driverAppender{
-		entry: newRecordEntry(),
+		entry: newNomalRecordEntry(),
 		wg:    sync.WaitGroup{},
 	}
 }
