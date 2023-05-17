@@ -24,6 +24,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/logservice"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/entry"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
 
 	// "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
 	"github.com/stretchr/testify/assert"
@@ -85,9 +86,10 @@ func TestReplay1(t *testing.T) {
 	defer service.Close()
 
 	cfg := NewTestConfig(ccfg)
+	cfg.RecordSize = 100
 	driver := NewLogServiceDriver(cfg)
 
-	entryCount := 10000
+	entryCount := 100
 	entries := make([]*entry.Entry, entryCount)
 
 	for i := 0; i < entryCount; i++ {
@@ -118,27 +120,29 @@ func TestReplay1(t *testing.T) {
 }
 
 func TestReplay2(t *testing.T) {
-	t.Skip("debug")
 
 	service, ccfg := initTest(t)
 	defer service.Close()
 
 	cfg := NewTestConfig(ccfg)
-	cfg.NewRecordSize = 100
+	cfg.RecordSize = 1000
 	driver := NewLogServiceDriver(cfg)
 
-	entryCount := 10000
+	entryCount := 300
 	entries := make([]*entry.Entry, entryCount)
 
 	for i := 0; i < entryCount; i++ {
-		payload := []byte(fmt.Sprintf("payload %d", i))
+		payload := []byte(fmt.Sprintf("payload %d", i+1))
 		e := entry.MockEntryWithPayload(payload)
 		driver.Append(e)
 		entries[i] = e
 	}
 
-	synced := driver.getSynced()
-	driver.Truncate(synced)
+	testutils.WaitExpect(10000, func() bool {
+		return driver.getSynced() > 150
+	})
+	assert.Less(t, uint64(150), driver.getSynced())
+	driver.Truncate(150)
 
 	for i, e := range entries {
 		e.WaitDone()
@@ -164,6 +168,12 @@ func TestReplay2(t *testing.T) {
 	}
 
 	driver = restartDriver(t, driver, h)
+	t.Logf("last entry is %d", i-1)
+	assert.Equal(t, uint64(301), i)
+
+	truncated, err = driver.GetTruncated()
+	assert.NoError(t, err)
+	assert.NotEqual(t, uint64(0), truncated)
 
 	for _, e := range entries {
 		e.Entry.Free()

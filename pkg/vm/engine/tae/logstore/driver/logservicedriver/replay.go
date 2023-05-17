@@ -105,11 +105,13 @@ func (r *replayer) readRecords() (readEnd bool) {
 		}
 		drlsn := record.GetMinLsn()
 		r.driverLsnLogserviceLsnMap[drlsn] = lsn
-		if drlsn < r.replayedLsn {
+		// logutil.Infof("record %d-%d curr %d", lsn, drlsn, r.replayedLsn)
+		if drlsn-1 < r.replayedLsn {
 			if r.inited {
 				panic("logic err")
 			}
 			r.replayedLsn = drlsn - 1
+			// logutil.Infof("replayedLsn %d", r.replayedLsn)
 		}
 	})
 	if nextLsn == r.nextToReadLsn {
@@ -145,6 +147,7 @@ func (r *replayer) replayRecords() {
 }
 
 func (r *replayer) replayLogserviceEntry(lsn uint64, safe bool) error {
+	logutil.Infof("replay %d", lsn)
 	logserviceLsn, ok := r.driverLsnLogserviceLsnMap[lsn]
 	if !ok {
 		if safe {
