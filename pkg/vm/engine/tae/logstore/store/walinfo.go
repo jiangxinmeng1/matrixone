@@ -126,6 +126,22 @@ func (w *StoreInfo) allocateLsn(gid uint32) uint64 {
 	return lsn
 }
 
+func (w *StoreInfo) gcWALDriverLsnMapByDriverLsn(drlsn uint64) {
+	w.lsnMu.Lock()
+	defer w.lsnMu.Unlock()
+	for _, drlsnMap := range w.walDriverLsnMap {
+		groupLSNToDelete := make([]uint64, 0)
+		for groupLSN, drLSN := range drlsnMap {
+			if drLSN < drlsn {
+				groupLSNToDelete = append(groupLSNToDelete, groupLSN)
+			}
+		}
+		for _, lsn := range groupLSNToDelete {
+			delete(drlsnMap, lsn)
+		}
+	}
+}
+
 func (w *StoreInfo) logDriverLsn(driverEntry *driverEntry.Entry) {
 	info := driverEntry.Info
 

@@ -172,12 +172,13 @@ func (w *StoreImpl) onTruncatingQueue(items ...any) {
 
 func (w *StoreImpl) onTruncateQueue(items ...any) {
 	lsn := w.driverCheckpointing.Load()
-	if lsn != w.driverCheckpointed {
+	if lsn > w.driverCheckpointed {
 		err := w.driver.Truncate(lsn)
 		for err != nil {
 			lsn = w.driverCheckpointing.Load()
 			err = w.driver.Truncate(lsn)
 		}
 		w.driverCheckpointed = lsn
+		w.gcWALDriverLsnMapByDriverLsn(lsn)
 	}
 }

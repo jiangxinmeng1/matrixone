@@ -78,7 +78,7 @@ func NewTestConfig(ccfg *logservice.ClientConfig) *Config {
 		RecordSize:       int(common.M * 10),
 		ReadCacheSize:    10,
 		ReadMaxSize:      common.K * 20,
-		AppenderMaxCount: 10,
+		AppenderMaxCount: 100,
 		NewRecordSize:    int(common.K * 20),
 		// AppendFrequency:      time.Millisecond /1000,
 		RetryTimeout:         time.Minute,
