@@ -93,6 +93,20 @@ func (info *driverInfo) onReplayRecordEntry(lsn uint64, driverLsns *common.Close
 	info.validLsn.Add(lsn)
 }
 
+func (info *driverInfo) gcAddrByLogserviceLSN(lsn uint64) {
+	info.addrMu.Lock()
+	defer info.addrMu.Unlock()
+	lsnToDelete := make([]uint64, 0)
+	for logserviceLSN := range info.addr {
+		if logserviceLSN < lsn {
+			lsnToDelete = append(lsnToDelete, logserviceLSN)
+		}
+	}
+	for _, logserviceLSN := range lsnToDelete {
+		delete(info.addr, logserviceLSN)
+	}
+}
+
 func (info *driverInfo) getNextValidLogserviceLsn(lsn uint64) uint64 {
 	info.addrMu.Lock()
 	defer info.addrMu.Unlock()

@@ -60,6 +60,7 @@ func (d *LogServiceDriver) doTruncate() {
 	}
 	d.truncateLogservice(lsn)
 	d.truncatedLogserviceLsn = lsn
+	d.gcAddrByLogserviceLSN(lsn)
 }
 
 func (d *LogServiceDriver) truncateLogservice(lsn uint64) {

@@ -150,7 +150,7 @@ func TestReplay2(t *testing.T) {
 	}
 
 	truncated, err := driver.GetTruncated()
-	i := truncated
+	i := truncated + 1
 	t.Logf("truncate %d", i)
 	assert.NoError(t, err)
 	h := func(e *entry.Entry) {

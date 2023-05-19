@@ -16,7 +16,7 @@ package logservicedriver
 
 import (
 	"context"
-	// "math/rand"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -55,7 +55,7 @@ func (a *driverAppender) append(retryTimout, appendTimeout time.Duration) {
 	copy(record.Payload(), a.entry.payload)
 	record.ResizePayload(size)
 	defer logSlowAppend()()
-	// time.Sleep(time.Duration(rand.Intn(10) * 10 * int(time.Millisecond)))
+	time.Sleep(time.Duration(rand.Intn(10) * 10 * int(time.Millisecond)))
 	ctx, cancel := context.WithTimeout(context.Background(), appendTimeout)
 	logutil.Debugf("Log Service Driver: append start %p", a.client.record.Data)
 	lsn, err := a.client.c.Append(ctx, record)
