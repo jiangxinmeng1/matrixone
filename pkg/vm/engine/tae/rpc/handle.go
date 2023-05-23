@@ -619,6 +619,7 @@ func (h *Handle) HandlePreCommitWrite(
 				PkCheck:      db.PKCheckType(pe.GetPkCheckByDn()),
 			}
 			if req.FileName != "" {
+				logutil.Infof("file number is %d", len(req.FileName))
 				rows := catalog.GenRows(req.Batch)
 				for _, row := range rows {
 					if req.Type == db.EntryInsert {
