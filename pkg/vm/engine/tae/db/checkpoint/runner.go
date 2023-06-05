@@ -609,6 +609,11 @@ func (r *runner) tryScheduleCheckpoint() {
 			tree.GetTree().Compact()
 			if tree.IsEmpty() {
 				done = true
+				return
+			}
+			physical := entry.end.Physical()
+			if physical <= time.Now().UTC().UnixNano()-time.Minute.Nanoseconds()*10 {
+				logutil.Warnf("checkpoint %s is pendding, tree is %v", entry.String(), tree.String())
 			}
 			return
 		}
@@ -631,7 +636,6 @@ func (r *runner) tryScheduleCheckpoint() {
 		r.tryScheduleIncrementalCheckpoint(entry.end.Next())
 	}
 }
-
 func (r *runner) fillDefaults() {
 	if r.options.forceFlushTimeout <= 0 {
 		r.options.forceFlushTimeout = time.Second * 90
