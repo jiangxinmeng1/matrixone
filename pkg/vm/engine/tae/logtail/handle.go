@@ -260,6 +260,10 @@ func (b *CatalogLogtailRespBuilder) VisitDB(entry *catalog.DBEntry) error {
 		if dbNode.HasDropCommitted() {
 			// delScehma is empty, it will just fill rowid / commit ts
 			catalogEntry2Batch(b.delBatch, entry, dbNode, DelSchema, txnimpl.FillDBRow, u64ToRowID(entry.GetID()), dbNode.GetEnd())
+			if len(b.delBatch.Vecs) == 2 {
+				b.delBatch.AddVector(pkgcatalog.SystemDBAttr_ID, containers.MakeVector(types.T_uint64.ToType()))
+			}
+			b.delBatch.GetVectorByName(pkgcatalog.SystemColAttr_UniqName).Append(entry.ID, false)
 		} else {
 			catalogEntry2Batch(b.insBatch, entry, dbNode, catalog.SystemDBSchema, txnimpl.FillDBRow, u64ToRowID(entry.GetID()), dbNode.GetEnd())
 		}
@@ -292,6 +296,10 @@ func (b *CatalogLogtailRespBuilder) VisitTbl(entry *catalog.TableEntry) error {
 				for _, name := range node.BaseNode.Schema.Extra.DroppedAttrs {
 					b.delBatch.GetVectorByName(catalog.AttrRowID).Append(bytesToRowID([]byte(fmt.Sprintf("%d-%s", entry.GetID(), name))), false)
 					b.delBatch.GetVectorByName(catalog.AttrCommitTs).Append(node.GetEnd(), false)
+					if len(b.delBatch.Vecs) == 2 {
+						b.delBatch.AddVector(pkgcatalog.SystemColAttr_UniqName, containers.MakeVector(types.T_varchar.ToType()))
+					}
+					b.delBatch.GetVectorByName(pkgcatalog.SystemColAttr_UniqName).Append([]byte(fmt.Sprintf("%d-%s", entry.GetID(), name)), false)
 				}
 			} else {
 				dstBatch = b.delBatch
@@ -309,6 +317,10 @@ func (b *CatalogLogtailRespBuilder) VisitTbl(entry *catalog.TableEntry) error {
 		} else {
 			if node.HasDropCommitted() {
 				catalogEntry2Batch(b.delBatch, entry, node, DelSchema, txnimpl.FillTableRow, u64ToRowID(entry.GetID()), node.GetEnd())
+				if len(b.delBatch.Vecs) == 2 {
+					b.delBatch.AddVector(pkgcatalog.SystemRelAttr_ID, containers.MakeVector(types.T_uint64.ToType()))
+				}
+				b.delBatch.GetVectorByName(pkgcatalog.SystemColAttr_UniqName).Append(entry.ID, false)
 			} else {
 				catalogEntry2Batch(b.insBatch, entry, node, catalog.SystemTableSchema, txnimpl.FillTableRow, u64ToRowID(entry.GetID()), node.GetEnd())
 			}
