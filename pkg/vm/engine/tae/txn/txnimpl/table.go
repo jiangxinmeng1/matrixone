@@ -724,6 +724,7 @@ func (tbl *txnTable) RangeDelete(id *common.ID, start, end uint32, dt handle.Del
 	}()
 	if tbl.localSegment != nil && id.SegmentID().Eq(tbl.localSegment.entry.ID) {
 		err = tbl.RangeDeleteLocalRows(start, end)
+		logutil.Infof("err is %v", err)
 		return
 	}
 	node := tbl.deleteNodes[*id]
@@ -739,6 +740,7 @@ func (tbl *txnTable) RangeDelete(id *common.ID, start, end uint32, dt handle.Del
 		if err != nil {
 			tbl.store.warChecker.Insert(mvcc.GetEntry())
 		}
+		logutil.Infof("err is %v", err)
 		return
 	}
 
@@ -747,16 +749,19 @@ func (tbl *txnTable) RangeDelete(id *common.ID, start, end uint32, dt handle.Del
 		id.TableID, id.SegmentID(),
 		&id.BlockID)
 	if err != nil {
+		logutil.Infof("err is %v", err)
 		return
 	}
 	blkData := blk.GetBlockData()
 	node2, err := blkData.RangeDelete(tbl.store.txn, start, end, dt)
 	if err == nil {
 		if err = tbl.AddDeleteNode(id, node2); err != nil {
+			logutil.Infof("err is %v", err)
 			return
 		}
 		tbl.store.warChecker.Insert(blk)
 	}
+	logutil.Infof("err is %v", err)
 	return
 }
 
