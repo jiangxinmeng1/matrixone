@@ -763,6 +763,7 @@ func (tbl *txnTable) RangeDelete(id *common.ID, start, end uint32, dt handle.Del
 func (tbl *txnTable) TryDeleteByDeltaloc(id *common.ID, deltaloc objectio.Location) (ok bool, err error) {
 	node := tbl.deleteNodes[*id]
 	if node != nil {
+		logutil.Infof("err is %v", err)
 		logutil.Infof("blk %v not ok", id.BlockID.String())
 		return
 	}
@@ -772,6 +773,7 @@ func (tbl *txnTable) TryDeleteByDeltaloc(id *common.ID, deltaloc objectio.Locati
 		id.TableID, id.SegmentID(),
 		&id.BlockID)
 	if err != nil {
+		logutil.Infof("err is %v", err)
 		logutil.Infof("blk %v not ok", id.BlockID.String())
 		return
 	}
@@ -779,15 +781,18 @@ func (tbl *txnTable) TryDeleteByDeltaloc(id *common.ID, deltaloc objectio.Locati
 	node2, ok, err := blkData.TryDeleteByDeltaloc(tbl.store.txn, deltaloc)
 	if err == nil && ok {
 		if err = tbl.AddDeleteNode(id, node2); err != nil {
+			logutil.Infof("err is %v", err)
 			return
 		}
 		tbl.store.warChecker.Insert(blk)
 		if err = tbl.UpdateDeltaLoc(id, deltaloc); err != nil {
+			logutil.Infof("err is %v", err)
 			return
 		}
 	} else {
 		logutil.Infof("blk %v not ok", id.BlockID.String())
 	}
+	logutil.Infof("err is %v", err)
 	return
 }
 

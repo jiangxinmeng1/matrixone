@@ -156,6 +156,7 @@ func (db *txnDB) TryDeleteByDeltaloc(
 ) (ok bool, err error) {
 	table, err := db.getOrSetTable(id.TableID)
 	if err != nil {
+		logutil.Infof("err is %v", err)
 		return
 	}
 	if table.IsDeleted() {

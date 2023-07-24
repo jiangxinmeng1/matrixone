@@ -207,6 +207,7 @@ func (store *txnStore) TryDeleteByDeltaloc(
 ) (ok bool, err error) {
 	db, err := store.getOrSetDB(id.DbID)
 	if err != nil {
+		logutil.Infof("err is %v", err)
 		return
 	}
 	return db.TryDeleteByDeltaloc(id, deltaloc)
