@@ -20,6 +20,7 @@ import (
 	"sync"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	apipb "github.com/matrixorigin/matrixone/pkg/pb/api"
 
@@ -279,6 +280,7 @@ func (h *txnRelation) DeleteByPhyAddrKeys(keys containers.Vector) (err error) {
 		func(rid types.Rowid, _ bool, _ int) (err error) {
 			id.BlockID, row = rid.Decode()
 			err = h.Txn.GetStore().RangeDelete(id, row, row, handle.DT_Normal)
+			logutil.Infof("err is %v", err)
 			return
 		}, nil, nil)
 	return

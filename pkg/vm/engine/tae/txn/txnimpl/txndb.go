@@ -143,6 +143,7 @@ func (db *txnDB) RangeDelete(
 ) (err error) {
 	table, err := db.getOrSetTable(id.TableID)
 	if err != nil {
+		logutil.Infof("err is %v", err)
 		return err
 	}
 	if table.IsDeleted() {

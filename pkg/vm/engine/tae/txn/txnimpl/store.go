@@ -197,6 +197,7 @@ func (store *txnStore) RangeDelete(
 ) (err error) {
 	db, err := store.getOrSetDB(id.DbID)
 	if err != nil {
+		logutil.Infof("err is %v", err)
 		return err
 	}
 	return db.RangeDelete(id, start, end, dt)
