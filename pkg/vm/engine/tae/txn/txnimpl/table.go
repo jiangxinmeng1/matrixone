@@ -781,9 +781,8 @@ func (tbl *txnTable) TryDeleteByDeltaloc(id *common.ID, deltaloc objectio.Locati
 	node2, ok, err := blkData.TryDeleteByDeltaloc(tbl.store.txn, deltaloc)
 	if err == nil && ok {
 		if err = tbl.UpdateDeltaLoc(id, deltaloc); err != nil {
-			ok = false
-			err = nil
-			return
+			logutil.Infof("err is nil")
+			return false, nil
 		}
 		logutil.Infof("blk %v, delete length %d", id.BlockID.String(), node2.GetCardinalityLocked())
 		if err = tbl.AddDeleteNode(id, node2); err != nil {
