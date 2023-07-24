@@ -275,6 +275,7 @@ func (h *txnRelation) DeleteByFilter(ctx context.Context, filter *handle.Filter)
 func (h *txnRelation) DeleteByPhyAddrKeys(keys containers.Vector) (err error) {
 	id := h.table.entry.AsCommonID()
 	var row uint32
+	logutil.Infof("lalala key length is %d", keys.Length())
 	err = containers.ForeachVectorWindow(
 		keys, 0, keys.Length(),
 		func(rid types.Rowid, _ bool, _ int) (err error) {
@@ -283,6 +284,7 @@ func (h *txnRelation) DeleteByPhyAddrKeys(keys containers.Vector) (err error) {
 			logutil.Infof("err is %v", err)
 			return
 		}, nil, nil)
+	logutil.Infof("err is %v", err)
 	return
 }
 
