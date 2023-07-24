@@ -522,6 +522,7 @@ func (blk *baseBlock) RangeDelete(
 	dt handle.DeleteType) (node txnif.DeleteNode, err error) {
 	blk.Lock()
 	defer blk.Unlock()
+	logutil.Infof("blk %v, delete [%d,%d], chain %v", blk.meta.ID.String(), start, end, blk.mvcc.GetDeleteChain().StringLocked())
 	if err = blk.mvcc.CheckNotDeleted(start, end, txn.GetStartTS()); err != nil {
 		return
 	}

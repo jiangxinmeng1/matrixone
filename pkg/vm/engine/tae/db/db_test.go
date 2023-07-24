@@ -7853,3 +7853,13 @@ func TestReplayPersistedDelete(t *testing.T) {
 	assert.Error(t, err)
 	assert.NoError(t, txn.Commit(context.Background()))
 }
+
+func TestWW(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	ctx := context.Background()
+
+	opts := config.WithLongScanAndCKPOpts(nil)
+	tae := newTestEngine(ctx, t, opts)
+	defer tae.Close()
+
+}
