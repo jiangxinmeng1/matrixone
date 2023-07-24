@@ -787,7 +787,8 @@ func (tbl *txnTable) TryDeleteByDeltaloc(id *common.ID, deltaloc objectio.Locati
 	if err == nil && ok {
 		if err = tbl.UpdateDeltaLoc(id, deltaloc); err != nil {
 			logutil.Infof("err is nil")
-			return false, nil
+			err = node2.PrepareRollback()
+			return false, err
 		}
 		logutil.Infof("blk %v, delete length %d", id.BlockID.String(), node2.GetCardinalityLocked())
 		if err = tbl.AddDeleteNode(id, node2); err != nil {
