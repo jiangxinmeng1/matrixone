@@ -26,6 +26,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/blockio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
@@ -538,6 +539,7 @@ func (blk *baseBlock) TryDeleteByDeltaloc(
 	blk.Lock()
 	defer blk.Unlock()
 	if !blk.mvcc.GetDeleteChain().IsEmpty() {
+		logutil.Infof("blk %v not ok", blk.meta.ID.String())
 		return
 	}
 	node = blk.mvcc.CreatePersistedDeleteNode(txn, deltaLoc)

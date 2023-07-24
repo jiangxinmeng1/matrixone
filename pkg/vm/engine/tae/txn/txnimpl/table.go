@@ -763,6 +763,7 @@ func (tbl *txnTable) RangeDelete(id *common.ID, start, end uint32, dt handle.Del
 func (tbl *txnTable) TryDeleteByDeltaloc(id *common.ID, deltaloc objectio.Location) (ok bool, err error) {
 	node := tbl.deleteNodes[*id]
 	if node != nil {
+		logutil.Infof("blk %v not ok", id.BlockID.String())
 		return
 	}
 
@@ -771,6 +772,7 @@ func (tbl *txnTable) TryDeleteByDeltaloc(id *common.ID, deltaloc objectio.Locati
 		id.TableID, id.SegmentID(),
 		&id.BlockID)
 	if err != nil {
+		logutil.Infof("blk %v not ok", id.BlockID.String())
 		return
 	}
 	blkData := blk.GetBlockData()
@@ -783,6 +785,8 @@ func (tbl *txnTable) TryDeleteByDeltaloc(id *common.ID, deltaloc objectio.Locati
 		if err = tbl.UpdateDeltaLoc(id, deltaloc); err != nil {
 			return
 		}
+	} else {
+		logutil.Infof("blk %v not ok", id.BlockID.String())
 	}
 	return
 }
