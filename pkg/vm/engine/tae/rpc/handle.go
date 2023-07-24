@@ -957,7 +957,7 @@ func (h *Handle) HandleWrite(
 			vec := containers.ToDNVector(bat.Vecs[0])
 			defer vec.Close()
 			if err = tb.DeleteByPhyAddrKeys(vec); err != nil {
-				logutil.Infof("err is %v", err)
+				logutil.Infof("err is %v, tb is  %T", err, tb)
 				return
 			}
 		}
