@@ -848,6 +848,9 @@ func (h *Handle) HandleWrite(
 				txn.String(),
 			)
 		}
+		if err != nil {
+			logutil.Infof("err is %v", err)
+		}
 	}()
 
 	dbase, err := txn.GetDatabaseByID(req.DatabaseId)
@@ -916,6 +919,7 @@ func (h *Handle) HandleWrite(
 			var location objectio.Location
 			location, err = blockio.EncodeLocationFromString(key)
 			if err != nil {
+				logutil.Infof("err is %v", err)
 				return err
 			}
 			var ok bool
@@ -929,6 +933,7 @@ func (h *Handle) HandleWrite(
 				nil,
 			)
 			if err != nil {
+				logutil.Infof("err is %v", err)
 				return
 			}
 			blkids := getBlkIDsFromRowids(bat.Vecs[0])
@@ -939,6 +944,7 @@ func (h *Handle) HandleWrite(
 				}
 				ok, err = tb.TryDeleteByDeltaloc(id, location)
 				if err != nil {
+					logutil.Infof("err is %v", err)
 					return
 				}
 				if ok {
@@ -951,6 +957,7 @@ func (h *Handle) HandleWrite(
 			vec := containers.ToDNVector(bat.Vecs[0])
 			defer vec.Close()
 			if err = tb.DeleteByPhyAddrKeys(vec); err != nil {
+				logutil.Infof("err is %v", err)
 				return
 			}
 		}
@@ -959,6 +966,7 @@ func (h *Handle) HandleWrite(
 	vec := containers.ToDNVector(req.Batch.GetVector(0))
 	defer vec.Close()
 	err = tb.DeleteByPhyAddrKeys(vec)
+	logutil.Infof("err is %v", err)
 	return
 }
 
