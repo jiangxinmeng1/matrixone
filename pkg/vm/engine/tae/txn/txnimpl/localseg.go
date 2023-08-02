@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
@@ -244,6 +245,7 @@ func (seg *localSegment) prepareApplyANode(node *anode) error {
 
 func (seg *localSegment) prepareApplyPNode(node *pnode) (err error) {
 	//handle persisted insertNode.
+	logutil.Infof("lalala commit txn %x", []byte(seg.table.store.txn.GetID()))
 	metaloc, deltaloc := node.GetPersistedLoc()
 	blkn := metaloc.ID()
 	sid := metaloc.Name().SegmentId()

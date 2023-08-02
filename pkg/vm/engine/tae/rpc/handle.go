@@ -139,6 +139,7 @@ func (h *Handle) HandleCommit(
 		logutil.Debugf("HandleCommit start : %X",
 			string(meta.GetID()))
 	})
+	logutil.Infof("lalala commit txn %x", meta.ID)
 	defer func() {
 		if ok {
 			//delete the txn's context.
@@ -169,12 +170,14 @@ func (h *Handle) HandleCommit(
 	if err != nil {
 		return
 	}
+	logutil.Infof("lalala commit txn %x", meta.ID)
 	//if txn is 2PC ,need to set commit timestamp passed by coordinator.
 	if txn.Is2PC() {
 		txn.SetCommitTS(types.TimestampToTS(meta.GetCommitTS()))
 	}
 	err = txn.Commit(ctx)
 	cts = txn.GetCommitTS().ToTimestamp()
+	logutil.Infof("lalala commit txn %x", meta.ID)
 
 	if moerr.IsMoErrCode(err, moerr.ErrTAENeedRetry) {
 		for {
@@ -864,6 +867,7 @@ func (h *Handle) HandleWrite(
 		return
 	}
 
+	logutil.Infof("lalala commit txn %x", []byte(txn.GetID()))
 	if req.Type == db.EntryInsert {
 		//Add blocks which had been bulk-loaded into S3 into table.
 		if req.FileName != "" {

@@ -671,6 +671,7 @@ func (tbl *txnTable) AddBlksWithMetaLoc(ctx context.Context, metaLocs []objectio
 			}
 		}
 	}
+	logutil.Infof("lalala commit txn %x", []byte(tbl.store.txn.GetID()))
 	if tbl.localSegment == nil {
 		tbl.localSegment = newLocalSegment(tbl)
 	}
