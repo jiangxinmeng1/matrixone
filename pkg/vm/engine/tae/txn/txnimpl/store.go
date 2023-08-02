@@ -613,11 +613,13 @@ func (store *txnStore) ApplyRollback() (err error) {
 }
 
 func (store *txnStore) WaitPrepared(ctx context.Context) (err error) {
+	logutil.Infof("lalala commit %x", store.txn.GetID())
 	for _, db := range store.dbs {
 		if err = db.WaitPrepared(); err != nil {
 			return
 		}
 	}
+	logutil.Infof("lalala commit %x", store.txn.GetID())
 	moprobe.WithRegion(ctx, moprobe.TxnStoreWaitWALFlush, func() {
 		for _, e := range store.logs {
 			if err = e.WaitDone(); err != nil {
@@ -626,16 +628,20 @@ func (store *txnStore) WaitPrepared(ctx context.Context) (err error) {
 			e.Free()
 		}
 	})
+	logutil.Infof("lalala commit %x", store.txn.GetID())
 	store.wg.Wait()
+	logutil.Infof("lalala commit %x", store.txn.GetID())
 	return
 }
 
 func (store *txnStore) ApplyCommit() (err error) {
+	logutil.Infof("lalala commit %x", store.txn.GetID())
 	for _, db := range store.dbs {
 		if err = db.ApplyCommit(); err != nil {
 			break
 		}
 	}
+	logutil.Infof("lalala commit %x", store.txn.GetID())
 	store.CleanUp()
 	return
 }
