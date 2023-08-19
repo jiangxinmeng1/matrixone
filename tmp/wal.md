@@ -7,7 +7,7 @@
 ## 提交流程
 TAE先把事务的改动更新到内存，检查冲突，然后为确认不会回滚的事务写WAL日志，确认日志持久化后，更新内存中的状态，标志成已提交。
 
-![](./image/wal_1.jpg)
+![](./image/wal_4.jpg)
 
 为了减少延迟，提交队列的pipelie中，worker1准备好日志后，异步调用Backend的Append接口，不等待Append成功，直接把事务交给下一个worker，然后开始处理下一个事务。目前有两种Backend.一种是基于本地磁盘的Batch Store。还有基于raft的分布式的Log Service。支持并发写入的Backend，能进一步加快提交。
 
