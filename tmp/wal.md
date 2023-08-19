@@ -1,7 +1,7 @@
 
 # WAL
 
-为了在能在重启时完整地恢复出所有数据，事务要在提交前持久化。TAE中最新的数据先用WAL(Write Ahead Log)持久化到一个Backend中。后台会定期发起事务，转存这些改动到S3上，然后通知Log Service销毁掉旧的WAL。
+为了在能在重启时完整地恢复出所有数据，事务要在提交前持久化。TAE中最新的数据先用WAL(Write Ahead Log)持久化到一个Backend中。后台会定期发起事务，转存这些改动到S3上，然后通知Backend销毁掉旧的WAL。
 
 
 ## 提交流程
