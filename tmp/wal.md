@@ -1,27 +1,59 @@
 
-# WAL
+# MatrixOne WAL设计解析
 
-为了在能在重启时完整地恢复出所有数据，事务要在提交前持久化。TAE中最新的数据先用WAL(Write Ahead Log)持久化到一个Backend中。后台会定期发起事务，转存这些改动到S3上，然后通知Backend销毁掉旧的WAL。
+为了保证持久性，事务要在提交前持久化。TAE中最新的数据先用WAL(Write Ahead Log)持久化到一个Log Backend中。后台会定期发起事务，转存这些改动到另一个Storage上，然后通知Log Backend销毁掉旧的WAL。
 
+## 物理日志
+MatrixOne的WAL是物理日志，记录每行更新发生的位置，而不是sql，这样，每次回放出来，底层的数据都是一样的。
 
-## 提交流程
-TAE先把事务的改动更新到内存，检查冲突，然后为确认不会回滚的事务写WAL日志，确认日志持久化后，更新内存中的状态，标志成已提交。
+## Log Backend
+   Log Backend 需要实现这些接口
+  1. Append，提交事务时Append WAL
+   ```
+    Append(entry) (Lsn, error)
+   ```
+  1. Read，重启时批量读取WAL
+   ```
+	Read(Lsn, maxSize) (entry, Lsn, error)
+   ```
+  2. Truncate，做checkpoint时销毁旧的WAL
+   ```
+	Truncate(lsn Lsn) error
+   ```
 
-![](./image/wal_4.jpg)
+  目前有两种Log Backend。一种基于文件系统。另一个是我们自研的高可靠低延迟的Log Service。
 
-为了减少延迟，提交队列的pipelie中，worker1准备好日志后，异步调用Backend的Append接口，不等待Append成功，直接把事务交给下一个worker，然后开始处理下一个事务。目前有两种Backend。一种是基于本地磁盘的Batch Store。还有基于raft的分布式的Log Service。支持并发写入的Backend，能进一步加快提交。
+## Commit Pipeline
+
+提交之前DN要把TAE先把事务的改动更新到内存，。检查冲突，然后为确认不会回滚的事务写WAL日志，确认日志持久化后，更新内存中的状态，标志成已提交。
+![](./image/wal_8.jpg)
+
+TAE中事务在进入提交队列前更新Memtable和Catalog，在提交pipeline中批量写WAL，然后快速地标记状态使更改可见完成提交。例如，有多个事务txn1，txn2，txn3，txn4一起来提交，
+
+## Group Commit
+
+  持久化WAL涉及到IO，非常耗时，经常是提交耗时的瓶颈。为了节省时间，TAE中批量向Log Backend中写入WAL。比如，在文件系统中fsync耗时很久。如果每条WAL都fsync，会耗费大量时间。基于文件系统的Log Backend中，多个WAL写完后统一只做一次fsync，这些WAL刷盘的时间成本之和近似一条WAL刷盘的时间。
+  
+![](./image/wal_9.jpg)
+
+Log Service中支持并发写入，各条WAL刷盘的时间可以重合，这也能缩短写WAL的总时间，提高了提交的并发。
+
+## 处理Log Backend的乱序LSN
+TAE向Log Backend并发写入WAL时，写入成功的顺序和发出请求的顺序不一致，导致Log Backend中产生LSN是乱序的。提交事务和销毁日志的时候要处理这些乱序LSN。
+
+提交时，更改变得可见的顺序应该和事务提交的顺序一致，
 
 ## Checkpoint
 
-DN会选一个合适的时间戳t1作为checkpoint，然后扫描t1之前，上个checkpoint t0之后的区间，转存区间中的修改。
+DN会选一个合适的时间戳作为checkpoint，然后扫描时间戳之前的修改。
 
-![](./image/wal_2.jpg)
+![](./image/wal_10.jpg)
 
-DN先转存DML修改。Logtail Mgr中记录着每个事务改动了哪些block。DN扫描[t0,t1]之间的事务涉及的block，发起后台事务把这些block转存到S3上，在元数据中记录地址。这样，所有t1前提交的DML更改都能通过元数据中的地址查到。
+DN先转存DML修改。DML更改存在Memtable中的各个block中。Logtail Mgr中记录着每个事务改动了哪些block。DN在Logtail Mgr上扫描[t0,t1]之间的事务，发起后台事务把这些block转存到S3上，在元数据中记录地址。这样，所有t1前提交的DML更改都能通过元数据中的地址查到。为了及时做checkpoint，控制WAL的大小，哪怕区间中block只改动了一行，也需要转存。
 
-![](./image/wal_3.jpg)
+![](./image/wal_11.jpg)
 
-然后扫描Catalog，收集[t0,t1]之间的DDL和元数据更改，转存到S3上。Logtail Mgr中存了每个事务对应的WAL LSN。根据时间戳，找到t1前最后一个事务，然后通知LBackend清理这个LSN之前的所有日志。
+然后扫描Catalog，收集[t0,t1]之间的DDL和元数据更改，转存到S3上。Logtail Mgr中存了每个事务对应的WAL LSN。根据时间戳，找到t1前最后一个事务，然后通知Log Backend清理这个LSN之前的所有日志。
 
 ## WAL格式
 
