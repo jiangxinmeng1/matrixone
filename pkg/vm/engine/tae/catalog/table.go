@@ -300,11 +300,19 @@ func (entry *TableEntry) StringWithLevel(level common.PPLevel) string {
 }
 func (entry *TableEntry) StringLockedWithLevel(level common.PPLevel) string {
 	name := entry.GetLastestSchema().Name
+	if entry.ID==272689{
+		s:=entry.schema
+		for _,def:=range s.Load().ColDefs{
+			if def.Name== "i"{
+				logutil.Infof("lalala squence %d",def.SeqNum)
+			}
+		}
+	}
 	if level <= common.PPL1 {
 		return fmt.Sprintf("TBL[%d][name=%s][C@%s,D@%s]",
 			entry.ID, name, entry.GetCreatedAt().ToString(), entry.GetDeleteAt().ToString())
 	}
-	return fmt.Sprintf("TBL%s[name=%s]", entry.BaseEntryImpl.StringLocked(), name)
+	return fmt.Sprintf("TBL%s[name=%s, id=%d]", entry.BaseEntryImpl.StringLocked(), name,entry.ID)
 }
 
 func (entry *TableEntry) StringLocked() string {

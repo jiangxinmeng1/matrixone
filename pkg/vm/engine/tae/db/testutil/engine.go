@@ -470,7 +470,10 @@ func isBatchEqual(t *testing.T, bat1, bat2 *containers.Batch) {
 				// logutil.Warnf("empty vec attr %v", bat1.Attrs[j])
 				continue
 			}
+			// if bat1.Attrs[j]== "attr_seqnum"{
 			// t.Logf("attr %v, row %d", bat1.Attrs[j], i)
+			// 	logutil.Infof("%v-%v",bat1.Vecs[6].Get(i),string(bat1.Vecs[8].Get(i).([]byte)))
+			// }
 			assert.Equal(t, vec1.Get(i), vec2.Get(i))
 		}
 	}

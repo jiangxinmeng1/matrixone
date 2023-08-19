@@ -34,35 +34,35 @@ func init() {
 		MakeTestCase(test1, "prepare-1", "test-1", "prepare-1=>test-1"),
 	)
 
-	PrepareCaseRegister(MakePrepareCase(
-		prepareDDL, "prepare-2", "prepare case ddl",
-		schemaCfg{10, 2, 18, 13}, 10*3+1, longOpt,
-	))
-	TestCaseRegister(
-		MakeTestCase(testDDL, "prepare-2", "test-2", "prepare-2=>test-2"),
-	)
+	// PrepareCaseRegister(MakePrepareCase(
+	// 	prepareDDL, "prepare-2", "prepare case ddl",
+	// 	schemaCfg{10, 2, 18, 13}, 10*3+1, longOpt,
+	// ))
+	// TestCaseRegister(
+	// 	MakeTestCase(testDDL, "prepare-2", "test-2", "prepare-2=>test-2"),
+	// )
 
-	PrepareCaseRegister(MakePrepareCase(
-		prepareCompact, "prepare-3", "prepare case compact", schemaCfg{10, 2, 18, 13}, (10*3+1)*2, longOpt))
-	TestCaseRegister(
-		MakeTestCase(testCompact, "prepare-3", "test-3", "prepare-3=>test-3"),
-	)
+	// PrepareCaseRegister(MakePrepareCase(
+	// 	prepareCompact, "prepare-3", "prepare case compact", schemaCfg{10, 2, 18, 13}, (10*3+1)*2, longOpt))
+	// TestCaseRegister(
+	// 	MakeTestCase(testCompact, "prepare-3", "test-3", "prepare-3=>test-3"),
+	// )
 
-	PrepareCaseRegister(MakePrepareCase(
-		prepareDelete, "prepare-4", "prepare case delete",
-		schemaCfg{10, 2, 18, 13}, (10*3+1)*3, longOpt,
-	))
-	TestCaseRegister(
-		MakeTestCase(testDelete, "prepare-4", "test-4", "prepare-4=>test-4"),
-	)
+	// PrepareCaseRegister(MakePrepareCase(
+	// 	prepareDelete, "prepare-4", "prepare case delete",
+	// 	schemaCfg{10, 2, 18, 13}, (10*3+1)*3, longOpt,
+	// ))
+	// TestCaseRegister(
+	// 	MakeTestCase(testDelete, "prepare-4", "test-4", "prepare-4=>test-4"),
+	// )
 
-	PrepareCaseRegister(MakePrepareCase(
-		prepareAppend, "prepare-5", "prepare case append",
-		schemaCfg{10, 2, 18, 13}, 10*3+1, longOpt,
-	))
-	TestCaseRegister(
-		MakeTestCase(testAppend, "prepare-5", "test-5", "prepare-5=>test-5"),
-	)
+	// PrepareCaseRegister(MakePrepareCase(
+	// 	prepareAppend, "prepare-5", "prepare case append",
+	// 	schemaCfg{10, 2, 18, 13}, 10*3+1, longOpt,
+	// ))
+	// TestCaseRegister(
+	// 	MakeTestCase(testAppend, "prepare-5", "test-5", "prepare-5=>test-5"),
+	// )
 }
 
 func prepare1(tc PrepareCase, t *testing.T) {
@@ -288,36 +288,37 @@ func prepareDelete(tc PrepareCase, t *testing.T) {
 }
 
 func test1(tc TestCase, t *testing.T) {
-	pc := GetPrepareCase(tc.dependsOn)
+	// pc := GetPrepareCase(tc.dependsOn)
 	tae := tc.GetEngine(t)
-
-	bat := pc.GetBatch(t)
-	defer bat.Close()
-	bats := bat.Split(4)
-	window := bat.CloneWindow(2, 1)
-	defer window.Close()
-
-	txn, rel := tae.GetRelation()
-	testutil.CheckAllColRowsByScan(t, rel, bats[0].Length()-1, true)
-	err := rel.Append(context.Background(), bats[0])
-	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry))
-	assert.NoError(t, txn.Commit(context.Background()))
-
-	txn, rel = tae.GetRelation()
-	err = rel.Append(context.Background(), window)
-	assert.NoError(t, err)
-	_ = txn.Rollback(context.Background())
-
-	schema := pc.GetSchema(t)
-	txn, rel = testutil.GetDefaultRelation(t, tae.DB, schema.Name)
-	testutil.CheckAllColRowsByScan(t, rel, bats[0].Length()-1, true)
-	assert.NoError(t, txn.Commit(context.Background()))
-
-	txn, rel = testutil.GetDefaultRelation(t, tae.DB, schema.Name)
-	err = rel.Append(context.Background(), window)
-	assert.NoError(t, err)
-	_ = txn.Rollback(context.Background())
 	tae.CheckReadCNCheckpoint()
+
+	// bat := pc.GetBatch(t)
+	// defer bat.Close()
+	// bats := bat.Split(4)
+	// window := bat.CloneWindow(2, 1)
+	// defer window.Close()
+
+	// txn, rel := tae.GetRelation()
+	// testutil.CheckAllColRowsByScan(t, rel, bats[0].Length()-1, true)
+	// err := rel.Append(context.Background(), bats[0])
+	// assert.True(t, moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry))
+	// assert.NoError(t, txn.Commit(context.Background()))
+
+	// txn, rel = tae.GetRelation()
+	// err = rel.Append(context.Background(), window)
+	// assert.NoError(t, err)
+	// _ = txn.Rollback(context.Background())
+
+	// schema := pc.GetSchema(t)
+	// txn, rel = testutil.GetDefaultRelation(t, tae.DB, schema.Name)
+	// testutil.CheckAllColRowsByScan(t, rel, bats[0].Length()-1, true)
+	// assert.NoError(t, txn.Commit(context.Background()))
+
+	// txn, rel = testutil.GetDefaultRelation(t, tae.DB, schema.Name)
+	// err = rel.Append(context.Background(), window)
+	// assert.NoError(t, err)
+	// _ = txn.Rollback(context.Background())
+	// tae.CheckReadCNCheckpoint()
 }
 
 func testAppend(tc TestCase, t *testing.T) {

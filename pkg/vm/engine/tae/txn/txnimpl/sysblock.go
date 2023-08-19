@@ -20,6 +20,7 @@ import (
 
 	pkgcatalog "github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
@@ -208,6 +209,7 @@ func FillColumnRow(table *catalog.TableEntry, node *catalog.MVCCNode[*catalog.Ta
 		case pkgcatalog.SystemColAttr_Update:
 			colData.Append(colDef.OnUpdate, false)
 		case pkgcatalog.SystemColAttr_Seqnum:
+			logutil.Infof("collect %d-%v %d %p",table.ID,colDef.Name,colDef.SeqNum,colDef)
 			colData.Append(colDef.SeqNum, false)
 		case pkgcatalog.SystemColAttr_EnumValues:
 			colData.Append([]byte(colDef.EnumValues), false)

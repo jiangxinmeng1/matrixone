@@ -917,6 +917,7 @@ func (data *CNCheckpointData) ReadFromData(
 	// }
 	if version <= CheckpointVersion4 {
 		if tableID == pkgcatalog.MO_DATABASE_ID || tableID == pkgcatalog.MO_TABLES_ID || tableID == pkgcatalog.MO_COLUMNS_ID {
+			logutil.Infof("lalala tid %d",tableID)
 			dataBats = make([]*batch.Batch, MetaMaxIdx)
 			switch tableID {
 			case pkgcatalog.MO_DATABASE_ID:
@@ -953,6 +954,7 @@ func (data *CNCheckpointData) ReadFromData(
 					return
 				}
 			}
+			logutil.Infof("lalala tid %d v %d",tableID,version)
 			if version == CheckpointVersion1 {
 				if tableID == pkgcatalog.MO_TABLES_ID {
 					bat := dataBats[BlockInsert]
@@ -971,7 +973,9 @@ func (data *CNCheckpointData) ReadFromData(
 					}
 				}
 			}
+			logutil.Infof("lalala tid %v",tableID)
 			if version <= CheckpointVersion2 {
+				logutil.Infof("lalala tid %v",tableID)
 				if tableID == pkgcatalog.MO_DATABASE_ID {
 					bat := dataBats[BlockDelete]
 					if bat != nil {
@@ -988,8 +992,9 @@ func (data *CNCheckpointData) ReadFromData(
 						bat.Vecs = append(bat.Vecs, pkVec)
 					}
 				} else if tableID == pkgcatalog.MO_TABLES_ID {
+					logutil.Infof("lalala tid %v",tableID)
 					bat := dataBats[BlockDelete]
-					if bat == nil {
+					if bat != nil {
 						rowIDVec := vector.MustFixedCol[types.Rowid](bat.Vecs[0])
 						length := len(rowIDVec)
 						pkVec2 := vector.NewVec(types.T_uint64.ToType())
@@ -1001,6 +1006,7 @@ func (data *CNCheckpointData) ReadFromData(
 						}
 						bat.Attrs = append(bat.Attrs, pkgcatalog.SystemRelAttr_ID)
 						bat.Vecs = append(bat.Vecs, pkVec2)
+						logutil.Infof("bat %d %p",len(bat.Vecs),bat)
 					}
 				}
 
@@ -1008,7 +1014,7 @@ func (data *CNCheckpointData) ReadFromData(
 			if version <= CheckpointVersion3 {
 				if tableID == pkgcatalog.MO_COLUMNS_ID {
 					bat := dataBats[BlockInsert]
-					if bat == nil {
+					if bat != nil {
 						rowIDVec := vector.MustFixedCol[types.Rowid](bat.Vecs[0])
 						length := len(rowIDVec)
 						enumVec := vector.NewVec(types.New(types.T_varchar, types.MaxVarcharLen, 0))

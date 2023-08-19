@@ -243,6 +243,7 @@ func Open(ctx context.Context, dirname string, opts *options.Options) (db *DB, e
 	db.GCManager.Start()
 
 	// For debug or test
-	// logutil.Info(db.Catalog.SimplePPString(common.PPL2))
+	logutil.Info(db.Catalog.SimplePPString(common.PPL3))
+	// db.Catalog.SimplePPString(common.PPL3)
 	return
 }
