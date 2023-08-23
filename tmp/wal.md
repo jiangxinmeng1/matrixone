@@ -1,7 +1,7 @@
 
 # MatrixOne WAL设计解析
 
-为了保证持久性，事务要在提交前持久化。一般会把这些改动更新到memtable中的各个block中，每个block对应Storage中的一页。如果在提交时重写发生更新的每一页，开销很大，不能保证提交的性能。WAL(Write Ahead Log)只记录事务的更改操作，类似于在哪个blk中增加了哪行。提交事务时不用重写整页，只持久化WAL，加速了事务提交。提交之后再异步地更新那些脏页，对应的WAL就能销毁了。MatrixOne的WAL是物理日志，记录每行更新发生的位置，而不是sql，这样，每次回放出来，数据不仅在逻辑上相同，底层的组织结构也是一样的。MatrixOne中DN负责提交事务，向Log Backend中写WAL，做checkpoint。
+为了保证持久性，事务要在提交前持久化。一般会把这些改动更新到memtable中的各个block中，每个block对应Storage中的一页。如果在提交时重写发生更新的每一页，开销很大，不能保证提交的性能。WAL(Write Ahead Log)只记录事务的更改操作，类似于在哪个blk中增加了哪行。提交事务时不用重写整页，只持久化WAL，加速了事务提交。提交之后再异步地更新那些脏页，对应的WAL就能销毁了。MatrixOne的WAL是物理日志，记录每行更新发生的位置，而不是sql，这样，每次回放出来，数据不仅在逻辑上相同，底层的组织结构也是一样的。
 
 下面是本文目录概览：
 1. Commit Pipeline
@@ -33,15 +33,15 @@
 
 1. 选定一个合适的时间戳作为checkpoint，然后扫描时间戳之前的修改。
 
-2. 转存DML修改。DML更改存在memtable中的各个block中。Logtail Mgr中记录着每个事务改动了哪些block。在Logtail Mgr上扫描[t0,t1]之间的事务，发起后台事务把这些block转存到Storage上，在元数据中记录地址。这样，所有t1前提交的DML更改都能通过元数据中的地址查到。为了及时做checkpoint，控制WAL的大小，哪怕区间中block只改动了一行，也需要转存。
+2. 转存DML修改。DML更改存在memtable中的各个block中。Logtail Mgr中记录着每个事务改动了哪些block。在Logtail Mgr上扫描[t0,t1]之间的事务，发起后台事务把这些block转存到Storage上，在元数据中记录地址。这样，所有t1前提交的DML更改都能通过元数据中的地址查到。为了及时做checkpoint，不让WAL无限增长，哪怕区间中block只改动了一行，也需要转存。
 
 ![](./image/wal_10.jpg)
 
-3. 扫描Catalog，收集[t0,t1]之间的DDL和元数据更改，转存到Storage上。内存里的Catalog是一棵树，每个结点是一条catalog entry。catalog entry有4类，database，table，segment和block，其中segment和block是元数据，在插入数据和后台排序的时候会变更。每条database entry对应一个库，每条table entry对应一张表。
+3. 扫描Catalog，收集[t0,t1]之间的DDL和元数据更改，转存到Storage上。
 
 ![](./image/wal_11.jpg)
 
-4. 销毁旧的LSN。Logtail Mgr中存了每个事务对应的WAL LSN。根据时间戳，找到t1前最后一个事务，然后通知Log Backend清理这个LSN之前的所有日志。
+1. 销毁旧的WAL。Logtail Mgr中存了每个事务对应的LSN。根据时间戳，找到t1前最后一个事务，然后通知Log Backend清理这个事务的LSN之前的所有日志。
 ## Driver & Log Backend
 MatrixOne的WAL能写在各种Log Backend中。最初的Log Backend基于本地文件系统。为了分布式特性，我们自研了高可靠低延迟Log Service作为新的Log Backend。Driver层被抽象出来，适配不同的Log Backend。
 
@@ -122,11 +122,11 @@ Driver收到上层传来的LSN，算出对应的Log Backend LSN，通知Log Back
 
 #### Operators
 
-DN支持建库，删库，建表，删表，更新表结构，插入，删除，同时后台会自动触发排序。更新操作被拆分成插入和删除。
+MatrixOne中DN负责提交事务，向Log Backend中写WAL，做checkpoint。DN支持建库，删库，建表，删表，更新表结构，插入，删除，同时后台会自动触发排序。更新操作被拆分成插入和删除。
 
 1. DDL
    
-   DDL包括建库，删库，建表，删表，更新表结构。DN在Catalog里记录了表和库的信息。每个DDL操作对应一条database/table entry，在WAL里记录成Update Catalog Command。
+   DDL包括建库，删库，建表，删表，更新表结构。DN在Catalog里记录了表和库的信息。内存里的Catalog是一棵树，每个结点是一条catalog entry。catalog entry有4类，database，table，segment和block，其中segment和block是元数据，在插入数据和后台排序的时候会变更。每条database entry对应一个库，每条table entry对应一张表。每个DDL操作对应一条database/table entry，在WAL里记录成Update Catalog Command。
 2. Insert
    
    新插入的数据记录在Append Command中。
