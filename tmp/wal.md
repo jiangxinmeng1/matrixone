@@ -1,48 +1,33 @@
 
 # MatrixOne WAL设计解析
 
-为了保证持久性，事务要在提交前持久化。TAE中最新的数据先用WAL(Write Ahead Log)持久化到一个Log Backend中。后台会定期发起事务，转存这些改动到另一个Storage上，然后通知Log Backend销毁掉旧的WAL。
+为了保证持久性，事务要在提交前持久化。一般内存里会把这些更改更新到memtable中的block中，每个block对应Storage中的一页。如果重写发生更新的页，开销很大，不能保证提交性能。WAL(Write Ahead Log)只记录了事务更改的地方，类似于在哪个blk中增加了哪行。提交事务时不用更新重写整页，只持久化WAL，加速了事务提交。提交之后再异步地更新那些脏页，对应的WAL就能销毁了。MatrixOne的WAL是物理日志，记录每行更新发生的位置，而不是sql，这样，每次回放出来，数据不仅在逻辑上相同，底层的组织结构也是一样的。
 
-## 物理日志
-MatrixOne的WAL是物理日志，记录每行更新发生的位置，而不是sql，这样，每次回放出来，底层的数据都是一样的。
-
-## Log Backend
-   Log Backend 需要实现这些接口
-  1. Append，提交事务时Append WAL
-   ```
-    Append(entry) (Lsn, error)
-   ```
-  1. Read，重启时批量读取WAL
-   ```
-	Read(Lsn, maxSize) (entry, Lsn, error)
-   ```
-  2. Truncate，做checkpoint时销毁旧的WAL
-   ```
-	Truncate(lsn Lsn) error
-   ```
-
-  目前有两种Log Backend。一种基于文件系统。另一个是我们自研的高可靠低延迟的Log Service。
+下面是本文目录概览：
+1. Commit Pipeline
+2. Checkpoint
+3. Driver & Log Backend
+4. Group Commit
+5. 处理Log Backend的乱序LSN
+6. MatrixOne中WAL的具体格式
 
 ## Commit Pipeline
 
-提交之前DN要把TAE先把事务的改动更新到内存，。检查冲突，然后为确认不会回滚的事务写WAL日志，确认日志持久化后，更新内存中的状态，标志成已提交。
+提交之前DN要更新memtable，持久化WAL，执行这些任务的耗时决定了提交的性能。 持久化WAL涉及到IO，比较耗时。TAE中采用commit pipeline，异步持久化WAL，不阻塞内存中的更新。事务提交的流程是：
+1. 把更改更新到memtable中
+   
+   事务进入commit pipeline之前，先并发的更新memtable，事务之间互相不阻塞。这时这些更改的状态为未提交，还不可见。
+2. 进入commit pipeline检查冲突
+3. 持久化WAL
+   
+   持久化WAL是异步的，队列里只通知Log Backend写入WAL就立刻返回，不用等待写入成功，这样不会阻塞后续其他事务。Log Backend中支持并发写入，不用等待之前的事务。Log Backend中同时处理一批事务，通过Group Commit加速持久化。
+4. 更新memtable中的状态使事务可见
+   
+   事务按照进队列的顺序依次更新状态，这样事务可见的顺序和队列里各个操作的顺序是一致的。
+
 ![](./image/wal_8.jpg)
 
-TAE中事务在进入提交队列前更新Memtable和Catalog，在提交pipeline中批量写WAL，然后快速地标记状态使更改可见完成提交。例如，有多个事务txn1，txn2，txn3，txn4一起来提交，
-
-## Group Commit
-
-  持久化WAL涉及到IO，非常耗时，经常是提交耗时的瓶颈。为了节省时间，TAE中批量向Log Backend中写入WAL。比如，在文件系统中fsync耗时很久。如果每条WAL都fsync，会耗费大量时间。基于文件系统的Log Backend中，多个WAL写完后统一只做一次fsync，这些WAL刷盘的时间成本之和近似一条WAL刷盘的时间。
-  
-![](./image/wal_9.jpg)
-
-Log Service中支持并发写入，各条WAL刷盘的时间可以重合，这也能缩短写WAL的总时间，提高了提交的并发。
-
-## 处理Log Backend的乱序LSN
-TAE向Log Backend并发写入WAL时，写入成功的顺序和发出请求的顺序不一致，导致Log Backend中产生LSN是乱序的。提交事务和销毁日志的时候要处理这些乱序LSN。
-
-提交时，更改变得可见的顺序应该和事务提交的顺序一致，
-
+TAE中事务在进入提交队列前更新Memtable和Catalog，在提交pipeline中批量写WAL，然后快速地标记状态使更改可见完成提交。
 ## Checkpoint
 
 DN会选一个合适的时间戳作为checkpoint，然后扫描时间戳之前的修改。
@@ -54,8 +39,45 @@ DN先转存DML修改。DML更改存在Memtable中的各个block中。Logtail Mgr
 ![](./image/wal_11.jpg)
 
 然后扫描Catalog，收集[t0,t1]之间的DDL和元数据更改，转存到S3上。Logtail Mgr中存了每个事务对应的WAL LSN。根据时间戳，找到t1前最后一个事务，然后通知Log Backend清理这个LSN之前的所有日志。
+## Driver & Log Backend
+MatrixOne的WAL能写在各种Log Backend中。最初使用的Log Backend基于本地文件系统。为了分布式特性，我们自研了高可靠低延迟Log Service作为新的Log Backend。Driver层被抽象出来，适配不同的Log Backend。
 
-## WAL格式
+   Driver需要适配出这些接口：
+  1. Append，提交事务时异步地Append WAL
+   ```
+    Append(entry) (Lsn, error)
+   ```
+  2. Read，重启时批量读取WAL
+   ```
+	Read(Lsn, maxSize) (entry, Lsn, error)
+   ```
+  3. Truncate，做checkpoint时销毁旧的WAL
+   ```
+	Truncate(lsn Lsn) error
+   ```
+
+  经过适配，各种消息队列（e.g. Kafka）也能作为Log Backend。
+
+
+## Group Commit
+
+  持久化WAL涉及到IO，非常耗时，经常是提交耗时的瓶颈。为了节省时间，TAE中批量向Log Backend中写入WAL。比如，在文件系统中fsync耗时很久。如果每条WAL都fsync，会耗费大量时间。基于文件系统的Log Backend中，多个WAL写完后统一只做一次fsync，这些WAL刷盘的时间成本之和近似一条WAL刷盘的时间。
+  
+![](./image/wal_9.jpg)
+
+Log Service中支持并发写入，各条WAL刷盘的时间可以重合，这也能缩短写WAL的总时间，提高了提交的并发。
+
+## 处理Log Backend的乱序LSN
+Driver和Log Backend中各维护了一套LSN。Driver向Log Backend并发写入WAL时，写入成功的顺序和发出请求的顺序不一致，导致Log Backend中产生LSN是乱序的。销毁WAL和重启的时候要处理这些乱序LSN。Driver中会维护一个map，记录两套LSN的对应关系。为了保证Log Backend中的LSN基本有序，乱序的跨度不太大，Driver中维持了一个窗口，如果有很早的WAL正在写入还未成功，会停止向Log Backend写入新的WAL。举个例子，如果窗口的长度是7，图中的LSN为13的WAL还未返回，会阻塞住LSN大于等于20的WAL。
+
+![](./image/wal_13.jpg)
+
+Log Backend中通过truncate操作销毁日志，销毁指定LSN之前的所有WAL。这个LSN之前的WAL所对应的Driver LSN都要小于Driver中的truncate点。比如图中Driver里truncate到7，这条WAL对应Log Backend中的11，但是Log Backend中5，6，7，10对应的Driver LSN都大于7，不能被truncate。Log Backend只能truncate 4。
+
+重启时，会跳过开始和末尾哪些不连续的WAL。如果Log Backend中写到14时，整个机器断电了，重启时会根据上次的truncate信息过滤掉开头8，9，11。等读完所有的WAL发现6，14的Driver LSN和其他的WAL不连续，就丢弃末尾的6和14。
+
+
+## MatrixOne中WAL的具体格式
 
 每个写事务对应一条WAL日志，由LSN，Transaction Context和多个Command组成。
 
@@ -197,3 +219,6 @@ DN支持建库，删库，建表，删表，更新表结构，插入，删除，
      ```
      * Destination记录Delete发生在哪个Block上。
      * Delete Mask记录删除掉的行号。
+
+##
+WAL在存储系统中应用得十分广泛。WAL减少掉每次事务写脏页的操作，是一种更高效的模式。WAL内部还有很多执行细节，我们会不断调整，不断优化。
