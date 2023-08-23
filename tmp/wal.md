@@ -1,32 +1,16 @@
 
 # MatrixOne WAL设计解析
 
-WAL(Write Ahead Log)是一项与数据库原子性和持久性相关的技术，把随机写变成顺序读写，加速事务提交。事务的更改随机地发生在各页上。这些页很分散，随机写的开销大于顺序写，会降低提交的性能。WAL只记录事务的更改操作，类似于在哪个block中增加了哪行。提交事务时新的WAL entry顺序地写在WAL文件末尾，加速了事务提交。提交之后再异步地更新那些脏页，销毁对应的WAL entry，释放空间。MatrixOne的WAL是物理日志，记录每行更新发生的位置，每次回放出来，数据不仅在逻辑上相同，底层的组织结构也是一样的，更方便做幂等。
+WAL(Write Ahead Log)是一项与数据库原子性和持久性相关的技术，把随机写变成顺序读写。事务的更改随机地发生在各页上。这些页很分散，随机写的开销大于顺序写，会降低提交的性能。WAL只记录事务的更改操作，类似于在哪个block中增加了哪行。提交事务时新的WAL entry顺序地写在WAL文件末尾。提交之后再异步地更新那些脏页，销毁对应的WAL entry，释放空间。MatrixOne的WAL是物理日志，记录每行更新发生的位置，每次回放出来，数据不仅在逻辑上相同，底层的组织结构也是一样的，更方便做幂等。
 
 下面是本文目录概览：
-1. Log Backend
-2. Commit Pipeline
-3. Checkpoint
+1. Commit Pipeline
+2. Checkpoint
+3. Log Backend
 4. Group Commit
 5. 处理Log Backend的乱序LSN
 6. MatrixOne中WAL的具体格式
 
-## Log Backend
-MatrixOne的WAL能写在各种Log Backend中。最初的Log Backend基于本地文件系统。为了分布式特性，我们自研了高可靠低延迟Log Service作为新的Log Backend。Driver层被抽象出来，适配不同的Log Backend。经过适配，Kafka也能作为Log Backend。
-
-   Driver需要适配出这些接口：
-  1. Append，提交事务时异步地写入log entry
-   ```
-    Append(entry) (Lsn, error)
-   ```
-  2. Read，重启时批量读取log entry
-   ```
-	Read(Lsn, maxSize) (entry, Lsn, error)
-   ```
-  3. Truncate接口会销毁LSN前的所有log entry，释放空间。
-   ```
-	Truncate(lsn Lsn) error
-   ```
 
 ## Commit Pipeline
 
@@ -41,7 +25,7 @@ Commit Pipeline是处理事务提交的组件。提交之前要更新memtable，
 2. 进入commit pipeline检查冲突
 3. 持久化WAL entry
    
-   持久化WAL entry是异步的，队列里只通知后端写入WAL entry就立刻返回，不用等待写入成功，这样不会阻塞后续其他事务。后端同时处理一批entry，通过Group Commit进一步加速持久化。
+   从内存收集WAL entry写到后端。持久化WAL entry是异步的，队列里只把WAL entry传给后端就立刻返回，不用等待写入成功，这样不会阻塞后续其他事务。后端同时处理一批entry，通过Group Commit进一步加速持久化。
 4. 更新memtable中的状态使事务可见
    
    事务按照进队列的顺序依次更新状态，这样事务可见的顺序和队列里写WAL entry的顺序是一致的。
@@ -61,6 +45,22 @@ Checkpoint将脏数据写入Storage，销毁旧的log entry，释放空间。Mat
 
 4. 销毁旧的WAL entry。Logtail Mgr中存了每个事务对应的LSN。根据时间戳，找到t1前最后一个事务，然后通知Log Backend清理这个事务的LSN之前的所有日志。
 
+## Log Backend
+MatrixOne的WAL能写在各种Log Backend中。最初的Log Backend基于本地文件系统。为了分布式特性，我们自研了高可靠低延迟Log Service作为新的Log Backend。Driver层被抽象出来，适配不同的Log Backend。经过适配，Kafka也能作为Log Backend。
+
+   Driver需要适配出这些接口：
+  1. Append，提交事务时异步地写入log entry
+   ```
+    Append(entry) (Lsn, error)
+   ```
+  2. Read，重启时批量读取log entry
+   ```
+	Read(Lsn, maxSize) (entry, Lsn, error)
+   ```
+  3. Truncate接口会销毁LSN前的所有log entry，释放空间。
+   ```
+	Truncate(lsn Lsn) error
+   ```
 ## Group Commit
 
   Group Commit可以加速持久化log entry。持久化log entry涉及到IO，非常耗时，经常是提交的瓶颈。为了降低延迟，TAE中批量向Log Backend中写入log entry。比如，在文件系统中fsync耗时很久。如果每条entry都fsync，会耗费大量时间。基于文件系统的Log Backend中，多个entry写完后统一只做一次fsync，这些entry刷盘的时间成本之和近似一条entry刷盘的时间。
