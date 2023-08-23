@@ -46,7 +46,7 @@ Checkpoint将脏数据写入Storage，销毁旧的log entry，释放空间。Mat
 4. 销毁旧的WAL entry。Logtail Mgr中存了每个事务对应的LSN。根据时间戳，找到t1前最后一个事务，然后通知Log Backend清理这个事务的LSN之前的所有日志。
 
 ## Log Backend
-MatrixOne的WAL能写在各种Log Backend中。最初的Log Backend基于本地文件系统。为了分布式特性，我们自研了高可靠低延迟Log Service作为新的Log Backend。Driver层被抽象出来，适配不同的Log Backend。经过适配，Kafka也能作为Log Backend。
+MatrixOne的WAL能写在各种Log Backend中。最初的Log Backend基于本地文件系统。为了分布式特性，我们自研了高可靠低延迟Log Service作为新的Log Backend。我们为适配不同的log backend,抽象出一个虚拟的backend, 通过一些很轻量的driver开发，对接不同的backend。
 
    Driver需要适配出这些接口：
   1. Append，提交事务时异步地写入log entry
