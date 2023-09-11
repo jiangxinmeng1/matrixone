@@ -64,8 +64,8 @@ const (
 	unsubscribeTimer         = 1 * time.Hour
 
 	// gc blocks and BlockIndexByTSEntry in partition state
-	gcPartitionStateTicker = 1 * time.Second
-	gcPartitionStateTimer  = 1 * time.Second
+	gcPartitionStateTicker = 1 * time.Minute
+	gcPartitionStateTimer  = 10 * time.Minute
 
 	// log tail consumer related constants.
 	// if buffer is almost full (percent > consumerWarningPercent, we will send a message to log.
