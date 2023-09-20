@@ -100,10 +100,13 @@ type txnTable struct {
 	createEntry  txnif.TxnEntry
 	dropEntry    txnif.TxnEntry
 	localSegment *localSegment
-	deleteNodes  map[common.ID]*deleteNode
-	entry        *catalog.TableEntry
-	schema       *catalog.Schema
-	logs         []wal.LogEntry
+
+	localTombstoneSegment *localTombstoneSegment
+
+	deleteNodes map[common.ID]*deleteNode
+	entry       *catalog.TableEntry
+	schema      *catalog.Schema
+	logs        []wal.LogEntry
 
 	dedupedSegmentHint uint64
 	dedupedBlockID     *types.Blockid
@@ -738,6 +741,8 @@ func (tbl *txnTable) RangeDelete(
 		err = tbl.RangeDeleteLocalRows(start, end)
 		return
 	}
+
+	tbl.localTombstoneSegment.RangeDelete(id, start, end, pk, dt)
 	node := tbl.deleteNodes[*id]
 	if node != nil {
 		// TODO: refactor
@@ -1284,8 +1289,13 @@ func (tbl *txnTable) DoPrecommitDedupByPK(pks containers.Vector, pksZM index.ZM)
 	return
 }
 
-func (tbl *txnTable) DoPrecommitDedupByNode(ctx context.Context, node InsertNode) (err error) {
-	segIt := tbl.entry.MakeSegmentIt(false)
+func (tbl *txnTable) DoPrecommitDedupByNode(ctx context.Context, node InsertNode, isTombStone bool) (err error) {
+	var segIt *common.GenericSortedDListIt[*catalog.SegmentEntry]
+	if isTombStone {
+		segIt = tbl.entry.MakeTombstoneIt(false)
+	} else {
+		segIt = tbl.entry.MakeSegmentIt(false)
+	}
 	var pks containers.Vector
 	//loaded := false
 	for segIt.Valid() {
@@ -1370,7 +1380,7 @@ func (tbl *txnTable) DoPrecommitDedupByNode(ctx context.Context, node InsertNode
 	return
 }
 
-func (tbl *txnTable) DedupWorkSpace(key containers.Vector) (err error) {
+func (tbl *txnTable) DedupWorkSpace(key containers.Vector, isTombStone bool) (err error) {
 	index := NewSimpleTableIndex()
 	//Check whether primary key is duplicated.
 	if err = index.BatchInsert(
@@ -1383,10 +1393,20 @@ func (tbl *txnTable) DedupWorkSpace(key containers.Vector) (err error) {
 		return
 	}
 
-	if tbl.localSegment != nil {
-		//Check whether primary key is duplicated in txn's workspace.
-		if err = tbl.localSegment.BatchDedup(key); err != nil {
-			return
+	if isTombStone {
+		if tbl.localTombstoneSegment != nil {
+			//Check whether primary key is duplicated in txn's workspace.
+			if err = tbl.localTombstoneSegment.BatchDedup(key); err != nil {
+				return
+			}
+		}
+
+	} else {
+		if tbl.localSegment != nil {
+			//Check whether primary key is duplicated in txn's workspace.
+			if err = tbl.localSegment.BatchDedup(key); err != nil {
+				return
+			}
 		}
 	}
 	return

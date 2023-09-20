@@ -55,6 +55,9 @@ type TableEntry struct {
 	DeletedDirties []*BlockEntry
 	// fullname is format as 'tenantID-tableName', the tenantID prefix is only used 'mo_catalog' database
 	fullName string
+
+	tombstoneEntries map[types.Uuid]*common.GenericDLNode[*SegmentEntry]
+	tombstoneLink    *common.GenericSortedDList[*SegmentEntry]
 }
 
 func genTblFullName(tenantID uint32, name string) string {
@@ -84,6 +87,9 @@ func NewTableEntryWithTableId(db *DBEntry, schema *Schema, txnCtx txnif.AsyncTxn
 		TableNode: &TableNode{},
 		link:      common.NewGenericSortedDList((*SegmentEntry).Less),
 		entries:   make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
+		
+		tombstoneLink:      common.NewGenericSortedDList((*SegmentEntry).Less),
+		tombstoneEntries:   make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
 	}
 	e.TableNode.schema.Store(schema)
 	if dataFactory != nil {
@@ -180,7 +186,11 @@ func (entry *TableEntry) MakeSegmentIt(reverse bool) *common.GenericSortedDListI
 	defer entry.RUnlock()
 	return common.NewGenericSortedDListIt(entry.RWMutex, entry.link, reverse)
 }
-
+func (entry *TableEntry) MakeTombstoneIt(reverse bool) *common.GenericSortedDListIt[*SegmentEntry] {
+	entry.RLock()
+	defer entry.RUnlock()
+	return common.NewGenericSortedDListIt(entry.RWMutex, entry.tombstoneLink, reverse)
+}
 func (entry *TableEntry) CreateSegment(
 	txn txnif.AsyncTxn,
 	state EntryState,
@@ -317,6 +327,8 @@ func (entry *TableEntry) StringLocked() string {
 func (entry *TableEntry) GetCatalog() *Catalog { return entry.db.catalog }
 
 func (entry *TableEntry) GetTableData() data.Table { return entry.tableData }
+
+func (entry *TableEntry) GetTombstoneData() data.Table { return entry.tableData }
 
 func (entry *TableEntry) LastAppendableSegmemt() (seg *SegmentEntry) {
 	it := entry.MakeSegmentIt(false)
