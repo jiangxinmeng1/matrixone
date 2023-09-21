@@ -31,6 +31,7 @@ const (
 	IOET_WALTxnCommand_Table    uint16 = 3010
 	IOET_WALTxnCommand_Segment  uint16 = 3011
 	IOET_WALTxnCommand_Block    uint16 = 3012
+	IOET_WALTxnCommand_Object   uint16 = 3014
 
 	IOET_WALTxnCommand_Database_V1 uint16 = 1
 	IOET_WALTxnCommand_Table_V1    uint16 = 1
@@ -38,11 +39,13 @@ const (
 	IOET_WALTxnCommand_Table_V3    uint16 = 3
 	IOET_WALTxnCommand_Segment_V1  uint16 = 1
 	IOET_WALTxnCommand_Block_V1    uint16 = 1
+	IOET_WALTxnCommand_Object_V1   uint16 = 1
 
 	IOET_WALTxnCommand_Database_CurrVer = IOET_WALTxnCommand_Database_V1
 	IOET_WALTxnCommand_Table_CurrVer    = IOET_WALTxnCommand_Table_V3
 	IOET_WALTxnCommand_Segment_CurrVer  = IOET_WALTxnCommand_Segment_V1
 	IOET_WALTxnCommand_Block_CurrVer    = IOET_WALTxnCommand_Block_V1
+	IOET_WALTxnCommand_Object_CurrVer   = IOET_WALTxnCommand_Object_V1
 )
 
 var cmdNames = map[uint16]string{
@@ -216,6 +219,17 @@ func newDBCmd(id uint32, cmdType uint16, entry *DBEntry) *EntryCommand[*EmptyMVC
 	return impl
 }
 
+func newObjectCmd(id uint32, cmdType uint16, entry *ObjectEntry) *EntryCommand[*ObjectMVCCNode, *ObjectNode] {
+	impl := &EntryCommand[*ObjectMVCCNode, *ObjectNode]{
+		ID:       entry.AsCommonID(),
+		cmdType:  cmdType,
+		node:     entry.ObjectNode,
+		mvccNode: entry.GetLatestNodeLocked(),
+	}
+	impl.BaseCustomizedCmd = txnbase.NewBaseCustomizedCmd(id, impl)
+	return impl
+}
+
 func (cmd *EntryCommand[T, N]) Desc() string {
 	s := fmt.Sprintf("CmdName=%s;%s;TS=%s;CSN=%d", CmdName(cmd.cmdType), cmd.IDString(), cmd.GetTs().ToString(), cmd.ID)
 	return s
@@ -285,6 +299,8 @@ func (cmd *EntryCommand[T, N]) GetCurrVersion() uint16 {
 		return IOET_WALTxnCommand_Segment_CurrVer
 	case IOET_WALTxnCommand_Block:
 		return IOET_WALTxnCommand_Block_CurrVer
+	case IOET_WALTxnCommand_Object:
+		return IOET_WALTxnCommand_Object_CurrVer
 	default:
 		panic(fmt.Sprintf("not support type %d", cmd.cmdType))
 	}
