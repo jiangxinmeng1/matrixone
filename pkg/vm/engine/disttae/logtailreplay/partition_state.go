@@ -744,3 +744,22 @@ func (p *PartitionState) truncate(ids [2]uint64, ts types.TS) {
 		logutil.Infof("GC partition_state at %v for table %d:%s", ts.ToString(), ids[1], blksToDelete)
 	}
 }
+
+func (p *PartitionState) checkBlockIndexAndBlocks() {
+	iter := p.blockIndexByTS.Copy().Iter()
+	if !iter.First() {
+		return
+	}
+	for e := iter.Item(); iter.Next(); {
+		blockPivot := BlockEntry{
+			BlockInfo: catalog.BlockInfo{
+				BlockID: e.BlockID,
+			},
+		}
+		_, ok := p.blocks.Get(blockPivot)
+		if !ok {
+			logutil.Infof("get blk entry failed %v %p", e.BlockID.String(), p)
+			// panic("blk entry not existed")
+		}
+	}
+}

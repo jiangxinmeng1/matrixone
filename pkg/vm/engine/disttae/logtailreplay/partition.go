@@ -63,6 +63,8 @@ func (p *Partition) MutateState() (*PartitionState, func()) {
 	state := curState.Copy()
 	return state, func() {
 		logutil.Infof("swap state %p %p", curState, state)
+		curState.checkBlockIndexAndBlocks()
+		state.checkBlockIndexAndBlocks()
 		if !p.state.CompareAndSwap(curState, state) {
 			panic("concurrent mutation")
 		}
@@ -114,6 +116,8 @@ func (p *Partition) ConsumeCheckpoints(
 	}
 
 	logutil.Infof("swap state %p %p", curState, state)
+	curState.checkBlockIndexAndBlocks()
+	state.checkBlockIndexAndBlocks()
 	if !p.state.CompareAndSwap(curState, state) {
 		panic("concurrent mutation")
 	}
@@ -136,6 +140,8 @@ func (p *Partition) Truncate(ctx context.Context, ids [2]uint64, ts types.TS) er
 	state.truncate(ids, ts)
 
 	logutil.Infof("swap state %p %p", curState, state)
+	curState.checkBlockIndexAndBlocks()
+	state.checkBlockIndexAndBlocks()
 	if !p.state.CompareAndSwap(curState, state) {
 		panic("concurrent mutation")
 	}
