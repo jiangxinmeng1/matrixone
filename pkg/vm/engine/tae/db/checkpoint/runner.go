@@ -974,6 +974,7 @@ func (r *runner) CollectCheckpointsInRange(ctx context.Context, start, end types
 	locs := make([]string, 0)
 	newStart := start
 	if global != nil && global.HasOverlap(start, end) {
+		logutil.Infof("ckp %v, location %v", global.String(), global.GetLocation().String())
 		locs = append(locs, global.GetLocation().String())
 		locs = append(locs, strconv.Itoa(int(global.version)))
 		newStart = global.end.Next()
@@ -1009,6 +1010,7 @@ func (r *runner) CollectCheckpointsInRange(ctx context.Context, start, end types
 				return
 			}
 			if e.HasOverlap(newStart, end) {
+				logutil.Infof("ckp %v, location %v", e.String(), e.GetLocation().String())
 				locs = append(locs, e.GetLocation().String())
 				locs = append(locs, strconv.Itoa(int(e.version)))
 				checkpointed = e.GetEnd()
@@ -1021,6 +1023,7 @@ func (r *runner) CollectCheckpointsInRange(ctx context.Context, start, end types
 			if !e.IsCommitted() || !e.HasOverlap(newStart, end) {
 				break
 			}
+			logutil.Infof("ckp %v, location %v", e.String(), e.GetLocation().String())
 			locs = append(locs, e.GetLocation().String())
 			locs = append(locs, strconv.Itoa(int(e.version)))
 			checkpointed = e.GetEnd()
@@ -1048,6 +1051,7 @@ func (r *runner) CollectCheckpointsInRange(ctx context.Context, start, end types
 			locations = strings.Join(locs, ";")
 			return
 		}
+		logutil.Infof("ckp %v, location %v", e.String(), e.GetLocation().String())
 		locs = append(locs, e.GetLocation().String())
 		locs = append(locs, strconv.Itoa(int(e.version)))
 		checkpointed = e.GetEnd()

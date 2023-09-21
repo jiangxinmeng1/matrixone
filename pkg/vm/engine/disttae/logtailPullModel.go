@@ -110,6 +110,7 @@ func consumeLogTailOfPull(
 		return
 	}
 	for _, e := range entries {
+		logutil.Infof("consume checkpoint entry %p",e)
 		if err = consumeEntry(ctx, primarySeqnum,
 			engine, state, e); err != nil {
 			for _, cb := range closeCBs {

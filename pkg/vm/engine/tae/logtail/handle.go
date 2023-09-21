@@ -809,6 +809,7 @@ func LoadCheckpointEntries(
 				Bat:          ins,
 			}
 			entries = append(entries, entry)
+			logutil.Infof("from ckp %v, get entry %p",locations[i].String(),entry)
 		}
 		if cnIns != nil {
 			entry := &api.Entry{
@@ -820,6 +821,7 @@ func LoadCheckpointEntries(
 				Bat:          cnIns,
 			}
 			entries = append(entries, entry)
+			logutil.Infof("from ckp %v, get entry %p",locations[i].String(),entry)
 		}
 		if del != nil {
 			entry := &api.Entry{
@@ -831,6 +833,7 @@ func LoadCheckpointEntries(
 				Bat:          del,
 			}
 			entries = append(entries, entry)
+			logutil.Infof("from ckp %v, get entry %p",locations[i].String(),entry)
 		}
 		if segDel != nil {
 			entry := &api.Entry{
@@ -842,6 +845,7 @@ func LoadCheckpointEntries(
 				Bat:          segDel,
 			}
 			entries = append(entries, entry)
+			logutil.Infof("from ckp %v, get entry %p",locations[i].String(),entry)
 		}
 	}
 	return entries, closeCBs, nil

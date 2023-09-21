@@ -1093,6 +1093,7 @@ func consumeLogTailOfPushWithoutLazyLoad(
 		}
 	}()
 	for _, entry := range entries {
+		logutil.Infof("consume checkpoint entry %p",entry)
 		if err = consumeEntry(ctx, primarySeqnum,
 			engine, state, entry); err != nil {
 			return
