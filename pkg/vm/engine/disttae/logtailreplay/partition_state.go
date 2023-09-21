@@ -528,8 +528,8 @@ func (p *PartitionState) HandleMetadataInsert(ctx context.Context, input *api.Ba
 			if !ok {
 				logutil.Infof("get blk entry failed %v", blockID.String())
 			}
-			
-			logutil.Infof("set blk entry %v", blockID.String())
+
+			logutil.Infof("set blk entry %v %p", blockID.String(), p)
 
 			{
 				scanCnt := int64(0)
@@ -644,8 +644,8 @@ func (p *PartitionState) HandleMetadataDelete(ctx context.Context, input *api.Ba
 			if !ok {
 				logutil.Infof("get blk entry failed %v", blockID.String())
 			}
-			
-			logutil.Infof("set blk entry %v", blockID.String())
+
+			logutil.Infof("set blk entry %v %p", blockID.String(), p)
 
 		})
 	}
@@ -720,8 +720,8 @@ func (p *PartitionState) truncate(ids [2]uint64, ts types.TS) {
 			}
 			blkEntry, ok := p.blocks.Get(blockPivot)
 			if !ok {
-				logutil.Infof("get blk entry failed %v", entry.BlockID.String())
-				panic("blk entry not existed")
+				logutil.Infof("get blk entry failed %v %p", entry.BlockID.String(), p)
+				// panic("blk entry not existed")
 			}
 			createEntry := BlockIndexByTSEntry{
 				Time:         blkEntry.CreateTime,

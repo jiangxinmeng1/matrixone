@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 )
 
@@ -61,6 +62,7 @@ func (p *Partition) MutateState() (*PartitionState, func()) {
 	curState := p.state.Load()
 	state := curState.Copy()
 	return state, func() {
+		logutil.Infof("swap state %p %p", curState, state)
 		if !p.state.CompareAndSwap(curState, state) {
 			panic("concurrent mutation")
 		}
@@ -111,6 +113,7 @@ func (p *Partition) ConsumeCheckpoints(
 		return err
 	}
 
+	logutil.Infof("swap state %p %p", curState, state)
 	if !p.state.CompareAndSwap(curState, state) {
 		panic("concurrent mutation")
 	}
@@ -132,6 +135,7 @@ func (p *Partition) Truncate(ctx context.Context, ids [2]uint64, ts types.TS) er
 
 	state.truncate(ids, ts)
 
+	logutil.Infof("swap state %p %p", curState, state)
 	if !p.state.CompareAndSwap(curState, state) {
 		panic("concurrent mutation")
 	}
