@@ -734,9 +734,9 @@ func (p *PartitionState) truncate(ids [2]uint64, ts types.TS) {
 			p.blockIndexByTS.Delete(entry)
 			p.blocks.Delete(blkEntry)
 			if gced {
-				blksToDelete = fmt.Sprintf("%s, %v", blksToDelete, entry.BlockID.String())
+				blksToDelete = fmt.Sprintf("%s, %v %v %v %v", blksToDelete, entry.BlockID.String(), entry.Time.ToString(), entry.IsDelete, entry.IsAppendable)
 			} else {
-				blksToDelete = fmt.Sprintf("%s%v", blksToDelete, entry.BlockID.String())
+				blksToDelete = fmt.Sprintf("%s%v %v %v %v", blksToDelete, entry.BlockID.String(), entry.Time.ToString(), entry.IsDelete, entry.IsAppendable)
 			}
 			gced = true
 		}
