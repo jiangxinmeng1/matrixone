@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"runtime/trace"
 	"sync"
 	"sync/atomic"
@@ -733,9 +734,9 @@ func (p *PartitionState) truncate(ids [2]uint64, ts types.TS) {
 			p.blockIndexByTS.Delete(entry)
 			p.blocks.Delete(blkEntry)
 			if gced {
-				blksToDelete = fmt.Sprintf("%s, %v", blksToDelete, entry.BlockID.ShortStringEx())
+				blksToDelete = fmt.Sprintf("%s, %v", blksToDelete, entry.BlockID.String())
 			} else {
-				blksToDelete = fmt.Sprintf("%s%v", blksToDelete, entry.BlockID.ShortStringEx())
+				blksToDelete = fmt.Sprintf("%s%v", blksToDelete, entry.BlockID.String())
 			}
 			gced = true
 		}
@@ -758,7 +759,7 @@ func (p *PartitionState) checkBlockIndexAndBlocks() {
 		}
 		_, ok := p.blocks.Get(blockPivot)
 		if !ok {
-			logutil.Infof("get blk entry failed %v %p", e.BlockID.String(), p)
+			logutil.Infof("get blk entry failed %v %p %s", e.BlockID.String(), p, debug.Stack())
 			// panic("blk entry not existed")
 		}
 	}
