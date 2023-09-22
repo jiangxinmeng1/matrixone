@@ -269,6 +269,7 @@ func (p *PartitionState) HandleLogtailEntry(
 			p.HandleRowsInsert(ctx, entry.Bat, primarySeqnum, packer)
 		}
 	case api.Entry_Delete:
+		logutil.Infof("entry %p, bat %p", entry, entry.Bat)
 		if IsBlkTable(entry.TableName) {
 			p.HandleMetadataDelete(ctx, entry.Bat)
 		} else if IsSegTable(entry.TableName) {
@@ -646,7 +647,7 @@ func (p *PartitionState) HandleMetadataDelete(ctx context.Context, input *api.Ba
 				logutil.Infof("get blk entry failed %v", blockID.String())
 			}
 
-			logutil.Infof("set blk entry %v %p", blockID.String(), p)
+			logutil.Infof("set blk entry %v %p %p", blockID.String(), p, input)
 
 		})
 	}
