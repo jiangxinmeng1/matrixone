@@ -445,7 +445,7 @@ func TestBlockWriter_GetName(t *testing.T) {
 	datas := make([]*logtail.CheckpointData, bat.Length())
 
 	entries := make([]*CheckpointEntry, bat.Length())
-	// emptyFile := make([]*CheckpointEntry, 0)
+	emptyFile := make([]*CheckpointEntry, 0)
 	readfn := func(i int, readType uint16) {
 		start := bat.GetVectorByName(CheckpointAttr_StartTS).Get(i).(types.TS)
 		end := bat.GetVectorByName(CheckpointAttr_EndTS).Get(i).(types.TS)
@@ -498,14 +498,14 @@ func TestBlockWriter_GetName(t *testing.T) {
 			if err != nil {
 				return
 			}
-			datas[i].PrintMetaBatch()
 		} else {
-			// if err2 = checkpointEntry.ReadWithFs(ctx, service, datas[i]); err2 != nil {
-			// 	logutil.Warnf("read %v failed: %v", checkpointEntry.String(), err2)
-			// 	emptyFile = append(emptyFile, checkpointEntry)
-			// } else {
-			// 	entries[i] = checkpointEntry
-			// }
+			if err2 = checkpointEntry.ReadWithFs(ctx, service, datas[i]); err2 != nil {
+				logutil.Warnf("read %v failed: %v", checkpointEntry.String(), err2)
+				emptyFile = append(emptyFile, checkpointEntry)
+			} else {
+				entries[i] = checkpointEntry
+			}
+			datas[i].PrintMetaBatch()
 		}
 	}
 	t0 = time.Now()
