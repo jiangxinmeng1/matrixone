@@ -445,7 +445,7 @@ func TestBlockWriter_GetName(t *testing.T) {
 	datas := make([]*logtail.CheckpointData, bat.Length())
 
 	entries := make([]*CheckpointEntry, bat.Length())
-	emptyFile := make([]*CheckpointEntry, 0)
+	// emptyFile := make([]*CheckpointEntry, 0)
 	readfn := func(i int, readType uint16) {
 		start := bat.GetVectorByName(CheckpointAttr_StartTS).Get(i).(types.TS)
 		end := bat.GetVectorByName(CheckpointAttr_EndTS).Get(i).(types.TS)
