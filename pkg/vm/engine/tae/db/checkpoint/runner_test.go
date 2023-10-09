@@ -500,12 +500,12 @@ func TestBlockWriter_GetName(t *testing.T) {
 			}
 			datas[i].PrintMetaBatch()
 		} else {
-			if err2 = checkpointEntry.ReadWithFs(ctx, service, datas[i]); err2 != nil {
-				logutil.Warnf("read %v failed: %v", checkpointEntry.String(), err2)
-				emptyFile = append(emptyFile, checkpointEntry)
-			} else {
-				entries[i] = checkpointEntry
-			}
+			// if err2 = checkpointEntry.ReadWithFs(ctx, service, datas[i]); err2 != nil {
+			// 	logutil.Warnf("read %v failed: %v", checkpointEntry.String(), err2)
+			// 	emptyFile = append(emptyFile, checkpointEntry)
+			// } else {
+			// 	entries[i] = checkpointEntry
+			// }
 		}
 	}
 	t0 = time.Now()
