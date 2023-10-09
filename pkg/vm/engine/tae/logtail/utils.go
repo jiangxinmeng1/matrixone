@@ -1816,6 +1816,7 @@ func (data *CheckpointData) ReadFrom(
 	m *mpool.MPool,
 ) (err error) {
 	err = data.readMetaBatch(ctx, version, reader, m)
+	return
 	if err != nil {
 		return
 	}
