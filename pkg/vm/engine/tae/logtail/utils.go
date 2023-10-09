@@ -1840,8 +1840,8 @@ func (data *CheckpointData) PrintMetaBatch() {
 	bat := data.bats[MetaIDX]
 	tables := make([]*tableAndLength, 0)
 	tidVec := bat.GetVectorByName(SnapshotAttr_TID)
-	locationsVec := bat.GetVectorByName(SnapshotAttr_TID)
-	for i := 0; i < bat.Length(); i++ {
+	locationsVec := bat.GetVectorByName(SnapshotMetaAttr_BlockCNInsertBatchLocation)
+	for i := 0; i < tidVec.Length(); i++ {
 		tid := tidVec.Get(i).(uint64)
 		var locations BlockLocations
 		locations = locationsVec.Get(i).([]byte)
@@ -1860,9 +1860,15 @@ func (data *CheckpointData) PrintMetaBatch() {
 	sort.Slice(tables, func(i, j int) bool {
 		return tables[i].length < tables[j].length
 	})
+	if len(tables)==0{
+		return
+	}
 	logutil.Infof("lalala table count %d", len(tables))
-	maxTable := tables[len(tables)]
-	logutil.Infof("lalala max table %d, length is %d", maxTable.tid, maxTable.length)
+	// maxTable := tables[len(tables)-1]
+	for _,tbl:=range tables {
+	logutil.Infof("lalala max table %d, length is %d", tbl.tid, tbl.length)
+		
+	}
 }
 func (data *CheckpointData) readMetaBatch(
 	ctx context.Context,
@@ -1874,6 +1880,7 @@ func (data *CheckpointData) readMetaBatch(
 		var bats []*containers.Batch
 		item := checkpointDataReferVersions[version][MetaIDX]
 		bats, err = LoadBlkColumnsByMeta(version, ctx, item.types, item.attrs, uint16(0), reader)
+		logutil.Infof("lalala load metabatch length %d err %v",bats[0].Vecs[2].Length(),err)
 		if err != nil {
 			return
 		}

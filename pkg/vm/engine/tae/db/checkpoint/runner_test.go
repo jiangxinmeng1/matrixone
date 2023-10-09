@@ -381,7 +381,7 @@ func TestBlockWriter_GetName(t *testing.T) {
 	defer testutils.AfterTest(t)()
 	ctx := context.Background()
 
-	fsDir := "/data1/shenjiangwei/mo-data/shared"
+	fsDir := "/home/jiangxinmeng/go/github.com/matrixone/shared"
 	c := fileservice.Config{
 		Name:    defines.LocalFileServiceName,
 		Backend: "DISK",
@@ -454,7 +454,7 @@ func TestBlockWriter_GetName(t *testing.T) {
 		typ := ET_Global
 		if isIncremental {
 			typ = ET_Incremental
-			return
+			// return
 		}
 		var version uint32
 		if isCheckpointVersion1 {
@@ -487,7 +487,8 @@ func TestBlockWriter_GetName(t *testing.T) {
 		}
 		var err2 error
 		if readType == PrefetchData {
-			logutil.Warnf("read %v failed: %v", checkpointEntry.String(), err2)
+			return
+			// logutil.Warnf("read %v failed: %v", checkpointEntry.String(), err2)
 		} else if readType == PrefetchMetaIdx {
 			datas[i], err = checkpointEntry.PrefetchMetaIdxWithFs(ctx, service)
 			if err != nil {
@@ -503,9 +504,11 @@ func TestBlockWriter_GetName(t *testing.T) {
 				logutil.Warnf("read %v failed: %v", checkpointEntry.String(), err2)
 				emptyFile = append(emptyFile, checkpointEntry)
 			} else {
+				logutil.Infof("%d %v %v", i, checkpointEntry.String(), checkpointEntry.tnLocation.String())
 				entries[i] = checkpointEntry
+				logutil.Infof("loc %v", checkpointEntry.cnLocation.String())
+				datas[i].PrintMetaBatch()
 			}
-			datas[i].PrintMetaBatch()
 		}
 	}
 	t0 = time.Now()
@@ -517,18 +520,22 @@ func TestBlockWriter_GetName(t *testing.T) {
 			return
 		}
 	}
-	for i := 0; i < bat.Length(); i++ {
-		readfn(i, PrefetchMetaIdx)
-	}
-	for i := 0; i < bat.Length(); i++ {
-		readfn(i, ReadMetaIdx)
-	}
-	for i := 0; i < bat.Length(); i++ {
-		readfn(i, PrefetchData)
-	}
-	for i := 0; i < bat.Length(); i++ {
-		readfn(i, ReadData)
-	}
+	readfn(55, PrefetchMetaIdx)
+	readfn(55, ReadMetaIdx)
+	readfn(55, PrefetchData)
+	readfn(55, ReadData)
+	// for i := 0; i < bat.Length(); i++ {
+	// readfn(i, PrefetchMetaIdx)
+	// }
+	// for i := 0; i < bat.Length(); i++ {
+	// 	readfn(i, ReadMetaIdx)
+	// }
+	// for i := 0; i < bat.Length(); i++ {
+	// 	readfn(i, PrefetchData)
+	// }
+	// for i := 0; i < bat.Length(); i++ {
+	// 	readfn(i, ReadData)
+	// }
 	readDuration += time.Since(t0)
 	if err != nil {
 		return
