@@ -393,6 +393,7 @@ func (node *memoryNode) BatchDedup(
 	return moerr.NewDuplicateEntryNoCtx(entry, def.Name)
 }
 
+// TODO: skip uncommit deletes
 func (node *memoryNode) checkConflictAndDupClosure(
 	txn txnif.TxnReader,
 	isCommitting bool,
@@ -414,21 +415,31 @@ func (node *memoryNode) checkConflictAndDupClosure(
 		if appendnode.IsAborted() || !visible {
 			return nil
 		}
-		deleteNode := node.block.mvcc.GetDeleteNodeByRow(row)
-		if deleteNode == nil {
+
+		existed, ts, err := node.block.GetTombstoneByRow(txn, node.block.meta.ID, row)
+		if !existed {
 			*dupRow = row
 			return moerr.GetOkExpectedDup()
 		}
+		if ts.Greater(txn.GetStartTS()) {
+			return txnif.ErrTxnWWConflict
+		}
+		return nil
+		// deleteNode := node.block.mvcc.GetDeleteNodeByRow(row)
+		// if deleteNode == nil {
+		// 	*dupRow = row
+		// 	return moerr.GetOkExpectedDup()
+		// }
 
-		if visible, err = node.checkConflictAandVisibility(
-			deleteNode,
-			isCommitting,
-			txn); err != nil {
-			return
-		}
-		if deleteNode.IsAborted() || !visible {
-			return moerr.GetOkExpectedDup()
-		}
+		// if visible, err = node.checkConflictAandVisibility(
+		// 	deleteNode,
+		// 	isCommitting,
+		// 	txn); err != nil {
+		// 	return
+		// }
+		// if deleteNode.IsAborted() || !visible {
+		// 	return moerr.GetOkExpectedDup()
+		// }
 		return nil
 	}
 }
@@ -467,8 +478,8 @@ func (node *memoryNode) checkConflictAandVisibility(
 	return
 }
 
-func (node *memoryNode) CollectAppendInRange(
-	start, end types.TS, withAborted bool,
+func (node *memoryNode) CollectInMemoryAppendInRange(
+	start, end types.TS, withAborted bool, isTombstone bool,
 ) (batWithVer *containers.BatchWithVersion, err error) {
 	node.block.RLock()
 	minRow, maxRow, commitTSVec, abortVec, abortedMap :=
@@ -479,6 +490,11 @@ func (node *memoryNode) CollectAppendInRange(
 		return nil, err
 	}
 	node.block.RUnlock()
+
+	if isTombstone {
+		// TODO: alter table schema version
+		return
+	}
 
 	batWithVer.Seqnums = append(batWithVer.Seqnums, objectio.SEQNUM_COMMITTS)
 	batWithVer.AddVector(catalog.AttrCommitTs, commitTSVec)
@@ -491,6 +507,12 @@ func (node *memoryNode) CollectAppendInRange(
 	}
 
 	return
+}
+
+func (node *memoryNode) CollectAppendInRange(
+	start, end types.TS, withAborted bool, isTombstone bool,
+) (batWithVer *containers.BatchWithVersion, err error) {
+	return node.CollectInMemoryAppendInRange(start, end, withAborted, isTombstone)
 }
 
 // Note: With PinNode Context
@@ -519,7 +541,9 @@ func (node *memoryNode) resolveInMemoryColumnDatas(
 		return
 	}
 
-	err = node.block.FillInMemoryDeletesLocked(txn, view.BaseView, node.block.RWMutex)
+	node.block.RLock()
+	err = node.block.FillInMemoryDeletesLockedWithTombstone(txn, view.BaseView, node.block.RWMutex)
+	node.block.RUnlock()
 	if err != nil {
 		return
 	}
@@ -562,10 +586,9 @@ func (node *memoryNode) resolveInMemoryColumnData(
 		return
 	}
 
-	err = node.block.FillInMemoryDeletesLocked(txn, view.BaseView, node.block.RWMutex)
-	if err != nil {
-		return
-	}
+	node.block.RLock()
+	err = node.block.FillInMemoryDeletesLockedWithTombstone(txn, view.BaseView, node.block.RWMutex)
+	node.block.RUnlock()
 	if deSels != nil && !deSels.IsEmpty() {
 		if view.DeleteMask != nil {
 			view.DeleteMask.Or(deSels)

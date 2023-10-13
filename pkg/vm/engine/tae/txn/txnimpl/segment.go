@@ -67,9 +67,9 @@ type composedSegmentIt struct {
 	uncommitted *catalog.SegmentEntry
 }
 
-func newSegmentItOnSnap(table *txnTable) handle.SegmentIt {
+func newSegmentItOnSnap(table *txnTable, isTombstone bool) handle.SegmentIt {
 	it := &segmentIt{
-		linkIt: table.entry.MakeSegmentIt(true),
+		linkIt: table.entry.MakeSegmentIt(true, isTombstone),
 		table:  table,
 	}
 	var err error
@@ -94,9 +94,9 @@ func newSegmentItOnSnap(table *txnTable) handle.SegmentIt {
 	return it
 }
 
-func newSegmentIt(table *txnTable) handle.SegmentIt {
+func newSegmentIt(table *txnTable, isTombstone bool) handle.SegmentIt {
 	it := &segmentIt{
-		linkIt: table.entry.MakeSegmentIt(true),
+		linkIt: table.entry.MakeSegmentIt(true, isTombstone),
 		table:  table,
 	}
 	var err error
@@ -222,7 +222,8 @@ func (seg *txnSegment) MakeBlockIt() (it handle.BlockIt) {
 }
 
 func (seg *txnSegment) CreateNonAppendableBlock(opts *objectio.CreateBlockOpt) (blk handle.Block, err error) {
-	return seg.Txn.GetStore().CreateNonAppendableBlock(seg.entry.AsCommonID(), opts)
+	isTombstone := seg.entry.IsTombstone
+	return seg.Txn.GetStore().CreateNonAppendableBlock(seg.entry.AsCommonID(), opts, isTombstone)
 }
 
 func (seg *txnSegment) IsUncommitted() bool {
@@ -244,10 +245,12 @@ func (seg *txnSegment) GetRelation() (rel handle.Relation) {
 func (seg *txnSegment) GetBlock(id types.Blockid) (blk handle.Block, err error) {
 	fp := seg.entry.AsCommonID()
 	fp.BlockID = id
-	return seg.Txn.GetStore().GetBlock(fp)
+	isTombstone := seg.entry.IsTombstone
+	return seg.Txn.GetStore().GetBlock(fp, isTombstone)
 }
 
 func (seg *txnSegment) CreateBlock(is1PC bool) (blk handle.Block, err error) {
 	id := seg.entry.AsCommonID()
-	return seg.Txn.GetStore().CreateBlock(id, is1PC)
+	isTombstone := seg.entry.IsTombstone
+	return seg.Txn.GetStore().CreateBlock(id, is1PC, isTombstone)
 }

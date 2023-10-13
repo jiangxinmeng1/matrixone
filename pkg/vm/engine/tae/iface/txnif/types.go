@@ -276,12 +276,12 @@ type TxnStore interface {
 	DropDatabaseByID(id uint64) (handle.Database, error)
 	DatabaseNames() []string
 
-	GetSegment(id *common.ID) (handle.Segment, error)
-	CreateSegment(dbId, tid uint64, is1PC bool) (handle.Segment, error)
-	CreateNonAppendableSegment(dbId, tid uint64, is1PC bool) (handle.Segment, error)
-	CreateBlock(id *common.ID, is1PC bool) (handle.Block, error)
-	GetBlock(id *common.ID) (handle.Block, error)
-	CreateNonAppendableBlock(id *common.ID, opts *objectio.CreateBlockOpt) (handle.Block, error)
+	GetSegment(id *common.ID, isTombstone bool) (handle.Segment, error)
+	CreateSegment(dbId, tid uint64, is1PC bool, isTombstone bool) (handle.Segment, error)
+	CreateNonAppendableSegment(dbId, tid uint64, is1PC bool, isTombstone bool) (handle.Segment, error)
+	CreateBlock(id *common.ID, is1PC bool, isTombstone bool) (handle.Block, error)
+	GetBlock(id *common.ID, isTombstone bool) (handle.Block, error)
+	CreateNonAppendableBlock(id *common.ID, opts *objectio.CreateBlockOpt, isTombstone bool) (handle.Block, error)
 	SoftDeleteSegment(id *common.ID) error
 	SoftDeleteBlock(id *common.ID) error
 	UpdateMetaLoc(id *common.ID, metaLoc objectio.Location) (err error)
@@ -305,6 +305,12 @@ type TxnStore interface {
 		visitAppend func(bat any),
 		visitDelete func(ctx context.Context, deletes DeleteNode))
 	GetTransactionType() TxnType
+	FillInWorkSpaceDeletesByTombstone(
+		id *common.ID,
+		view *containers.BaseView) (err error)
+	GetWorkspaceTombstoneByRow(
+		id *common.ID,
+		row uint32) (existed bool, commitTS types.TS, err error)
 }
 
 type TxnType int8

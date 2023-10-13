@@ -47,6 +47,7 @@ const (
 	SegmentAttr_ID               = "id"
 	SegmentAttr_CreateAt         = "create_at"
 	SegmentAttr_SegNode          = "seg_node"
+	SegmentAttr_IsTombstone      = "seg_is_tombstone"
 	SnapshotAttr_BlockMaxRow     = "block_max_row"
 	SnapshotAttr_SegmentMaxBlock = "segment_max_block"
 	SnapshotAttr_SchemaExtra     = "schema_extra"
@@ -516,7 +517,7 @@ func (catalog *Catalog) onReplayUpdateSegment(
 		logutil.Info(catalog.SimplePPString(3))
 		panic(err)
 	}
-	seg, err := tbl.GetSegmentByID(cmd.ID.SegmentID())
+	seg, err := tbl.GetSegmentByID(cmd.ID.SegmentID(), false)
 	un := cmd.mvccNode
 	if un.Is1PC() {
 		if err := un.ApplyCommit(); err != nil {
@@ -530,7 +531,7 @@ func (catalog *Catalog) onReplayUpdateSegment(
 		seg.segData = dataFactory.MakeSegmentFactory()(seg)
 		seg.Insert(un)
 		seg.SegmentNode = cmd.node
-		tbl.AddEntryLocked(seg)
+		tbl.AddEntryLocked(seg, seg.IsTombstone)
 	} else {
 		node := seg.SearchNode(un)
 		if node == nil {
@@ -553,7 +554,8 @@ func (catalog *Catalog) OnReplaySegmentBatch(ins, insTxn, del, delTxn *container
 		}
 		sid := ins.GetVectorByName(SegmentAttr_ID).Get(i).(types.Segmentid)
 		txnNode := txnbase.ReadTuple(insTxn, i)
-		catalog.onReplayCreateSegment(dbid, tid, &sid, node, txnNode, dataFactory)
+		isTombstone := insTxn.GetVectorByName(SegmentAttr_IsTombstone).Get(i).(bool)
+		catalog.onReplayCreateSegment(dbid, tid, &sid, isTombstone, node, txnNode, dataFactory)
 	}
 	idVec = delTxn.GetVectorByName(SnapshotAttr_DBID)
 	for i := 0; i < idVec.Length(); i++ {
@@ -561,12 +563,14 @@ func (catalog *Catalog) OnReplaySegmentBatch(ins, insTxn, del, delTxn *container
 		tid := delTxn.GetVectorByName(SnapshotAttr_TID).Get(i).(uint64)
 		rid := del.GetVectorByName(AttrRowID).Get(i).(types.Rowid)
 		txnNode := txnbase.ReadTuple(delTxn, i)
-		catalog.onReplayDeleteSegment(dbid, tid, rid.BorrowSegmentID(), txnNode)
+		isTombstone := delTxn.GetVectorByName(SegmentAttr_IsTombstone).Get(i).(bool)
+		catalog.onReplayDeleteSegment(dbid, tid, rid.BorrowSegmentID(),isTombstone, txnNode)
 	}
 }
 func (catalog *Catalog) onReplayCreateSegment(
 	dbid, tbid uint64,
 	segid *types.Segmentid,
+	isTombstone bool,
 	segNode *SegmentNode,
 
 	txnNode *txnbase.TxnMVCCNode,
@@ -583,7 +587,7 @@ func (catalog *Catalog) onReplayCreateSegment(
 		logutil.Info(catalog.SimplePPString(common.PPL3))
 		panic(err)
 	}
-	seg, _ := rel.GetSegmentByID(segid)
+	seg, _ := rel.GetSegmentByID(segid, isTombstone)
 	if seg != nil {
 		segCreatedAt := seg.GetCreatedAt()
 		if !segCreatedAt.Equal(txnNode.End) {
@@ -596,7 +600,7 @@ func (catalog *Catalog) onReplayCreateSegment(
 	seg.table = rel
 	seg.ID = *segid
 	seg.segData = dataFactory.MakeSegmentFactory()(seg)
-	rel.AddEntryLocked(seg)
+	rel.AddEntryLocked(seg, isTombstone)
 	un := &MVCCNode[*MetadataMVCCNode]{
 		EntryMVCCNode: &EntryMVCCNode{
 			CreatedAt: txnNode.End,
@@ -609,6 +613,7 @@ func (catalog *Catalog) onReplayCreateSegment(
 func (catalog *Catalog) onReplayDeleteSegment(
 	dbid, tbid uint64,
 	segid *types.Segmentid,
+	isTombstone bool,
 	txnNode *txnbase.TxnMVCCNode,
 ) {
 	// catalog.OnReplaySegmentID(segid)
@@ -622,7 +627,7 @@ func (catalog *Catalog) onReplayDeleteSegment(
 		logutil.Info(catalog.SimplePPString(common.PPL3))
 		panic(err)
 	}
-	seg, err := rel.GetSegmentByID(segid)
+	seg, err := rel.GetSegmentByID(segid, isTombstone)
 	if err != nil {
 		logutil.Info(catalog.SimplePPString(common.PPL3))
 		panic(err)
@@ -659,7 +664,7 @@ func (catalog *Catalog) onReplayUpdateBlock(
 	if err != nil {
 		panic(err)
 	}
-	seg, err := tbl.GetSegmentByID(cmd.ID.SegmentID())
+	seg, err := tbl.GetSegmentByID(cmd.ID.SegmentID(), cmd.IsTombstone)
 	if err != nil {
 		panic(err)
 	}
@@ -717,7 +722,8 @@ func (catalog *Catalog) OnReplayBlockBatch(ins, insTxn, del, delTxn *containers.
 		metaLoc := ins.GetVectorByName(pkgcatalog.BlockMeta_MetaLoc).Get(i).([]byte)
 		deltaLoc := ins.GetVectorByName(pkgcatalog.BlockMeta_DeltaLoc).Get(i).([]byte)
 		txnNode := txnbase.ReadTuple(insTxn, i)
-		catalog.onReplayCreateBlock(dbid, tid, sid, &blkID, state, metaLoc, deltaLoc, txnNode, dataFactory)
+		isTombstone := insTxn.GetVectorByName(SegmentAttr_IsTombstone).Get(i).(bool)
+		catalog.onReplayCreateBlock(dbid, tid, sid, &blkID,isTombstone, state, metaLoc, deltaLoc, txnNode, dataFactory)
 	}
 	for i := 0; i < del.Length(); i++ {
 		dbid := delTxn.GetVectorByName(SnapshotAttr_DBID).Get(i).(uint64)
@@ -728,13 +734,15 @@ func (catalog *Catalog) OnReplayBlockBatch(ins, insTxn, del, delTxn *containers.
 		un := txnbase.ReadTuple(delTxn, i)
 		metaLoc := delTxn.GetVectorByName(pkgcatalog.BlockMeta_MetaLoc).Get(i).([]byte)
 		deltaLoc := delTxn.GetVectorByName(pkgcatalog.BlockMeta_DeltaLoc).Get(i).([]byte)
-		catalog.onReplayDeleteBlock(dbid, tid, sid, blkID, metaLoc, deltaLoc, un)
+		isTombstone := delTxn.GetVectorByName(SegmentAttr_IsTombstone).Get(i).(bool)
+		catalog.onReplayDeleteBlock(dbid, tid, sid, blkID,isTombstone, metaLoc, deltaLoc, un)
 	}
 }
 func (catalog *Catalog) onReplayCreateBlock(
 	dbid, tid uint64,
 	segid *types.Segmentid,
 	blkid *types.Blockid,
+	isTombstone bool,
 	state EntryState,
 	metaloc, deltaloc objectio.Location,
 	txnNode *txnbase.TxnMVCCNode,
@@ -750,7 +758,7 @@ func (catalog *Catalog) onReplayCreateBlock(
 		logutil.Info(catalog.SimplePPString(common.PPL3))
 		panic(err)
 	}
-	seg, err := rel.GetSegmentByID(segid)
+	seg, err := rel.GetSegmentByID(segid, isTombstone)
 	if err != nil {
 		logutil.Info(catalog.SimplePPString(common.PPL3))
 		panic(err)
@@ -804,6 +812,7 @@ func (catalog *Catalog) onReplayDeleteBlock(
 	dbid, tid uint64,
 	segid *types.Segmentid,
 	blkid *types.Blockid,
+	isTombstone bool,
 	metaloc,
 	deltaloc objectio.Location,
 	txnNode *txnbase.TxnMVCCNode,
@@ -819,7 +828,7 @@ func (catalog *Catalog) onReplayDeleteBlock(
 		logutil.Info(catalog.SimplePPString(common.PPL3))
 		panic(err)
 	}
-	seg, err := rel.GetSegmentByID(segid)
+	seg, err := rel.GetSegmentByID(segid, isTombstone)
 	if err != nil {
 		logutil.Info(catalog.SimplePPString(common.PPL3))
 		panic(err)

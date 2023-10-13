@@ -262,14 +262,14 @@ func (e *DBEntry) AsCommonID() *common.ID {
 		DbID: e.ID,
 	}
 }
-func (e *DBEntry) GetBlockEntryByID(id *common.ID) (blk *BlockEntry, err error) {
+func (e *DBEntry) GetBlockEntryByID(id *common.ID, isTombstone bool) (blk *BlockEntry, err error) {
 	e.RLock()
 	table, err := e.GetTableEntryByID(id.TableID)
 	e.RUnlock()
 	if err != nil {
 		return
 	}
-	seg, err := table.GetSegmentByID(id.SegmentID())
+	seg, err := table.GetSegmentByID(id.SegmentID(),isTombstone)
 	if err != nil {
 		return
 	}

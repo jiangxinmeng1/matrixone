@@ -32,16 +32,20 @@ type anode struct {
 	data    *containers.Batch
 	rows    uint32
 	appends []*appendInfo
+
+	isTombStone bool
 }
 
 // NewANode creates a InsertNode with data in memory.
 func NewANode(
 	tbl *txnTable,
 	meta *catalog.BlockEntry,
+	isTombstone bool,
 ) *anode {
 	impl := new(anode)
 	impl.baseNode = newBaseNode(tbl, meta)
 	impl.appends = make([]*appendInfo, 0)
+	impl.isTombStone = isTombstone
 	return impl
 }
 
@@ -74,7 +78,7 @@ func (n *anode) MakeCommand(id uint32) (cmd txnif.TxnCmd, err error) {
 	if n.data == nil {
 		return
 	}
-	composedCmd := NewAppendCmd(id, n, n.data)
+	composedCmd := NewAppendCmd(id, n, n.data, n.isTombStone)
 	return composedCmd, nil
 }
 
@@ -95,8 +99,7 @@ func (n *anode) PrepareAppend(data *containers.Batch, offset uint32) uint32 {
 	return nodeLeft
 }
 
-func (n *anode) Append(data *containers.Batch, offset uint32) (an uint32, err error) {
-	schema := n.table.GetLocalSchema()
+func (n *anode) Append(data *containers.Batch, offset uint32, schema *catalog.Schema) (an uint32, err error) {
 	if n.data == nil {
 		capacity := data.Length() - int(offset)
 		if capacity > int(MaxNodeRows) {
@@ -121,7 +124,7 @@ func (n *anode) Append(data *containers.Batch, offset uint32) (an uint32, err er
 	from := uint32(n.data.Length())
 	an = n.PrepareAppend(data, offset)
 	for _, attr := range data.Attrs {
-		if attr == catalog.PhyAddrColumnName {
+		if !n.isTombStone && attr == catalog.PhyAddrColumnName {
 			continue
 		}
 		def := schema.ColDefs[schema.GetColIdx(attr)]
@@ -130,7 +133,9 @@ func (n *anode) Append(data *containers.Batch, offset uint32) (an uint32, err er
 		destVec.ExtendWithOffset(data.Vecs[def.Idx], int(offset), int(an))
 	}
 	n.rows = uint32(n.data.Length())
-	err = n.FillPhyAddrColumn(from, an)
+	if !n.isTombStone {
+		err = n.FillPhyAddrColumn(from, an)
+	}
 	return
 }
 
@@ -144,7 +149,7 @@ func (n *anode) FillPhyAddrColumn(startRow, length uint32) (err error) {
 		col.Close()
 		return
 	}
-	err = n.data.Vecs[n.table.GetLocalSchema().PhyAddrKey.Idx].ExtendVec(col.GetDownstreamVector())
+	err = n.data.Vecs[n.table.GetLocalSchema(n.isTombStone).PhyAddrKey.Idx].ExtendVec(col.GetDownstreamVector())
 	col.Close()
 	return
 }

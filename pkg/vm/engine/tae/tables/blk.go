@@ -78,15 +78,16 @@ func (blk *block) Pin() *common.PinnedItem[*block] {
 
 func (blk *block) GetColumnDataByIds(
 	ctx context.Context,
-	txn txnif.AsyncTxn,
+	txn txnif.TxnReader,
 	readSchema any,
 	colIdxes []int,
+	fillDeletes bool,
 ) (view *containers.BlockView, err error) {
 	node := blk.PinNode()
 	defer node.Unref()
 	schema := readSchema.(*catalog.Schema)
 	return blk.ResolvePersistedColumnDatas(
-		ctx, txn, schema, colIdxes, false,
+		ctx, txn, schema, colIdxes, !fillDeletes,
 	)
 }
 
@@ -95,9 +96,10 @@ func (blk *block) GetColumnDataByIds(
 // then all the block data pointed by meta location also be visible to txn;
 func (blk *block) GetColumnDataById(
 	ctx context.Context,
-	txn txnif.AsyncTxn,
+	txn txnif.TxnReader,
 	readSchema any,
 	col int,
+	fillDeletes bool,
 ) (view *containers.ColumnView, err error) {
 	schema := readSchema.(*catalog.Schema)
 	return blk.ResolvePersistedColumnData(
@@ -105,7 +107,7 @@ func (blk *block) GetColumnDataById(
 		txn,
 		schema,
 		col,
-		false)
+		!fillDeletes)
 }
 func (blk *block) CoarseCheckAllRowsCommittedBefore(ts types.TS) bool {
 	blk.meta.RLock()

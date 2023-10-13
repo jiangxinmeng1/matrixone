@@ -189,8 +189,15 @@ func (blk *txnBlock) getDBID() uint64 {
 	return blk.entry.GetSegment().GetTable().GetDB().ID
 }
 
+// Used in test and merge
 func (blk *txnBlock) RangeDelete(start, end uint32, dt handle.DeleteType) (err error) {
-	return blk.Txn.GetStore().RangeDelete(blk.entry.AsCommonID(), start, end, nil, dt)
+	pkDef:=blk.table.schema.GetPrimaryKey()
+	pkView,err:=blk.GetColumnDataById(blk.Txn.GetContext(),pkDef.Idx,false)
+	if err!=nil{
+		return
+	}
+	pk:=pkView.GetData().Window(int(start),int(end-start+1))
+	return blk.Txn.GetStore().RangeDelete(blk.entry.AsCommonID(), start, end, pk, dt)
 }
 
 func (blk *txnBlock) GetMetaLoc() (metaLoc objectio.Location) {
@@ -220,16 +227,16 @@ func (blk *txnBlock) Rows() int {
 }
 
 func (blk *txnBlock) GetColumnDataByName(ctx context.Context, attr string) (*containers.ColumnView, error) {
-	schema := blk.table.GetLocalSchema()
+	schema := blk.table.GetLocalSchema(false)
 	colIdx := schema.GetColIdx(attr)
 	if blk.isUncommitted {
 		return blk.table.localSegment.GetColumnDataById(ctx, blk.entry, colIdx)
 	}
-	return blk.entry.GetBlockData().GetColumnDataById(ctx, blk.Txn, schema, colIdx)
+	return blk.entry.GetBlockData().GetColumnDataById(ctx, blk.Txn, schema, colIdx, true)
 }
 
 func (blk *txnBlock) GetColumnDataByNames(ctx context.Context, attrs []string) (*containers.BlockView, error) {
-	schema := blk.table.GetLocalSchema()
+	schema := blk.table.GetLocalSchema(false)
 	attrIds := make([]int, len(attrs))
 	for i, attr := range attrs {
 		attrIds[i] = schema.GetColIdx(attr)
@@ -237,29 +244,29 @@ func (blk *txnBlock) GetColumnDataByNames(ctx context.Context, attrs []string) (
 	if blk.isUncommitted {
 		return blk.table.localSegment.GetColumnDataByIds(blk.entry, attrIds)
 	}
-	return blk.entry.GetBlockData().GetColumnDataByIds(ctx, blk.Txn, schema, attrIds)
+	return blk.entry.GetBlockData().GetColumnDataByIds(ctx, blk.Txn, schema, attrIds, true)
 }
 
 func (blk *txnBlock) GetDeltaPersistedTS() types.TS {
 	return blk.entry.GetDeltaPersistedTS()
 }
 
-func (blk *txnBlock) GetColumnDataById(ctx context.Context, colIdx int) (*containers.ColumnView, error) {
+func (blk *txnBlock) GetColumnDataById(ctx context.Context, colIdx int, fillDeletes bool) (*containers.ColumnView, error) {
 	if blk.isUncommitted {
 		return blk.table.localSegment.GetColumnDataById(ctx, blk.entry, colIdx)
 	}
-	return blk.entry.GetBlockData().GetColumnDataById(ctx, blk.Txn, blk.table.GetLocalSchema(), colIdx)
+	return blk.entry.GetBlockData().GetColumnDataById(ctx, blk.Txn, blk.table.GetLocalSchema(false), colIdx, fillDeletes)
 }
 
-func (blk *txnBlock) GetColumnDataByIds(ctx context.Context, colIdxes []int) (*containers.BlockView, error) {
+func (blk *txnBlock) GetColumnDataByIds(ctx context.Context, colIdxes []int, fillDeletes bool) (*containers.BlockView, error) {
 	if blk.isUncommitted {
 		return blk.table.localSegment.GetColumnDataByIds(blk.entry, colIdxes)
 	}
-	return blk.entry.GetBlockData().GetColumnDataByIds(ctx, blk.Txn, blk.table.GetLocalSchema(), colIdxes)
+	return blk.entry.GetBlockData().GetColumnDataByIds(ctx, blk.Txn, blk.table.GetLocalSchema(false), colIdxes, fillDeletes)
 }
 
 func (blk *txnBlock) Prefetch(idxes []int) error {
-	schema := blk.table.GetLocalSchema()
+	schema := blk.table.GetLocalSchema(false)
 	seqnums := make([]uint16, 0, len(idxes))
 	for _, idx := range idxes {
 		seqnums = append(seqnums, schema.ColDefs[idx].SeqNum)
@@ -285,9 +292,9 @@ func (blk *txnBlock) GetByFilter(ctx context.Context, filter *handle.Filter) (of
 
 // newRelationBlockItOnSnap make a iterator on txn 's segments of snapshot, exclude segment of workspace
 // TODO: segmentit or tableit
-func newRelationBlockItOnSnap(rel handle.Relation) *relBlockIt {
+func newRelationBlockItOnSnap(rel handle.Relation, isTombstone bool) *relBlockIt {
 	it := new(relBlockIt)
-	segmentIt := rel.MakeSegmentItOnSnap()
+	segmentIt := rel.MakeSegmentItOnSnap(isTombstone)
 	if !segmentIt.Valid() {
 		it.err = segmentIt.GetError()
 		return it

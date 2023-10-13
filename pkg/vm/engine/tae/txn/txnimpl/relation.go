@@ -145,7 +145,7 @@ func (h *txnRelation) Close() error { return nil }
 func (h *txnRelation) GetMeta() any { return h.table.entry }
 
 // Schema return schema in txnTable, not the lastest schema in TableEntry
-func (h *txnRelation) Schema() any { return h.table.GetLocalSchema() }
+func (h *txnRelation) Schema() any { return h.table.GetLocalSchema(false) }
 
 func (h *txnRelation) GetCardinality(attr string) int64 { return 0 }
 
@@ -154,7 +154,7 @@ func (h *txnRelation) BatchDedup(col containers.Vector) error {
 }
 
 func (h *txnRelation) Append(ctx context.Context, data *containers.Batch) error {
-	if !h.table.GetLocalSchema().IsSameColumns(h.table.GetMeta().GetLastestSchema()) {
+	if !h.table.GetLocalSchema(false).IsSameColumns(h.table.GetMeta().GetLastestSchema()) {
 		return moerr.NewInternalErrorNoCtx("schema changed, please rollback and retry")
 	}
 	return h.Txn.GetStore().Append(ctx, h.table.entry.GetDB().ID, h.table.entry.GetID(), data)
@@ -169,18 +169,18 @@ func (h *txnRelation) AddBlksWithMetaLoc(ctx context.Context, metaLocs []objecti
 	)
 }
 
-func (h *txnRelation) GetSegment(id *types.Segmentid) (seg handle.Segment, err error) {
+func (h *txnRelation) GetSegment(id *types.Segmentid, isTombstone bool) (seg handle.Segment, err error) {
 	fp := h.table.entry.AsCommonID()
 	fp.SetSegmentID(id)
-	return h.Txn.GetStore().GetSegment(fp)
+	return h.Txn.GetStore().GetSegment(fp, isTombstone)
 }
 
-func (h *txnRelation) CreateSegment(is1PC bool) (seg handle.Segment, err error) {
-	return h.Txn.GetStore().CreateSegment(h.table.entry.GetDB().ID, h.table.entry.GetID(), is1PC)
+func (h *txnRelation) CreateSegment(is1PC bool, isTombstone bool) (seg handle.Segment, err error) {
+	return h.Txn.GetStore().CreateSegment(h.table.entry.GetDB().ID, h.table.entry.GetID(), is1PC, isTombstone)
 }
 
-func (h *txnRelation) CreateNonAppendableSegment(is1PC bool) (seg handle.Segment, err error) {
-	return h.Txn.GetStore().CreateNonAppendableSegment(h.table.entry.GetDB().ID, h.table.entry.GetID(), is1PC)
+func (h *txnRelation) CreateNonAppendableSegment(is1PC bool, isTombstone bool) (seg handle.Segment, err error) {
+	return h.Txn.GetStore().CreateNonAppendableSegment(h.table.entry.GetDB().ID, h.table.entry.GetID(), is1PC, isTombstone)
 }
 
 func (h *txnRelation) SoftDeleteSegment(id *types.Segmentid) (err error) {
@@ -189,12 +189,12 @@ func (h *txnRelation) SoftDeleteSegment(id *types.Segmentid) (err error) {
 	return h.Txn.GetStore().SoftDeleteSegment(fp)
 }
 
-func (h *txnRelation) MakeSegmentItOnSnap() handle.SegmentIt {
-	return newSegmentItOnSnap(h.table)
+func (h *txnRelation) MakeSegmentItOnSnap(isTombStone bool) handle.SegmentIt {
+	return newSegmentItOnSnap(h.table, isTombStone)
 }
 
 func (h *txnRelation) MakeSegmentIt() handle.SegmentIt {
-	return newSegmentIt(h.table)
+	return newSegmentIt(h.table, false)
 }
 
 func (h *txnRelation) MakeBlockIt() handle.BlockIt {
@@ -214,12 +214,13 @@ func (h *txnRelation) GetValueByFilter(ctx context.Context, filter *handle.Filte
 	return
 }
 
+// Only used by test.
 func (h *txnRelation) UpdateByFilter(ctx context.Context, filter *handle.Filter, col uint16, v any, isNull bool) (err error) {
 	id, row, err := h.table.GetByFilter(ctx, filter)
 	if err != nil {
 		return
 	}
-	schema := h.table.GetLocalSchema()
+	schema := h.table.GetLocalSchema(false)
 	bat := containers.NewBatch()
 	defer bat.Close()
 	for _, def := range schema.ColDefs {
@@ -241,7 +242,15 @@ func (h *txnRelation) UpdateByFilter(ctx context.Context, filter *handle.Filter,
 		vec.Append(colVal, colValIsNull)
 		bat.AddVector(def.Name, vec)
 	}
-	if err = h.table.RangeDelete(id, row, row, nil, handle.DT_Normal); err != nil {
+	pkDef := schema.GetPrimaryKey()
+	pkVec := containers.MakeVector(pkDef.Type)
+	defer pkVec.Close()
+	pkVal, _, err := h.table.GetValue(ctx, id, row, uint16(pkDef.Idx))
+	if err != nil {
+		return
+	}
+	pkVec.Append(pkVal, false)
+	if err = h.table.RangeDelete(id, row, row, pkVec, handle.DT_Normal); err != nil {
 		return
 	}
 	err = h.Append(ctx, bat)
@@ -249,6 +258,7 @@ func (h *txnRelation) UpdateByFilter(ctx context.Context, filter *handle.Filter,
 	return
 }
 
+// Only used by test.
 func (h *txnRelation) DeleteByFilter(ctx context.Context, filter *handle.Filter) (err error) {
 	id, row, err := h.GetByFilter(ctx, filter)
 	if err != nil {
@@ -285,11 +295,33 @@ func (h *txnRelation) DeleteByPhyAddrKey(key any) error {
 	bid, row := rid.Decode()
 	id := h.table.entry.AsCommonID()
 	id.BlockID = bid
-	return h.Txn.GetStore().RangeDelete(id, row, row, nil, handle.DT_Normal)
+	pkDef:=h.table.schema.GetPrimaryKey()
+	pkVal,_,err:=h.GetValue(id,row,uint16(pkDef.Idx))
+	if err!=nil{
+		return err
+	}
+	pkVec:=containers.MakeVector(pkDef.Type)
+	pkVec.Append(pkVal,false)
+	return h.Txn.GetStore().RangeDelete(id, row, row, pkVec, handle.DT_Normal)
 }
 
+// Only used by test.
 func (h *txnRelation) RangeDelete(id *common.ID, start, end uint32, dt handle.DeleteType) error {
-	return h.Txn.GetStore().RangeDelete(id, start, end, nil, dt)
+	seg, err := h.GetSegment(id.SegmentID(), false)
+	if err != nil {
+		return err
+	}
+	blk, err := seg.GetBlock(id.BlockID)
+	if err != nil {
+		return err
+	}
+	pk := h.table.entry.GetLastestSchema().GetPrimaryKey()
+	pkView, err := blk.GetColumnDataById(h.Txn.GetContext(), pk.Idx, true)
+	if err != nil {
+		return err
+	}
+	pkVec := pkView.GetData().Window(int(start), int(end-start+1))
+	return h.Txn.GetStore().RangeDelete(id, start, end, pkVec, dt)
 }
 func (h *txnRelation) TryDeleteByDeltaloc(id *common.ID, deltaloc objectio.Location) (ok bool, err error) {
 	return h.Txn.GetStore().TryDeleteByDeltaloc(id, deltaloc)

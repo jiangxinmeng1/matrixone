@@ -257,7 +257,15 @@ func (entry *BlockEntry) InitData(factory DataFactory) {
 	entry.blkData = dataFactory(entry)
 }
 func (entry *BlockEntry) GetBlockData() data.Block { return entry.blkData }
-func (entry *BlockEntry) GetSchema() *Schema       { return entry.GetSegment().GetTable().GetLastestSchema() }
+
+func (entry *BlockEntry) GetSchema() *Schema {
+	if entry.GetSegment().IsTombstone {
+		return entry.GetSegment().GetTable().DeleteSchema()
+	} else {
+		return entry.GetSegment().GetTable().GetLastestSchema(false)
+	}
+}
+
 func (entry *BlockEntry) PrepareRollback() (err error) {
 	var empty bool
 	empty, err = entry.BaseEntryImpl.PrepareRollback()

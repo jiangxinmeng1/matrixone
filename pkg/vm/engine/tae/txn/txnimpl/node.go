@@ -48,7 +48,7 @@ func (n *pnode) IsPersisted() bool {
 	return true
 }
 
-func (n *pnode) Append(data *containers.Batch, offset uint32) (appended uint32, err error) {
+func (n *pnode) Append(data *containers.Batch, offset uint32, schema *catalog.Schema) (appended uint32, err error) {
 	panic("not supported")
 }
 

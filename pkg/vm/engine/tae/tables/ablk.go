@@ -118,30 +118,32 @@ func (blk *ablock) Pin() *common.PinnedItem[*ablock] {
 
 func (blk *ablock) GetColumnDataByIds(
 	ctx context.Context,
-	txn txnif.AsyncTxn,
+	txn txnif.TxnReader,
 	readSchema any,
 	colIdxes []int,
+	fillDeletes bool,
 ) (view *containers.BlockView, err error) {
 	return blk.resolveColumnDatas(
 		ctx,
 		txn,
 		readSchema.(*catalog.Schema),
 		colIdxes,
-		false)
+		!fillDeletes)
 }
 
 func (blk *ablock) GetColumnDataById(
 	ctx context.Context,
-	txn txnif.AsyncTxn,
+	txn txnif.TxnReader,
 	readSchema any,
 	col int,
+	fillDeletes bool,
 ) (view *containers.ColumnView, err error) {
 	return blk.resolveColumnData(
 		ctx,
 		txn,
 		readSchema.(*catalog.Schema),
 		col,
-		false)
+		!fillDeletes)
 }
 
 func (blk *ablock) resolveColumnDatas(
@@ -152,7 +154,6 @@ func (blk *ablock) resolveColumnDatas(
 	skipDeletes bool) (view *containers.BlockView, err error) {
 	node := blk.PinNode()
 	defer node.Unref()
-
 	if !node.IsPersisted() {
 		return node.MustMNode().resolveInMemoryColumnDatas(
 			txn, readSchema, colIdxes, skipDeletes,
@@ -292,14 +293,20 @@ func (blk *ablock) BatchDedup(
 	}
 }
 
+func (blk *ablock) CollectInMemoryAppendInRange(
+	start, end types.TS,
+	withAborted bool) (*containers.BatchWithVersion, error) {
+	node := blk.PinNode()
+	defer node.Unref()
+	return node.CollectInMemoryAppendInRange(start, end, withAborted, blk.meta.GetSegment().IsTombstone)
+}
 func (blk *ablock) CollectAppendInRange(
 	start, end types.TS,
 	withAborted bool) (*containers.BatchWithVersion, error) {
 	node := blk.PinNode()
 	defer node.Unref()
-	return node.CollectAppendInRange(start, end, withAborted)
+	return node.CollectAppendInRange(start, end, withAborted, blk.meta.GetSegment().IsTombstone)
 }
-
 func (blk *ablock) estimateRawScore() (score int, dropped bool) {
 	if blk.meta.HasDropCommitted() {
 		dropped = true

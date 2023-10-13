@@ -32,7 +32,7 @@ const MaxNodeRows = 10000
 
 type InsertNode interface {
 	Close() error
-	Append(data *containers.Batch, offset uint32) (appended uint32, err error)
+	Append(data *containers.Batch, offset uint32, schema *catalog.Schema) (appended uint32, err error)
 	RangeDelete(start, end uint32) error
 	IsRowDeleted(row uint32) bool
 	IsPersisted() bool
@@ -139,7 +139,7 @@ func (n *baseNode) LoadPersistedColumnData(ctx context.Context, colIdx int) (vec
 	if location.IsEmpty() {
 		panic("cannot load persisted column data from empty location")
 	}
-	def := n.table.GetLocalSchema().ColDefs[colIdx]
+	def := n.table.GetLocalSchema(false).ColDefs[colIdx]
 	return tables.LoadPersistedColumnData(
 		ctx,
 		n.table.store.rt,

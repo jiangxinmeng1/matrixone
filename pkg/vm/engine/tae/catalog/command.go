@@ -150,11 +150,12 @@ type Node interface {
 
 type EntryCommand[T BaseNode[T], N Node] struct {
 	*txnbase.BaseCustomizedCmd
-	cmdType  uint16
-	version  uint16
-	ID       *common.ID
-	mvccNode *MVCCNode[T]
-	node     N
+	cmdType     uint16
+	version     uint16
+	ID          *common.ID
+	IsTombstone bool
+	mvccNode    *MVCCNode[T]
+	node        N
 }
 
 func newEmptyEntryCmd[T BaseNode[T], N Node](cmdType uint16, mvccNodeFactory func() *MVCCNode[T], nodeFactory func() N, ver uint16) *EntryCommand[T, N] {
@@ -171,10 +172,11 @@ func newEmptyEntryCmd[T BaseNode[T], N Node](cmdType uint16, mvccNodeFactory fun
 
 func newBlockCmd(id uint32, cmdType uint16, entry *BlockEntry) *EntryCommand[*MetadataMVCCNode, *BlockNode] {
 	impl := &EntryCommand[*MetadataMVCCNode, *BlockNode]{
-		ID:       entry.AsCommonID(),
-		cmdType:  cmdType,
-		mvccNode: entry.BaseEntryImpl.GetLatestNodeLocked(),
-		node:     entry.BlockNode,
+		ID:          entry.AsCommonID(),
+		IsTombstone: entry.segment.IsTombstone,
+		cmdType:     cmdType,
+		mvccNode:    entry.BaseEntryImpl.GetLatestNodeLocked(),
+		node:        entry.BlockNode,
 	}
 	impl.BaseCustomizedCmd = txnbase.NewBaseCustomizedCmd(id, impl)
 	return impl
@@ -306,6 +308,10 @@ func (cmd *EntryCommand[T, N]) WriteTo(w io.Writer) (n int64, err error) {
 		return
 	}
 	n += int64(sn2)
+	if _, err = w.Write(types.EncodeBool(&cmd.IsTombstone)); err != nil {
+		return
+	}
+	n += 1
 	var sn int64
 	if sn, err = cmd.mvccNode.WriteTo(w); err != nil {
 		return
@@ -331,6 +337,10 @@ func (cmd *EntryCommand[T, N]) ReadFrom(r io.Reader) (n int64, err error) {
 		return
 	}
 	n += int64(sn2)
+	if _, err = r.Read(types.EncodeBool(&cmd.IsTombstone)); err != nil {
+		return
+	}
+	n += 1
 	var sn int64
 	if sn, err = cmd.mvccNode.ReadFromWithVersion(r, cmd.version); err != nil {
 		return

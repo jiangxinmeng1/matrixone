@@ -73,8 +73,8 @@ type Block interface {
 	PrepareCompact() bool
 
 	Rows() int
-	GetColumnDataById(ctx context.Context, txn txnif.AsyncTxn, readSchema any /*avoid import cycle*/, colIdx int) (*containers.ColumnView, error)
-	GetColumnDataByIds(ctx context.Context, txn txnif.AsyncTxn, readSchema any, colIdxes []int) (*containers.BlockView, error)
+	GetColumnDataById(ctx context.Context, txn txnif.TxnReader, readSchema any /*avoid import cycle*/, colIdx int, fillDeletes bool) (*containers.ColumnView, error)
+	GetColumnDataByIds(ctx context.Context, txn txnif.TxnReader, readSchema any, colIdxes []int, fillDeletes bool) (*containers.BlockView, error)
 	Prefetch(idxes []uint16) error
 	GetMeta() any
 
@@ -119,7 +119,8 @@ type Block interface {
 	Init() error
 	TryUpgrade() error
 	GCInMemeoryDeletesByTS(types.TS)
-	CollectAppendInRange(start, end types.TS, withAborted bool) (*containers.BatchWithVersion, error)
+	// Only collect in memory append
+	CollectInMemoryAppendInRange(start, end types.TS, withAborted bool) (*containers.BatchWithVersion, error)
 	CollectDeleteInRange(ctx context.Context, start, end types.TS, withAborted bool) (*containers.Batch, error)
 	// GetAppendNodeByRow(row uint32) (an txnif.AppendNode)
 	// GetDeleteNodeByRow(row uint32) (an txnif.DeleteNode)

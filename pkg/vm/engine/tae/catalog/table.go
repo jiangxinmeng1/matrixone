@@ -654,7 +654,7 @@ func (entry *TableEntry) CollectDeletesInRange(
 				visible = createTS.LessEq(end) || deleteTS.GreaterEq(start)
 				if visible {
 					// TODO
-					batchWithVersion, err := tombstoneBlk.GetBlockData().CollectAppendInRange(start, end, withAbort)
+					batchWithVersion, err := tombstoneBlk.GetBlockData().CollectInMemoryAppendInRange(start, end, withAbort)
 					if err != nil {
 						return nil, err
 					}
@@ -701,7 +701,7 @@ func (entry *TableEntry) CollectDeletesInRangeWithBlockId(
 				tombstoneBlk.RUnlock()
 				visible = createTS.LessEq(end) || deleteTS.GreaterEq(start)
 				if visible {
-					batchWithVersion, err := tombstoneBlk.GetBlockData().CollectAppendInRange(start, end, withAbort)
+					batchWithVersion, err := tombstoneBlk.GetBlockData().CollectInMemoryAppendInRange(start, end, withAbort)
 					if err != nil {
 						return nil, err
 					}
@@ -727,7 +727,8 @@ func (entry *TableEntry) CollectDeletesInRangeWithBlockId(
 }
 
 // Only used in test.
-func (entry *TableEntry) CollectChangesInRange(ctx context.Context, startTS, endTS types.TS, bid types.Blockid) (view *containers.BlockView, err error){
+func (entry *TableEntry) CollectChangesInRange(ctx context.Context, startTS, endTS types.TS, bid types.Blockid) (view *containers.BlockView, err error) {
+	view = containers.NewBlockView()
 	tombStoneIter := entry.MakeSegmentIt(false, true)
 	for tombStoneIter.Valid() {
 		seg := tombStoneIter.Get().GetPayload()
@@ -751,7 +752,7 @@ func (entry *TableEntry) CollectChangesInRange(ctx context.Context, startTS, end
 				tombstoneBlk.RUnlock()
 				visible = createTS.LessEq(endTS) || deleteTS.GreaterEq(startTS)
 				if visible {
-					batchWithVersion, err := tombstoneBlk.GetBlockData().CollectAppendInRange(startTS, endTS, false)
+					batchWithVersion, err := tombstoneBlk.GetBlockData().CollectInMemoryAppendInRange(startTS, endTS, false)
 					if err != nil {
 						return nil, err
 					}
@@ -759,9 +760,10 @@ func (entry *TableEntry) CollectChangesInRange(ctx context.Context, startTS, end
 					rowIDs.Foreach(func(v any, isNull bool, row int) error {
 						rowID := v.(types.Rowid)
 						if rowID.BorrowBlockID().Compare(bid) == 0 {
-							if view.DeleteMask==nil{
-								view.DeleteMask= &nulls.Nulls{}
+							if view.DeleteMask == nil {
+								view.DeleteMask = &nulls.Nulls{}
 							}
+							view.DeleteMask.Add(uint64(rowID.GetRowOffset()))
 						}
 						return nil
 					}, nil)

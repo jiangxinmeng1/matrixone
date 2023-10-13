@@ -51,7 +51,7 @@ type SegStat struct {
 	MergeIntent    int
 }
 
-func NewSegmentEntry(table *TableEntry, id *objectio.Segmentid, txn txnif.AsyncTxn, state EntryState, dataFactory SegmentDataFactory) *SegmentEntry {
+func NewSegmentEntry(table *TableEntry, id *objectio.Segmentid, txn txnif.AsyncTxn, state EntryState, dataFactory SegmentDataFactory, isTombstone bool) *SegmentEntry {
 	e := &SegmentEntry{
 		ID: *id,
 		BaseEntryImpl: NewBaseEntry(
@@ -60,8 +60,9 @@ func NewSegmentEntry(table *TableEntry, id *objectio.Segmentid, txn txnif.AsyncT
 		link:    common.NewGenericSortedDList((*BlockEntry).Less),
 		entries: make(map[types.Blockid]*common.GenericDLNode[*BlockEntry]),
 		SegmentNode: &SegmentNode{
-			state:    state,
-			SortHint: table.GetDB().catalog.NextSegment(),
+			state:       state,
+			SortHint:    table.GetDB().catalog.NextSegment(),
+			IsTombstone: isTombstone,
 		},
 	}
 	e.CreateWithTxn(txn, &MetadataMVCCNode{})
@@ -111,7 +112,7 @@ func NewSysSegmentEntry(table *TableEntry, id types.Uuid) *SegmentEntry {
 	}
 	e.CreateWithTS(types.SystemDBTS, &MetadataMVCCNode{})
 	var bid types.Blockid
-	schema := table.GetLastestSchema()
+	schema := table.GetLastestSchema(false)
 	if schema.Name == SystemTableSchema.Name {
 		bid = SystemBlock_Table_ID
 	} else if schema.Name == SystemDBSchema.Name {

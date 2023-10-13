@@ -24,6 +24,8 @@ type dataTable struct {
 	meta *catalog.TableEntry
 	aBlk *ablock
 	rt   *dbutils.Runtime
+
+	tombStone *ablock
 }
 
 func newTable(meta *catalog.TableEntry, rt *dbutils.Runtime) *dataTable {
@@ -33,11 +35,19 @@ func newTable(meta *catalog.TableEntry, rt *dbutils.Runtime) *dataTable {
 	}
 }
 
-func (table *dataTable) GetHandle() data.TableHandle {
-	return newHandle(table, table.aBlk)
+func (table *dataTable) GetHandle(isTombstone bool) data.TableHandle {
+	blk := table.aBlk
+	if isTombstone {
+		blk = table.tombStone
+	}
+	return newHandle(table, blk,isTombstone)
 }
 
-func (table *dataTable) ApplyHandle(h data.TableHandle) {
+func (table *dataTable) ApplyHandle(h data.TableHandle, isTombstone bool) {
 	handle := h.(*tableHandle)
-	table.aBlk = handle.block
+	if isTombstone {
+		table.tombStone = handle.block
+	} else {
+		table.aBlk = handle.block
+	}
 }
