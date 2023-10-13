@@ -443,7 +443,7 @@ func TestBlockWriter_GetName(t *testing.T) {
 	}
 	readDuration += time.Since(t0)
 	datas := make([]*logtail.CheckpointData, bat.Length())
-
+	r:=MockRunner()
 	entries := make([]*CheckpointEntry, bat.Length())
 	emptyFile := make([]*CheckpointEntry, 0)
 	readfn := func(i int, readType uint16) {
@@ -485,6 +485,12 @@ func TestBlockWriter_GetName(t *testing.T) {
 			ckpLSN:      ckpLSN,
 			truncateLSN: truncateLSN,
 		}
+		if typ == ET_Incremental{
+			r.storage.entries.Set(checkpointEntry)
+		}else {
+			r.storage.globals.Set(checkpointEntry)
+		}
+		return
 		var err2 error
 		if readType == PrefetchData {
 			logutil.Warnf("read %v failed: %v", checkpointEntry.String(), err2)
@@ -533,6 +539,47 @@ func TestBlockWriter_GetName(t *testing.T) {
 	if err != nil {
 		return
 	}
+	locations,_,_:=r.CollectCheckpointsInRange(context.BackGround(),types.TS{},txnif.UncommitTS)
+	locationsAndVersions := strings.Split(metLoc, ";")
+	datas := make([]*CNCheckpointData, len(locationsAndVersions)/2)
+
+	readers := make([]*blockio.BlockReader, len(locationsAndVersions)/2)
+	objectLocations := make([]objectio.Location, len(locationsAndVersions)/2)
+	versions := make([]uint32, len(locationsAndVersions)/2)
+	locations := make([]objectio.Location, len(locationsAndVersions)/2)
+	for i := 0; i < len(locationsAndVersions); i += 2 {
+		key := locationsAndVersions[i]
+		version, err := strconv.ParseUint(locationsAndVersions[i+1], 10, 32)
+		if err != nil {
+			return nil, nil, err
+		}
+		location, err := blockio.EncodeLocationFromString(key)
+		if err != nil {
+			return nil, nil, err
+		}
+		locations[i/2] = location
+		reader, err := blockio.NewObjectReader(fs, location)
+		if err != nil {
+			return nil, nil, err
+		}
+		readers[i/2] = reader
+		err = blockio.PrefetchMeta(fs, location)
+		if err != nil {
+			return nil, nil, err
+		}
+		objectLocations[i/2] = location
+		versions[i/2] = uint32(version)
+	}
+	
+	for i := range objectLocations {
+		data := NewCNCheckpointData()
+		meteIdxSchema := checkpointDataReferVersions[versions[i]][MetaIDX]
+		idxes := make([]uint16, len(meteIdxSchema.attrs))
+		for attr := range meteIdxSchema.attrs {
+			idxes[attr] = uint16(attr)
+		}
+	}
+
 	t0 = time.Now()
 	//globalIdx := 0
 	for i := 0; i < bat.Length(); i++ {

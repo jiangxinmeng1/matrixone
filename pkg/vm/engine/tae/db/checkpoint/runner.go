@@ -230,6 +230,21 @@ type runner struct {
 	onceStop  sync.Once
 }
 
+func MockRunner()*runner{
+	r:= &runner{}
+	r.storage.entries = btree.NewBTreeGOptions(func(a, b *CheckpointEntry) bool {
+		return a.end.Less(b.end)
+	}, btree.Options{
+		NoLocks: true,
+	})
+	r.storage.globals = btree.NewBTreeGOptions(func(a, b *CheckpointEntry) bool {
+		return a.end.Less(b.end)
+	}, btree.Options{
+		NoLocks: true,
+	})
+	return r
+}
+
 func NewRunner(
 	ctx context.Context,
 	rt *dbutils.Runtime,
