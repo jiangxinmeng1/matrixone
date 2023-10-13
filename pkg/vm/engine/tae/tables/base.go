@@ -170,6 +170,110 @@ func (blk *baseBlock) FillInMemoryDeletesLocked(
 	return
 }
 
+// TODO workspace deletes
+func (blk *baseBlock) FillInMemoryDeletesLockedWithTombstone(
+	txn txnif.TxnReader,
+	view *containers.BaseView,
+	rwlocker *sync.RWMutex) (err error) {
+	tbl := blk.meta.GetSegment().GetTable()
+	tombStoneIter := tbl.MakeSegmentIt(false, true)
+
+	schema := tbl.GetLastestSchema().MakeDeleteSchema()
+	for tombStoneIter.Valid() {
+		seg := tombStoneIter.Get().GetPayload()
+		seg.RLock()
+		var visible bool
+		visible, err = seg.IsVisible(txn, seg.RWMutex)
+		seg.RUnlock()
+		if err != nil {
+			return
+		}
+		if visible {
+			segIter := seg.MakeBlockIt(false)
+			for segIter.Valid() {
+				tombstoneBlk := segIter.Get().GetPayload()
+				tombstoneBlk.RLock()
+				var visible bool
+				visible, err = tombstoneBlk.IsVisible(txn, seg.RWMutex)
+				tombstoneBlk.RUnlock()
+				if visible {
+					// TODO
+					blockView, err := tombstoneBlk.GetBlockData().GetColumnDataByIds(txn.GetContext(), txn, schema, []int{0, 1, 2, 3}, false)
+					if err != nil {
+						return err
+					}
+					rowIdVec := blockView.GetColumnData(0)
+					commitTSVec := blockView.GetColumnData(1)
+					rowIdVec.Foreach(func(v any, isNull bool, row int) error {
+						rowID := v.(types.Rowid)
+						blkID := rowID.CloneBlockID()
+						commitTS := commitTSVec.Get(row).(types.TS)
+						if txn.GetStartTS().GreaterEq(commitTS) {
+							if blkID.Compare(blk.meta.ID) == 0 {
+								if view.DeleteMask == nil {
+									view.DeleteMask = &nulls.Nulls{}
+								}
+								view.DeleteMask.Add(uint64(rowID.GetRowOffset()))
+							}
+						}
+						return nil
+					}, nil)
+				}
+				segIter.Next()
+			}
+		}
+		tombStoneIter.Next()
+	}
+	err = txn.GetStore().FillInWorkSpaceDeletesByTombstone(blk.meta.AsCommonID(), view)
+	return
+}
+func (blk *baseBlock) GetTombstoneByRow(txn txnif.TxnReader, blkID types.Blockid, row uint32) (existed bool, commitTS types.TS, err error) {
+	tbl := blk.meta.GetSegment().GetTable()
+	tombStoneIter := tbl.MakeSegmentIt(false, true)
+
+	schema := tbl.GetLastestSchema().MakeDeleteSchema()
+	for tombStoneIter.Valid() {
+		seg := tombStoneIter.Get().GetPayload()
+		if err != nil {
+			return
+		}
+		segIter := seg.MakeBlockIt(false)
+		for segIter.Valid() {
+			tombstoneBlk := segIter.Get().GetPayload()
+			// TODO
+			blockView, err := tombstoneBlk.GetBlockData().GetColumnDataByIds(txn.GetContext(), txn, schema, []int{0, 1, 2, 3}, false)
+			if err != nil {
+				return false, types.TS{}, err
+			}
+			if blockView == nil {
+				return false, types.TS{}, nil
+			}
+			rowIdVec := blockView.GetColumnData(0)
+			commitTSVec := blockView.GetColumnData(1)
+			err2 := rowIdVec.Foreach(func(v any, isNull bool, row2 int) error {
+				rowID := v.(types.Rowid)
+				blkID := rowID.CloneBlockID()
+				offset := rowID.GetRowOffset()
+				ts := commitTSVec.Get(row2).(types.TS)
+				if blkID.Compare(blk.meta.ID) == 0 && offset == row {
+					existed = true
+					commitTS = ts
+					return moerr.GetOkStopCurrRecur()
+				}
+				return nil
+			}, nil)
+			if moerr.IsMoErrCode(err2, moerr.OkStopCurrRecur) {
+				return existed, commitTS, err
+			}
+			segIter.Next()
+		}
+		tombStoneIter.Next()
+	}
+	id := blk.meta.AsCommonID()
+	id.BlockID = blkID
+	existed, commitTS, err = txn.GetStore().GetWorkspaceTombstoneByRow(id, row)
+	return
+}
 func (blk *baseBlock) LoadPersistedCommitTS() (vec containers.Vector, err error) {
 	if !blk.meta.IsAppendable() {
 		return
@@ -296,7 +400,6 @@ func (blk *baseBlock) persistedCollectDeleteMaskInRange(
 	return
 }
 
-// for each deletes in [start,end]
 func (blk *baseBlock) foreachPersistedDeletesCommittedInRange(
 	ctx context.Context,
 	start, end types.TS,
@@ -320,10 +423,6 @@ func (blk *baseBlock) foreachPersistedDeletesCommittedInRange(
 		for i := 0; i < deletes.Length(); i++ {
 			loopOp(i, rowIdVec)
 		}
-		commitTSVec := containers.NewConstFixed[types.TS](types.T_TS.ToType(), deltalocCommitTS, deletes.Length())
-		abortVec := containers.NewConstFixed[bool](types.T_bool.ToType(), false, deletes.Length())
-		deletes.AddVector(catalog.AttrCommitTs, commitTSVec)
-		deletes.AddVector(catalog.AttrAborted, abortVec)
 	} else {
 		abortVec := deletes.Vecs[3].GetDownstreamVector()
 		commitTsVec := deletes.Vecs[1].GetDownstreamVector()
@@ -366,7 +465,6 @@ func (blk *baseBlock) ResolvePersistedColumnDatas(
 	readSchema *catalog.Schema,
 	colIdxs []int,
 	skipDeletes bool) (view *containers.BlockView, err error) {
-
 	view = containers.NewBlockView()
 	vecs, err := LoadPersistedColumnDatas(ctx, readSchema, blk.rt, blk.meta.AsCommonID(), colIdxs, blk.meta.GetMetaLoc())
 	if err != nil {
@@ -386,13 +484,14 @@ func (blk *baseBlock) ResolvePersistedColumnDatas(
 		}
 	}()
 
-	blk.RLock()
-	err = blk.FillInMemoryDeletesLocked(txn, view.BaseView, blk.RWMutex)
-	blk.RUnlock()
+	// blk.RLock()
+	// err = blk.FillInMemoryDeletesLocked(txn, view.BaseView, blk.RWMutex)
+	// blk.RUnlock()
+	err = blk.FillInMemoryDeletesLockedWithTombstone(txn, view.BaseView, blk.RWMutex)
 
-	if err = blk.FillPersistedDeletes(ctx, txn, view.BaseView); err != nil {
-		return
-	}
+	// if err = blk.FillPersistedDeletes(ctx, txn, view.BaseView); err != nil {
+	// 	return
+	// }
 	return
 }
 
@@ -418,14 +517,17 @@ func (blk *baseBlock) ResolvePersistedColumnData(
 			view.Close()
 		}
 	}()
-
-	if err = blk.FillPersistedDeletes(ctx, txn, view.BaseView); err != nil {
+	if err = blk.FillInMemoryDeletesLockedWithTombstone(txn, view.BaseView, blk.RWMutex); err != nil {
 		return
 	}
 
-	blk.RLock()
-	err = blk.FillInMemoryDeletesLocked(txn, view.BaseView, blk.RWMutex)
-	blk.RUnlock()
+	// if err = blk.FillPersistedDeletes(ctx, txn, view.BaseView); err != nil {
+	// 	return
+	// }
+
+	// blk.RLock()
+	// err = blk.FillInMemoryDeletesLocked(txn, view.BaseView, blk.RWMutex)
+	// blk.RUnlock()
 	return
 }
 
@@ -593,9 +695,7 @@ func (blk *baseBlock) HasDeleteIntentsPreparedIn(from, to types.TS) (found, isPe
 }
 
 func (blk *baseBlock) CollectChangesInRange(ctx context.Context, startTs, endTs types.TS) (view *containers.BlockView, err error) {
-	view = containers.NewBlockView()
-	view.DeleteMask, err = blk.inMemoryCollectDeletesInRange(startTs, endTs)
-	blk.fillPersistedDeletesInRange(ctx, startTs, endTs, view.BaseView)
+	view, err = blk.meta.GetSegment().GetTable().CollectChangesInRange(ctx, startTs, endTs, blk.meta.ID)
 	return
 }
 
@@ -612,32 +712,45 @@ func (blk *baseBlock) CollectDeleteInRange(
 	ctx context.Context,
 	start, end types.TS,
 	withAborted bool) (bat *containers.Batch, err error) {
-	bat, minTS, err := blk.inMemoryCollectDeleteInRange(
-		ctx,
-		start,
-		end,
-		withAborted)
-	if err != nil {
-		return
-	}
-	if !minTS.IsEmpty() && end.Greater(minTS) {
-		end = minTS.Prev()
-	}
-	bat, err = blk.persistedCollectDeleteInRange(
-		ctx,
-		bat,
-		start,
-		end,
-		withAborted)
+	bat, err = blk.meta.GetSegment().GetTable().CollectDeletesInRangeWithBlockId(ctx, start, end, blk.meta.ID, withAborted)
+	// bat, persistedTS, err := blk.inMemoryCollectDeleteInRange(
+	// 	ctx,
+	// 	start,
+	// 	end,
+	// 	withAborted)
+	// if err != nil {
+	// 	return
+	// }
+	// if end.Greater(persistedTS) {
+	// 	end = persistedTS
+	// }
+	// bat, err = blk.persistedCollectDeleteInRange(
+	// 	ctx,
+	// 	bat,
+	// 	start,
+	// 	end,
+	// 	withAborted)
 	return
 }
 
 func (blk *baseBlock) inMemoryCollectDeleteInRange(
 	ctx context.Context,
 	start, end types.TS,
-	withAborted bool) (bat *containers.Batch, minTS types.TS, err error) {
+	withAborted bool) (bat *containers.Batch, persistedTS types.TS, err error) {
+	catalogPersistedTS := blk.meta.GetDeltaPersistedTS()
 	blk.RLock()
-	rowID, ts, abort, abortedMap, deletes, minTS := blk.mvcc.CollectDeleteLocked(start.Next(), end)
+	persistedTS = blk.mvcc.GetDeletesPersistedTSInMVCCChain()
+	if persistedTS.IsEmpty() {
+		persistedTS = catalogPersistedTS
+	}
+	if persistedTS.GreaterEq(end) {
+		blk.RUnlock()
+		return
+	}
+	if start.Less(persistedTS) {
+		start = persistedTS
+	}
+	rowID, ts, abort, abortedMap, deletes := blk.mvcc.CollectDeleteLocked(start.Next(), end)
 	blk.RUnlock()
 	if rowID == nil {
 		return
@@ -829,6 +942,8 @@ func (blk *baseBlock) BuildCompactionTaskFactory() (
 	return
 }
 
-func (blk *baseBlock) CollectAppendInRange(start, end types.TS, withAborted bool) (*containers.BatchWithVersion, error) {
+func (blk *baseBlock) CollectInMemoryAppendInRange(start, end types.TS, withAborted bool) (*containers.BatchWithVersion, error) {
 	return nil, nil
 }
+
+func (blk *baseBlock) CollectAppendInRange

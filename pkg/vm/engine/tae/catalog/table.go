@@ -22,11 +22,13 @@ import (
 
 	pkgcatalog "github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	apipb "github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
@@ -55,6 +57,9 @@ type TableEntry struct {
 	DeletedDirties []*BlockEntry
 	// fullname is format as 'tenantID-tableName', the tenantID prefix is only used 'mo_catalog' database
 	fullName string
+
+	tombstoneEntries map[types.Uuid]*common.GenericDLNode[*SegmentEntry]
+	tombstoneLink    *common.GenericSortedDList[*SegmentEntry]
 }
 
 func genTblFullName(tenantID uint32, name string) string {
@@ -84,6 +89,9 @@ func NewTableEntryWithTableId(db *DBEntry, schema *Schema, txnCtx txnif.AsyncTxn
 		TableNode: &TableNode{},
 		link:      common.NewGenericSortedDList((*SegmentEntry).Less),
 		entries:   make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
+
+		tombstoneLink:    common.NewGenericSortedDList((*SegmentEntry).Less),
+		tombstoneEntries: make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
 	}
 	e.TableNode.schema.Store(schema)
 	if dataFactory != nil {
@@ -102,6 +110,9 @@ func NewSystemTableEntry(db *DBEntry, id uint64, schema *Schema) *TableEntry {
 		TableNode: &TableNode{},
 		link:      common.NewGenericSortedDList((*SegmentEntry).Less),
 		entries:   make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
+
+		tombstoneLink:    common.NewGenericSortedDList((*SegmentEntry).Less),
+		tombstoneEntries: make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
 	}
 	e.TableNode.schema.Store(schema)
 	e.CreateWithTS(types.SystemDBTS, &TableMVCCNode{Schema: schema})
@@ -116,7 +127,7 @@ func NewSystemTableEntry(db *DBEntry, id uint64, schema *Schema) *TableEntry {
 		panic("not supported")
 	}
 	segment := NewSysSegmentEntry(e, sid)
-	e.AddEntryLocked(segment)
+	e.AddEntryLocked(segment, false)
 	return e
 }
 
@@ -126,6 +137,9 @@ func NewReplayTableEntry() *TableEntry {
 			func() *TableMVCCNode { return &TableMVCCNode{} }),
 		link:    common.NewGenericSortedDList((*SegmentEntry).Less),
 		entries: make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
+
+		tombstoneLink:    common.NewGenericSortedDList((*SegmentEntry).Less),
+		tombstoneEntries: make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
 	}
 	return e
 }
@@ -140,6 +154,9 @@ func MockStaloneTableEntry(id uint64, schema *Schema) *TableEntry {
 		TableNode: node,
 		link:      common.NewGenericSortedDList((*SegmentEntry).Less),
 		entries:   make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
+
+		tombstoneLink:    common.NewGenericSortedDList((*SegmentEntry).Less),
+		tombstoneEntries: make(map[types.Uuid]*common.GenericDLNode[*SegmentEntry]),
 	}
 }
 func (entry *TableEntry) GetID() uint64 { return entry.ID }
@@ -165,25 +182,38 @@ func (entry *TableEntry) RemoveRows(delta uint64) uint64 {
 	return entry.rows.Add(^(delta - 1))
 }
 
-func (entry *TableEntry) GetSegmentByID(id *types.Segmentid) (seg *SegmentEntry, err error) {
+func (entry *TableEntry) GetSegmentByID(id *types.Segmentid, isTombstone bool) (seg *SegmentEntry, err error) {
 	entry.RLock()
 	defer entry.RUnlock()
-	node := entry.entries[*id]
-	if node == nil {
-		return nil, moerr.GetOkExpectedEOB()
+	if isTombstone {
+		node := entry.tombstoneEntries[*id]
+		if node == nil {
+			return nil, moerr.GetOkExpectedEOB()
+		}
+		return node.GetPayload(), nil
+	} else {
+		node := entry.entries[*id]
+		if node == nil {
+			return nil, moerr.GetOkExpectedEOB()
+		}
+		return node.GetPayload(), nil
 	}
-	return node.GetPayload(), nil
 }
 
-func (entry *TableEntry) MakeSegmentIt(reverse bool) *common.GenericSortedDListIt[*SegmentEntry] {
+func (entry *TableEntry) MakeSegmentIt(reverse bool, isTombstone bool) *common.GenericSortedDListIt[*SegmentEntry] {
 	entry.RLock()
 	defer entry.RUnlock()
-	return common.NewGenericSortedDListIt(entry.RWMutex, entry.link, reverse)
+	if isTombstone {
+		return common.NewGenericSortedDListIt(entry.RWMutex, entry.tombstoneLink, reverse)
+	} else {
+		return common.NewGenericSortedDListIt(entry.RWMutex, entry.link, reverse)
+	}
 }
 
 func (entry *TableEntry) CreateSegment(
 	txn txnif.AsyncTxn,
 	state EntryState,
+	isTombstone bool,
 	dataFactory SegmentDataFactory,
 	opts *objectio.CreateSegOpt) (created *SegmentEntry, err error) {
 	entry.Lock()
@@ -194,8 +224,8 @@ func (entry *TableEntry) CreateSegment(
 	} else {
 		id = objectio.NewSegmentid()
 	}
-	created = NewSegmentEntry(entry, id, txn, state, dataFactory)
-	entry.AddEntryLocked(created)
+	created = NewSegmentEntry(entry, id, txn, state, dataFactory, isTombstone)
+	entry.AddEntryLocked(created, isTombstone)
 	return
 }
 
@@ -212,9 +242,14 @@ func (entry *TableEntry) Set1PC() {
 func (entry *TableEntry) Is1PC() bool {
 	return entry.GetLatestNodeLocked().Is1PC()
 }
-func (entry *TableEntry) AddEntryLocked(segment *SegmentEntry) {
-	n := entry.link.Insert(segment)
-	entry.entries[segment.ID] = n
+func (entry *TableEntry) AddEntryLocked(segment *SegmentEntry, isTombstone bool) {
+	if isTombstone {
+		n := entry.tombstoneLink.Insert(segment)
+		entry.tombstoneEntries[segment.ID] = n
+	} else {
+		n := entry.link.Insert(segment)
+		entry.entries[segment.ID] = n
+	}
 }
 
 func (entry *TableEntry) deleteEntryLocked(segment *SegmentEntry) error {
@@ -280,7 +315,7 @@ func (entry *TableEntry) PPString(level common.PPLevel, depth int, prefix string
 	if level == common.PPL0 {
 		return w.String()
 	}
-	it := entry.MakeSegmentIt(true)
+	it := entry.MakeSegmentIt(true, false)
 	for it.Valid() {
 		segment := it.Get().GetPayload()
 		_ = w.WriteByte('\n')
@@ -318,8 +353,8 @@ func (entry *TableEntry) GetCatalog() *Catalog { return entry.db.catalog }
 
 func (entry *TableEntry) GetTableData() data.Table { return entry.tableData }
 
-func (entry *TableEntry) LastAppendableSegmemt() (seg *SegmentEntry) {
-	it := entry.MakeSegmentIt(false)
+func (entry *TableEntry) LastAppendableSegmemt(isTombstone bool) (seg *SegmentEntry) {
+	it := entry.MakeSegmentIt(false, isTombstone)
 	for it.Valid() {
 		itSeg := it.Get().GetPayload()
 		dropped := itSeg.HasDropCommitted()
@@ -333,7 +368,7 @@ func (entry *TableEntry) LastAppendableSegmemt() (seg *SegmentEntry) {
 }
 
 func (entry *TableEntry) LastNonAppendableSegmemt() (seg *SegmentEntry) {
-	it := entry.MakeSegmentIt(false)
+	it := entry.MakeSegmentIt(false, false)
 	for it.Valid() {
 		itSeg := it.Get().GetPayload()
 		dropped := itSeg.HasDropCommitted()
@@ -359,7 +394,7 @@ func (entry *TableEntry) RecurLoop(processor Processor) (err error) {
 			err = nil
 		}
 	}()
-	segIt := entry.MakeSegmentIt(true)
+	segIt := entry.MakeSegmentIt(true, false)
 	for segIt.Valid() {
 		segment := segIt.Get().GetPayload()
 		if err := processor.OnSegment(segment); err != nil {
@@ -390,7 +425,7 @@ func (entry *TableEntry) RecurLoop(processor Processor) (err error) {
 }
 
 func (entry *TableEntry) DropSegmentEntry(id *types.Segmentid, txn txnif.AsyncTxn) (deleted *SegmentEntry, err error) {
-	seg, err := entry.GetSegmentByID(id)
+	seg, err := entry.GetSegmentByID(id, false)
 	if err != nil {
 		return
 	}
@@ -484,7 +519,7 @@ func (entry *TableEntry) isColumnChangedInSchema() bool {
 }
 
 func (entry *TableEntry) FreezeAppend() {
-	seg := entry.LastAppendableSegmemt()
+	seg := entry.LastAppendableSegmemt(false)
 	if seg == nil {
 		// nothing to freeze
 		return
@@ -583,5 +618,158 @@ func (entry *TableEntry) GetVisibilityAndName(txn txnif.TxnReader) (visible, dro
 		dropped = un.HasDropCommitted()
 	}
 	name = un.BaseNode.Schema.Name
+	return
+}
+
+func (entry *TableEntry) DeleteSchema() *Schema {
+	schema := entry.GetLastestSchema().MakeDeleteSchema()
+	return schema
+}
+
+func (entry *TableEntry) CollectDeletesInRange(
+	ctx context.Context,
+	start, end types.TS,
+	withAbort bool) (bat *containers.Batch, err error) {
+	tombStoneIter := entry.MakeSegmentIt(false, true)
+	for tombStoneIter.Valid() {
+		seg := tombStoneIter.Get().GetPayload()
+		seg.RLock()
+		var visible bool
+		createTS := seg.GetCreatedAt()
+		deleteTS := seg.GetDeleteAt()
+		seg.RUnlock()
+		visible = createTS.LessEq(end) || deleteTS.GreaterEq(start)
+		if err != nil {
+			return
+		}
+		if visible {
+			segIter := seg.MakeBlockIt(false)
+			for segIter.Valid() {
+				tombstoneBlk := segIter.Get().GetPayload()
+				tombstoneBlk.RLock()
+				var visible bool
+				createTS := tombstoneBlk.GetCreatedAt()
+				deleteTS := tombstoneBlk.GetDeleteAt()
+				tombstoneBlk.RUnlock()
+				visible = createTS.LessEq(end) || deleteTS.GreaterEq(start)
+				if visible {
+					// TODO
+					batchWithVersion, err := tombstoneBlk.GetBlockData().CollectAppendInRange(start, end, withAbort)
+					if err != nil {
+						return nil, err
+					}
+					if bat == nil {
+						bat = batchWithVersion.Batch
+					} else {
+						bat.Extend(batchWithVersion.Batch)
+					}
+				}
+				segIter.Next()
+			}
+		}
+		tombStoneIter.Next()
+	}
+	return
+}
+
+// Only used in test
+func (entry *TableEntry) CollectDeletesInRangeWithBlockId(
+	ctx context.Context,
+	start, end types.TS,
+	bid types.Blockid,
+	withAbort bool) (bat *containers.Batch, err error) {
+	tombStoneIter := entry.MakeSegmentIt(false, true)
+	for tombStoneIter.Valid() {
+		seg := tombStoneIter.Get().GetPayload()
+		seg.RLock()
+		var visible bool
+		createTS := seg.GetCreatedAt()
+		deleteTS := seg.GetDeleteAt()
+		seg.RUnlock()
+		visible = createTS.LessEq(end) || deleteTS.GreaterEq(start)
+		if err != nil {
+			return
+		}
+		if visible {
+			segIter := seg.MakeBlockIt(false)
+			for segIter.Valid() {
+				tombstoneBlk := segIter.Get().GetPayload()
+				tombstoneBlk.RLock()
+				var visible bool
+				createTS := tombstoneBlk.GetCreatedAt()
+				deleteTS := tombstoneBlk.GetDeleteAt()
+				tombstoneBlk.RUnlock()
+				visible = createTS.LessEq(end) || deleteTS.GreaterEq(start)
+				if visible {
+					batchWithVersion, err := tombstoneBlk.GetBlockData().CollectAppendInRange(start, end, withAbort)
+					if err != nil {
+						return nil, err
+					}
+					rowIDs := batchWithVersion.Batch.GetVectorByName(AttrRowID)
+					rowIDs.Foreach(func(v any, isNull bool, row int) error {
+						rowID := v.(types.Rowid)
+						if rowID.BorrowBlockID().Compare(bid) == 0 {
+							if bat == nil {
+								bat = batchWithVersion.Batch.CloneWindow(row, 1)
+							} else {
+								bat.Append(batchWithVersion.Batch.Window(row, 1))
+							}
+						}
+						return nil
+					}, nil)
+				}
+				segIter.Next()
+			}
+		}
+		tombStoneIter.Next()
+	}
+	return
+}
+
+// Only used in test.
+func (entry *TableEntry) CollectChangesInRange(ctx context.Context, startTS, endTS types.TS, bid types.Blockid) (view *containers.BlockView, err error){
+	tombStoneIter := entry.MakeSegmentIt(false, true)
+	for tombStoneIter.Valid() {
+		seg := tombStoneIter.Get().GetPayload()
+		seg.RLock()
+		var visible bool
+		createTS := seg.GetCreatedAt()
+		deleteTS := seg.GetDeleteAt()
+		seg.RUnlock()
+		visible = createTS.LessEq(endTS) || deleteTS.GreaterEq(startTS)
+		if err != nil {
+			return
+		}
+		if visible {
+			segIter := seg.MakeBlockIt(false)
+			for segIter.Valid() {
+				tombstoneBlk := segIter.Get().GetPayload()
+				tombstoneBlk.RLock()
+				var visible bool
+				createTS := tombstoneBlk.GetCreatedAt()
+				deleteTS := tombstoneBlk.GetDeleteAt()
+				tombstoneBlk.RUnlock()
+				visible = createTS.LessEq(endTS) || deleteTS.GreaterEq(startTS)
+				if visible {
+					batchWithVersion, err := tombstoneBlk.GetBlockData().CollectAppendInRange(startTS, endTS, false)
+					if err != nil {
+						return nil, err
+					}
+					rowIDs := batchWithVersion.Batch.GetVectorByName(AttrRowID)
+					rowIDs.Foreach(func(v any, isNull bool, row int) error {
+						rowID := v.(types.Rowid)
+						if rowID.BorrowBlockID().Compare(bid) == 0 {
+							if view.DeleteMask==nil{
+								view.DeleteMask= &nulls.Nulls{}
+							}
+						}
+						return nil
+					}, nil)
+				}
+				segIter.Next()
+			}
+		}
+		tombStoneIter.Next()
+	}
 	return
 }
