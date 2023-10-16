@@ -564,7 +564,7 @@ func (catalog *Catalog) OnReplaySegmentBatch(ins, insTxn, del, delTxn *container
 		rid := del.GetVectorByName(AttrRowID).Get(i).(types.Rowid)
 		txnNode := txnbase.ReadTuple(delTxn, i)
 		isTombstone := delTxn.GetVectorByName(SegmentAttr_IsTombstone).Get(i).(bool)
-		catalog.onReplayDeleteSegment(dbid, tid, rid.BorrowSegmentID(),isTombstone, txnNode)
+		catalog.onReplayDeleteSegment(dbid, tid, rid.BorrowSegmentID(), isTombstone, txnNode)
 	}
 }
 func (catalog *Catalog) onReplayCreateSegment(
@@ -723,7 +723,7 @@ func (catalog *Catalog) OnReplayBlockBatch(ins, insTxn, del, delTxn *containers.
 		deltaLoc := ins.GetVectorByName(pkgcatalog.BlockMeta_DeltaLoc).Get(i).([]byte)
 		txnNode := txnbase.ReadTuple(insTxn, i)
 		isTombstone := insTxn.GetVectorByName(SegmentAttr_IsTombstone).Get(i).(bool)
-		catalog.onReplayCreateBlock(dbid, tid, sid, &blkID,isTombstone, state, metaLoc, deltaLoc, txnNode, dataFactory)
+		catalog.onReplayCreateBlock(dbid, tid, sid, &blkID, isTombstone, state, metaLoc, deltaLoc, txnNode, dataFactory)
 	}
 	for i := 0; i < del.Length(); i++ {
 		dbid := delTxn.GetVectorByName(SnapshotAttr_DBID).Get(i).(uint64)
@@ -735,7 +735,7 @@ func (catalog *Catalog) OnReplayBlockBatch(ins, insTxn, del, delTxn *containers.
 		metaLoc := delTxn.GetVectorByName(pkgcatalog.BlockMeta_MetaLoc).Get(i).([]byte)
 		deltaLoc := delTxn.GetVectorByName(pkgcatalog.BlockMeta_DeltaLoc).Get(i).([]byte)
 		isTombstone := delTxn.GetVectorByName(SegmentAttr_IsTombstone).Get(i).(bool)
-		catalog.onReplayDeleteBlock(dbid, tid, sid, blkID,isTombstone, metaLoc, deltaLoc, un)
+		catalog.onReplayDeleteBlock(dbid, tid, sid, blkID, isTombstone, metaLoc, deltaLoc, un)
 	}
 }
 func (catalog *Catalog) onReplayCreateBlock(

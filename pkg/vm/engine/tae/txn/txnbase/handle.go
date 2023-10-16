@@ -69,19 +69,23 @@ func (rel *TxnRelation) Size(attr string) int64                                 
 func (rel *TxnRelation) GetCardinality(attr string) int64                         { return 0 }
 func (rel *TxnRelation) Schema() any                                              { return nil }
 func (rel *TxnRelation) MakeSegmentIt() handle.SegmentIt                          { return nil }
-func (rel *TxnRelation) MakeSegmentItOnSnap(_ bool) handle.SegmentIt                    { return nil }
+func (rel *TxnRelation) MakeSegmentItOnSnap(_ bool) handle.SegmentIt              { return nil }
 func (rel *TxnRelation) MakeBlockIt() handle.BlockIt                              { return nil }
 func (rel *TxnRelation) BatchDedup(col containers.Vector) error                   { return nil }
 func (rel *TxnRelation) Append(ctx context.Context, data *containers.Batch) error { return nil }
 func (rel *TxnRelation) AddBlksWithMetaLoc(context.Context, []objectio.Location) error {
 	return nil
 }
-func (rel *TxnRelation) GetMeta() any                                                         { return nil }
-func (rel *TxnRelation) GetDB() (handle.Database, error)                                      { return nil, nil }
-func (rel *TxnRelation) GetSegment(id *types.Segmentid,isTombstone bool) (seg handle.Segment, err error)       { return }
-func (rel *TxnRelation) SoftDeleteSegment(id *types.Segmentid) (err error)                    { return }
-func (rel *TxnRelation) CreateSegment(bool,bool) (seg handle.Segment, err error)                   { return }
-func (rel *TxnRelation) CreateNonAppendableSegment(bool,bool) (seg handle.Segment, err error)      { return }
+func (rel *TxnRelation) GetMeta() any                    { return nil }
+func (rel *TxnRelation) GetDB() (handle.Database, error) { return nil, nil }
+func (rel *TxnRelation) GetSegment(id *types.Segmentid, isTombstone bool) (seg handle.Segment, err error) {
+	return
+}
+func (rel *TxnRelation) SoftDeleteSegment(id *types.Segmentid) (err error)        { return }
+func (rel *TxnRelation) CreateSegment(bool, bool) (seg handle.Segment, err error) { return }
+func (rel *TxnRelation) CreateNonAppendableSegment(bool, bool) (seg handle.Segment, err error) {
+	return
+}
 func (rel *TxnRelation) GetValue(*common.ID, uint32, uint16) (v any, isNull bool, err error)  { return }
 func (rel *TxnRelation) GetValueByPhyAddrKey(any, int) (v any, isNull bool, err error)        { return }
 func (rel *TxnRelation) Update(*common.ID, uint32, uint16, any, bool) (err error)             { return }

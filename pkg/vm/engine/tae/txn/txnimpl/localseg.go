@@ -64,10 +64,10 @@ func newLocalSegment(table *txnTable, isTombstone bool) *localSegment {
 		entry: catalog.NewStandaloneSegment(
 			table.entry,
 			table.store.txn.GetStartTS()),
-		nodes:   make([]InsertNode, 0),
-		index:   NewSimpleTableIndex(),
-		appends: make([]*appendCtx, 0),
-		table:   table,
+		nodes:       make([]InsertNode, 0),
+		index:       NewSimpleTableIndex(),
+		appends:     make([]*appendCtx, 0),
+		table:       table,
 		isTombstone: isTombstone,
 	}
 }
@@ -172,7 +172,7 @@ func (seg *localSegment) prepareApplyANode(node *anode) error {
 	for appended < node.Rows() {
 		appender, err := seg.tableHandle.GetAppender()
 		if moerr.IsMoErrCode(err, moerr.ErrAppendableSegmentNotFound) {
-			segH, err := seg.table.CreateSegment(true,seg.isTombstone)
+			segH, err := seg.table.CreateSegment(true, seg.isTombstone)
 			if err != nil {
 				return err
 			}
@@ -185,7 +185,7 @@ func (seg *localSegment) prepareApplyANode(node *anode) error {
 			blk.Close()
 		} else if moerr.IsMoErrCode(err, moerr.ErrAppendableBlockNotFound) {
 			id := appender.GetID()
-			blk, err := seg.table.CreateBlock(id.SegmentID(), true,seg.isTombstone)
+			blk, err := seg.table.CreateBlock(id.SegmentID(), true, seg.isTombstone)
 			if err != nil {
 				return err
 			}
@@ -262,7 +262,7 @@ func (seg *localSegment) prepareApplyPNode(node *pnode) (err error) {
 	}
 
 	if shouldCreateNewSeg() {
-		seg.nseg, err = seg.table.CreateNonAppendableSegment(true,seg.isTombstone, new(objectio.CreateSegOpt).WithId(&sid))
+		seg.nseg, err = seg.table.CreateNonAppendableSegment(true, seg.isTombstone, new(objectio.CreateSegOpt).WithId(&sid))
 		seg.nseg.GetMeta().(*catalog.SegmentEntry).SetSorted()
 		if err != nil {
 			return
@@ -313,7 +313,7 @@ func (seg *localSegment) Append(data *containers.Batch) (err error) {
 			seg.registerANode()
 			h = seg.appendable
 		}
-		appended, err = h.Append(data, offset,schema)
+		appended, err = h.Append(data, offset, schema)
 		if err != nil {
 			return
 		}

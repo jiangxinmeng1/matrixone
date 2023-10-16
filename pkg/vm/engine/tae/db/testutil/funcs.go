@@ -194,7 +194,7 @@ func GetColumnRowsByScan(t *testing.T, rel handle.Relation, colIdx int, applyDel
 
 func ForEachColumnView(rel handle.Relation, colIdx int, fn func(view *containers.ColumnView) error) {
 	ForEachBlock(rel, func(blk handle.Block) (err error) {
-		view, err := blk.GetColumnDataById(context.Background(), colIdx,false)
+		view, err := blk.GetColumnDataById(context.Background(), colIdx, false)
 		if view == nil {
 			logutil.Warnf("blk %v", blk.String())
 			return

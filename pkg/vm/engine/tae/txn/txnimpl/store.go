@@ -523,7 +523,7 @@ func (store *txnStore) CreateNonAppendableSegment(dbId, tid uint64, is1PC bool, 
 	if db, err = store.getOrSetDB(dbId); err != nil {
 		return
 	}
-	return db.CreateNonAppendableSegment(tid, is1PC,isTombstone)
+	return db.CreateNonAppendableSegment(tid, is1PC, isTombstone)
 }
 
 func (store *txnStore) getOrSetDB(id uint64) (db *txnDB, err error) {
@@ -557,7 +557,7 @@ func (store *txnStore) CreateNonAppendableBlock(id *common.ID, isTombstone bool,
 	perfcounter.Update(store.ctx, func(counter *perfcounter.CounterSet) {
 		counter.TAE.Block.CreateNonAppendable.Add(1)
 	})
-	return db.CreateNonAppendableBlock(id,isTombstone, opts)
+	return db.CreateNonAppendableBlock(id, isTombstone, opts)
 }
 
 func (store *txnStore) GetBlock(id *common.ID, isTombstone bool) (blk handle.Block, err error) {
@@ -565,7 +565,7 @@ func (store *txnStore) GetBlock(id *common.ID, isTombstone bool) (blk handle.Blo
 	if db, err = store.getOrSetDB(id.DbID); err != nil {
 		return
 	}
-	return db.GetBlock(id,isTombstone)
+	return db.GetBlock(id, isTombstone)
 }
 
 func (store *txnStore) CreateBlock(id *common.ID, is1PC bool, isTombstone bool) (blk handle.Block, err error) {

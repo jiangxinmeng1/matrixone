@@ -716,7 +716,7 @@ func (r *runner) tryCompactBlock(dbID, tableID uint64, id *objectio.Blockid, for
 		panic(err)
 	}
 	sid := objectio.ToSegmentId(id)
-	segment, err := table.GetSegmentByID(sid,false)
+	segment, err := table.GetSegmentByID(sid, false)
 	if err != nil {
 		panic(err)
 	}
@@ -762,7 +762,7 @@ func (r *runner) onWaitWaitableItems(items ...any) {
 func (r *runner) fireFlushTabletail(table *catalog.TableEntry, tree *model.TableTree, endTs types.TS) error {
 	metas := make([]*catalog.BlockEntry, 0, 10)
 	for _, seg := range tree.Segs {
-		segment, err := table.GetSegmentByID(seg.ID,false)
+		segment, err := table.GetSegmentByID(seg.ID, false)
 		if err != nil {
 			panic(err)
 		}
@@ -799,7 +799,7 @@ func (r *runner) fireFlushTabletail(table *catalog.TableEntry, tree *model.Table
 func (r *runner) EstimateTableMemSize(table *catalog.TableEntry, tree *model.TableTree) int {
 	size := 0
 	for _, seg := range tree.Segs {
-		segment, err := table.GetSegmentByID(seg.ID,false)
+		segment, err := table.GetSegmentByID(seg.ID, false)
 		if err != nil {
 			panic(err)
 		}

@@ -55,7 +55,7 @@ type Relation interface {
 	AddBlksWithMetaLoc(ctx context.Context, metaLcos []objectio.Location) error
 
 	GetMeta() any
-	CreateSegment(bool,bool) (Segment, error)
+	CreateSegment(bool, bool) (Segment, error)
 	CreateNonAppendableSegment(is1PC bool, isTombstone bool) (Segment, error)
 	GetSegment(id *types.Segmentid, isTombstone bool) (Segment, error)
 	SoftDeleteSegment(id *types.Segmentid) (err error)

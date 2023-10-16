@@ -295,13 +295,13 @@ func (h *txnRelation) DeleteByPhyAddrKey(key any) error {
 	bid, row := rid.Decode()
 	id := h.table.entry.AsCommonID()
 	id.BlockID = bid
-	pkDef:=h.table.schema.GetPrimaryKey()
-	pkVal,_,err:=h.GetValue(id,row,uint16(pkDef.Idx))
-	if err!=nil{
+	pkDef := h.table.schema.GetPrimaryKey()
+	pkVal, _, err := h.GetValue(id, row, uint16(pkDef.Idx))
+	if err != nil {
 		return err
 	}
-	pkVec:=containers.MakeVector(pkDef.Type)
-	pkVec.Append(pkVal,false)
+	pkVec := containers.MakeVector(pkDef.Type)
+	pkVec.Append(pkVal, false)
 	return h.Txn.GetStore().RangeDelete(id, row, row, pkVec, handle.DT_Normal)
 }
 
@@ -316,7 +316,7 @@ func (h *txnRelation) RangeDelete(id *common.ID, start, end uint32, dt handle.De
 		return err
 	}
 	pk := h.table.entry.GetLastestSchema().GetPrimaryKey()
-	pkView, err := blk.GetColumnDataById(h.Txn.GetContext(), pk.Idx,false)
+	pkView, err := blk.GetColumnDataById(h.Txn.GetContext(), pk.Idx, false)
 	if err != nil {
 		return err
 	}

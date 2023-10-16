@@ -269,7 +269,7 @@ func (e *DBEntry) GetBlockEntryByID(id *common.ID, isTombstone bool) (blk *Block
 	if err != nil {
 		return
 	}
-	seg, err := table.GetSegmentByID(id.SegmentID(),isTombstone)
+	seg, err := table.GetSegmentByID(id.SegmentID(), isTombstone)
 	if err != nil {
 		return
 	}

@@ -99,8 +99,8 @@ func (appender *blockAppender) ApplyAppend(
 	appender.blk.Lock()
 	defer appender.blk.Unlock()
 	from, err = node.ApplyAppend(bat, txn)
-	if appender.blk.meta.GetSegment().IsTombstone{
-		logutil.Infof("delete %d",bat.Length())
+	if appender.blk.meta.GetSegment().IsTombstone {
+		logutil.Infof("delete %d", bat.Length())
 	}
 
 	schema := node.writeSchema

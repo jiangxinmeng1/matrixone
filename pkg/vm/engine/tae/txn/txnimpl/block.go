@@ -191,12 +191,12 @@ func (blk *txnBlock) getDBID() uint64 {
 
 // Used in test and merge
 func (blk *txnBlock) RangeDelete(start, end uint32, dt handle.DeleteType) (err error) {
-	pkDef:=blk.table.schema.GetPrimaryKey()
-	pkView,err:=blk.GetColumnDataById(blk.Txn.GetContext(),pkDef.Idx,false)
-	if err!=nil{
+	pkDef := blk.table.schema.GetPrimaryKey()
+	pkView, err := blk.GetColumnDataById(blk.Txn.GetContext(), pkDef.Idx, false)
+	if err != nil {
 		return
 	}
-	pk:=pkView.GetData().Window(int(start),int(end-start+1))
+	pk := pkView.GetData().Window(int(start), int(end-start+1))
 	return blk.Txn.GetStore().RangeDelete(blk.entry.AsCommonID(), start, end, pk, dt)
 }
 

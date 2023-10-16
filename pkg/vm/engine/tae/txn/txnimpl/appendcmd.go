@@ -75,9 +75,9 @@ func NewEmptyAppendCmd() *AppendCmd {
 
 func NewAppendCmd(id uint32, node InsertNode, data *containers.Batch, isTombstone bool) *AppendCmd {
 	impl := &AppendCmd{
-		Node:  node,
-		Infos: node.GetAppends(),
-		Data:  data,
+		Node:        node,
+		Infos:       node.GetAppends(),
+		Data:        data,
 		IsTombStone: isTombstone,
 	}
 	impl.BaseCustomizedCmd = txnbase.NewBaseCustomizedCmd(id, impl)
@@ -158,7 +158,7 @@ func (c *AppendCmd) WriteTo(w io.Writer) (n int64, err error) {
 	if _, err = w.Write(types.EncodeBool(&c.IsTombStone)); err != nil {
 		return
 	}
-	n+=1
+	n += 1
 	return
 }
 
@@ -193,7 +193,7 @@ func (c *AppendCmd) ReadFrom(r io.Reader) (n int64, err error) {
 	if _, err = r.Read(types.EncodeBool(&c.IsTombStone)); err != nil {
 		return
 	}
-	n+=1
+	n += 1
 	return
 }
 
