@@ -344,7 +344,7 @@ func (tbl *txnTable) TransferTombstone(
 
 	// rollback transferred delete node. should not fail
 	err = tbl.localTombStone.RangeDelete(tombstoneOffset, tombstoneOffset)
-	if err!=nil{
+	if err != nil {
 		panic(err)
 	}
 	tbl.store.warChecker.Delete(id)
@@ -790,12 +790,12 @@ func (tbl *txnTable) AddBlksWithMetaLoc(ctx context.Context, metaLocs []objectio
 			}
 		} else if dedupType == txnif.FullSkipWorkSpaceDedup {
 			//do PK deduplication check against txn's snapshot data.
-			if err = tbl.DedupSnapByMetaLocs(ctx, metaLocs, false); err != nil {
+			if err = tbl.DedupSnapByMetaLocs(ctx, metaLocs, false, false); err != nil {
 				return
 			}
 		} else if dedupType == txnif.IncrementalDedup {
 			//do PK deduplication check against txn's snapshot data.
-			if err = tbl.DedupSnapByMetaLocs(ctx, metaLocs, true); err != nil {
+			if err = tbl.DedupSnapByMetaLocs(ctx, metaLocs, true, false); err != nil {
 				return
 			}
 		}
@@ -804,6 +804,60 @@ func (tbl *txnTable) AddBlksWithMetaLoc(ctx context.Context, metaLocs []objectio
 		tbl.localSegment = newLocalSegment(tbl, false)
 	}
 	return tbl.localSegment.AddBlksWithMetaLoc(pkVecs, metaLocs)
+}
+
+func (tbl *txnTable) AddTombstoneWithMetaLoc(ctx context.Context, metaLocs []objectio.Location) (err error) {
+	var pkVecs []containers.Vector
+	defer func() {
+		for _, v := range pkVecs {
+			v.Close()
+		}
+	}()
+	if tbl.schema.HasPK() {
+		dedupType := tbl.store.txn.GetDedupType()
+		if dedupType == txnif.FullDedup {
+			//TODO::parallel load pk.
+			for _, loc := range metaLocs {
+				bat, err := blockio.LoadColumns(
+					ctx,
+					[]uint16{uint16(tbl.schema.GetSingleSortKeyIdx())},
+					nil,
+					tbl.store.rt.Fs.Service,
+					loc,
+					nil,
+				)
+				if err != nil {
+					return err
+				}
+				vec := containers.ToTNVector(bat.Vecs[0])
+				pkVecs = append(pkVecs, vec)
+			}
+			for _, v := range pkVecs {
+				//do PK deduplication check against txn's work space.
+				if err = tbl.DedupWorkSpace(v, true); err != nil {
+					return
+				}
+				//do PK deduplication check against txn's snapshot data.
+				if err = tbl.DedupSnapByPK(ctx, v, false, true); err != nil {
+					return
+				}
+			}
+		} else if dedupType == txnif.FullSkipWorkSpaceDedup {
+			//do PK deduplication check against txn's snapshot data.
+			if err = tbl.DedupSnapByMetaLocs(ctx, metaLocs, false, true); err != nil {
+				return
+			}
+		} else if dedupType == txnif.IncrementalDedup {
+			//do PK deduplication check against txn's snapshot data.
+			if err = tbl.DedupSnapByMetaLocs(ctx, metaLocs, true, true); err != nil {
+				return
+			}
+		}
+	}
+	if tbl.localTombStone == nil {
+		tbl.localTombStone = newLocalSegment(tbl, false)
+	}
+	return tbl.localTombStone.AddBlksWithMetaLoc(pkVecs, metaLocs)
 }
 
 func (tbl *txnTable) RangeDeleteLocalRows(start, end uint32) (err error) {
@@ -1298,13 +1352,13 @@ func (tbl *txnTable) DedupSnapByPK(ctx context.Context, keys containers.Vector, 
 // DedupSnapByMetaLocs 1. checks whether the Primary Key of all the input blocks exist in the list of block
 // which are visible and not dropped at txn's snapshot timestamp.
 // 2. It is called when appending blocks into this table.
-func (tbl *txnTable) DedupSnapByMetaLocs(ctx context.Context, metaLocs []objectio.Location, dedupAfterSnapshotTS bool) (err error) {
+func (tbl *txnTable) DedupSnapByMetaLocs(ctx context.Context, metaLocs []objectio.Location, dedupAfterSnapshotTS bool, isTombstone bool) (err error) {
 	loaded := make(map[int]containers.Vector)
 	maxSegmentHint := uint64(0)
 	maxBlockID := &types.Blockid{}
 	for i, loc := range metaLocs {
 		h := newRelation(tbl)
-		it := newRelationBlockItOnSnap(h, false)
+		it := newRelationBlockItOnSnap(h, isTombstone)
 		for it.Valid() {
 			blk := it.GetBlock().GetMeta().(*catalog.BlockEntry)
 			segmentHint := blk.GetSegment().SortHint
