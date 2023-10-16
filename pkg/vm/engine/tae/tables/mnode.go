@@ -604,9 +604,7 @@ func (node *memoryNode) resolveInMemoryColumnData(
 		return
 	}
 
-	node.block.RLock()
 	err = node.block.FillInMemoryDeletesLockedWithTombstone(txn, view.BaseView, node.block.RWMutex)
-	node.block.RUnlock()
 	if deSels != nil && !deSels.IsEmpty() {
 		if view.DeleteMask != nil {
 			view.DeleteMask.Or(deSels)
