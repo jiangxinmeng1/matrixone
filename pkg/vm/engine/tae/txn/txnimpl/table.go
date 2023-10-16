@@ -749,7 +749,7 @@ func (tbl *txnTable) Append(ctx context.Context, data *containers.Batch) (err er
 	if tbl.localSegment == nil {
 		tbl.localSegment = newLocalSegment(tbl, false)
 	}
-	return tbl.localSegment.Append(data)
+	return tbl.localSegment.Append(data, false)
 }
 
 func (tbl *txnTable) AddBlksWithMetaLoc(ctx context.Context, metaLocs []objectio.Location) (err error) {
@@ -915,7 +915,7 @@ func (tbl *txnTable) RangeDelete(
 		err = tbl.RangeDeleteLocalRows(start, end)
 		return
 	}
-	err = tbl.rangeDeleteWithTombstone(id, start, end, pk)
+	err = tbl.rangeDeleteWithTombstone(id, start, end, dt, pk)
 	if err != nil {
 		return
 	}
@@ -1840,6 +1840,7 @@ func (tbl *txnTable) rangeDeleteWithTombstone(
 	id *common.ID,
 	start,
 	end uint32,
+	deleteType handle.DeleteType,
 	pk containers.Vector) error {
 	if tbl.localTombStone == nil {
 		tbl.localTombStone = newLocalSegment(tbl, true)
@@ -1860,7 +1861,7 @@ func (tbl *txnTable) rangeDeleteWithTombstone(
 		return err
 	}
 	tbl.store.IncreateWriteCnt()
-	err = tbl.localTombStone.Append(bat)
+	err = tbl.localTombStone.Append(bat, deleteType == handle.DT_MergeCompact)
 	return err
 }
 

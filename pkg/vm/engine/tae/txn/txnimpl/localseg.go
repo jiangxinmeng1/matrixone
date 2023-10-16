@@ -166,11 +166,19 @@ func (seg *localSegment) PrepareApply() (err error) {
 	return
 }
 
-func (seg *localSegment) prepareApplyANode(node *anode) error {
+// In Merge, it transfers tombstones when PrepareCommit.
+// addAppendNode adds an append node for the tombstones.
+func (seg *localSegment) addAppendNode(appended uint32, node *anode) error {
+	if !seg.isTombstone {
+		panic("not support")
+	}
+	return seg.prepareApplyANode(appended, node, true)
+}
+
+func (seg *localSegment) prepareApplyANode(appended uint32, node *anode, isPrepareCommit bool) error {
 	node.Compact()
 	tableData := seg.table.entry.GetTableData()
 	seg.tableHandle = tableData.GetHandle(seg.isTombstone)
-	appended := uint32(0)
 	vec := seg.table.store.rt.VectorPool.Small.GetVector(&objectio.RowidType)
 	for appended < node.Rows() {
 		appender, err := seg.tableHandle.GetAppender()
@@ -206,6 +214,9 @@ func (seg *localSegment) prepareApplyANode(node *anode) error {
 		if err != nil {
 			return err
 		}
+		if isPrepareCommit {
+			anode.PrepareCommit()
+		}
 		blockId := appender.GetMeta().(*catalog.BlockEntry).ID
 		col := seg.table.store.rt.VectorPool.Small.GetVector(&objectio.RowidType)
 		defer col.Close()
@@ -235,7 +246,7 @@ func (seg *localSegment) prepareApplyANode(node *anode) error {
 		id := appender.GetID()
 		seg.table.store.warChecker.Insert(appender.GetMeta().(*catalog.BlockEntry))
 		seg.table.store.txn.GetMemo().AddBlock(seg.table.entry.GetDB().ID,
-			id.TableID, &id.BlockID,seg.isTombstone)
+			id.TableID, &id.BlockID, seg.isTombstone)
 		seg.appends = append(seg.appends, ctx)
 		// logutil.Debugf("%s: toAppend %d, appended %d, blks=%d",
 		// 	id.String(), toAppend, appended, len(seg.appends))
@@ -287,7 +298,7 @@ func (seg *localSegment) prepareApplyPNode(node *pnode) (err error) {
 
 func (seg *localSegment) prepareApplyNode(node InsertNode) (err error) {
 	if !node.IsPersisted() {
-		return seg.prepareApplyANode(node.(*anode))
+		return seg.prepareApplyANode(0, node.(*anode), false)
 	}
 	return seg.prepareApplyPNode(node.(*pnode))
 }
@@ -303,7 +314,7 @@ func (seg *localSegment) CloseAppends() {
 }
 
 // Append appends batch of data into anode.
-func (seg *localSegment) Append(data *containers.Batch) (err error) {
+func (seg *localSegment) Append(data *containers.Batch, prepareCommit bool) (err error) {
 	if seg.appendable == nil {
 		seg.registerANode()
 	}
@@ -318,9 +329,16 @@ func (seg *localSegment) Append(data *containers.Batch) (err error) {
 			seg.registerANode()
 			h = seg.appendable
 		}
+		appendedInAnode:=h.Rows()
 		appended, err = h.Append(data, offset, schema)
 		if err != nil {
 			return
+		}
+		if prepareCommit{
+			err = seg.addAppendNode(appendedInAnode,h.(*anode))
+			if err != nil {
+				return
+			}
 		}
 		dedupType := seg.table.store.txn.GetDedupType()
 		if schema.HasPK() && dedupType == txnif.FullDedup {
