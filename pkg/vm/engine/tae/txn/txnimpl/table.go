@@ -1698,15 +1698,12 @@ func (tbl *txnTable) GetWorkspaceTombstoneByRow(
 		} else {
 			an := n.(*anode)
 			rowIdVec := an.data.GetVectorByName(catalog.AttrRowID)
-			commitTSVec := an.data.GetVectorByName(catalog.AttrCommitTs)
 			err2 := rowIdVec.Foreach(func(v any, isNull bool, row2 int) error {
 				rowID := v.(types.Rowid)
 				bid := rowID.CloneBlockID()
 				offset := rowID.GetRowOffset()
-				ts := commitTSVec.Get(row2).(types.TS)
 				if bid.Compare(*blkID) == 0 && offset == row {
 					existed = true
-					commitTS = ts
 					return moerr.GetOkStopCurrRecur()
 				}
 				return nil

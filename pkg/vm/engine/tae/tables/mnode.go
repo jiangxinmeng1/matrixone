@@ -421,6 +421,10 @@ func (node *memoryNode) checkConflictAndDupClosure(
 			*dupRow = row
 			return moerr.GetOkExpectedDup()
 		}
+		// for tombstone in workspace, ts is 0
+		if ts.IsEmpty(){
+			return nil
+		}
 		if ts.Greater(txn.GetStartTS()) {
 			return txnif.ErrTxnWWConflict
 		}
