@@ -189,6 +189,9 @@ func (tbl *txnTable) TransferDeletes(ts types.TS, phase string) (err error) {
 		} else {
 			an := node.(*anode)
 			for i := 0; i < an.data.Length(); i++ {
+				if an.data.Deletes.Contains(uint64(i)) {
+					continue
+				}
 				rowID := an.data.Vecs[0].Get(i).(types.Rowid)
 				id.BlockID = rowID.CloneBlockID()
 				// search the read set to check wether the delete node relevant
@@ -341,7 +344,10 @@ func (tbl *txnTable) TransferTombstone(
 
 	// rollback transferred delete node. should not fail
 	err = tbl.localTombStone.RangeDelete(tombstoneOffset, tombstoneOffset)
-
+	if err!=nil{
+		panic(err)
+	}
+	tbl.store.warChecker.Delete(id)
 	return
 }
 
@@ -1640,9 +1646,15 @@ func (tbl *txnTable) ApplyAppend() (err error) {
 func (tbl *txnTable) PrePrepare() (err error) {
 	if tbl.localSegment != nil {
 		err = tbl.localSegment.PrepareApply()
+		if err != nil {
+			return
+		}
 	}
 	if tbl.localTombStone != nil {
 		err = tbl.localTombStone.PrepareApply()
+		if err != nil {
+			return
+		}
 	}
 	return
 }
