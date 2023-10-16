@@ -17,6 +17,7 @@ package tables
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -531,6 +532,38 @@ func (blk *baseBlock) ResolvePersistedColumnData(
 	return
 }
 
+// Only used in tombstone blk
+func (blk *baseBlock) CollectPersistedColumnDataInRange(
+	ctx context.Context,
+	startTS, endTS types.TS) (batWithVer *containers.BatchWithVersion, err error) {
+	schema := blk.meta.GetSchema()
+	vecs, err := LoadPersistedColumnDatas(context.Background(), schema, blk.rt, blk.GetID(), []int{0, 1, 2, 3}, blk.meta.GetMetaLoc())
+	if err != nil {
+		return
+	}
+	commitTSVec := vecs[1]
+
+	startOffset := sort.Search(commitTSVec.Length(), func(i int) bool {
+		return commitTSVec.Get(i).(types.TS).Greater(startTS)
+	})
+	startOffset++
+	endOffset := sort.Search(commitTSVec.Length(), func(i int) bool {
+		return commitTSVec.Get(i).(types.TS).Greater(endTS)
+	})
+	endOffset++
+	length := endOffset - startOffset
+	bat := containers.NewBatch()
+	for i, col := range schema.ColDefs {
+		bat.AddVector(col.Name, vecs[i].Window(startOffset, length))
+	}
+	return &containers.BatchWithVersion{
+		Version:    schema.Version,
+		NextSeqnum: uint16(schema.Extra.NextColSeqnum),
+		Seqnums:    schema.AllSeqnums(),
+		Batch:      bat,
+	}, nil
+}
+
 func (blk *baseBlock) dedupWithLoad(
 	ctx context.Context,
 	txn txnif.TxnReader,
@@ -750,7 +783,7 @@ func (blk *baseBlock) inMemoryCollectDeleteInRange(
 	if start.Less(persistedTS) {
 		start = persistedTS
 	}
-	rowID, ts, abort, abortedMap, deletes := blk.mvcc.CollectDeleteLocked(start.Next(), end)
+	rowID, ts, abort, abortedMap, deletes, _ := blk.mvcc.CollectDeleteLocked(start.Next(), end)
 	blk.RUnlock()
 	if rowID == nil {
 		return
@@ -945,5 +978,3 @@ func (blk *baseBlock) BuildCompactionTaskFactory() (
 func (blk *baseBlock) CollectInMemoryAppendInRange(start, end types.TS, withAborted bool) (*containers.BatchWithVersion, error) {
 	return nil, nil
 }
-
-// func (blk *baseBlock) CollectAppendInRange

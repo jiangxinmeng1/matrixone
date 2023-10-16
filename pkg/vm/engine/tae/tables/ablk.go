@@ -300,13 +300,20 @@ func (blk *ablock) CollectInMemoryAppendInRange(
 	defer node.Unref()
 	return node.CollectInMemoryAppendInRange(start, end, withAborted, blk.meta.GetSegment().IsTombstone)
 }
+
 func (blk *ablock) CollectAppendInRange(
+	ctx context.Context,
 	start, end types.TS,
 	withAborted bool) (*containers.BatchWithVersion, error) {
 	node := blk.PinNode()
 	defer node.Unref()
-	return node.CollectAppendInRange(start, end, withAborted, blk.meta.GetSegment().IsTombstone)
+	if node.IsPersisted() {
+		return node.MustMNode().CollectInMemoryAppendInRange(start, end, withAborted, blk.meta.GetSegment().IsTombstone)
+	} else {
+		return blk.CollectPersistedColumnDataInRange(ctx, start, end)
+	}
 }
+
 func (blk *ablock) estimateRawScore() (score int, dropped bool) {
 	if blk.meta.HasDropCommitted() {
 		dropped = true

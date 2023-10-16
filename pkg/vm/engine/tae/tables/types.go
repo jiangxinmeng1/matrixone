@@ -65,8 +65,8 @@ type NodeT interface {
 	Rows() uint32
 
 	GetRowByFilter(ctx context.Context, txn txnif.TxnReader, filter *handle.Filter) (row uint32, err error)
-	CollectAppendInRange(
-		start, end types.TS, withAborted bool,
+	CollectInMemoryAppendInRange(
+		start, end types.TS, withAborted bool, isTombstone bool,
 	) (batWithVer *containers.BatchWithVersion, err error)
 }
 

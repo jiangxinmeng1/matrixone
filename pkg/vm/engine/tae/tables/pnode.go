@@ -227,3 +227,9 @@ func (node *persistedNode) CollectInMemoryAppendInRange(
 	// logtail should have sent metaloc
 	return nil, nil
 }
+func (node *persistedNode) CollectAppendInRange(
+	start, end types.TS, withAborted bool, isTombstone bool,
+) (bat *containers.BatchWithVersion, err error) {
+	// logtail should have sent metaloc
+	return nil, nil
+}
