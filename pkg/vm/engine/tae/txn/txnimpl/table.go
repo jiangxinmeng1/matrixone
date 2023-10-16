@@ -548,7 +548,7 @@ func (tbl *txnTable) createSegment(state catalog.EntryState, is1PC bool, isTombs
 	}
 	seg = newSegment(tbl, meta)
 	tbl.store.IncreateWriteCnt()
-	tbl.store.txn.GetMemo().AddSegment(tbl.entry.GetDB().ID, tbl.entry.ID, &meta.ID,isTombstone)
+	tbl.store.txn.GetMemo().AddSegment(tbl.entry.GetDB().ID, tbl.entry.ID, &meta.ID, isTombstone)
 	if is1PC {
 		meta.Set1PC()
 	}
@@ -711,7 +711,7 @@ func (tbl *txnTable) AddDeleteNode(id *common.ID, node txnif.DeleteNode) error {
 		return ErrDuplicateNode
 	}
 	tbl.store.IncreateWriteCnt()
-	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID,false)
+	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID, false)
 	tbl.deleteNodes[nid] = newDeleteNode(node, tbl.txnEntries.Len())
 	tbl.txnEntries.Append(node)
 	return nil
@@ -1077,7 +1077,7 @@ func (tbl *txnTable) UpdateDeltaLoc(id *common.ID, deltaloc objectio.Location) (
 	if err != nil {
 		return
 	}
-	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID,false)
+	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID, false)
 	if isNewNode {
 		tbl.txnEntries.Append(meta)
 	}
@@ -1167,12 +1167,18 @@ func (tbl *txnTable) PrePrepareDedup(ctx context.Context) (err error) {
 			if node.IsPersisted() {
 				err = tbl.DoPrecommitDedupByNode(ctx, node, true)
 				if err != nil {
+					if moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry) {
+						return txnif.ErrTxnWWConflict
+					}
 					return
 				}
 				continue
 			}
 			pkVec, err := node.WindowColumn(0, node.Rows(), 0)
 			if err != nil {
+				if moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry) {
+					return txnif.ErrTxnWWConflict
+				}
 				return err
 			}
 			if zm.Valid() {
@@ -1183,10 +1189,16 @@ func (tbl *txnTable) PrePrepareDedup(ctx context.Context) (err error) {
 			}
 			if err = index.BatchUpdateZM(zm, pkVec.GetDownstreamVector()); err != nil {
 				pkVec.Close()
+				if moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry) {
+					return txnif.ErrTxnWWConflict
+				}
 				return err
 			}
 			if err = tbl.DoPrecommitDedupByPK(pkVec, zm, true); err != nil {
 				pkVec.Close()
+				if moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry) {
+					return txnif.ErrTxnWWConflict
+				}
 				return err
 			}
 			pkVec.Close()
@@ -1807,6 +1819,9 @@ func (tbl *txnTable) rangeDeleteWithTombstone(
 	if err = tbl.DedupSnapByPK(
 		tbl.store.ctx,
 		bat.GetVectorByName(catalog.AttrRowID), false, true); err != nil {
+		if moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry) {
+			return txnif.ErrTxnWWConflict
+		}
 		return err
 	}
 	tbl.store.IncreateWriteCnt()
