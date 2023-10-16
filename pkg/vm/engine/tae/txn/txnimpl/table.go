@@ -855,6 +855,15 @@ func (tbl *txnTable) RangeDelete(
 		return
 	}
 
+	blk, err := tbl.store.warChecker.CacheGet(
+		tbl.entry.GetDB().ID,
+		id.TableID, id.SegmentID(), false,
+		&id.BlockID)
+	if err != nil {
+		return
+	}
+	tbl.store.warChecker.Insert(blk)
+
 	// node := tbl.deleteNodes[*id]
 	// if node != nil {
 	// 	// TODO: refactor
