@@ -370,7 +370,7 @@ func (seg *localSegment) AddBlksWithMetaLoc(
 }
 
 func (seg *localSegment) DeleteFromIndex(from, to uint32, node InsertNode) (err error) {
-	schema := seg.table.GetLocalSchema(false)
+	schema := seg.table.GetLocalSchema(seg.isTombstone)
 	for i := from; i <= to; i++ {
 		v, _, err := node.GetValue(schema.GetSingleSortKeyIdx(), i)
 		if err != nil {
