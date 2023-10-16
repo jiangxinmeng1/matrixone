@@ -1092,9 +1092,7 @@ func TestFlushTabletail(t *testing.T) {
 	{
 		require.NoError(t, commitDeleteAfterFlush.Commit(context.Background()))
 		txn, rel := testutil.GetDefaultRelation(t, tae.DB, schema.Name)
-		logutil.Infof("lalala get by filter ******************************")
 		_, _, err := rel.GetByFilter(context.Background(), handle.NewEQFilter(bat.Vecs[2].Get(42)))
-		logutil.Infof("lalala get by filter ******************************")
 		require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotFound))
 
 		require.NoError(t, rel.Append(context.Background(), bat2))

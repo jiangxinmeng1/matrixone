@@ -179,35 +179,75 @@ func (tbl *txnTable) TransferDeletes(ts types.TS, phase string) (err error) {
 	if tbl.store.rt.TransferTable == nil {
 		return
 	}
-	if len(tbl.deleteNodes) == 0 {
+	if tbl.localTombStone == nil {
 		return
 	}
-	for id, node := range tbl.deleteNodes {
-		// search the read set to check wether the delete node relevant
-		// block was deleted.
-		// if not deleted, go to next
-		// if deleted, try to transfer the delete node
-		if err = tbl.store.warChecker.checkOne(
-			&id,
-			ts,
-		); err == nil {
-			continue
-		}
+	id := tbl.entry.AsCommonID()
+	for _, node := range tbl.localTombStone.nodes {
+		if node.IsPersisted() {
+			//TODO
+		} else {
+			an := node.(*anode)
+			for i := 0; i < an.data.Length(); i++ {
+				rowID := an.data.Vecs[0].Get(i).(types.Rowid)
+				id.BlockID = rowID.CloneBlockID()
+				// search the read set to check wether the delete node relevant
+				// block was deleted.
+				// if not deleted, go to next
+				// if deleted, try to transfer the delete node
+				if err = tbl.store.warChecker.checkOne(
+					id,
+					ts,
+				); err == nil {
+					continue
+				}
+				// if the error is not a r-w conflict. something wrong really happened
+				if !moerr.IsMoErrCode(err, moerr.ErrTxnRWConflict) {
+					return
+				}
 
-		// if the error is not a r-w conflict. something wrong really happened
-		if !moerr.IsMoErrCode(err, moerr.ErrTxnRWConflict) {
-			return
-		}
+				pk := an.data.Vecs[2].Window(i, 1)
 
-		// try to transfer the delete node
-		// here are some possible returns
-		// nil: transferred successfully
-		// ErrTxnRWConflict: the target block was also be compacted
-		// ErrTxnWWConflict: w-w error
-		if _, err = tbl.TransferDeleteNode(&id, node, phase); err != nil {
-			return
+				// try to transfer the delete node
+				// here are some possible returns
+				// nil: transferred successfully
+				// ErrTxnRWConflict: the target block was also be compacted
+				// ErrTxnWWConflict: w-w error
+				if _, err = tbl.TransferTombstone(id, rowID.GetRowOffset(), uint32(i), an, pk, phase); err != nil {
+					return
+				}
+			}
 		}
 	}
+	// if len(tbl.deleteNodes) == 0 {
+	// 	return
+	// }
+	// for id, node := range tbl.deleteNodes {
+	// 	// search the read set to check wether the delete node relevant
+	// 	// block was deleted.
+	// 	// if not deleted, go to next
+	// 	// if deleted, try to transfer the delete node
+	// 	if err = tbl.store.warChecker.checkOne(
+	// 		&id,
+	// 		ts,
+	// 	); err == nil {
+	// 		continue
+	// 	}
+
+	// 	// if the error is not a r-w conflict. something wrong really happened
+	// 	if !moerr.IsMoErrCode(err, moerr.ErrTxnRWConflict) {
+	// 		return
+	// 	}
+
+	// 	// try to transfer the delete node
+	// 	// here are some possible returns
+	// 	// nil: transferred successfully
+	// 	// ErrTxnRWConflict: the target block was also be compacted
+	// 	// ErrTxnWWConflict: w-w error
+	// 	if _, err = tbl.TransferDeleteNode(&id, node, phase); err != nil {
+	// 		return
+	// 	}
+	// }
 	return
 }
 
@@ -292,6 +332,19 @@ func (tbl *txnTable) TransferDeleteNode(
 	return
 }
 
+func (tbl *txnTable) TransferTombstone(
+	id *common.ID, rowOffset uint32, tombstoneOffset uint32, an *anode, pk containers.Vector, phase string,
+) (transferred bool, err error) {
+	if transferred, err = tbl.TransferTombstoneRows(id, rowOffset, pk, phase); err != nil {
+		return
+	}
+
+	// rollback transferred delete node. should not fail
+	err = tbl.localTombStone.RangeDelete(tombstoneOffset, tombstoneOffset)
+
+	return
+}
+
 func (tbl *txnTable) TransferDeleteRows(
 	id *common.ID,
 	rows []uint32,
@@ -335,6 +388,52 @@ func (tbl *txnTable) TransferDeleteRows(
 		if err = tbl.recurTransferDelete(memo, page, id, row, pk[row], depth); err != nil {
 			return
 		}
+	}
+
+	return
+}
+
+func (tbl *txnTable) TransferTombstoneRows(
+	id *common.ID,
+	row uint32,
+	pk containers.Vector,
+	phase string) (transferred bool, err error) {
+	memo := make(map[types.Blockid]*common.PinnedItem[*model.TransferHashPage])
+	common.DoIfInfoEnabled(func() {
+		logutil.Info("[Start]",
+			common.AnyField("txn-start-ts", tbl.store.txn.GetStartTS().ToString()),
+			common.OperationField("transfer-deletes"),
+			common.OperandField(id.BlockString()),
+			common.AnyField("phase", phase))
+	})
+	defer func() {
+		common.DoIfInfoEnabled(func() {
+			logutil.Info("[End]",
+				common.AnyField("txn-start-ts", tbl.store.txn.GetStartTS().ToString()),
+				common.OperationField("transfer-deletes"),
+				common.OperandField(id.BlockString()),
+				common.AnyField("phase", phase),
+				common.ErrorField(err))
+		})
+		for _, m := range memo {
+			m.Close()
+		}
+	}()
+
+	pinned, err := tbl.store.rt.TransferTable.Pin(*id)
+	// cannot find a transferred record. maybe the transferred record was TTL'ed
+	// here we can convert the error back to r-w conflict
+	if err != nil {
+		err = moerr.NewTxnRWConflictNoCtx()
+		return
+	}
+	memo[id.BlockID] = pinned
+
+	// logutil.Infof("TransferDeleteNode deletenode %s", node.DeleteNode.(*updates.DeleteNode).GeneralVerboseString())
+	page := pinned.Item()
+	depth := 0
+	if err = tbl.recurTransferDelete(memo, page, id, row, pk, depth); err != nil {
+		return
 	}
 
 	return
