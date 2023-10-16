@@ -306,7 +306,7 @@ func (task *flushTableTailTask) prepareAblkSortedData(ctx context.Context, blkid
 	}
 	blk := task.ablksHandles[blkidx]
 
-	views, err := blk.GetColumnDataByIds(ctx, idxs, false)
+	views, err := blk.GetColumnDataByIds(ctx, idxs, true)
 	if err != nil {
 		return
 	}

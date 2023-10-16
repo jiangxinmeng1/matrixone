@@ -383,7 +383,7 @@ func (blk *txnSysBlock) Prefetch(idxes []int) error {
 
 func (blk *txnSysBlock) GetColumnDataByName(ctx context.Context, attr string) (view *containers.ColumnView, err error) {
 	colIdx := blk.entry.GetSchema().GetColIdx(attr)
-	return blk.GetColumnDataById(ctx, colIdx, false)
+	return blk.GetColumnDataById(ctx, colIdx, true)
 }
 
 func (blk *txnSysBlock) GetColumnDataByNames(ctx context.Context, attrs []string) (view *containers.BlockView, err error) {

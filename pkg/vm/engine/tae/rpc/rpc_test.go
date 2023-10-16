@@ -1912,7 +1912,7 @@ func TestApplyDeltaloc(t *testing.T) {
 		for it.Valid() {
 			blk := it.GetBlock()
 			meta := blk.GetMeta().(*catalog.BlockEntry)
-			view, err := meta.GetBlockData().GetColumnDataById(context.Background(), txn0, schema, def.Idx, false)
+			view, err := meta.GetBlockData().GetColumnDataById(context.Background(), txn0, schema, def.Idx, true)
 			assert.NoError(t, err)
 			view.ApplyDeletes()
 			length += view.GetData().Length()

@@ -517,13 +517,13 @@ func TestMergeBlocks1(t *testing.T) {
 		it := rel.MakeBlockIt()
 		for it.Valid() {
 			blk := it.GetBlock()
-			view, _ := blk.GetColumnDataById(context.Background(), 3, false)
+			view, _ := blk.GetColumnDataById(context.Background(), 3, true)
 			assert.NotNil(t, view)
 			defer view.Close()
 			if view.DeleteMask != nil {
 				t.Log(view.DeleteMask.String())
 			}
-			pkView, _ := blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx(), false)
+			pkView, _ := blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx(), true)
 			defer pkView.Close()
 			for i := 0; i < pkView.Length(); i++ {
 				pkv, _ := pkView.GetValue(i)
@@ -621,7 +621,7 @@ func TestCompaction1(t *testing.T) {
 		it := rel.MakeBlockIt()
 		for it.Valid() {
 			blk := it.GetBlock()
-			view, _ := blk.GetColumnDataById(context.Background(), 3, false)
+			view, _ := blk.GetColumnDataById(context.Background(), 3, true)
 			assert.NotNil(t, view)
 			view.Close()
 			assert.True(t, blk.GetMeta().(*catalog.BlockEntry).GetBlockData().IsAppendable())
@@ -643,7 +643,7 @@ func TestCompaction1(t *testing.T) {
 		it := rel.MakeBlockIt()
 		for it.Valid() {
 			blk := it.GetBlock()
-			view, _ := blk.GetColumnDataById(context.Background(), 3, false)
+			view, _ := blk.GetColumnDataById(context.Background(), 3, true)
 			assert.NotNil(t, view)
 			view.Close()
 			assert.False(t, blk.GetMeta().(*catalog.BlockEntry).GetBlockData().IsAppendable())
@@ -689,7 +689,7 @@ func TestCompaction2(t *testing.T) {
 		it := rel.MakeBlockIt()
 		for it.Valid() {
 			blk := it.GetBlock()
-			view, _ := blk.GetColumnDataById(context.Background(), 3, false)
+			view, _ := blk.GetColumnDataById(context.Background(), 3, true)
 			assert.NotNil(t, view)
 			view.Close()
 			assert.False(t, blk.GetMeta().(*catalog.BlockEntry).IsAppendable())
@@ -704,7 +704,7 @@ func TestCompaction2(t *testing.T) {
 		it := rel.MakeBlockIt()
 		for it.Valid() {
 			blk := it.GetBlock()
-			view, _ := blk.GetColumnDataById(context.Background(), 3, false)
+			view, _ := blk.GetColumnDataById(context.Background(), 3, true)
 			assert.NotNil(t, view)
 			view.Close()
 			assert.False(t, blk.GetMeta().(*catalog.BlockEntry).IsAppendable())
