@@ -510,8 +510,8 @@ func (tbl *txnTable) GetSegment(id *types.Segmentid, isTombstone bool) (seg hand
 	return
 }
 
-func (tbl *txnTable) SoftDeleteSegment(id *types.Segmentid) (err error) {
-	txnEntry, err := tbl.entry.DropSegmentEntry(id, tbl.store.txn)
+func (tbl *txnTable) SoftDeleteSegment(id *types.Segmentid, isTombstone bool) (err error) {
+	txnEntry, err := tbl.entry.DropSegmentEntry(id, tbl.store.txn, isTombstone)
 	if err != nil {
 		return
 	}
@@ -519,7 +519,7 @@ func (tbl *txnTable) SoftDeleteSegment(id *types.Segmentid) (err error) {
 	if txnEntry != nil {
 		tbl.txnEntries.Append(txnEntry)
 	}
-	tbl.store.txn.GetMemo().AddSegment(tbl.entry.GetDB().GetID(), tbl.entry.ID, id)
+	tbl.store.txn.GetMemo().AddSegment(tbl.entry.GetDB().GetID(), tbl.entry.ID, id, isTombstone)
 	return
 }
 
@@ -548,7 +548,7 @@ func (tbl *txnTable) createSegment(state catalog.EntryState, is1PC bool, isTombs
 	}
 	seg = newSegment(tbl, meta)
 	tbl.store.IncreateWriteCnt()
-	tbl.store.txn.GetMemo().AddSegment(tbl.entry.GetDB().ID, tbl.entry.ID, &meta.ID)
+	tbl.store.txn.GetMemo().AddSegment(tbl.entry.GetDB().ID, tbl.entry.ID, &meta.ID,isTombstone)
 	if is1PC {
 		meta.Set1PC()
 	}
@@ -556,7 +556,7 @@ func (tbl *txnTable) createSegment(state catalog.EntryState, is1PC bool, isTombs
 	return
 }
 
-func (tbl *txnTable) SoftDeleteBlock(id *common.ID) (err error) {
+func (tbl *txnTable) SoftDeleteBlock(id *common.ID, isTombstone bool) (err error) {
 	var seg *catalog.SegmentEntry
 	if seg, err = tbl.entry.GetSegmentByID(id.SegmentID(), false); err != nil {
 		return
@@ -566,7 +566,7 @@ func (tbl *txnTable) SoftDeleteBlock(id *common.ID) (err error) {
 		return
 	}
 	tbl.store.IncreateWriteCnt()
-	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID)
+	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID, isTombstone)
 	if meta != nil {
 		tbl.txnEntries.Append(meta)
 	}
@@ -642,7 +642,7 @@ func (tbl *txnTable) createBlock(
 	}
 	tbl.store.IncreateWriteCnt()
 	id := meta.AsCommonID()
-	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID)
+	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID, isTombstone)
 	tbl.txnEntries.Append(meta)
 	return buildBlock(tbl, meta), err
 }
@@ -711,7 +711,7 @@ func (tbl *txnTable) AddDeleteNode(id *common.ID, node txnif.DeleteNode) error {
 		return ErrDuplicateNode
 	}
 	tbl.store.IncreateWriteCnt()
-	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID)
+	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID,false)
 	tbl.deleteNodes[nid] = newDeleteNode(node, tbl.txnEntries.Len())
 	tbl.txnEntries.Append(node)
 	return nil
@@ -1044,11 +1044,11 @@ func (tbl *txnTable) GetValue(ctx context.Context, id *common.ID, row uint32, co
 	return block.GetValue(ctx, tbl.store.txn, tbl.GetLocalSchema(false), int(row), int(col))
 }
 
-func (tbl *txnTable) UpdateMetaLoc(id *common.ID, metaLoc objectio.Location) (err error) {
+func (tbl *txnTable) UpdateMetaLoc(id *common.ID, metaLoc objectio.Location, isTombstone bool) (err error) {
 	meta, err := tbl.store.warChecker.CacheGet(
 		tbl.entry.GetDB().ID,
 		id.TableID,
-		id.SegmentID(), false,
+		id.SegmentID(), isTombstone,
 		&id.BlockID)
 	if err != nil {
 		panic(err)
@@ -1057,7 +1057,7 @@ func (tbl *txnTable) UpdateMetaLoc(id *common.ID, metaLoc objectio.Location) (er
 	if err != nil {
 		return
 	}
-	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID)
+	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID, isTombstone)
 	if isNewNode {
 		tbl.txnEntries.Append(meta)
 	}
@@ -1077,7 +1077,7 @@ func (tbl *txnTable) UpdateDeltaLoc(id *common.ID, deltaloc objectio.Location) (
 	if err != nil {
 		return
 	}
-	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID)
+	tbl.store.txn.GetMemo().AddBlock(tbl.entry.GetDB().ID, id.TableID, &id.BlockID,false)
 	if isNewNode {
 		tbl.txnEntries.Append(meta)
 	}

@@ -376,19 +376,19 @@ func (db *txnDB) CreateBlock(id *common.ID, is1PC bool, isTombstone bool) (blk h
 	return table.CreateBlock(id.SegmentID(), is1PC, isTombstone)
 }
 
-func (db *txnDB) SoftDeleteBlock(id *common.ID) (err error) {
+func (db *txnDB) SoftDeleteBlock(id *common.ID, isTombstone bool) (err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(id.TableID); err != nil {
 		return
 	}
-	return table.SoftDeleteBlock(id)
+	return table.SoftDeleteBlock(id, isTombstone)
 }
-func (db *txnDB) UpdateMetaLoc(id *common.ID, metaLoc objectio.Location) (err error) {
+func (db *txnDB) UpdateMetaLoc(id *common.ID, metaLoc objectio.Location, isTombstone bool) (err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(id.TableID); err != nil {
 		return
 	}
-	return table.UpdateMetaLoc(id, metaLoc)
+	return table.UpdateMetaLoc(id, metaLoc, isTombstone)
 }
 func (db *txnDB) UpdateDeltaLoc(id *common.ID, deltaLoc objectio.Location) (err error) {
 	var table *txnTable
@@ -397,12 +397,12 @@ func (db *txnDB) UpdateDeltaLoc(id *common.ID, deltaLoc objectio.Location) (err 
 	}
 	return table.UpdateDeltaLoc(id, deltaLoc)
 }
-func (db *txnDB) SoftDeleteSegment(id *common.ID) (err error) {
+func (db *txnDB) SoftDeleteSegment(id *common.ID, isTombstone bool) (err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(id.TableID); err != nil {
 		return
 	}
-	return table.SoftDeleteSegment(id.SegmentID())
+	return table.SoftDeleteSegment(id.SegmentID(),isTombstone)
 }
 func (db *txnDB) NeedRollback() bool {
 	return db.createEntry != nil && db.dropEntry != nil

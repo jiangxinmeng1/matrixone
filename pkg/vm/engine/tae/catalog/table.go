@@ -424,8 +424,8 @@ func (entry *TableEntry) RecurLoop(processor Processor) (err error) {
 	return
 }
 
-func (entry *TableEntry) DropSegmentEntry(id *types.Segmentid, txn txnif.AsyncTxn) (deleted *SegmentEntry, err error) {
-	seg, err := entry.GetSegmentByID(id, false)
+func (entry *TableEntry) DropSegmentEntry(id *types.Segmentid, txn txnif.AsyncTxn, isTombstone bool) (deleted *SegmentEntry, err error) {
+	seg, err := entry.GetSegmentByID(id, isTombstone)
 	if err != nil {
 		return
 	}

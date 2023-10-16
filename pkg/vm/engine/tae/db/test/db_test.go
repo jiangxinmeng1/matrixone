@@ -4118,7 +4118,7 @@ func TestUpdateAttr(t *testing.T) {
 	blk, err = seg.CreateBlock(false)
 	assert.NoError(t, err)
 	blk.GetMeta().(*catalog.BlockEntry).UpdateDeltaLoc(txn, objectio.Location("test_2"))
-	rel.SoftDeleteSegment(seg.GetID())
+	rel.SoftDeleteSegment(seg.GetID(),false)
 	assert.NoError(t, txn.Commit(context.Background()))
 
 	t.Log(tae.Catalog.SimplePPString(3))
@@ -7409,14 +7409,14 @@ func TestGCCatalog1(t *testing.T) {
 	assert.NoError(t, err)
 	tb3, err = db2.GetRelationByName("tb3")
 	assert.NoError(t, err)
-	err = tb3.SoftDeleteSegment(seg4.GetID())
+	err = tb3.SoftDeleteSegment(seg4.GetID(),false)
 	assert.NoError(t, err)
 
 	db2, err = txn3.GetDatabase("db1")
 	assert.NoError(t, err)
 	tb3, err = db2.GetRelationByName("tb2")
 	assert.NoError(t, err)
-	err = tb3.SoftDeleteSegment(seg3.GetID())
+	err = tb3.SoftDeleteSegment(seg3.GetID(),false)
 	assert.NoError(t, err)
 
 	err = txn3.Commit(context.Background())

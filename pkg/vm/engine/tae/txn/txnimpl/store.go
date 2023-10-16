@@ -214,7 +214,7 @@ func (store *txnStore) TryDeleteByDeltaloc(
 	return db.TryDeleteByDeltaloc(id, deltaloc)
 }
 
-func (store *txnStore) UpdateMetaLoc(id *common.ID, metaLoc objectio.Location) (err error) {
+func (store *txnStore) UpdateMetaLoc(id *common.ID, metaLoc objectio.Location, isTombstone bool) (err error) {
 	store.IncreateWriteCnt()
 	db, err := store.getOrSetDB(id.DbID)
 	if err != nil {
@@ -223,7 +223,7 @@ func (store *txnStore) UpdateMetaLoc(id *common.ID, metaLoc objectio.Location) (
 	// if table.IsDeleted() {
 	// 	return txnbase.ErrNotFound
 	// }
-	return db.UpdateMetaLoc(id, metaLoc)
+	return db.UpdateMetaLoc(id, metaLoc, isTombstone)
 }
 
 func (store *txnStore) UpdateDeltaLoc(id *common.ID, deltaLoc objectio.Location) (err error) {
@@ -580,7 +580,7 @@ func (store *txnStore) CreateBlock(id *common.ID, is1PC bool, isTombstone bool) 
 	return db.CreateBlock(id, is1PC, isTombstone)
 }
 
-func (store *txnStore) SoftDeleteBlock(id *common.ID) (err error) {
+func (store *txnStore) SoftDeleteBlock(id *common.ID, isTombstone bool) (err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(id.DbID); err != nil {
 		return
@@ -588,10 +588,10 @@ func (store *txnStore) SoftDeleteBlock(id *common.ID) (err error) {
 	perfcounter.Update(store.ctx, func(counter *perfcounter.CounterSet) {
 		counter.TAE.Block.SoftDelete.Add(1)
 	})
-	return db.SoftDeleteBlock(id)
+	return db.SoftDeleteBlock(id, isTombstone)
 }
 
-func (store *txnStore) SoftDeleteSegment(id *common.ID) (err error) {
+func (store *txnStore) SoftDeleteSegment(id *common.ID, isTombstone bool) (err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(id.DbID); err != nil {
 		return
@@ -599,7 +599,7 @@ func (store *txnStore) SoftDeleteSegment(id *common.ID) (err error) {
 	perfcounter.Update(store.ctx, func(counter *perfcounter.CounterSet) {
 		counter.TAE.Segment.SoftDelete.Add(1)
 	})
-	return db.SoftDeleteSegment(id)
+	return db.SoftDeleteSegment(id, isTombstone)
 }
 
 func (store *txnStore) ApplyRollback() (err error) {

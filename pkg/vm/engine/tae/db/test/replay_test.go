@@ -261,7 +261,7 @@ func TestReplayCatalog3(t *testing.T) {
 	assert.Nil(t, err)
 	rel, err = e.GetRelationByName(schema.Name)
 	assert.Nil(t, err)
-	err = rel.SoftDeleteSegment(seg.GetID())
+	err = rel.SoftDeleteSegment(seg.GetID(), false)
 	assert.Nil(t, err)
 	assert.Nil(t, txn.Commit(context.Background()))
 
@@ -1352,7 +1352,7 @@ func TestReplaySnapshots(t *testing.T) {
 	assert.NoError(t, err)
 	rel, err = db.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	err = rel.SoftDeleteSegment(seg.GetID())
+	err = rel.SoftDeleteSegment(seg.GetID(), false)
 	assert.NoError(t, err)
 	assert.NoError(t, txn.Commit(context.Background()))
 

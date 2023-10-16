@@ -81,7 +81,7 @@ func (rel *TxnRelation) GetDB() (handle.Database, error) { return nil, nil }
 func (rel *TxnRelation) GetSegment(id *types.Segmentid, isTombstone bool) (seg handle.Segment, err error) {
 	return
 }
-func (rel *TxnRelation) SoftDeleteSegment(id *types.Segmentid) (err error)        { return }
+func (rel *TxnRelation) SoftDeleteSegment(id *types.Segmentid, isTombstone bool) (err error)        { return }
 func (rel *TxnRelation) CreateSegment(bool, bool) (seg handle.Segment, err error) { return }
 func (rel *TxnRelation) CreateNonAppendableSegment(bool, bool) (seg handle.Segment, err error) {
 	return

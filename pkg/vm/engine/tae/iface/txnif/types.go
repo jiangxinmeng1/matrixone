@@ -282,9 +282,9 @@ type TxnStore interface {
 	CreateBlock(id *common.ID, is1PC bool, isTombstone bool) (handle.Block, error)
 	GetBlock(id *common.ID, isTombstone bool) (handle.Block, error)
 	CreateNonAppendableBlock(id *common.ID, isTombstone bool, opts *objectio.CreateBlockOpt) (handle.Block, error)
-	SoftDeleteSegment(id *common.ID) error
-	SoftDeleteBlock(id *common.ID) error
-	UpdateMetaLoc(id *common.ID, metaLoc objectio.Location) (err error)
+	SoftDeleteSegment(id *common.ID, isTombstone bool) error
+	SoftDeleteBlock(id *common.ID, isTombstone bool) error
+	UpdateMetaLoc(id *common.ID, metaLoc objectio.Location, isTombstone bool) (err error)
 	UpdateDeltaLoc(id *common.ID, deltaLoc objectio.Location) (err error)
 
 	AddTxnEntry(TxnEntryType, TxnEntry)

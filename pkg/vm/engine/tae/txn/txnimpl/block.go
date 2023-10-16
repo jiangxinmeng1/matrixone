@@ -208,7 +208,7 @@ func (blk *txnBlock) GetDeltaLoc() (deltaloc objectio.Location) {
 }
 func (blk *txnBlock) UpdateMetaLoc(metaLoc objectio.Location) (err error) {
 	blkID := blk.Fingerprint()
-	err = blk.Txn.GetStore().UpdateMetaLoc(blkID, metaLoc)
+	err = blk.Txn.GetStore().UpdateMetaLoc(blkID, metaLoc, blk.entry.GetSegment().IsTombstone)
 	return
 }
 

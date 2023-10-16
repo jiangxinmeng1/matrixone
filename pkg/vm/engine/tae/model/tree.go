@@ -111,8 +111,9 @@ type TableTree struct {
 }
 
 type SegmentTree struct {
-	ID   *objectio.Segmentid
-	Blks map[keyT]struct{}
+	ID          *objectio.Segmentid
+	IsTombstone bool
+	Blks        map[keyT]struct{}
 }
 
 func NewTree() *Tree {
@@ -129,10 +130,11 @@ func NewTableTree(dbID, id uint64) *TableTree {
 	}
 }
 
-func NewSegmentTree(id *objectio.Segmentid) *SegmentTree {
+func NewSegmentTree(id *objectio.Segmentid, isTombstone bool) *SegmentTree {
 	return &SegmentTree{
-		ID:   id,
-		Blks: make(map[keyT]struct{}),
+		ID:          id,
+		IsTombstone: isTombstone,
+		Blks:        make(map[keyT]struct{}),
 	}
 }
 
@@ -225,20 +227,20 @@ func (tree *Tree) AddTable(dbID, id uint64) {
 	}
 }
 
-func (tree *Tree) AddSegment(dbID, tableID uint64, id *objectio.Segmentid) {
+func (tree *Tree) AddSegment(dbID, tableID uint64, id *objectio.Segmentid, isTombstone bool) {
 	var table *TableTree
 	var exist bool
 	if table, exist = tree.Tables[tableID]; !exist {
 		table = NewTableTree(dbID, tableID)
 		tree.Tables[tableID] = table
 	}
-	table.AddSegment(id)
+	table.AddSegment(id, isTombstone)
 }
 
-func (tree *Tree) AddBlock(dbID, tableID uint64, id *objectio.Blockid) {
+func (tree *Tree) AddBlock(dbID, tableID uint64, id *objectio.Blockid, isTombstone bool) {
 	sid := objectio.ToSegmentId(id)
-	tree.AddSegment(dbID, tableID, sid)
-	tree.Tables[tableID].AddBlock(id)
+	tree.AddSegment(dbID, tableID, sid, isTombstone)
+	tree.Tables[tableID].AddBlock(id, isTombstone)
 }
 
 func (tree *Tree) Shrink(tableID uint64) (empty bool) {
@@ -323,16 +325,16 @@ func (ttree *TableTree) GetSegment(id types.Uuid) *SegmentTree {
 	return ttree.Segs[id]
 }
 
-func (ttree *TableTree) AddSegment(sid *objectio.Segmentid) {
+func (ttree *TableTree) AddSegment(sid *objectio.Segmentid, isTombstone bool) {
 	id := *sid
 	if _, exist := ttree.Segs[id]; !exist {
-		ttree.Segs[id] = NewSegmentTree(&id)
+		ttree.Segs[id] = NewSegmentTree(&id, isTombstone)
 	}
 }
 
-func (ttree *TableTree) AddBlock(id *objectio.Blockid) {
+func (ttree *TableTree) AddBlock(id *objectio.Blockid, isTombstone bool) {
 	sid := objectio.ToSegmentId(id)
-	ttree.AddSegment(sid)
+	ttree.AddSegment(sid, isTombstone)
 	ttree.Segs[*sid].AddBlock(id.Offsets())
 }
 
@@ -380,7 +382,7 @@ func (ttree *TableTree) Merge(ot *TableTree) {
 		panic(fmt.Sprintf("Cannot merge 2 different table tree: %d, %d", ttree.ID, ot.ID))
 	}
 	for _, seg := range ot.Segs {
-		ttree.AddSegment(seg.ID)
+		ttree.AddSegment(seg.ID, seg.IsTombstone)
 		ttree.Segs[*seg.ID].Merge(seg)
 	}
 }
@@ -425,7 +427,7 @@ func (ttree *TableTree) ReadFrom(r io.Reader) (n int64, err error) {
 	var tmpn int64
 	for i := 0; i < int(cnt); i++ {
 		id := objectio.NewSegmentid()
-		seg := NewSegmentTree(id)
+		seg := NewSegmentTree(id, false)
 		if tmpn, err = seg.ReadFrom(r); err != nil {
 			return
 		}
@@ -503,6 +505,10 @@ func (stree *SegmentTree) WriteTo(w io.Writer) (n int64, err error) {
 		return
 	}
 	n += int64(types.UuidSize)
+	if _, err = w.Write(types.EncodeBool(&stree.IsTombstone)); err != nil {
+		return
+	}
+	n += 1
 	cnt := uint32(len(stree.Blks))
 	if _, err = w.Write(types.EncodeUint32(&cnt)); err != nil {
 		return
@@ -537,6 +543,10 @@ func (stree *SegmentTree) ReadFrom(r io.Reader) (n int64, err error) {
 		return
 	}
 	n += int64(types.UuidSize)
+	if _, err = r.Read(types.EncodeBool(&stree.IsTombstone)); err != nil {
+		return
+	}
+	n += 1
 	var cnt uint32
 	if _, err = r.Read(types.EncodeUint32(&cnt)); err != nil {
 		return

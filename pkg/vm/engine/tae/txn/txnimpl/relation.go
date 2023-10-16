@@ -183,10 +183,10 @@ func (h *txnRelation) CreateNonAppendableSegment(is1PC bool, isTombstone bool) (
 	return h.Txn.GetStore().CreateNonAppendableSegment(h.table.entry.GetDB().ID, h.table.entry.GetID(), is1PC, isTombstone)
 }
 
-func (h *txnRelation) SoftDeleteSegment(id *types.Segmentid) (err error) {
+func (h *txnRelation) SoftDeleteSegment(id *types.Segmentid, isTombstone bool) (err error) {
 	fp := h.table.entry.AsCommonID()
 	fp.SetSegmentID(id)
-	return h.Txn.GetStore().SoftDeleteSegment(fp)
+	return h.Txn.GetStore().SoftDeleteSegment(fp, isTombstone)
 }
 
 func (h *txnRelation) MakeSegmentItOnSnap(isTombStone bool) handle.SegmentIt {

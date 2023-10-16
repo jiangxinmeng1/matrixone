@@ -62,7 +62,7 @@ func (t *delSegTask) Execute(ctx context.Context) (err error) {
 		return
 	}
 	for _, entry := range t.delSegs {
-		if err = rel.SoftDeleteSegment(&entry.ID); err != nil {
+		if err = rel.SoftDeleteSegment(&entry.ID,entry.IsTombstone); err != nil {
 			return
 		}
 	}

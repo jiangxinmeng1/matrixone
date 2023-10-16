@@ -235,7 +235,7 @@ func (seg *txnSegment) IsAppendable() bool { return seg.entry.IsAppendable() }
 func (seg *txnSegment) SoftDeleteBlock(id types.Blockid) (err error) {
 	fp := seg.entry.AsCommonID()
 	fp.BlockID = id
-	return seg.Txn.GetStore().SoftDeleteBlock(fp)
+	return seg.Txn.GetStore().SoftDeleteBlock(fp, seg.entry.IsTombstone)
 }
 
 func (seg *txnSegment) GetRelation() (rel handle.Relation) {

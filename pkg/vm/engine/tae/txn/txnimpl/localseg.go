@@ -235,7 +235,7 @@ func (seg *localSegment) prepareApplyANode(node *anode) error {
 		id := appender.GetID()
 		seg.table.store.warChecker.Insert(appender.GetMeta().(*catalog.BlockEntry))
 		seg.table.store.txn.GetMemo().AddBlock(seg.table.entry.GetDB().ID,
-			id.TableID, &id.BlockID)
+			id.TableID, &id.BlockID,seg.isTombstone)
 		seg.appends = append(seg.appends, ctx)
 		// logutil.Debugf("%s: toAppend %d, appended %d, blks=%d",
 		// 	id.String(), toAppend, appended, len(seg.appends))

@@ -58,7 +58,7 @@ type Relation interface {
 	CreateSegment(bool, bool) (Segment, error)
 	CreateNonAppendableSegment(is1PC bool, isTombstone bool) (Segment, error)
 	GetSegment(id *types.Segmentid, isTombstone bool) (Segment, error)
-	SoftDeleteSegment(id *types.Segmentid) (err error)
+	SoftDeleteSegment(id *types.Segmentid, isTombstone bool) (err error)
 
 	GetDB() (Database, error)
 }

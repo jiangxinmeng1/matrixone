@@ -112,14 +112,14 @@ func (store *NoopTxnStore) CreateNonAppendableBlock(*common.ID, bool, *objectio.
 	return
 }
 
-func (store *NoopTxnStore) UpdateMetaLoc(id *common.ID, un objectio.Location) (err error) {
+func (store *NoopTxnStore) UpdateMetaLoc(id *common.ID, un objectio.Location, isTombstone bool) (err error) {
 	return
 }
 func (store *NoopTxnStore) UpdateDeltaLoc(id *common.ID, un objectio.Location) (err error) {
 	return
 }
-func (store *NoopTxnStore) SoftDeleteBlock(id *common.ID) (err error)                { return }
-func (store *NoopTxnStore) SoftDeleteSegment(id *common.ID) (err error)              { return }
+func (store *NoopTxnStore) SoftDeleteBlock(id *common.ID, isTombstone bool) (err error)                { return }
+func (store *NoopTxnStore) SoftDeleteSegment(id *common.ID, isTombstone bool) (err error)              { return }
 func (store *NoopTxnStore) BatchDedup(uint64, uint64, containers.Vector) (err error) { return }
 func (store *NoopTxnStore) Update(uint64, *common.ID, uint32, uint16, any) (err error) {
 	return

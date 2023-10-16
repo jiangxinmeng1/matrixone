@@ -273,7 +273,7 @@ func (task *mergeBlocksTask) Execute(ctx context.Context) (err error) {
 			}
 		}
 		for _, entry := range task.mergedSegs {
-			if err = task.rel.SoftDeleteSegment(&entry.ID); err != nil {
+			if err = task.rel.SoftDeleteSegment(&entry.ID, entry.IsTombstone); err != nil {
 				return err
 			}
 		}
@@ -415,7 +415,7 @@ func (task *mergeBlocksTask) Execute(ctx context.Context) (err error) {
 		}
 	}
 	for _, entry := range task.mergedSegs {
-		if err = task.rel.SoftDeleteSegment(&entry.ID); err != nil {
+		if err = task.rel.SoftDeleteSegment(&entry.ID, entry.IsTombstone); err != nil {
 			return err
 		}
 	}
