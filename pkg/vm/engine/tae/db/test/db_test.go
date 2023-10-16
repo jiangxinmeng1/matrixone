@@ -352,6 +352,7 @@ func TestTableHandle(t *testing.T) {
 	schema.SegmentMaxBlocks = 2
 
 	txn, _ := db.StartTxn(nil)
+	
 	database, _ := txn.CreateDatabase("db", "", "")
 	rel, _ := database.CreateRelation(schema)
 

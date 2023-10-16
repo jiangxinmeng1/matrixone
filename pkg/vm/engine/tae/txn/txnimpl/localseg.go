@@ -128,6 +128,11 @@ func (seg *localSegment) ApplyAppend() (err error) {
 	for _, ctx := range seg.appends {
 		bat, _ := ctx.node.Window(ctx.start, ctx.start+ctx.count)
 		defer bat.Close()
+		if seg.isTombstone {
+			commitTSVec := containers.NewConstFixed(types.T_TS.ToType(), seg.table.store.txn.GetPrepareTS(), bat.Length())
+			bat.Vecs[1].Close()
+			bat.Vecs[1] = commitTSVec
+		}
 		if destOff, err = ctx.driver.ApplyAppend(
 			bat,
 			seg.table.store.txn); err != nil {
