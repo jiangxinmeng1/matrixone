@@ -352,7 +352,7 @@ func TestTableHandle(t *testing.T) {
 	schema.SegmentMaxBlocks = 2
 
 	txn, _ := db.StartTxn(nil)
-	
+
 	database, _ := txn.CreateDatabase("db", "", "")
 	rel, _ := database.CreateRelation(schema)
 
@@ -450,7 +450,10 @@ func TestNonAppendableBlock(t *testing.T) {
 		assert.Nil(t, view.DeleteMask)
 		assert.Equal(t, bat.Vecs[2].Length(), view.Length())
 
-		_, err = dataBlk.RangeDelete(txn, 1, 2, nil, handle.DT_Normal)
+		pkView,err:=dataBlk.GetColumnDataById(context.Background(),txn,schema,schema.GetPrimaryKey().Idx,false)
+		assert.Nil(t, err)
+		pkVec:=pkView.GetData()
+		_, err = dataBlk.RangeDelete(txn, 1, 2, pkVec.CloneWindow(1,2), handle.DT_Normal)
 		assert.Nil(t, err)
 
 		view, err = dataBlk.GetColumnDataById(context.Background(), txn, readSchema, 2, true)

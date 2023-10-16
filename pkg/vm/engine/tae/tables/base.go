@@ -673,18 +673,20 @@ func (blk *baseBlock) DeletesInfo() string {
 	return blk.mvcc.GetDeleteChain().StringLocked()
 }
 
+// Only used in test.
 func (blk *baseBlock) RangeDelete(
 	txn txnif.AsyncTxn,
 	start, end uint32,
 	pk containers.Vector,
 	dt handle.DeleteType) (node txnif.DeleteNode, err error) {
-	blk.Lock()
-	defer blk.Unlock()
-	if err = blk.mvcc.CheckNotDeleted(start, end, txn.GetStartTS()); err != nil {
-		return
-	}
-	node = blk.mvcc.CreateDeleteNode(txn, dt)
-	node.RangeDeleteLocked(start, end, pk)
+	return nil, txn.GetStore().RangeDelete(blk.GetID(), start, end, pk, dt)
+	// blk.Lock()
+	// defer blk.Unlock()
+	// if err = blk.mvcc.CheckNotDeleted(start, end, txn.GetStartTS()); err != nil {
+	// 	return
+	// }
+	// node = blk.mvcc.CreateDeleteNode(txn, dt)
+	// node.RangeDeleteLocked(start, end, pk)
 	return
 }
 
