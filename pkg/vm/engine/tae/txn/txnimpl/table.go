@@ -482,6 +482,11 @@ func (tbl *txnTable) CollectCmd(cmdMgr *commandManager) (err error) {
 			return
 		}
 	}
+	if tbl.localTombStone != nil {
+		if err = tbl.localTombStone.CollectCmd(cmdMgr); err != nil {
+			return
+		}
+	}
 	return
 }
 
