@@ -1831,6 +1831,9 @@ func (tbl *txnTable) CleanUp() {
 	if tbl.localSegment != nil {
 		tbl.localSegment.CloseAppends()
 	}
+	if tbl.localTombStone != nil {
+		tbl.localTombStone.CloseAppends()
+	}
 }
 
 func (tbl *txnTable) rangeDeleteWithTombstone(
