@@ -48,6 +48,18 @@ func RoaringToMOBitmap(bm *roaring.Bitmap) *nulls.Bitmap {
 	return nbm
 }
 
+func MOToMRoaringBitmap(bm *nulls.Bitmap) *roaring.Bitmap {
+	if bm == nil {
+		return nil
+	}
+	nbm := &roaring.Bitmap{}
+	iterator := bm.GetBitmap().Iterator()
+	for iterator.HasNext() {
+		nbm.Add(uint32(iterator.Next()))
+	}
+	return nbm
+}
+
 func MOOrRoaringBitmap(bm *nulls.Bitmap, rbm *roaring.Bitmap) {
 	if bm == nil || rbm == nil {
 		return

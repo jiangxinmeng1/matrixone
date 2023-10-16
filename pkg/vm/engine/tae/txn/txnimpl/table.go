@@ -1316,13 +1316,21 @@ func (tbl *txnTable) DedupSnapByPK(ctx context.Context, keys containers.Vector, 
 			continue
 		}
 		var rowmask *roaring.Bitmap
-		if len(tbl.deleteNodes) > 0 {
-			fp := blk.AsCommonID()
-			deleteNode := tbl.deleteNodes[*fp]
-			if deleteNode != nil {
-				rowmask = deleteNode.GetRowMaskRefLocked()
+		if tbl.localTombStone != nil {
+			view := &containers.BaseView{}
+			err = tbl.FillInWorkSpaceDeletesByTombstone(&blk.ID, view)
+			if err != nil {
+				return
 			}
+			rowmask = common.MOToMRoaringBitmap(view.DeleteMask)
 		}
+		// if len(tbl.deleteNodes) > 0 {
+		// 	fp := blk.AsCommonID()
+		// 	deleteNode := tbl.deleteNodes[*fp]
+		// 	if deleteNode != nil {
+		// 		rowmask = deleteNode.GetRowMaskRefLocked()
+		// 	}
+		// }
 		location := blk.FastGetMetaLoc()
 		if len(location) > 0 {
 			var skip bool
@@ -1397,13 +1405,21 @@ func (tbl *txnTable) DedupSnapByMetaLocs(ctx context.Context, metaLocs []objecti
 			}
 
 			var rowmask *roaring.Bitmap
-			if len(tbl.deleteNodes) > 0 {
-				fp := blk.AsCommonID()
-				deleteNode := tbl.deleteNodes[*fp]
-				if deleteNode != nil {
-					rowmask = deleteNode.GetRowMaskRefLocked()
+			if tbl.localTombStone != nil {
+				view := &containers.BaseView{}
+				err = tbl.FillInWorkSpaceDeletesByTombstone(&blk.ID, view)
+				if err != nil {
+					return
 				}
+				rowmask = common.MOToMRoaringBitmap(view.DeleteMask)
 			}
+			// if len(tbl.deleteNodes) > 0 {
+			// 	fp := blk.AsCommonID()
+			// 	deleteNode := tbl.deleteNodes[*fp]
+			// 	if deleteNode != nil {
+			// 		rowmask = deleteNode.GetRowMaskRefLocked()
+			// 	}
+			// }
 			//TODO::laod zm index first, then load pk column if necessary.
 			_, ok := loaded[i]
 			if !ok {
@@ -1503,16 +1519,24 @@ func (tbl *txnTable) DoPrecommitDedupByPK(pks containers.Vector, pksZM index.ZM,
 				}
 				blkData := blk.GetBlockData()
 				var rowmask *roaring.Bitmap
-				if len(tbl.deleteNodes) > 0 {
-					if tbl.store.warChecker.HasConflict(blk.ID) {
-						continue
+				if tbl.localTombStone != nil {
+					view := &containers.BaseView{}
+					err = tbl.FillInWorkSpaceDeletesByTombstone(&blk.ID, view)
+					if err != nil {
+						return
 					}
-					fp := blk.AsCommonID()
-					deleteNode := tbl.deleteNodes[*fp]
-					if deleteNode != nil {
-						rowmask = deleteNode.GetRowMaskRefLocked()
-					}
+					rowmask = common.MOToMRoaringBitmap(view.DeleteMask)
 				}
+				// if len(tbl.deleteNodes) > 0 {
+				// 	if tbl.store.warChecker.HasConflict(blk.ID) {
+				// 		continue
+				// 	}
+				// 	fp := blk.AsCommonID()
+				// 	deleteNode := tbl.deleteNodes[*fp]
+				// 	if deleteNode != nil {
+				// 		rowmask = deleteNode.GetRowMaskRefLocked()
+				// 	}
+				// }
 				if err = blkData.BatchDedup(
 					context.Background(),
 					tbl.store.txn,
@@ -1598,16 +1622,24 @@ func (tbl *txnTable) DoPrecommitDedupByNode(ctx context.Context, node InsertNode
 			}
 			blkData := blk.GetBlockData()
 			var rowmask *roaring.Bitmap
-			if len(tbl.deleteNodes) > 0 {
-				if tbl.store.warChecker.HasConflict(blk.ID) {
-					continue
+			if tbl.localTombStone != nil {
+				view := &containers.BaseView{}
+				err = tbl.FillInWorkSpaceDeletesByTombstone(&blk.ID, view)
+				if err != nil {
+					return
 				}
-				fp := blk.AsCommonID()
-				deleteNode := tbl.deleteNodes[*fp]
-				if deleteNode != nil {
-					rowmask = deleteNode.GetRowMaskRefLocked()
-				}
+				rowmask = common.MOToMRoaringBitmap(view.DeleteMask)
 			}
+			// if len(tbl.deleteNodes) > 0 {
+			// 	if tbl.store.warChecker.HasConflict(blk.ID) {
+			// 		continue
+			// 	}
+			// 	fp := blk.AsCommonID()
+			// 	deleteNode := tbl.deleteNodes[*fp]
+			// 	if deleteNode != nil {
+			// 		rowmask = deleteNode.GetRowMaskRefLocked()
+			// 	}
+			// }
 			if err = blkData.BatchDedup(
 				context.Background(),
 				tbl.store.txn,
