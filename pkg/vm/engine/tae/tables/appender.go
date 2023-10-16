@@ -15,7 +15,6 @@
 package tables
 
 import (
-	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
@@ -99,9 +98,6 @@ func (appender *blockAppender) ApplyAppend(
 	appender.blk.Lock()
 	defer appender.blk.Unlock()
 	from, err = node.ApplyAppend(bat, txn)
-	if appender.blk.meta.GetSegment().IsTombstone {
-		logutil.Infof("delete %d", bat.Length())
-	}
 
 	schema := node.writeSchema
 	for _, colDef := range schema.ColDefs {

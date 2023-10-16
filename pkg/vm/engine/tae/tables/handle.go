@@ -26,12 +26,14 @@ type tableHandle struct {
 	table    *dataTable
 	block    *ablock
 	appender data.BlockAppender
+	isTombstone bool
 }
 
-func newHandle(table *dataTable, block *ablock) *tableHandle {
+func newHandle(table *dataTable, block *ablock, isTombstone bool) *tableHandle {
 	h := &tableHandle{
 		table: table,
 		block: block,
+		isTombstone:  isTombstone,
 	}
 	if block != nil {
 		h.appender, _ = block.MakeAppender()
@@ -41,7 +43,7 @@ func newHandle(table *dataTable, block *ablock) *tableHandle {
 
 func (h *tableHandle) SetAppender(id *common.ID) (appender data.BlockAppender) {
 	tableMeta := h.table.meta
-	segMeta, _ := tableMeta.GetSegmentByID(id.SegmentID(), false)
+	segMeta, _ := tableMeta.GetSegmentByID(id.SegmentID(), h.isTombstone)
 	blkMeta, _ := segMeta.GetBlockEntryByID(&id.BlockID)
 	h.block = blkMeta.GetBlockData().(*ablock)
 	h.appender, _ = h.block.MakeAppender()
@@ -51,7 +53,7 @@ func (h *tableHandle) SetAppender(id *common.ID) (appender data.BlockAppender) {
 
 func (h *tableHandle) ThrowAppenderAndErr() (appender data.BlockAppender, err error) {
 	id := h.appender.GetID()
-	segEntry, _ := h.table.meta.GetSegmentByID(id.SegmentID(), false)
+	segEntry, _ := h.table.meta.GetSegmentByID(id.SegmentID(), h.isTombstone)
 	if segEntry == nil ||
 		segEntry.GetAppendableBlockCnt() >= int(segEntry.GetTable().GetLastestSchema().SegmentMaxBlocks) {
 		err = data.ErrAppendableSegmentNotFound
@@ -67,7 +69,7 @@ func (h *tableHandle) ThrowAppenderAndErr() (appender data.BlockAppender, err er
 func (h *tableHandle) GetAppender() (appender data.BlockAppender, err error) {
 	var segEntry *catalog.SegmentEntry
 	if h.appender == nil {
-		segEntry = h.table.meta.LastAppendableSegmemt(false)
+		segEntry = h.table.meta.LastAppendableSegmemt(h.isTombstone)
 		if segEntry == nil {
 			err = data.ErrAppendableSegmentNotFound
 			return

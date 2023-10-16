@@ -224,7 +224,7 @@ func (entry *BlockEntry) String() string {
 }
 
 func (entry *BlockEntry) StringLocked() string {
-	return fmt.Sprintf("[%s]BLK%s", entry.state.Repr(), entry.BaseEntryImpl.StringLocked())
+	return fmt.Sprintf("[%s]BLK[%v]%s", entry.state.Repr(),entry.ID.String(), entry.BaseEntryImpl.StringLocked())
 }
 
 func (entry *BlockEntry) StringWithLevel(level common.PPLevel) string {

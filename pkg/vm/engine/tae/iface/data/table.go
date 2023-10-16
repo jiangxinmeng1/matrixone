@@ -30,6 +30,6 @@ type TableHandle interface {
 }
 
 type Table interface {
-	GetHandle() TableHandle
-	ApplyHandle(TableHandle)
+	GetHandle(isTombstone bool) TableHandle
+	ApplyHandle(TableHandle, bool)
 }

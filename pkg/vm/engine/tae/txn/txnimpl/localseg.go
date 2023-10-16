@@ -141,7 +141,7 @@ func (seg *localSegment) ApplyAppend() (err error) {
 			ctx.count, id)
 	}
 	if seg.tableHandle != nil {
-		seg.table.entry.GetTableData().ApplyHandle(seg.tableHandle)
+		seg.table.entry.GetTableData().ApplyHandle(seg.tableHandle, seg.isTombstone)
 	}
 	return
 }
@@ -164,9 +164,7 @@ func (seg *localSegment) PrepareApply() (err error) {
 func (seg *localSegment) prepareApplyANode(node *anode) error {
 	node.Compact()
 	tableData := seg.table.entry.GetTableData()
-	if seg.tableHandle == nil {
-		seg.tableHandle = tableData.GetHandle()
-	}
+	seg.tableHandle = tableData.GetHandle(seg.isTombstone)
 	appended := uint32(0)
 	vec := seg.table.store.rt.VectorPool.Small.GetVector(&objectio.RowidType)
 	for appended < node.Rows() {
@@ -241,8 +239,10 @@ func (seg *localSegment) prepareApplyANode(node *anode) error {
 			break
 		}
 	}
-	node.data.Vecs[seg.table.GetLocalSchema(seg.isTombstone).PhyAddrKey.Idx].Close()
-	node.data.Vecs[seg.table.GetLocalSchema(seg.isTombstone).PhyAddrKey.Idx] = vec
+	if !seg.isTombstone {
+		node.data.Vecs[seg.table.GetLocalSchema(seg.isTombstone).PhyAddrKey.Idx].Close()
+		node.data.Vecs[seg.table.GetLocalSchema(seg.isTombstone).PhyAddrKey.Idx] = vec
+	}
 	return nil
 }
 

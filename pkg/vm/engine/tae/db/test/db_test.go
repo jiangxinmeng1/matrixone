@@ -359,7 +359,7 @@ func TestTableHandle(t *testing.T) {
 	t.Log(tableMeta.String())
 	table := tableMeta.GetTableData()
 
-	handle := table.GetHandle()
+	handle := table.GetHandle(false)
 	appender, err := handle.GetAppender()
 	assert.Nil(t, appender)
 	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrAppendableSegmentNotFound))

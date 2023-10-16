@@ -144,6 +144,7 @@ func NewEmptySchema(name string) *Schema {
 		Extra:     &apipb.SchemaExtra{},
 	}
 }
+// TODO: save delete schema in tablenode
 func (s *Schema) MakeDeleteSchema() *Schema {
 	pkDef := s.GetPrimaryKey()
 	schema := NewEmptySchema("delete")
@@ -163,6 +164,8 @@ func (s *Schema) MakeDeleteSchema() *Schema {
 	if err != nil {
 		panic(err)
 	}
+	schema.BlockMaxRows=s.BlockMaxRows
+	schema.SegmentMaxBlocks = s.SegmentMaxBlocks
 	schema.Finalize(true)
 	return schema
 }
