@@ -40,6 +40,7 @@ const (
 	SegmentAttr_ID                              = catalog.SegmentAttr_ID
 	SegmentAttr_CreateAt                        = catalog.SegmentAttr_CreateAt
 	SegmentAttr_SegNode                         = catalog.SegmentAttr_SegNode
+	SegmentAttr_IsTombstone                     = catalog.SegmentAttr_IsTombstone
 	SnapshotAttr_BlockMaxRow                    = catalog.SnapshotAttr_BlockMaxRow
 	SnapshotAttr_SegmentMaxBlock                = catalog.SnapshotAttr_SegmentMaxBlock
 	SnapshotMetaAttr_BlockInsertBatchStart      = "block_insert_batch_start"
@@ -159,6 +160,7 @@ var (
 		txnbase.SnapshotAttr_LogIndex_Size,
 		SnapshotAttr_DBID,
 		SnapshotAttr_TID,
+		SegmentAttr_IsTombstone,
 	}
 	SegmentTNSchemaTypes = []types.Type{
 		types.New(types.T_uint64, 0, 0),
@@ -169,6 +171,7 @@ var (
 		types.New(types.T_uint32, 0, 0),
 		types.New(types.T_uint64, 0, 0),
 		types.New(types.T_uint64, 0, 0),
+		types.New(types.T_bool, 0, 0),
 	}
 	BlockTNSchemaAttr = []string{
 		txnbase.SnapshotAttr_LogIndex_LSN,
@@ -181,6 +184,7 @@ var (
 		SnapshotAttr_TID,
 		pkgcatalog.BlockMeta_MetaLoc,
 		pkgcatalog.BlockMeta_DeltaLoc,
+		SegmentAttr_IsTombstone,
 	}
 	BlockTNSchemaTypes = []types.Type{
 		types.New(types.T_uint64, 0, 0),
@@ -193,6 +197,7 @@ var (
 		types.New(types.T_uint64, 0, 0),
 		types.New(types.T_varchar, types.MaxVarcharLen, 0),
 		types.New(types.T_varchar, types.MaxVarcharLen, 0),
+		types.New(types.T_bool, 0, 0),
 	}
 	MetaSchemaAttr_V1 = []string{
 		SnapshotAttr_TID,

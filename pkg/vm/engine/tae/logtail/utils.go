@@ -2359,6 +2359,12 @@ func (collector *BaseCollector) VisitSeg(entry *catalog.SegmentEntry) (err error
 				false,
 				common.DefaultAllocator,
 			)
+			vector.AppendFixed(
+				segDelTxn.GetVectorByName(SegmentAttr_IsTombstone).GetDownstreamVector(),
+				entry.IsTombstone,
+				false,
+				common.DefaultAllocator,
+			)
 			segNode.TxnMVCCNode.AppendTuple(segDelTxn)
 		} else {
 			vector.AppendFixed(
@@ -2392,6 +2398,12 @@ func (collector *BaseCollector) VisitSeg(entry *catalog.SegmentEntry) (err error
 			vector.AppendFixed(
 				segInsTxn.GetVectorByName(SnapshotAttr_TID).GetDownstreamVector(),
 				entry.GetTable().GetID(),
+				false,
+				common.DefaultAllocator,
+			)
+			vector.AppendFixed(
+				segInsTxn.GetVectorByName(SegmentAttr_IsTombstone).GetDownstreamVector(),
+				entry.IsTombstone,
 				false,
 				common.DefaultAllocator,
 			)
@@ -2441,6 +2453,7 @@ func (collector *BaseCollector) VisitBlk(entry *catalog.BlockEntry) (err error) 
 	blkTNMetaDelTxnTIDVec := blkTNMetaDelTxnBat.GetVectorByName(SnapshotAttr_TID).GetDownstreamVector()
 	blkTNMetaDelTxnMetaLocVec := blkTNMetaDelTxnBat.GetVectorByName(pkgcatalog.BlockMeta_MetaLoc).GetDownstreamVector()
 	blkTNMetaDelTxnDeltaLocVec := blkTNMetaDelTxnBat.GetVectorByName(pkgcatalog.BlockMeta_DeltaLoc).GetDownstreamVector()
+	blkTNMetaDelTxnIsTombstoneVec := blkTNMetaDelTxnBat.GetVectorByName(SegmentAttr_IsTombstone).GetDownstreamVector()
 
 	blkTNMetaInsRowIDVec := blkTNMetaInsBat.GetVectorByName(catalog.AttrRowID).GetDownstreamVector()
 	blkTNMetaInsCommitTimeVec := blkTNMetaInsBat.GetVectorByName(catalog.AttrCommitTs).GetDownstreamVector()
@@ -2457,6 +2470,7 @@ func (collector *BaseCollector) VisitBlk(entry *catalog.BlockEntry) (err error) 
 	blkTNMetaInsTxnTIDVec := blkTNMetaInsTxnBat.GetVectorByName(SnapshotAttr_TID).GetDownstreamVector()
 	blkTNMetaInsTxnMetaLocVec := blkTNMetaInsTxnBat.GetVectorByName(pkgcatalog.BlockMeta_MetaLoc).GetDownstreamVector()
 	blkTNMetaInsTxnDeltaLocVec := blkTNMetaInsTxnBat.GetVectorByName(pkgcatalog.BlockMeta_DeltaLoc).GetDownstreamVector()
+	blkTNMetaInsTxnIsTombstoneVec := blkTNMetaDelTxnBat.GetVectorByName(SegmentAttr_IsTombstone).GetDownstreamVector()
 
 	blkMetaDelRowIDVec := blkMetaDelBat.GetVectorByName(catalog.AttrRowID).GetDownstreamVector()
 	blkMetaDelCommitTsVec := blkMetaDelBat.GetVectorByName(catalog.AttrCommitTs).GetDownstreamVector()
@@ -2465,6 +2479,7 @@ func (collector *BaseCollector) VisitBlk(entry *catalog.BlockEntry) (err error) 
 	blkMetaDelTxnTIDVec := blkMetaDelTxnBat.GetVectorByName(SnapshotAttr_TID).GetDownstreamVector()
 	blkMetaDelTxnMetaLocVec := blkMetaDelTxnBat.GetVectorByName(pkgcatalog.BlockMeta_MetaLoc).GetDownstreamVector()
 	blkMetaDelTxnDeltaLocVec := blkMetaDelTxnBat.GetVectorByName(pkgcatalog.BlockMeta_DeltaLoc).GetDownstreamVector()
+	blkMetaDelTxnIsTombstoneVec := blkTNMetaDelTxnBat.GetVectorByName(SegmentAttr_IsTombstone).GetDownstreamVector()
 
 	blkCNMetaInsRowIDVec := blkCNMetaInsBat.GetVectorByName(catalog.AttrRowID).GetDownstreamVector()
 	blkCNMetaInsCommitTimeVec := blkCNMetaInsBat.GetVectorByName(catalog.AttrCommitTs).GetDownstreamVector()
@@ -2492,6 +2507,7 @@ func (collector *BaseCollector) VisitBlk(entry *catalog.BlockEntry) (err error) 
 	blkMetaInsTxnTIDVec := blkMetaInsTxnBat.GetVectorByName(SnapshotAttr_TID).GetDownstreamVector()
 	blkMetaInsTxnMetaLocVec := blkMetaInsTxnBat.GetVectorByName(pkgcatalog.BlockMeta_MetaLoc).GetDownstreamVector()
 	blkMetaInsTxnDeltaLocVec := blkMetaInsTxnBat.GetVectorByName(pkgcatalog.BlockMeta_DeltaLoc).GetDownstreamVector()
+	blkMetaInsTxnIsTombstoneVec := blkTNMetaDelTxnBat.GetVectorByName(SegmentAttr_IsTombstone).GetDownstreamVector()
 
 	for _, node := range mvccNodes {
 		if node.IsAborted() {
@@ -2533,6 +2549,12 @@ func (collector *BaseCollector) VisitBlk(entry *catalog.BlockEntry) (err error) 
 				vector.AppendBytes(
 					blkTNMetaDelTxnDeltaLocVec,
 					[]byte(metaNode.BaseNode.DeltaLoc),
+					false,
+					common.DefaultAllocator,
+				)
+				vector.AppendFixed(
+					blkTNMetaDelTxnIsTombstoneVec,
+					entry.GetSegment().IsTombstone,
 					false,
 					common.DefaultAllocator,
 				)
@@ -2621,6 +2643,12 @@ func (collector *BaseCollector) VisitBlk(entry *catalog.BlockEntry) (err error) 
 					false,
 					common.DefaultAllocator,
 				)
+				vector.AppendFixed(
+					blkTNMetaInsTxnIsTombstoneVec,
+					entry.GetSegment().IsTombstone,
+					false,
+					common.DefaultAllocator,
+				)
 				metaNode.TxnMVCCNode.AppendTuple(blkTNMetaInsTxnBat)
 			}
 		} else {
@@ -2659,6 +2687,12 @@ func (collector *BaseCollector) VisitBlk(entry *catalog.BlockEntry) (err error) 
 				vector.AppendBytes(
 					blkMetaDelTxnDeltaLocVec,
 					[]byte(metaNode.BaseNode.DeltaLoc),
+					false,
+					common.DefaultAllocator,
+				)
+				vector.AppendFixed(
+					blkMetaDelTxnIsTombstoneVec,
+					entry.GetSegment().IsTombstone,
 					false,
 					common.DefaultAllocator,
 				)
@@ -2810,6 +2844,12 @@ func (collector *BaseCollector) VisitBlk(entry *catalog.BlockEntry) (err error) 
 				vector.AppendBytes(
 					blkMetaInsTxnDeltaLocVec,
 					[]byte(metaNode.BaseNode.DeltaLoc),
+					false,
+					common.DefaultAllocator,
+				)
+				vector.AppendFixed(
+					blkMetaInsTxnIsTombstoneVec,
+					entry.GetSegment().IsTombstone,
 					false,
 					common.DefaultAllocator,
 				)
