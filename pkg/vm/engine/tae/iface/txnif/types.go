@@ -281,7 +281,7 @@ type TxnStore interface {
 	CreateNonAppendableSegment(dbId, tid uint64, is1PC bool, isTombstone bool) (handle.Segment, error)
 	CreateBlock(id *common.ID, is1PC bool, isTombstone bool) (handle.Block, error)
 	GetBlock(id *common.ID, isTombstone bool) (handle.Block, error)
-	CreateNonAppendableBlock(id *common.ID, opts *objectio.CreateBlockOpt, isTombstone bool) (handle.Block, error)
+	CreateNonAppendableBlock(id *common.ID, isTombstone bool, opts *objectio.CreateBlockOpt) (handle.Block, error)
 	SoftDeleteSegment(id *common.ID) error
 	SoftDeleteBlock(id *common.ID) error
 	UpdateMetaLoc(id *common.ID, metaLoc objectio.Location) (err error)

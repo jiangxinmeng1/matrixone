@@ -378,7 +378,7 @@ func TestCreateBlock(t *testing.T) {
 	schema := catalog.MockSchemaAll(13, 12)
 	rel, err := database.CreateRelation(schema)
 	assert.Nil(t, err)
-	seg, err := rel.CreateSegment(false)
+	seg, err := rel.CreateSegment(false, false)
 	assert.Nil(t, err)
 	blk1, err := seg.CreateBlock(false)
 	assert.Nil(t, err)
@@ -418,7 +418,7 @@ func TestNonAppendableBlock(t *testing.T) {
 		rel, err := database.GetRelationByName(schema.Name)
 		readSchema := rel.Schema()
 		assert.Nil(t, err)
-		seg, err := rel.CreateSegment(false)
+		seg, err := rel.CreateSegment(false, false)
 		assert.Nil(t, err)
 		blk, err := seg.CreateNonAppendableBlock(nil)
 		assert.Nil(t, err)
@@ -443,7 +443,7 @@ func TestNonAppendableBlock(t *testing.T) {
 		assert.Equal(t, expectVal, v)
 		assert.Equal(t, bat.Vecs[0].Length(), blk.Rows())
 
-		view, err := dataBlk.GetColumnDataById(context.Background(), txn, readSchema, 2)
+		view, err := dataBlk.GetColumnDataById(context.Background(), txn, readSchema, 2, false)
 		assert.Nil(t, err)
 		defer view.Close()
 		assert.Nil(t, view.DeleteMask)
@@ -452,7 +452,7 @@ func TestNonAppendableBlock(t *testing.T) {
 		_, err = dataBlk.RangeDelete(txn, 1, 2, nil, handle.DT_Normal)
 		assert.Nil(t, err)
 
-		view, err = dataBlk.GetColumnDataById(context.Background(), txn, readSchema, 2)
+		view, err = dataBlk.GetColumnDataById(context.Background(), txn, readSchema, 2, false)
 		assert.Nil(t, err)
 		defer view.Close()
 		assert.True(t, view.DeleteMask.Contains(1))
@@ -462,7 +462,7 @@ func TestNonAppendableBlock(t *testing.T) {
 		// _, err = dataBlk.Update(txn, 3, 2, int32(999))
 		// assert.Nil(t, err)
 
-		view, err = dataBlk.GetColumnDataById(context.Background(), txn, readSchema, 2)
+		view, err = dataBlk.GetColumnDataById(context.Background(), txn, readSchema, 2, false)
 		assert.Nil(t, err)
 		defer view.Close()
 		assert.True(t, view.DeleteMask.Contains(1))
@@ -488,7 +488,7 @@ func TestCreateSegment(t *testing.T) {
 	assert.Nil(t, err)
 	rel, err := db.CreateRelation(schema)
 	assert.Nil(t, err)
-	_, err = rel.CreateNonAppendableSegment(false)
+	_, err = rel.CreateNonAppendableSegment(false, false)
 	assert.Nil(t, err)
 	assert.Nil(t, txn.Commit(context.Background()))
 
@@ -558,7 +558,7 @@ func TestCompactBlock1(t *testing.T) {
 		filter.Val = v
 		id, _, err := rel.GetByFilter(context.Background(), filter)
 		assert.Nil(t, err)
-		seg, _ := rel.GetSegment(id.SegmentID())
+		seg, _ := rel.GetSegment(id.SegmentID(), false)
 		block, err := seg.GetBlock(id.BlockID)
 		assert.Nil(t, err)
 		blkMeta := block.GetMeta().(*catalog.BlockEntry)
@@ -594,7 +594,7 @@ func TestCompactBlock1(t *testing.T) {
 		var maxTs types.TS
 		{
 			txn, rel := testutil.GetDefaultRelation(t, db, schema.Name)
-			seg, err := rel.GetSegment(id.SegmentID())
+			seg, err := rel.GetSegment(id.SegmentID(), false)
 			assert.Nil(t, err)
 			blk, err := seg.GetBlock(id.BlockID)
 			assert.Nil(t, err)
@@ -685,20 +685,20 @@ func TestAddBlksWithMetaLoc(t *testing.T) {
 	{
 		txn, rel := testutil.GetRelation(t, 0, db, "db", schema.Name)
 		assert.True(t, newBlockFp2.SegmentID().Eq(*newBlockFp1.SegmentID()))
-		seg, err := rel.GetSegment(newBlockFp1.SegmentID())
+		seg, err := rel.GetSegment(newBlockFp1.SegmentID(), false)
 		assert.Nil(t, err)
 		blk1, err := seg.GetBlock(newBlockFp1.BlockID)
 		assert.Nil(t, err)
 		blk2, err := seg.GetBlock(newBlockFp2.BlockID)
 		assert.Nil(t, err)
 
-		view1, err := blk1.GetColumnDataById(context.Background(), 2)
+		view1, err := blk1.GetColumnDataById(context.Background(), 2, false)
 		assert.NoError(t, err)
 		defer view1.Close()
 		assert.True(t, view1.GetData().Equals(bats[0].Vecs[2]))
 		assert.Equal(t, blk1.Rows(), bats[0].Vecs[2].Length())
 
-		view2, err := blk2.GetColumnDataById(context.Background(), 2)
+		view2, err := blk2.GetColumnDataById(context.Background(), 2, false)
 		assert.NoError(t, err)
 		defer view2.Close()
 		assert.True(t, view2.GetData().Equals(bats[1].Vecs[2]))
@@ -744,7 +744,7 @@ func TestAddBlksWithMetaLoc(t *testing.T) {
 		cntOfblk := 0
 		testutil.ForEachBlock(rel, func(blk handle.Block) (err error) {
 			if blk.IsAppendableBlock() {
-				view, err := blk.GetColumnDataById(context.Background(), 3)
+				view, err := blk.GetColumnDataById(context.Background(), 3, false)
 				assert.NoError(t, err)
 				defer view.Close()
 				cntOfAblk++
@@ -753,12 +753,12 @@ func TestAddBlksWithMetaLoc(t *testing.T) {
 			metaLoc := blk.GetMetaLoc()
 			assert.True(t, !metaLoc.IsEmpty())
 			if bytes.Equal(metaLoc, metaLoc1) {
-				view, err := blk.GetColumnDataById(context.Background(), 2)
+				view, err := blk.GetColumnDataById(context.Background(), 2, false)
 				assert.NoError(t, err)
 				defer view.Close()
 				assert.True(t, view.GetData().Equals(bats[0].Vecs[2]))
 			} else {
-				view, err := blk.GetColumnDataById(context.Background(), 3)
+				view, err := blk.GetColumnDataById(context.Background(), 3, false)
 				assert.NoError(t, err)
 				defer view.Close()
 				assert.True(t, view.GetData().Equals(bats[1].Vecs[3]))
@@ -830,12 +830,12 @@ func TestCompactMemAlter(t *testing.T) {
 	}
 	{
 		txn, rel := testutil.GetDefaultRelation(t, db, schema.Name)
-		seg, err := rel.GetSegment(newBlockFp.SegmentID())
+		seg, err := rel.GetSegment(newBlockFp.SegmentID(), false)
 		assert.Nil(t, err)
 		blk, err := seg.GetBlock(newBlockFp.BlockID)
 		assert.Nil(t, err)
 		for i := 0; i <= 5; i++ {
-			view, err := blk.GetColumnDataById(context.Background(), i)
+			view, err := blk.GetColumnDataById(context.Background(), i, false)
 			assert.NoError(t, err)
 			defer view.Close()
 			if i < 5 {
@@ -1122,7 +1122,7 @@ func TestFlushTabletail(t *testing.T) {
 		total := 0
 		for i := 0; it.Valid(); it.Next() {
 			blk := it.GetBlock()
-			view, err := blk.GetColumnDataById(context.Background(), 2)
+			view, err := blk.GetColumnDataById(context.Background(), 2, false)
 			require.NoError(t, err)
 			defer view.Close()
 			viewDel := 0
@@ -1153,7 +1153,7 @@ func TestFlushTabletail(t *testing.T) {
 		}
 		for i := 0; it.Valid(); it.Next() {
 			blk := it.GetBlock()
-			views, err := blk.GetColumnDataByIds(context.Background(), idxs)
+			views, err := blk.GetColumnDataByIds(context.Background(), idxs, false)
 			require.NoError(t, err)
 			defer views.Close()
 			for j, view := range views.Columns {
@@ -1210,11 +1210,11 @@ func TestCompactBlock2(t *testing.T) {
 		t.Log(db.Catalog.SimplePPString(common.PPL1))
 		txn, rel := testutil.GetDefaultRelation(t, db, schema.Name)
 		t.Log(rel.SimplePPString(common.PPL1))
-		seg, err := rel.GetSegment(newBlockFp.SegmentID())
+		seg, err := rel.GetSegment(newBlockFp.SegmentID(), false)
 		assert.Nil(t, err)
 		blk, err := seg.GetBlock(newBlockFp.BlockID)
 		assert.Nil(t, err)
-		view, err := blk.GetColumnDataById(context.Background(), 3)
+		view, err := blk.GetColumnDataById(context.Background(), 3, false)
 		assert.NoError(t, err)
 		defer view.Close()
 		assert.True(t, view.GetData().Equals(bat.Vecs[3]))
@@ -1233,13 +1233,13 @@ func TestCompactBlock2(t *testing.T) {
 
 	{
 		txn, rel := testutil.GetDefaultRelation(t, db, schema.Name)
-		seg, err := rel.GetSegment(newBlockFp.SegmentID())
+		seg, err := rel.GetSegment(newBlockFp.SegmentID(), false)
 		assert.Nil(t, err)
 		blk, err := seg.GetBlock(newBlockFp.BlockID)
 		assert.Nil(t, err)
 
 		// read generated column from nablk-1
-		newColumnView, err := blk.GetColumnDataById(context.Background(), 3)
+		newColumnView, err := blk.GetColumnDataById(context.Background(), 3, false)
 		require.NoError(t, err)
 		require.Equal(t, 2, newColumnView.DeleteMask.GetCardinality())
 		require.Equal(t, 20, newColumnView.GetData().Length())
@@ -1264,12 +1264,12 @@ func TestCompactBlock2(t *testing.T) {
 	{
 		t.Log(db.Catalog.SimplePPString(common.PPL1))
 		txn, rel := testutil.GetDefaultRelation(t, db, schema.Name)
-		seg, err := rel.GetSegment(newBlockFp.SegmentID())
+		seg, err := rel.GetSegment(newBlockFp.SegmentID(), false)
 		assert.Nil(t, err)
 		blk, err := seg.GetBlock(newBlockFp.BlockID)
 		assert.Nil(t, err)
 		// not generated, it is a new column produced in sort(shuffle) process of the previous compaction
-		view, err := blk.GetColumnDataById(context.Background(), 3)
+		view, err := blk.GetColumnDataById(context.Background(), 3, false)
 		require.False(t, view.GetData().GetDownstreamVector().IsConstNull())
 		cnt := 0
 		view.GetData().Foreach(func(v any, isNull bool, row int) error {
@@ -1301,7 +1301,7 @@ func TestCompactBlock2(t *testing.T) {
 		newBlockFp = task.GetNewBlock().Fingerprint()
 		{
 			txn, rel := testutil.GetDefaultRelation(t, db, schema.Name)
-			seg, err := rel.GetSegment(newBlockFp.SegmentID())
+			seg, err := rel.GetSegment(newBlockFp.SegmentID(), false)
 			assert.NoError(t, err)
 			blk, err := seg.GetBlock(newBlockFp.BlockID)
 			assert.NoError(t, err)
@@ -1316,11 +1316,11 @@ func TestCompactBlock2(t *testing.T) {
 		txn, rel := testutil.GetDefaultRelation(t, db, schema.Name)
 		t.Log(rel.SimplePPString(common.PPL1))
 		t.Log(db.Catalog.SimplePPString(common.PPL1))
-		seg, err := rel.GetSegment(newBlockFp.SegmentID())
+		seg, err := rel.GetSegment(newBlockFp.SegmentID(), false)
 		assert.Nil(t, err)
 		blk, err := seg.GetBlock(newBlockFp.BlockID)
 		assert.Nil(t, err)
-		view, err := blk.GetColumnDataById(context.Background(), 3)
+		view, err := blk.GetColumnDataById(context.Background(), 3, false)
 		assert.Nil(t, err)
 		defer view.Close()
 		assert.True(t, view.DeleteMask.Contains(4))
@@ -1329,7 +1329,7 @@ func TestCompactBlock2(t *testing.T) {
 
 		// this delete will be transfered to nablk-4
 		txn2, rel2 := testutil.GetDefaultRelation(t, db, schema.Name)
-		seg2, err := rel2.GetSegment(newBlockFp.SegmentID())
+		seg2, err := rel2.GetSegment(newBlockFp.SegmentID(), false)
 		assert.NoError(t, err)
 		blk2, err := seg2.GetBlock(newBlockFp.BlockID)
 		assert.NoError(t, err)
@@ -1399,7 +1399,7 @@ func TestCompactBlock2(t *testing.T) {
 			switch cnt {
 			case 0:
 				// localseg blk, will be ablk-6
-				view, err := blk.GetColumnDataById(context.Background(), 0 /*uvw*/)
+				view, err := blk.GetColumnDataById(context.Background(), 0 /*uvw*/, false)
 				require.NoError(t, err)
 				require.Equal(t, 10, view.Length())
 				require.False(t, view.GetData().GetDownstreamVector().IsConstNull())
@@ -1408,7 +1408,7 @@ func TestCompactBlock2(t *testing.T) {
 			case 1:
 				// nablk-4 16 rows + 1 delete
 				require.False(t, blk.IsAppendableBlock())
-				view, err := blk.GetColumnDataById(context.Background(), 0 /*uvw*/)
+				view, err := blk.GetColumnDataById(context.Background(), 0 /*uvw*/, false)
 				require.NoError(t, err)
 				require.Equal(t, types.T_int32, view.GetData().GetType().Oid)
 				require.Equal(t, 16, view.Length())
@@ -1416,7 +1416,7 @@ func TestCompactBlock2(t *testing.T) {
 				require.True(t, view.GetData().GetDownstreamVector().IsConstNull())
 			case 2:
 				// ablk-5 10 rows
-				view, err := blk.GetColumnDataById(context.Background(), 0 /*uvw*/)
+				view, err := blk.GetColumnDataById(context.Background(), 0 /*uvw*/, false)
 				require.NoError(t, err)
 				require.Equal(t, types.T_int32, view.GetData().GetType().Oid)
 				require.Equal(t, 10, view.Length())
@@ -1511,7 +1511,7 @@ func TestAutoCompactABlk2(t *testing.T) {
 			it := rel.MakeBlockIt()
 			for it.Valid() {
 				blk := it.GetBlock()
-				view, err := blk.GetColumnDataById(context.Background(), schema1.GetSingleSortKeyIdx())
+				view, err := blk.GetColumnDataById(context.Background(), schema1.GetSingleSortKeyIdx(), false)
 				assert.Nil(t, err)
 				view.Close()
 				it.Next()
@@ -1607,7 +1607,7 @@ func TestRollback1(t *testing.T) {
 	processor.SegmentFn = onSegFn
 	processor.BlockFn = onBlkFn
 	txn, rel := testutil.GetDefaultRelation(t, db, schema.Name)
-	_, err := rel.CreateSegment(false)
+	_, err := rel.CreateSegment(false, false)
 	assert.Nil(t, err)
 
 	tableMeta := rel.GetMeta().(*catalog.TableEntry)
@@ -1622,7 +1622,7 @@ func TestRollback1(t *testing.T) {
 	assert.Equal(t, segCnt, 0)
 
 	txn, rel = testutil.GetDefaultRelation(t, db, schema.Name)
-	seg, err := rel.CreateSegment(false)
+	seg, err := rel.CreateSegment(false, false)
 	assert.Nil(t, err)
 	segMeta := seg.GetMeta().(*catalog.SegmentEntry)
 	assert.Nil(t, txn.Commit(context.Background()))
@@ -1632,7 +1632,7 @@ func TestRollback1(t *testing.T) {
 	assert.Equal(t, segCnt, 1)
 
 	txn, rel = testutil.GetDefaultRelation(t, db, schema.Name)
-	seg, err = rel.GetSegment(&segMeta.ID)
+	seg, err = rel.GetSegment(&segMeta.ID, false)
 	assert.Nil(t, err)
 	_, err = seg.CreateBlock(false)
 	assert.Nil(t, err)
@@ -1710,7 +1710,7 @@ func TestMVCC1(t *testing.T) {
 		block := it.GetBlock()
 		bid := block.Fingerprint()
 		if bid.BlockID == id.BlockID {
-			view, err := block.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx())
+			view, err := block.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx(), false)
 			assert.Nil(t, err)
 			defer view.Close()
 			assert.Nil(t, view.DeleteMask)
@@ -1946,7 +1946,7 @@ func TestDelete1(t *testing.T) {
 	{
 		txn, rel := testutil.GetDefaultRelation(t, tae, schema.Name)
 		blk := testutil.GetOneBlock(rel)
-		view, err := blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx())
+		view, err := blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx(), false)
 		assert.NoError(t, err)
 		defer view.Close()
 		assert.Nil(t, view.DeleteMask)
@@ -1954,7 +1954,7 @@ func TestDelete1(t *testing.T) {
 
 		err = blk.RangeDelete(0, 0, handle.DT_Normal)
 		assert.NoError(t, err)
-		view, err = blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx())
+		view, err = blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx(), false)
 		assert.NoError(t, err)
 		defer view.Close()
 		assert.True(t, view.DeleteMask.Contains(0))
@@ -1967,7 +1967,7 @@ func TestDelete1(t *testing.T) {
 	{
 		txn, rel := testutil.GetDefaultRelation(t, tae, schema.Name)
 		blk := testutil.GetOneBlock(rel)
-		view, err := blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx())
+		view, err := blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx(), false)
 		assert.NoError(t, err)
 		defer view.Close()
 		assert.True(t, view.DeleteMask.Contains(0))
@@ -2025,7 +2025,7 @@ func TestLogIndex1(t *testing.T) {
 		blk := testutil.GetOneBlock(rel)
 		meta := blk.GetMeta().(*catalog.BlockEntry)
 
-		view, err := blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx())
+		view, err := blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx(), false)
 		assert.Nil(t, err)
 		defer view.Close()
 		assert.True(t, view.DeleteMask.Contains(uint64(offset)))
@@ -2491,7 +2491,7 @@ func TestADA(t *testing.T) {
 	it := rel.MakeBlockIt()
 	for it.Valid() {
 		blk := it.GetBlock()
-		view, err := blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx())
+		view, err := blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx(), false)
 		assert.NoError(t, err)
 		defer view.Close()
 		assert.Equal(t, 4, view.Length())
@@ -2658,7 +2658,7 @@ func TestChaos1(t *testing.T) {
 	assert.True(t, appendCnt-deleteCnt <= 1)
 	_, rel := testutil.GetDefaultRelation(t, tae, schema.Name)
 	blk := testutil.GetOneBlock(rel)
-	view, err := blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx())
+	view, err := blk.GetColumnDataById(context.Background(), schema.GetSingleSortKeyIdx(), false)
 	assert.NoError(t, err)
 	defer view.Close()
 	assert.Equal(t, int(appendCnt), view.Length())
@@ -2808,7 +2808,7 @@ func TestMergeBlocks(t *testing.T) {
 	assert.Nil(t, err)
 	for it.Valid() {
 		testutil.CheckAllColRowsByScan(t, rel, bat.Length(), false)
-		col, err := it.GetBlock().GetMeta().(*catalog.BlockEntry).GetBlockData().GetColumnDataById(context.Background(), txn, schema, 0)
+		col, err := it.GetBlock().GetMeta().(*catalog.BlockEntry).GetBlockData().GetColumnDataById(context.Background(), txn, schema, 0, false)
 		assert.NoError(t, err)
 		defer col.Close()
 		t.Log(col)
@@ -2828,7 +2828,7 @@ func TestMergeBlocks(t *testing.T) {
 	it = rel.MakeBlockIt()
 	for it.Valid() {
 		testutil.CheckAllColRowsByScan(t, rel, bat.Length()-5, false)
-		col, err := it.GetBlock().GetMeta().(*catalog.BlockEntry).GetBlockData().GetColumnDataById(context.Background(), txn, schema, 0)
+		col, err := it.GetBlock().GetMeta().(*catalog.BlockEntry).GetBlockData().GetColumnDataById(context.Background(), txn, schema, 0, false)
 		assert.Nil(t, err)
 		t.Log(col)
 		defer col.Close()
@@ -2984,7 +2984,7 @@ func TestMergeblocks2(t *testing.T) {
 
 		segIt := rel.MakeSegmentIt()
 		seg := segIt.GetSegment().GetMeta().(*catalog.SegmentEntry)
-		segHandle, err := rel.GetSegment(&seg.ID)
+		segHandle, err := rel.GetSegment(&seg.ID, false)
 		assert.NoError(t, err)
 
 		var metas []*catalog.BlockEntry
@@ -3066,7 +3066,7 @@ func TestMergeEmptyBlocks(t *testing.T) {
 
 		segIt := rel.MakeSegmentIt()
 		seg := segIt.GetSegment().GetMeta().(*catalog.SegmentEntry)
-		segHandle, err := rel.GetSegment(&seg.ID)
+		segHandle, err := rel.GetSegment(&seg.ID, false)
 		assert.NoError(t, err)
 
 		var metas []*catalog.BlockEntry
@@ -3140,7 +3140,7 @@ func TestNull1(t *testing.T) {
 
 	txn, rel := tae.GetRelation()
 	blk := testutil.GetOneBlock(rel)
-	view, err := blk.GetColumnDataById(context.Background(), 3)
+	view, err := blk.GetColumnDataById(context.Background(), 3, false)
 	assert.NoError(t, err)
 	defer view.Close()
 	//v := view.GetData().Get(2)
@@ -3151,7 +3151,7 @@ func TestNull1(t *testing.T) {
 	tae.Restart(ctx)
 	txn, rel = tae.GetRelation()
 	blk = testutil.GetOneBlock(rel)
-	view, err = blk.GetColumnDataById(context.Background(), 3)
+	view, err = blk.GetColumnDataById(context.Background(), 3, false)
 	assert.NoError(t, err)
 	defer view.Close()
 	//v = view.GetData().Get(2)
@@ -3305,12 +3305,12 @@ func TestGetColumnData(t *testing.T) {
 	tae.CreateRelAndAppend(bats[0], true)
 	txn, rel := tae.GetRelation()
 	blk := testutil.GetOneBlock(rel)
-	view, _ := blk.GetColumnDataById(context.Background(), 2)
+	view, _ := blk.GetColumnDataById(context.Background(), 2, false)
 	defer view.Close()
 	assert.Equal(t, bats[0].Length(), view.Length())
 	assert.NotZero(t, view.GetData().Allocated())
 
-	view, _ = blk.GetColumnDataById(context.Background(), 2)
+	view, _ = blk.GetColumnDataById(context.Background(), 2, false)
 	defer view.Close()
 	assert.Equal(t, bats[0].Length(), view.Length())
 	assert.NotZero(t, view.GetData().Allocated())
@@ -3319,12 +3319,12 @@ func TestGetColumnData(t *testing.T) {
 	tae.CompactBlocks(false)
 	txn, rel = tae.GetRelation()
 	blk = testutil.GetOneBlock(rel)
-	view, _ = blk.GetColumnDataById(context.Background(), 2)
+	view, _ = blk.GetColumnDataById(context.Background(), 2, false)
 	defer view.Close()
 	assert.Equal(t, bats[0].Length(), view.Length())
 	assert.NotZero(t, view.GetData().Allocated())
 
-	view, _ = blk.GetColumnDataById(context.Background(), 2)
+	view, _ = blk.GetColumnDataById(context.Background(), 2, false)
 	defer view.Close()
 	assert.Equal(t, bats[0].Length(), view.Length())
 	assert.NotZero(t, view.GetData().Allocated())
@@ -3334,12 +3334,12 @@ func TestGetColumnData(t *testing.T) {
 	err := rel.Append(context.Background(), bats[1])
 	assert.NoError(t, err)
 	blk = testutil.GetOneBlock(rel)
-	view, err = blk.GetColumnDataById(context.Background(), 2)
+	view, err = blk.GetColumnDataById(context.Background(), 2, false)
 	assert.NoError(t, err)
 	defer view.Close()
 	assert.True(t, view.GetData().Equals(bats[1].Vecs[2]))
 	assert.NotZero(t, view.GetData().Allocated())
-	view, err = blk.GetColumnDataById(context.Background(), 2)
+	view, err = blk.GetColumnDataById(context.Background(), 2, false)
 	assert.NoError(t, err)
 	defer view.Close()
 	assert.True(t, view.GetData().Equals(bats[1].Vecs[2]))
@@ -3570,7 +3570,7 @@ func TestCompactblk3(t *testing.T) {
 		if be.GetSegment().GetTable().GetDB().IsSystemDB() {
 			return nil
 		}
-		view, err := be.GetBlockData().GetColumnDataById(context.Background(), txn, schema, 0)
+		view, err := be.GetBlockData().GetColumnDataById(context.Background(), txn, schema, 0, false)
 		assert.NoError(t, err)
 		view.ApplyDeletes()
 		assert.Equal(t, 2, view.Length())
@@ -3705,8 +3705,8 @@ func TestDropCreated1(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Nil(t, txn.Commit(context.Background()))
 
-	assert.Equal(t, txn.GetCommitTS(), db.GetMeta().(*catalog.DBEntry).GetCreatedAt())
-	assert.Equal(t, txn.GetCommitTS(), db.GetMeta().(*catalog.DBEntry).GetCreatedAt())
+	assert.Equal(t, txn.GetCommitTS(), db.GetMeta().(*catalog.DBEntry).GetCreatedAtLocked())
+	assert.Equal(t, txn.GetCommitTS(), db.GetMeta().(*catalog.DBEntry).GetCreatedAtLocked())
 
 	tae.Restart(ctx)
 }
@@ -3730,8 +3730,8 @@ func TestDropCreated2(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Nil(t, txn.Commit(context.Background()))
 
-	assert.Equal(t, txn.GetCommitTS(), rel.GetMeta().(*catalog.TableEntry).GetCreatedAt())
-	assert.Equal(t, txn.GetCommitTS(), rel.GetMeta().(*catalog.TableEntry).GetCreatedAt())
+	assert.Equal(t, txn.GetCommitTS(), rel.GetMeta().(*catalog.TableEntry).GetCreatedAtLocked())
+	assert.Equal(t, txn.GetCommitTS(), rel.GetMeta().(*catalog.TableEntry).GetCreatedAtLocked())
 
 	tae.Restart(ctx)
 }
@@ -4094,7 +4094,7 @@ func TestUpdateAttr(t *testing.T) {
 	assert.NoError(t, err)
 	rel, err := db.CreateRelation(schema)
 	assert.NoError(t, err)
-	seg, err := rel.CreateSegment(false)
+	seg, err := rel.CreateSegment(false, false)
 	assert.NoError(t, err)
 	blk, err := seg.CreateBlock(false)
 	assert.NoError(t, err)
@@ -4107,7 +4107,7 @@ func TestUpdateAttr(t *testing.T) {
 	assert.NoError(t, err)
 	rel, err = db.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	seg, err = rel.GetSegment(seg.GetID())
+	seg, err = rel.GetSegment(seg.GetID(), false)
 	assert.NoError(t, err)
 	blk, err = seg.CreateBlock(false)
 	assert.NoError(t, err)
@@ -4441,28 +4441,28 @@ func TestCollectInsert(t *testing.T) {
 	blkit := rel.MakeBlockIt()
 	blkdata := blkit.GetBlock().GetMeta().(*catalog.BlockEntry).GetBlockData()
 
-	batch, err := blkdata.CollectAppendInRange(types.TS{}, p1, true)
+	batch, err := blkdata.CollectInMemoryAppendInRange(types.TS{}, p1, true)
 	assert.NoError(t, err)
 	t.Log((batch.Attrs))
 	for _, vec := range batch.Vecs {
 		t.Log(vec)
 		assert.Equal(t, 6, vec.Length())
 	}
-	batch, err = blkdata.CollectAppendInRange(types.TS{}, p2, true)
+	batch, err = blkdata.CollectInMemoryAppendInRange(types.TS{}, p2, true)
 	assert.NoError(t, err)
 	t.Log((batch.Attrs))
 	for _, vec := range batch.Vecs {
 		t.Log(vec)
 		assert.Equal(t, 9, vec.Length())
 	}
-	batch, err = blkdata.CollectAppendInRange(p1.Next(), p2, true)
+	batch, err = blkdata.CollectInMemoryAppendInRange(p1.Next(), p2, true)
 	assert.NoError(t, err)
 	t.Log((batch.Attrs))
 	for _, vec := range batch.Vecs {
 		t.Log(vec)
 		assert.Equal(t, 3, vec.Length())
 	}
-	batch, err = blkdata.CollectAppendInRange(p1.Next(), p3, true)
+	batch, err = blkdata.CollectInMemoryAppendInRange(p1.Next(), p3, true)
 	assert.NoError(t, err)
 	t.Log((batch.Attrs))
 	for _, vec := range batch.Vecs {
@@ -5218,7 +5218,7 @@ func TestDelete4(t *testing.T) {
 		it := rel.MakeBlockIt()
 		for it.Valid() {
 			blk := it.GetBlock()
-			view, err := blk.GetColumnDataById(context.Background(), 0)
+			view, err := blk.GetColumnDataById(context.Background(), 0, false)
 			assert.NoError(t, err)
 			defer view.Close()
 			view.ApplyDeletes()
@@ -5395,7 +5395,7 @@ func TestMergeBlocks3(t *testing.T) {
 		txn, rel := tae.GetRelation()
 		segit := rel.MakeSegmentIt()
 		seg1 := segit.GetSegment().GetMeta().(*catalog.SegmentEntry)
-		segHandle, err := rel.GetSegment(&seg1.ID)
+		segHandle, err := rel.GetSegment(&seg1.ID, false)
 		require.NoError(t, err)
 
 		blk1it := segHandle.MakeBlockIt()
@@ -5426,7 +5426,7 @@ func TestMergeBlocks3(t *testing.T) {
 		// merge first segment
 		segit := relm.MakeSegmentIt()
 		seg1 := segit.GetSegment().GetMeta().(*catalog.SegmentEntry)
-		segHandle, err := relm.GetSegment(&seg1.ID)
+		segHandle, err := relm.GetSegment(&seg1.ID, false)
 		require.NoError(t, err)
 		metas := make([]*catalog.BlockEntry, 0, 10)
 		it := segHandle.MakeBlockIt()
@@ -6593,7 +6593,7 @@ func TestAlterFakePk(t *testing.T) {
 
 	{
 		txn, rel := tae.GetRelation()
-		seg, err := rel.GetSegment(blkFp.SegmentID())
+		seg, err := rel.GetSegment(blkFp.SegmentID(), false)
 		require.NoError(t, err)
 		blk, err := seg.GetBlock(blkFp.BlockID)
 		require.NoError(t, err)
@@ -6606,7 +6606,7 @@ func TestAlterFakePk(t *testing.T) {
 
 	{
 		txn, rel := tae.GetRelation()
-		seg, err := rel.GetSegment(blkFp.SegmentID())
+		seg, err := rel.GetSegment(blkFp.SegmentID(), false)
 		require.NoError(t, err)
 		blk, err := seg.GetBlock(blkFp.BlockID)
 		require.NoError(t, err)
@@ -7307,13 +7307,13 @@ func TestGCCatalog1(t *testing.T) {
 	tb3, err := db2.CreateRelation(schema3)
 	assert.Nil(t, err)
 
-	seg1, err := tb.CreateSegment(false)
+	seg1, err := tb.CreateSegment(false, false)
 	assert.Nil(t, err)
-	seg2, err := tb2.CreateSegment(false)
+	seg2, err := tb2.CreateSegment(false, false)
 	assert.Nil(t, err)
-	seg3, err := tb2.CreateSegment(false)
+	seg3, err := tb2.CreateSegment(false, false)
 	assert.Nil(t, err)
-	seg4, err := tb3.CreateSegment(false)
+	seg4, err := tb3.CreateSegment(false, false)
 	assert.Nil(t, err)
 
 	_, err = seg1.CreateBlock(false)
@@ -7378,7 +7378,7 @@ func TestGCCatalog1(t *testing.T) {
 	assert.NoError(t, err)
 	tb3, err = db2.GetRelationByName("tb3")
 	assert.NoError(t, err)
-	seg4, err = tb3.GetSegment(seg4.GetID())
+	seg4, err = tb3.GetSegment(seg4.GetID(), false)
 	assert.NoError(t, err)
 	err = seg4.SoftDeleteBlock(blk4.ID())
 	assert.NoError(t, err)
@@ -7991,7 +7991,7 @@ func TestDeduplication(t *testing.T) {
 		tae.Dir)
 	seg, err := tbl.CreateSegment(
 		txn,
-		catalog.ES_Appendable,
+		catalog.ES_Appendable, false,
 		dataFactory.MakeSegmentFactory(),
 		new(objectio.CreateSegOpt).WithId(segmentIDs[0]))
 	assert.NoError(t, err)
@@ -8210,7 +8210,7 @@ func TestReplayDeletes(t *testing.T) {
 	assert.NoError(t, err)
 	tbl, err := db.GetTableEntryByID(blkEntry.AsCommonID().TableID)
 	assert.NoError(t, err)
-	seg, err := tbl.GetSegmentByID(blkEntry.AsCommonID().SegmentID())
+	seg, err := tbl.GetSegmentByID(blkEntry.AsCommonID().SegmentID(), false)
 	segString1 := seg.Repr()
 	assert.NoError(t, err)
 	tae.Restart(context.Background())
@@ -8219,7 +8219,7 @@ func TestReplayDeletes(t *testing.T) {
 	assert.NoError(t, err)
 	tbl, err = db.GetTableEntryByID(blkEntry.AsCommonID().TableID)
 	assert.NoError(t, err)
-	seg, err = tbl.GetSegmentByID(blkEntry.AsCommonID().SegmentID())
+	seg, err = tbl.GetSegmentByID(blkEntry.AsCommonID().SegmentID(), false)
 	assert.NoError(t, err)
 	segString2 := seg.Repr()
 	assert.Equal(t, segString1, segString2)

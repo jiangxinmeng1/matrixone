@@ -554,7 +554,7 @@ func TestWarehouse(t *testing.T) {
 		assert.Nil(t, err)
 		it := rel.MakeBlockIt()
 		blk := it.GetBlock()
-		view, _ := blk.GetColumnDataById(context.Background(), 1)
+		view, _ := blk.GetColumnDataById(context.Background(), 1, false)
 		t.Log(view.GetData().String())
 		defer view.Close()
 		testutil.CheckAllColRowsByScan(t, rel, 20, false)
@@ -701,7 +701,7 @@ func TestTxn9(t *testing.T) {
 		it := rel.MakeBlockIt()
 		for it.Valid() {
 			blk := it.GetBlock()
-			view, err := blk.GetColumnDataById(context.Background(), 2)
+			view, err := blk.GetColumnDataById(context.Background(), 2, false)
 			assert.NoError(t, err)
 			defer view.Close()
 			t.Log(view.GetData().String())

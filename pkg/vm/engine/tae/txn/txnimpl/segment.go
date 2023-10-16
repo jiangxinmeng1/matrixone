@@ -223,7 +223,7 @@ func (seg *txnSegment) MakeBlockIt() (it handle.BlockIt) {
 
 func (seg *txnSegment) CreateNonAppendableBlock(opts *objectio.CreateBlockOpt) (blk handle.Block, err error) {
 	isTombstone := seg.entry.IsTombstone
-	return seg.Txn.GetStore().CreateNonAppendableBlock(seg.entry.AsCommonID(), opts, isTombstone)
+	return seg.Txn.GetStore().CreateNonAppendableBlock(seg.entry.AsCommonID(), isTombstone, opts)
 }
 
 func (seg *txnSegment) IsUncommitted() bool {

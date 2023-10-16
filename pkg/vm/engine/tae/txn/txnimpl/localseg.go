@@ -55,9 +55,11 @@ type localSegment struct {
 	appends     []*appendCtx
 	tableHandle data.TableHandle
 	nseg        handle.Segment
+
+	isTombstone bool
 }
 
-func newLocalSegment(table *txnTable) *localSegment {
+func newLocalSegment(table *txnTable, isTombstone bool) *localSegment {
 	return &localSegment{
 		entry: catalog.NewStandaloneSegment(
 			table.entry,
@@ -66,6 +68,7 @@ func newLocalSegment(table *txnTable) *localSegment {
 		index:   NewSimpleTableIndex(),
 		appends: make([]*appendCtx, 0),
 		table:   table,
+		isTombstone: isTombstone,
 	}
 }
 
@@ -108,6 +111,7 @@ func (seg *localSegment) registerANode() {
 	n := NewANode(
 		seg.table,
 		meta,
+		seg.isTombstone,
 	)
 	seg.appendable = n
 	seg.nodes = append(seg.nodes, n)
@@ -168,7 +172,7 @@ func (seg *localSegment) prepareApplyANode(node *anode) error {
 	for appended < node.Rows() {
 		appender, err := seg.tableHandle.GetAppender()
 		if moerr.IsMoErrCode(err, moerr.ErrAppendableSegmentNotFound) {
-			segH, err := seg.table.CreateSegment(true)
+			segH, err := seg.table.CreateSegment(true,seg.isTombstone)
 			if err != nil {
 				return err
 			}
@@ -181,14 +185,14 @@ func (seg *localSegment) prepareApplyANode(node *anode) error {
 			blk.Close()
 		} else if moerr.IsMoErrCode(err, moerr.ErrAppendableBlockNotFound) {
 			id := appender.GetID()
-			blk, err := seg.table.CreateBlock(id.SegmentID(), true)
+			blk, err := seg.table.CreateBlock(id.SegmentID(), true,seg.isTombstone)
 			if err != nil {
 				return err
 			}
 			appender = seg.tableHandle.SetAppender(blk.Fingerprint())
 			blk.Close()
 		}
-		if !appender.IsSameColumns(seg.table.GetLocalSchema()) {
+		if !appender.IsSameColumns(seg.table.GetLocalSchema(seg.isTombstone)) {
 			return moerr.NewInternalErrorNoCtx("schema changed, please rollback and retry")
 		}
 		//PrepareAppend: It is very important that appending a AppendNode into
@@ -237,8 +241,8 @@ func (seg *localSegment) prepareApplyANode(node *anode) error {
 			break
 		}
 	}
-	node.data.Vecs[seg.table.GetLocalSchema().PhyAddrKey.Idx].Close()
-	node.data.Vecs[seg.table.GetLocalSchema().PhyAddrKey.Idx] = vec
+	node.data.Vecs[seg.table.GetLocalSchema(seg.isTombstone).PhyAddrKey.Idx].Close()
+	node.data.Vecs[seg.table.GetLocalSchema(seg.isTombstone).PhyAddrKey.Idx] = vec
 	return nil
 }
 
@@ -258,7 +262,7 @@ func (seg *localSegment) prepareApplyPNode(node *pnode) (err error) {
 	}
 
 	if shouldCreateNewSeg() {
-		seg.nseg, err = seg.table.CreateNonAppendableSegment(true, new(objectio.CreateSegOpt).WithId(&sid))
+		seg.nseg, err = seg.table.CreateNonAppendableSegment(true,seg.isTombstone, new(objectio.CreateSegOpt).WithId(&sid))
 		seg.nseg.GetMeta().(*catalog.SegmentEntry).SetSorted()
 		if err != nil {
 			return
@@ -301,7 +305,7 @@ func (seg *localSegment) Append(data *containers.Batch) (err error) {
 	appended := uint32(0)
 	offset := uint32(0)
 	length := uint32(data.Length())
-	schema := seg.table.GetLocalSchema()
+	schema := seg.table.GetLocalSchema(seg.isTombstone)
 	for {
 		h := seg.appendable
 		space := h.GetSpace()
@@ -309,7 +313,7 @@ func (seg *localSegment) Append(data *containers.Batch) (err error) {
 			seg.registerANode()
 			h = seg.appendable
 		}
-		appended, err = h.Append(data, offset)
+		appended, err = h.Append(data, offset,schema)
 		if err != nil {
 			return
 		}
@@ -345,7 +349,7 @@ func (seg *localSegment) AddBlksWithMetaLoc(
 		//insert primary keys into seg.index
 		if pkVecs != nil && dedupType == txnif.FullDedup {
 			if err = seg.index.BatchInsert(
-				seg.table.GetLocalSchema().GetSingleSortKey().Name,
+				seg.table.GetLocalSchema(false).GetSingleSortKey().Name,
 				pkVecs[i],
 				0,
 				pkVecs[i].Length(),
@@ -361,7 +365,7 @@ func (seg *localSegment) AddBlksWithMetaLoc(
 }
 
 func (seg *localSegment) DeleteFromIndex(from, to uint32, node InsertNode) (err error) {
-	schema := seg.table.GetLocalSchema()
+	schema := seg.table.GetLocalSchema(false)
 	for i := from; i <= to; i++ {
 		v, _, err := node.GetValue(schema.GetSingleSortKeyIdx(), i)
 		if err != nil {
@@ -385,7 +389,7 @@ func (seg *localSegment) RangeDelete(start, end uint32) error {
 		if err != nil {
 			return err
 		}
-		if !seg.table.GetLocalSchema().HasPK() {
+		if !seg.table.GetLocalSchema(false).HasPK() {
 			// If no pk defined
 			return err
 		}
@@ -459,7 +463,7 @@ func (seg *localSegment) Rows() (n uint32) {
 }
 
 func (seg *localSegment) GetByFilter(filter *handle.Filter) (id *common.ID, offset uint32, err error) {
-	if !seg.table.GetLocalSchema().HasPK() {
+	if !seg.table.GetLocalSchema(seg.isTombstone).HasPK() {
 		id = seg.table.entry.AsCommonID()
 		rid := filter.Val.(types.Rowid)
 		id.BlockID, offset = rid.Decode()
@@ -488,7 +492,7 @@ func (seg *localSegment) GetPKVecs() []containers.Vector {
 }
 
 func (seg *localSegment) BatchDedup(key containers.Vector) error {
-	return seg.index.BatchDedup(seg.table.GetLocalSchema().GetSingleSortKey().Name, key)
+	return seg.index.BatchDedup(seg.table.GetLocalSchema(seg.isTombstone).GetSingleSortKey().Name, key)
 }
 
 func (seg *localSegment) GetColumnDataByIds(

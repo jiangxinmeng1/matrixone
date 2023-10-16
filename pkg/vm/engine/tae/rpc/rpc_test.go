@@ -1861,7 +1861,7 @@ func TestApplyDeltaloc(t *testing.T) {
 	vecOpts.Capacity = 0
 	delLocBat := containers.BuildBatch(attrs, vecTypes, vecOpts)
 	for id, offsets := range blkIDOffsetsMap {
-		seg, err := rel.GetMeta().(*catalog.TableEntry).GetSegmentByID(id.SegmentID())
+		seg, err := rel.GetMeta().(*catalog.TableEntry).GetSegmentByID(id.SegmentID(),false)
 		assert.NoError(t, err)
 		blk, err := seg.GetBlockEntryByID(&id.BlockID)
 		assert.NoError(t, err)
@@ -1912,7 +1912,7 @@ func TestApplyDeltaloc(t *testing.T) {
 		for it.Valid() {
 			blk := it.GetBlock()
 			meta := blk.GetMeta().(*catalog.BlockEntry)
-			view, err := meta.GetBlockData().GetColumnDataById(context.Background(), txn0, schema, def.Idx)
+			view, err := meta.GetBlockData().GetColumnDataById(context.Background(), txn0, schema, def.Idx,false)
 			assert.NoError(t, err)
 			view.ApplyDeletes()
 			length += view.GetData().Length()

@@ -144,8 +144,8 @@ func HandleSyncLogTailReq(
 	if err != nil {
 		return
 	}
-	if start.Less(tableEntry.GetCreatedAt()) {
-		start = tableEntry.GetCreatedAt()
+	if start.Less(tableEntry.GetCreatedAtLocked()) {
+		start = tableEntry.GetCreatedAtLocked()
 	}
 
 	ckpLoc, checkpointed, err := ckpClient.CollectCheckpointsInRange(ctx, start, end)
@@ -570,7 +570,7 @@ func visitBlkMeta(e *catalog.BlockEntry, node *catalog.MVCCNode[*catalog.Metadat
 // visitBlkData collects logtail in memory
 func (b *TableLogtailRespBuilder) visitBlkData(ctx context.Context, e *catalog.BlockEntry) (err error) {
 	block := e.GetBlockData()
-	insBatch, err := block.CollectAppendInRange(b.start, b.end, false)
+	insBatch, err := block.CollectInMemoryAppendInRange(b.start, b.end, false)
 	if err != nil {
 		return
 	}

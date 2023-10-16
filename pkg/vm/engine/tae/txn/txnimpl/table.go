@@ -477,6 +477,7 @@ func (tbl *txnTable) LogTxnEntry(entry txnif.TxnEntry, readed []*common.ID) (err
 			tbl.entry.GetDB().ID,
 			id.TableID,
 			id.SegmentID(),
+			false,
 			&id.BlockID)
 	}
 	return

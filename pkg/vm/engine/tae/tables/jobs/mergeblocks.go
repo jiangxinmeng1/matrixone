@@ -102,7 +102,7 @@ func NewMergeBlocksTask(
 		return
 	}
 	for _, meta := range mergedBlks {
-		seg, err := task.rel.GetSegment(&meta.GetSegment().ID)
+		seg, err := task.rel.GetSegment(&meta.GetSegment().ID, false)
 		if err != nil {
 			return nil, err
 		}
@@ -236,7 +236,7 @@ func (task *mergeBlocksTask) Execute(ctx context.Context) (err error) {
 
 	var size, rowCnt int
 	for i, block := range task.compacted {
-		if views[i], err = block.GetColumnDataByIds(ctx, Idxs); err != nil {
+		if views[i], err = block.GetColumnDataByIds(ctx, Idxs, false); err != nil {
 			return
 		}
 		defer views[i].Close()
@@ -283,7 +283,7 @@ func (task *mergeBlocksTask) Execute(ctx context.Context) (err error) {
 
 	var toSegEntry handle.Segment
 	if task.toSegEntry == nil {
-		if toSegEntry, err = task.rel.CreateNonAppendableSegment(false); err != nil {
+		if toSegEntry, err = task.rel.CreateNonAppendableSegment(false, false); err != nil {
 			return err
 		}
 		task.toSegEntry = toSegEntry.GetMeta().(*catalog.SegmentEntry)

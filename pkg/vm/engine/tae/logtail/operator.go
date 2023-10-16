@@ -72,7 +72,7 @@ func (c *BoundTableOperator) processTableData() error {
 	}
 	dirty := c.reader.GetDirtyByTable(c.dbID, c.tableID)
 	for _, dirtySeg := range dirty.Segs {
-		seg, err := tbl.GetSegmentByID(dirtySeg.ID)
+		seg, err := tbl.GetSegmentByID(dirtySeg.ID,false)
 		if err != nil {
 			if moerr.IsMoErrCode(err, moerr.OkExpectedEOB) {
 				continue

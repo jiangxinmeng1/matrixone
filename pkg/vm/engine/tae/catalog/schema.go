@@ -144,6 +144,28 @@ func NewEmptySchema(name string) *Schema {
 		Extra:     &apipb.SchemaExtra{},
 	}
 }
+func (s *Schema) MakeDeleteSchema() *Schema {
+	pkDef := s.GetPrimaryKey()
+	schema := NewEmptySchema("delete")
+	err := schema.AppendPKCol(AttrRowID, types.T_Rowid.ToType(), 0)
+	if err != nil {
+		panic(err)
+	}
+	err = schema.AppendCol(AttrCommitTs, types.T_TS.ToType())
+	if err != nil {
+		panic(err)
+	}
+	err = schema.AppendCol(pkDef.Name, pkDef.Type)
+	if err != nil {
+		panic(err)
+	}
+	err = schema.AppendCol(AttrAborted, types.T_bool.ToType())
+	if err != nil {
+		panic(err)
+	}
+	schema.Finalize(true)
+	return schema
+}
 
 func (s *Schema) Clone() *Schema {
 	buf, err := s.Marshal()

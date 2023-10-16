@@ -86,6 +86,8 @@ type UpdateCmd struct {
 	delete  *DeleteNode
 	append  *AppendNode
 	cmdType uint16
+
+	IsTombstone bool
 }
 
 func NewEmptyCmd(cmdType uint16) *UpdateCmd {
@@ -107,6 +109,8 @@ func NewAppendCmd(id uint32, app *AppendNode) *UpdateCmd {
 		append:  app,
 		cmdType: IOET_WALTxnCommand_AppendNode,
 		dest:    app.mvcc.meta.AsCommonID(),
+
+		IsTombstone: app.mvcc.meta.GetSegment().IsTombstone,
 	}
 	impl.BaseCustomizedCmd = txnbase.NewBaseCustomizedCmd(id, impl)
 	return impl
@@ -242,6 +246,10 @@ func (c *UpdateCmd) WriteTo(w io.Writer) (n int64, err error) {
 		return
 	}
 	n += common.IDSize
+	if _, err = w.Write(types.EncodeBool(&c.IsTombstone)); err != nil {
+		return
+	}
+	n += 1
 	switch c.GetType() {
 	case IOET_WALTxnCommand_DeleteNode, IOET_WALTxnCommand_PersistedDeleteNode:
 		sn, err = c.delete.WriteTo(w)
@@ -258,6 +266,9 @@ func (c *UpdateCmd) ReadFrom(r io.Reader) (n int64, err error) {
 	}
 	c.dest = &common.ID{}
 	if _, err = r.Read(common.EncodeID(c.dest)); err != nil {
+		return
+	}
+	if _, err = r.Read(types.EncodeBool(&c.IsTombstone)); err != nil {
 		return
 	}
 	switch c.GetType() {

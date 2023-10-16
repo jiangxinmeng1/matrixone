@@ -112,7 +112,7 @@ func NewSysSegmentEntry(table *TableEntry, id types.Uuid) *SegmentEntry {
 	}
 	e.CreateWithTS(types.SystemDBTS, &MetadataMVCCNode{})
 	var bid types.Blockid
-	schema := table.GetLastestSchema(false)
+	schema := table.GetLastestSchema()
 	if schema.Name == SystemTableSchema.Name {
 		bid = SystemBlock_Table_ID
 	} else if schema.Name == SystemDBSchema.Name {
@@ -209,7 +209,7 @@ func (entry *SegmentEntry) StringWithLevel(level common.PPLevel) string {
 func (entry *SegmentEntry) StringWithLevelLocked(level common.PPLevel) string {
 	if level <= common.PPL1 {
 		return fmt.Sprintf("[%s-%s]SEG[%s][C@%s,D@%s]",
-			entry.state.Repr(), entry.SegmentNode.String(), entry.ID.ToString(), entry.GetCreatedAt().ToString(), entry.GetDeleteAt().ToString())
+			entry.state.Repr(), entry.SegmentNode.String(), entry.ID.ToString(), entry.GetCreatedAtLocked().ToString(), entry.GetDeleteAt().ToString())
 	}
 	return fmt.Sprintf("[%s-%s]SEG[%s]%s", entry.state.Repr(), entry.SegmentNode.String(), entry.ID.ToString(), entry.BaseEntryImpl.StringLocked())
 }

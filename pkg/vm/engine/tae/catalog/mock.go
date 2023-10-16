@@ -206,7 +206,7 @@ func (h *mockTableHandle) MakeSegmentIt() (it handle.SegmentIt) {
 	return new(mockSegIt)
 }
 
-func (h *mockTableHandle) MakeSegmentItOnSnap() (it handle.SegmentIt) {
+func (h *mockTableHandle) MakeSegmentItOnSnap(_ bool) (it handle.SegmentIt) {
 	return new(mockSegIt)
 }
 

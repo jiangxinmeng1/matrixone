@@ -129,7 +129,7 @@ func (store *replayTxnStore) replayAppendData(cmd *AppendCmd, observer wal.Repla
 		if err != nil {
 			panic(err)
 		}
-		blk, err := database.GetBlockEntryByID(id)
+		blk, err := database.GetBlockEntryByID(id, cmd.IsTombStone)
 		if err != nil {
 			panic(err)
 		}
@@ -157,7 +157,7 @@ func (store *replayTxnStore) replayAppendData(cmd *AppendCmd, observer wal.Repla
 		if err != nil {
 			panic(err)
 		}
-		blk, err := database.GetBlockEntryByID(id)
+		blk, err := database.GetBlockEntryByID(id, cmd.IsTombStone)
 		if err != nil {
 			panic(err)
 		}
@@ -198,7 +198,7 @@ func (store *replayTxnStore) replayDelete(cmd *updates.UpdateCmd, observer wal.R
 	if err != nil {
 		panic(err)
 	}
-	blk, err := database.GetBlockEntryByID(id)
+	blk, err := database.GetBlockEntryByID(id, false)
 	if err != nil {
 		panic(err)
 	}
@@ -225,7 +225,7 @@ func (store *replayTxnStore) replayAppend(cmd *updates.UpdateCmd, observer wal.R
 	if err != nil {
 		panic(err)
 	}
-	blk, err := database.GetBlockEntryByID(id)
+	blk, err := database.GetBlockEntryByID(id, cmd.IsTombstone)
 	if err != nil {
 		panic(err)
 	}

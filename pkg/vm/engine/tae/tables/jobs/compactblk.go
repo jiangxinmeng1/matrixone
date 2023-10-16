@@ -83,7 +83,7 @@ func NewCompactBlockTask(
 		return
 	}
 	task.schema = rel.Schema().(*catalog.Schema)
-	seg, err := rel.GetSegment(&meta.GetSegment().ID)
+	seg, err := rel.GetSegment(&meta.GetSegment().ID, false)
 	if err != nil {
 		return
 	}
@@ -118,7 +118,7 @@ func (task *compactBlockTask) PrepareData(ctx context.Context) (
 	}
 	if len(idxs) > 0 {
 		var views *containers.BlockView
-		views, err = task.compacted.GetColumnDataByIds(ctx, idxs)
+		views, err = task.compacted.GetColumnDataByIds(ctx, idxs,false)
 		if err != nil {
 			return
 		}
@@ -203,7 +203,7 @@ func (task *compactBlockTask) Execute(ctx context.Context) (err error) {
 		// double the threshold to make more room for creating new appendable segment during appending, just a piece of defensive code
 		// check GetAppender function in tableHandle
 		if curSeg.GetNextObjectIndex() > options.DefaultObejctPerSegment*2 {
-			nextSeg := curSeg.GetTable().LastAppendableSegmemt()
+			nextSeg := curSeg.GetTable().LastAppendableSegmemt(false)
 			if nextSeg.ID == curSeg.ID {
 				// we can't create appendable seg here because compaction can be rollbacked.
 				// so just wait until the new appendable seg is available.
@@ -211,7 +211,7 @@ func (task *compactBlockTask) Execute(ctx context.Context) (err error) {
 				logutil.Infof("do not compact on seg %s %d, wait", curSeg.ID.ToString(), curSeg.GetNextObjectIndex())
 				return moerr.GetOkExpectedEOB()
 			}
-			if createOnSeg, err = task.compacted.GetSegment().GetRelation().GetSegment(&nextSeg.ID); err != nil {
+			if createOnSeg, err = task.compacted.GetSegment().GetRelation().GetSegment(&nextSeg.ID, false); err != nil {
 				return err
 			} else {
 				defer createOnSeg.Close()
@@ -233,7 +233,7 @@ func (task *compactBlockTask) Execute(ctx context.Context) (err error) {
 	if oldBMeta.IsAppendable() {
 		// for ablk, flush data and deletes
 		var data *containers.Batch
-		dataVer, errr := oldBlkData.CollectAppendInRange(types.TS{}, task.txn.GetStartTS(), true)
+		dataVer, errr := oldBlkData.CollectInMemoryAppendInRange(types.TS{}, task.txn.GetStartTS(), true)
 		if errr != nil {
 			return errr
 		}

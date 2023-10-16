@@ -67,6 +67,7 @@ func (checker *warChecker) CacheGet(
 	dbID uint64,
 	tableID uint64,
 	segmentID *types.Segmentid,
+	isTombstone bool,
 	blockID *objectio.Blockid) (block *catalog.BlockEntry, err error) {
 	block = checker.cacheGet(blockID)
 	if block != nil {
@@ -80,7 +81,7 @@ func (checker *warChecker) CacheGet(
 	if err != nil {
 		return
 	}
-	segment, err := table.GetSegmentByID(segmentID)
+	segment, err := table.GetSegmentByID(segmentID, isTombstone)
 	if err != nil {
 		return
 	}
@@ -96,8 +97,9 @@ func (checker *warChecker) InsertByID(
 	dbID uint64,
 	tableID uint64,
 	segmentID *types.Segmentid,
+	isTombstone bool,
 	blockID *objectio.Blockid) {
-	block, err := checker.CacheGet(dbID, tableID, segmentID, blockID)
+	block, err := checker.CacheGet(dbID, tableID, segmentID, isTombstone, blockID)
 	if err != nil {
 		panic(err)
 	}

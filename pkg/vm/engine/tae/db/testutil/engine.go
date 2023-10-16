@@ -320,7 +320,7 @@ func (e *TestEngine) TryDeleteByDeltalocWithTxn(vals []any, txn txnif.AsyncTxn) 
 	}
 
 	for id, offsets := range idOffsetsMap {
-		seg, err := rel.GetMeta().(*catalog.TableEntry).GetSegmentByID(id.SegmentID())
+		seg, err := rel.GetMeta().(*catalog.TableEntry).GetSegmentByID(id.SegmentID(),false)
 		assert.NoError(e.t, err)
 		blk, err := seg.GetBlockEntryByID(&id.BlockID)
 		assert.NoError(e.t, err)
@@ -686,9 +686,9 @@ func (e *TestEngine) CheckCollectDeleteInRange() {
 		pkDef := e.schema.GetPrimaryKey()
 		deleteRowIDs := deleteBat.GetVectorByName(catalog.AttrRowID)
 		deletePKs := deleteBat.GetVectorByName(pkDef.Name)
-		pks, err := meta.GetBlockData().GetColumnDataById(context.Background(), txn, e.schema, pkDef.Idx)
+		pks, err := meta.GetBlockData().GetColumnDataById(context.Background(), txn, e.schema, pkDef.Idx,false)
 		assert.NoError(e.t, err)
-		rowIDs, err := meta.GetBlockData().GetColumnDataById(context.Background(), txn, e.schema, e.schema.PhyAddrKey.Idx)
+		rowIDs, err := meta.GetBlockData().GetColumnDataById(context.Background(), txn, e.schema, e.schema.PhyAddrKey.Idx,false)
 		assert.NoError(e.t, err)
 		for i := 0; i < deleteBat.Length(); i++ {
 			rowID := deleteRowIDs.Get(i).(types.Rowid)

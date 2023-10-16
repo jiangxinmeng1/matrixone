@@ -35,7 +35,7 @@ type Relation interface {
 	Schema() any
 	AlterTable(ctx context.Context, req *apipb.AlterTableReq) error
 	MakeSegmentIt() SegmentIt
-	MakeSegmentItOnSnap() SegmentIt
+	MakeSegmentItOnSnap(bool) SegmentIt
 	MakeBlockIt() BlockIt
 
 	DeleteByPhyAddrKey(key any) error
@@ -55,9 +55,9 @@ type Relation interface {
 	AddBlksWithMetaLoc(ctx context.Context, metaLcos []objectio.Location) error
 
 	GetMeta() any
-	CreateSegment(bool) (Segment, error)
-	CreateNonAppendableSegment(is1PC bool) (Segment, error)
-	GetSegment(id *types.Segmentid) (Segment, error)
+	CreateSegment(bool,bool) (Segment, error)
+	CreateNonAppendableSegment(is1PC bool, isTombstone bool) (Segment, error)
+	GetSegment(id *types.Segmentid, isTombstone bool) (Segment, error)
 	SoftDeleteSegment(id *types.Segmentid) (err error)
 
 	GetDB() (Database, error)

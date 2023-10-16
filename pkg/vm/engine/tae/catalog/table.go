@@ -340,7 +340,7 @@ func (entry *TableEntry) StringLockedWithLevel(level common.PPLevel) string {
 	name := entry.GetLastestSchema().Name
 	if level <= common.PPL1 {
 		return fmt.Sprintf("TBL[%d][name=%s][C@%s,D@%s]",
-			entry.ID, name, entry.GetCreatedAt().ToString(), entry.GetDeleteAt().ToString())
+			entry.ID, name, entry.GetCreatedAtLocked().ToString(), entry.GetDeleteAt().ToString())
 	}
 	return fmt.Sprintf("TBL%s[name=%s, id=%d]", entry.BaseEntryImpl.StringLocked(), name, entry.ID)
 }
@@ -635,7 +635,7 @@ func (entry *TableEntry) CollectDeletesInRange(
 		seg := tombStoneIter.Get().GetPayload()
 		seg.RLock()
 		var visible bool
-		createTS := seg.GetCreatedAt()
+		createTS := seg.GetCreatedAtLocked()
 		deleteTS := seg.GetDeleteAt()
 		seg.RUnlock()
 		visible = createTS.LessEq(end) || deleteTS.GreaterEq(start)
@@ -648,7 +648,7 @@ func (entry *TableEntry) CollectDeletesInRange(
 				tombstoneBlk := segIter.Get().GetPayload()
 				tombstoneBlk.RLock()
 				var visible bool
-				createTS := tombstoneBlk.GetCreatedAt()
+				createTS := tombstoneBlk.GetCreatedAtLocked()
 				deleteTS := tombstoneBlk.GetDeleteAt()
 				tombstoneBlk.RUnlock()
 				visible = createTS.LessEq(end) || deleteTS.GreaterEq(start)
@@ -683,7 +683,7 @@ func (entry *TableEntry) CollectDeletesInRangeWithBlockId(
 		seg := tombStoneIter.Get().GetPayload()
 		seg.RLock()
 		var visible bool
-		createTS := seg.GetCreatedAt()
+		createTS := seg.GetCreatedAtLocked()
 		deleteTS := seg.GetDeleteAt()
 		seg.RUnlock()
 		visible = createTS.LessEq(end) || deleteTS.GreaterEq(start)
@@ -696,7 +696,7 @@ func (entry *TableEntry) CollectDeletesInRangeWithBlockId(
 				tombstoneBlk := segIter.Get().GetPayload()
 				tombstoneBlk.RLock()
 				var visible bool
-				createTS := tombstoneBlk.GetCreatedAt()
+				createTS := tombstoneBlk.GetCreatedAtLocked()
 				deleteTS := tombstoneBlk.GetDeleteAt()
 				tombstoneBlk.RUnlock()
 				visible = createTS.LessEq(end) || deleteTS.GreaterEq(start)
@@ -734,7 +734,7 @@ func (entry *TableEntry) CollectChangesInRange(ctx context.Context, startTS, end
 		seg := tombStoneIter.Get().GetPayload()
 		seg.RLock()
 		var visible bool
-		createTS := seg.GetCreatedAt()
+		createTS := seg.GetCreatedAtLocked()
 		deleteTS := seg.GetDeleteAt()
 		seg.RUnlock()
 		visible = createTS.LessEq(endTS) || deleteTS.GreaterEq(startTS)
@@ -747,7 +747,7 @@ func (entry *TableEntry) CollectChangesInRange(ctx context.Context, startTS, end
 				tombstoneBlk := segIter.Get().GetPayload()
 				tombstoneBlk.RLock()
 				var visible bool
-				createTS := tombstoneBlk.GetCreatedAt()
+				createTS := tombstoneBlk.GetCreatedAtLocked()
 				deleteTS := tombstoneBlk.GetDeleteAt()
 				tombstoneBlk.RUnlock()
 				visible = createTS.LessEq(endTS) || deleteTS.GreaterEq(startTS)

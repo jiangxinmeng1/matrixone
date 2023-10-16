@@ -41,7 +41,7 @@ func newHandle(table *dataTable, block *ablock) *tableHandle {
 
 func (h *tableHandle) SetAppender(id *common.ID) (appender data.BlockAppender) {
 	tableMeta := h.table.meta
-	segMeta, _ := tableMeta.GetSegmentByID(id.SegmentID())
+	segMeta, _ := tableMeta.GetSegmentByID(id.SegmentID(),false)
 	blkMeta, _ := segMeta.GetBlockEntryByID(&id.BlockID)
 	h.block = blkMeta.GetBlockData().(*ablock)
 	h.appender, _ = h.block.MakeAppender()
@@ -51,7 +51,7 @@ func (h *tableHandle) SetAppender(id *common.ID) (appender data.BlockAppender) {
 
 func (h *tableHandle) ThrowAppenderAndErr() (appender data.BlockAppender, err error) {
 	id := h.appender.GetID()
-	segEntry, _ := h.table.meta.GetSegmentByID(id.SegmentID())
+	segEntry, _ := h.table.meta.GetSegmentByID(id.SegmentID(),false)
 	if segEntry == nil ||
 		segEntry.GetAppendableBlockCnt() >= int(segEntry.GetTable().GetLastestSchema().SegmentMaxBlocks) {
 		err = data.ErrAppendableSegmentNotFound
@@ -67,7 +67,7 @@ func (h *tableHandle) ThrowAppenderAndErr() (appender data.BlockAppender, err er
 func (h *tableHandle) GetAppender() (appender data.BlockAppender, err error) {
 	var segEntry *catalog.SegmentEntry
 	if h.appender == nil {
-		segEntry = h.table.meta.LastAppendableSegmemt()
+		segEntry = h.table.meta.LastAppendableSegmemt(false)
 		if segEntry == nil {
 			err = data.ErrAppendableSegmentNotFound
 			return

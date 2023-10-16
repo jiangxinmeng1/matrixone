@@ -17,6 +17,7 @@ package txnbase
 import (
 	"context"
 
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
@@ -93,21 +94,21 @@ func (store *NoopTxnStore) UnsafeGetRelation(dbId, id uint64) (rel handle.Relati
 func (store *NoopTxnStore) GetDatabase(name string) (db handle.Database, err error)   { return }
 func (store *NoopTxnStore) GetDatabaseByID(id uint64) (db handle.Database, err error) { return }
 func (store *NoopTxnStore) DatabaseNames() (names []string)                           { return }
-func (store *NoopTxnStore) GetSegment(id *common.ID) (seg handle.Segment, err error) {
+func (store *NoopTxnStore) GetSegment(id *common.ID, _ bool) (seg handle.Segment, err error) {
 	return
 }
 
-func (store *NoopTxnStore) CreateSegment(dbId, tid uint64, is1PC bool) (seg handle.Segment, err error) {
+func (store *NoopTxnStore) CreateSegment(dbId, tid uint64, is1PC, _ bool) (seg handle.Segment, err error) {
 	return
 }
-func (store *NoopTxnStore) CreateNonAppendableSegment(dbId, tid uint64, _ bool) (seg handle.Segment, err error) {
+func (store *NoopTxnStore) CreateNonAppendableSegment(dbId, tid uint64, _, _ bool) (seg handle.Segment, err error) {
 	return
 }
-func (store *NoopTxnStore) GetBlock(id *common.ID) (blk handle.Block, err error) { return }
-func (store *NoopTxnStore) CreateBlock(*common.ID, bool) (blk handle.Block, err error) {
+func (store *NoopTxnStore) GetBlock(id *common.ID, _ bool) (blk handle.Block, err error) { return }
+func (store *NoopTxnStore) CreateBlock(*common.ID, bool, bool) (blk handle.Block, err error) {
 	return
 }
-func (store *NoopTxnStore) CreateNonAppendableBlock(*common.ID, *objectio.CreateBlockOpt) (blk handle.Block, err error) {
+func (store *NoopTxnStore) CreateNonAppendableBlock(*common.ID, bool, *objectio.CreateBlockOpt) (blk handle.Block, err error) {
 	return
 }
 
@@ -164,4 +165,15 @@ func (store *NoopTxnStore) ObserveTxn(
 
 func (store *NoopTxnStore) GetTransactionType() txnif.TxnType {
 	return txnif.TxnType_Normal
+}
+
+func (store *NoopTxnStore) FillInWorkSpaceDeletesByTombstone(
+	id *common.ID,
+	view *containers.BaseView) (err error) {
+	return
+}
+func (store *NoopTxnStore) GetWorkspaceTombstoneByRow(
+	id *common.ID,
+	row uint32) (existed bool, commitTS types.TS, err error) {
+	return
 }

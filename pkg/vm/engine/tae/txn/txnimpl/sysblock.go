@@ -362,9 +362,9 @@ func (blk *txnSysBlock) getDBTableData(colIdx int) (view *containers.ColumnView,
 	return
 }
 
-func (blk *txnSysBlock) GetColumnDataById(ctx context.Context, colIdx int) (view *containers.ColumnView, err error) {
+func (blk *txnSysBlock) GetColumnDataById(ctx context.Context, colIdx int, _ bool) (view *containers.ColumnView, err error) {
 	if !blk.isSysTable() {
-		return blk.txnBlock.GetColumnDataById(ctx, colIdx)
+		return blk.txnBlock.GetColumnDataById(ctx, colIdx, true)
 	}
 	if blk.table.GetID() == pkgcatalog.MO_DATABASE_ID {
 		return blk.getDBTableData(colIdx)
@@ -383,7 +383,7 @@ func (blk *txnSysBlock) Prefetch(idxes []int) error {
 
 func (blk *txnSysBlock) GetColumnDataByName(ctx context.Context, attr string) (view *containers.ColumnView, err error) {
 	colIdx := blk.entry.GetSchema().GetColIdx(attr)
-	return blk.GetColumnDataById(ctx, colIdx)
+	return blk.GetColumnDataById(ctx, colIdx, false)
 }
 
 func (blk *txnSysBlock) GetColumnDataByNames(ctx context.Context, attrs []string) (view *containers.BlockView, err error) {

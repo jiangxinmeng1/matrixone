@@ -105,7 +105,7 @@ func NewFlushTableTailTask(
 	for _, blk := range blks {
 		task.scopes = append(task.scopes, *blk.AsCommonID())
 		var seg handle.Segment
-		seg, err = rel.GetSegment(&meta.GetSegment().ID)
+		seg, err = rel.GetSegment(&meta.GetSegment().ID,false)
 		if err != nil {
 			return
 		}
@@ -132,7 +132,7 @@ func NewFlushTableTailTask(
 	for _, blk := range tblEntry.DeletedDirties {
 		task.scopes = append(task.scopes, *blk.AsCommonID())
 		var seg handle.Segment
-		seg, err = rel.GetSegment(&meta.GetSegment().ID)
+		seg, err = rel.GetSegment(&meta.GetSegment().ID,false)
 		if err != nil {
 			return
 		}
@@ -306,7 +306,7 @@ func (task *flushTableTailTask) prepareAblkSortedData(ctx context.Context, blkid
 	}
 	blk := task.ablksHandles[blkidx]
 
-	views, err := blk.GetColumnDataByIds(ctx, idxs)
+	views, err := blk.GetColumnDataByIds(ctx, idxs,false)
 	if err != nil {
 		return
 	}
@@ -414,7 +414,7 @@ func (task *flushTableTailTask) mergeAblks(ctx context.Context) (err error) {
 	// create new object to hold merged blocks
 	var toSegmentEntry *catalog.SegmentEntry
 	var toSegmentHandle handle.Segment
-	if toSegmentHandle, err = task.rel.CreateNonAppendableSegment(false); err != nil {
+	if toSegmentHandle, err = task.rel.CreateNonAppendableSegment(false,false); err != nil {
 		return
 	}
 	toSegmentEntry = toSegmentHandle.GetMeta().(*catalog.SegmentEntry)
@@ -563,7 +563,7 @@ func (task *flushTableTailTask) flushAblksForSnapshot(ctx context.Context) (subt
 		var data, deletes *containers.Batch
 		var dataVer *containers.BatchWithVersion
 		blkData := blk.GetBlockData()
-		if dataVer, err = blkData.CollectAppendInRange(types.TS{}, task.txn.GetStartTS(), true); err != nil {
+		if dataVer, err = blkData.CollectInMemoryAppendInRange(types.TS{}, task.txn.GetStartTS(), true); err != nil {
 			return
 		}
 		data = dataVer.Batch

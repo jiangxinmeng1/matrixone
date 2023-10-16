@@ -263,7 +263,7 @@ func (catalog *Catalog) onReplayCreateDB(
 	catalog.OnReplayDBID(dbid)
 	db, _ := catalog.GetDatabaseByID(dbid)
 	if db != nil {
-		dbCreatedAt := db.GetCreatedAt()
+		dbCreatedAt := db.GetCreatedAtLocked()
 		if !dbCreatedAt.Equal(txnNode.End) {
 			panic(moerr.NewInternalErrorNoCtx("logic err expect %s, get %s",
 				txnNode.End.ToString(), dbCreatedAt.ToString()))
@@ -310,7 +310,7 @@ func (catalog *Catalog) onReplayDeleteDB(dbid uint64, txnNode *txnbase.TxnMVCCNo
 	prev := db.MVCCChain.GetLatestNodeLocked()
 	un := &MVCCNode[*EmptyMVCCNode]{
 		EntryMVCCNode: &EntryMVCCNode{
-			CreatedAt: db.GetCreatedAt(),
+			CreatedAt: db.GetCreatedAtLocked(),
 			DeletedAt: txnNode.End,
 		},
 		TxnMVCCNode: txnNode,
@@ -422,7 +422,7 @@ func (catalog *Catalog) onReplayCreateTable(dbid, tid uint64, schema *Schema, tx
 	}
 	tbl, _ := db.GetTableEntryByID(tid)
 	if tbl != nil {
-		tblCreatedAt := tbl.GetCreatedAt()
+		tblCreatedAt := tbl.GetCreatedAtLocked()
 		if tblCreatedAt.Greater(txnNode.End) {
 			panic(moerr.NewInternalErrorNoCtx("logic err expect %s, get %s", txnNode.End.ToString(), tblCreatedAt.ToString()))
 		}
@@ -589,7 +589,7 @@ func (catalog *Catalog) onReplayCreateSegment(
 	}
 	seg, _ := rel.GetSegmentByID(segid, isTombstone)
 	if seg != nil {
-		segCreatedAt := seg.GetCreatedAt()
+		segCreatedAt := seg.GetCreatedAtLocked()
 		if !segCreatedAt.Equal(txnNode.End) {
 			panic(moerr.NewInternalErrorNoCtx("logic err expect %s, get %s", txnNode.End.ToString(), segCreatedAt.ToString()))
 		}

@@ -100,6 +100,8 @@ type SegmentNode struct {
 	// decide to create a new non-appendable segment, its content is all set.
 	nextObjectIdx uint16
 	sorted        bool // deprecated
+
+	IsTombstone bool
 }
 
 const (
@@ -128,6 +130,11 @@ func (node *SegmentNode) ReadFrom(r io.Reader) (n int64, err error) {
 		return
 	}
 	n += 1
+	_, err = r.Read(types.EncodeBool(&node.IsTombstone))
+	if err != nil {
+		return
+	}
+	n += 1
 	return
 }
 
@@ -148,6 +155,11 @@ func (node *SegmentNode) WriteTo(w io.Writer) (n int64, err error) {
 	}
 	n += 8
 	_, err = w.Write(types.EncodeBool(&node.sorted))
+	if err != nil {
+		return
+	}
+	n += 1
+	_, err = w.Write(types.EncodeBool(&node.IsTombstone))
 	if err != nil {
 		return
 	}

@@ -316,7 +316,7 @@ func (h *txnRelation) RangeDelete(id *common.ID, start, end uint32, dt handle.De
 		return err
 	}
 	pk := h.table.entry.GetLastestSchema().GetPrimaryKey()
-	pkView, err := blk.GetColumnDataById(h.Txn.GetContext(), pk.Idx, true)
+	pkView, err := blk.GetColumnDataById(h.Txn.GetContext(), pk.Idx,false)
 	if err != nil {
 		return err
 	}

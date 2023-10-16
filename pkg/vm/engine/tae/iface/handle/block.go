@@ -59,9 +59,9 @@ type BlockReader interface {
 	IsUncommitted() bool
 	GetByFilter(ctx context.Context, filter *Filter) (uint32, error)
 	GetColumnDataByNames(ctx context.Context, attrs []string) (*containers.BlockView, error)
-	GetColumnDataByIds(ctx context.Context, colIdxes []int) (*containers.BlockView, error)
+	GetColumnDataByIds(ctx context.Context, colIdxes []int, isTombstone bool) (*containers.BlockView, error)
 	GetColumnDataByName(context.Context, string) (*containers.ColumnView, error)
-	GetColumnDataById(context.Context, int) (*containers.ColumnView, error)
+	GetColumnDataById(context.Context, int, bool) (*containers.ColumnView, error)
 	GetMeta() any
 	GetDeltaPersistedTS() types.TS
 	GetMetaLoc() objectio.Location

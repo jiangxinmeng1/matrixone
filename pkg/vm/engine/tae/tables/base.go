@@ -946,4 +946,4 @@ func (blk *baseBlock) CollectInMemoryAppendInRange(start, end types.TS, withAbor
 	return nil, nil
 }
 
-func (blk *baseBlock) CollectAppendInRange
+// func (blk *baseBlock) CollectAppendInRange

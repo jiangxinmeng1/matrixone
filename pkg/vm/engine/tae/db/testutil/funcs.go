@@ -194,7 +194,7 @@ func GetColumnRowsByScan(t *testing.T, rel handle.Relation, colIdx int, applyDel
 
 func ForEachColumnView(rel handle.Relation, colIdx int, fn func(view *containers.ColumnView) error) {
 	ForEachBlock(rel, func(blk handle.Block) (err error) {
-		view, err := blk.GetColumnDataById(context.Background(), colIdx)
+		view, err := blk.GetColumnDataById(context.Background(), colIdx,false)
 		if view == nil {
 			logutil.Warnf("blk %v", blk.String())
 			return
@@ -329,7 +329,7 @@ func MergeBlocks(t *testing.T, tenantID uint32, e *db.DB, dbName string, schema 
 		txn.BindAccessInfo(tenantID, 0, 0)
 		db, _ = txn.GetDatabase(dbName)
 		rel, _ = db.GetRelationByName(schema.Name)
-		segHandle, err := rel.GetSegment(&seg.ID)
+		segHandle, err := rel.GetSegment(&seg.ID, false)
 		if err != nil {
 			if skipConflict {
 				_ = txn.Rollback(context.Background())
@@ -378,7 +378,7 @@ func MockCNDeleteInS3(
 	deleteRows []uint32,
 ) (location objectio.Location, err error) {
 	pkDef := schema.GetPrimaryKey()
-	view, err := blk.GetColumnDataById(context.Background(), txn, schema, pkDef.Idx)
+	view, err := blk.GetColumnDataById(context.Background(), txn, schema, pkDef.Idx, false)
 	pkVec := containers.MakeVector(pkDef.Type)
 	rowIDVec := containers.MakeVector(types.T_Rowid.ToType())
 	blkID := &blk.GetMeta().(*catalog.BlockEntry).ID

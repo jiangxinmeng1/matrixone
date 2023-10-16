@@ -298,28 +298,28 @@ func (db *txnDB) GetRelationByID(id uint64) (relation handle.Relation, err error
 	return
 }
 
-func (db *txnDB) GetSegment(id *common.ID) (seg handle.Segment, err error) {
+func (db *txnDB) GetSegment(id *common.ID, isTombstone bool) (seg handle.Segment, err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(id.TableID); err != nil {
 		return
 	}
-	return table.GetSegment(id.SegmentID())
+	return table.GetSegment(id.SegmentID(), isTombstone)
 }
 
-func (db *txnDB) CreateSegment(tid uint64, is1PC bool) (seg handle.Segment, err error) {
+func (db *txnDB) CreateSegment(tid uint64, is1PC bool, isTombstone bool) (seg handle.Segment, err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(tid); err != nil {
 		return
 	}
-	return table.CreateSegment(is1PC)
+	return table.CreateSegment(is1PC, isTombstone)
 }
 
-func (db *txnDB) CreateNonAppendableSegment(tid uint64, is1PC bool) (seg handle.Segment, err error) {
+func (db *txnDB) CreateNonAppendableSegment(tid uint64, is1PC bool, isTombstone bool) (seg handle.Segment, err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(tid); err != nil {
 		return
 	}
-	return table.CreateNonAppendableSegment(is1PC, nil)
+	return table.CreateNonAppendableSegment(is1PC, isTombstone, nil)
 }
 
 func (db *txnDB) getOrSetTable(id uint64) (table *txnTable, err error) {
@@ -351,28 +351,28 @@ func (db *txnDB) getOrSetTable(id uint64) (table *txnTable, err error) {
 	return
 }
 
-func (db *txnDB) CreateNonAppendableBlock(id *common.ID, opts *objectio.CreateBlockOpt) (blk handle.Block, err error) {
+func (db *txnDB) CreateNonAppendableBlock(id *common.ID, isTombstone bool, opts *objectio.CreateBlockOpt) (blk handle.Block, err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(id.TableID); err != nil {
 		return
 	}
-	return table.CreateNonAppendableBlock(id.SegmentID(), opts)
+	return table.CreateNonAppendableBlock(id.SegmentID(), isTombstone, opts)
 }
 
-func (db *txnDB) GetBlock(id *common.ID) (blk handle.Block, err error) {
+func (db *txnDB) GetBlock(id *common.ID, isTombstone bool) (blk handle.Block, err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(id.TableID); err != nil {
 		return
 	}
-	return table.GetBlock(id)
+	return table.GetBlock(id, isTombstone)
 }
 
-func (db *txnDB) CreateBlock(id *common.ID, is1PC bool) (blk handle.Block, err error) {
+func (db *txnDB) CreateBlock(id *common.ID, is1PC bool, isTombstone bool) (blk handle.Block, err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(id.TableID); err != nil {
 		return
 	}
-	return table.CreateBlock(id.SegmentID(), is1PC)
+	return table.CreateBlock(id.SegmentID(), is1PC, isTombstone)
 }
 
 func (db *txnDB) SoftDeleteBlock(id *common.ID) (err error) {

@@ -383,7 +383,7 @@ func (store *txnStore) ObserveTxn(
 		dbName := db.entry.GetName()
 		dbid := db.entry.ID
 		for _, tbl := range db.tables {
-			tblName := tbl.GetLocalSchema().Name
+			tblName := tbl.GetLocalSchema(false).Name
 			tid := tbl.entry.ID
 			rotateTable(dbName, tblName, dbid, tid)
 			if tbl.createEntry != nil || tbl.dropEntry != nil {
@@ -408,7 +408,7 @@ func (store *txnStore) ObserveTxn(
 				for _, node := range tbl.localSegment.nodes {
 					anode, ok := node.(*anode)
 					if ok {
-						schema := anode.table.GetLocalSchema()
+						schema := anode.table.GetLocalSchema(false)
 						bat := &containers.BatchWithVersion{
 							Version:    schema.Version,
 							NextSeqnum: uint16(schema.Extra.NextColSeqnum),
@@ -502,28 +502,28 @@ func (store *txnStore) GetRelationByID(dbId uint64, id uint64) (relation handle.
 	return db.GetRelationByID(id)
 }
 
-func (store *txnStore) GetSegment(id *common.ID) (seg handle.Segment, err error) {
+func (store *txnStore) GetSegment(id *common.ID, isTombstone bool) (seg handle.Segment, err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(id.DbID); err != nil {
 		return
 	}
-	return db.GetSegment(id)
+	return db.GetSegment(id, isTombstone)
 }
 
-func (store *txnStore) CreateSegment(dbId, tid uint64, is1PC bool) (seg handle.Segment, err error) {
+func (store *txnStore) CreateSegment(dbId, tid uint64, is1PC bool, isTombstone bool) (seg handle.Segment, err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(dbId); err != nil {
 		return
 	}
-	return db.CreateSegment(tid, is1PC)
+	return db.CreateSegment(tid, is1PC, isTombstone)
 }
 
-func (store *txnStore) CreateNonAppendableSegment(dbId, tid uint64, is1PC bool) (seg handle.Segment, err error) {
+func (store *txnStore) CreateNonAppendableSegment(dbId, tid uint64, is1PC bool, isTombstone bool) (seg handle.Segment, err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(dbId); err != nil {
 		return
 	}
-	return db.CreateNonAppendableSegment(tid, is1PC)
+	return db.CreateNonAppendableSegment(tid, is1PC,isTombstone)
 }
 
 func (store *txnStore) getOrSetDB(id uint64) (db *txnDB, err error) {
@@ -549,7 +549,7 @@ func (store *txnStore) getOrSetDB(id uint64) (db *txnDB, err error) {
 	return
 }
 
-func (store *txnStore) CreateNonAppendableBlock(id *common.ID, opts *objectio.CreateBlockOpt) (blk handle.Block, err error) {
+func (store *txnStore) CreateNonAppendableBlock(id *common.ID, isTombstone bool, opts *objectio.CreateBlockOpt) (blk handle.Block, err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(id.DbID); err != nil {
 		return
@@ -557,18 +557,18 @@ func (store *txnStore) CreateNonAppendableBlock(id *common.ID, opts *objectio.Cr
 	perfcounter.Update(store.ctx, func(counter *perfcounter.CounterSet) {
 		counter.TAE.Block.CreateNonAppendable.Add(1)
 	})
-	return db.CreateNonAppendableBlock(id, opts)
+	return db.CreateNonAppendableBlock(id,isTombstone, opts)
 }
 
-func (store *txnStore) GetBlock(id *common.ID) (blk handle.Block, err error) {
+func (store *txnStore) GetBlock(id *common.ID, isTombstone bool) (blk handle.Block, err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(id.DbID); err != nil {
 		return
 	}
-	return db.GetBlock(id)
+	return db.GetBlock(id,isTombstone)
 }
 
-func (store *txnStore) CreateBlock(id *common.ID, is1PC bool) (blk handle.Block, err error) {
+func (store *txnStore) CreateBlock(id *common.ID, is1PC bool, isTombstone bool) (blk handle.Block, err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(id.DbID); err != nil {
 		return
@@ -576,7 +576,7 @@ func (store *txnStore) CreateBlock(id *common.ID, is1PC bool) (blk handle.Block,
 	perfcounter.Update(store.ctx, func(counter *perfcounter.CounterSet) {
 		counter.TAE.Block.Create.Add(1)
 	})
-	return db.CreateBlock(id, is1PC)
+	return db.CreateBlock(id, is1PC, isTombstone)
 }
 
 func (store *txnStore) SoftDeleteBlock(id *common.ID) (err error) {

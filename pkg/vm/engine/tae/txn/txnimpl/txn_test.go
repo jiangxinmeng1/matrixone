@@ -207,7 +207,7 @@ func TestAppend(t *testing.T) {
 	rows := uint64(MaxNodeRows) / 8 * 3
 	brows := rows / 3
 
-	bat := catalog.MockBatch(tbl.GetLocalSchema(), int(rows))
+	bat := catalog.MockBatch(tbl.GetLocalSchema(false), int(rows))
 	defer bat.Close()
 	bats := bat.Split(3)
 
@@ -529,9 +529,9 @@ func TestTransaction2(t *testing.T) {
 	err = txn1.Commit(context.Background())
 	assert.Nil(t, err)
 	t.Log(db.String())
-	assert.Equal(t, txn1.GetCommitTS(), db.GetMeta().(*catalog.DBEntry).GetCreatedAt())
+	assert.Equal(t, txn1.GetCommitTS(), db.GetMeta().(*catalog.DBEntry).GetCreatedAtLocked())
 	assert.True(t, db.GetMeta().(*catalog.DBEntry).IsCommitted())
-	assert.Equal(t, txn1.GetCommitTS(), rel.GetMeta().(*catalog.TableEntry).GetCreatedAt())
+	assert.Equal(t, txn1.GetCommitTS(), rel.GetMeta().(*catalog.TableEntry).GetCreatedAtLocked())
 	assert.True(t, rel.GetMeta().(*catalog.TableEntry).IsCommitted())
 
 	txn2, _ := mgr.StartTxn(nil)
@@ -612,7 +612,7 @@ func TestSegment1(t *testing.T) {
 	assert.Nil(t, err)
 	rel, err := db.CreateRelation(schema)
 	assert.Nil(t, err)
-	_, err = rel.CreateSegment(false)
+	_, err = rel.CreateSegment(false, false)
 	assert.Nil(t, err)
 	err = txn1.Commit(context.Background())
 	assert.Nil(t, err)
@@ -632,7 +632,7 @@ func TestSegment1(t *testing.T) {
 	}
 	assert.Equal(t, 1, cnt)
 
-	_, err = rel.CreateSegment(false)
+	_, err = rel.CreateSegment(false, false)
 	assert.Nil(t, err)
 
 	segIt = rel.MakeSegmentIt()
@@ -688,7 +688,7 @@ func TestSegment2(t *testing.T) {
 	rel, _ := db.CreateRelation(schema)
 	segCnt := 10
 	for i := 0; i < segCnt; i++ {
-		_, err := rel.CreateSegment(false)
+		_, err := rel.CreateSegment(false, false)
 		assert.Nil(t, err)
 	}
 
@@ -719,7 +719,7 @@ func TestBlock1(t *testing.T) {
 	db, _ := txn1.CreateDatabase("db", "", "")
 	schema := catalog.MockSchema(1, 0)
 	rel, _ := db.CreateRelation(schema)
-	seg, _ := rel.CreateSegment(false)
+	seg, _ := rel.CreateSegment(false, false)
 
 	blkCnt := 100
 	for i := 0; i < blkCnt; i++ {
