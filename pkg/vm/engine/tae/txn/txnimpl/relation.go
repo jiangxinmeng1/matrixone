@@ -307,7 +307,7 @@ func (h *txnRelation) DeleteByPhyAddrKey(key any) error {
 
 // Only used by test.
 func (h *txnRelation) RangeDelete(id *common.ID, start, end uint32, dt handle.DeleteType) error {
-	if id.SegmentID().Eq(h.table.localSegment.entry.ID) {
+	if h.table.localSegment != nil && id.SegmentID().Eq(h.table.localSegment.entry.ID) {
 		h.table.RangeDeleteLocalRows(start, end)
 		return nil
 	}
