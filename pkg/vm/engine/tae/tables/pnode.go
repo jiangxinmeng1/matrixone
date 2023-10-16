@@ -197,9 +197,12 @@ func (node *persistedNode) GetRowByFilter(
 
 	// Load persisted deletes
 	view := containers.NewColumnView(0)
-	if err = node.block.FillPersistedDeletes(ctx, txn, view.BaseView); err != nil {
+	node.block.RLock()
+	if err = node.block.FillInMemoryDeletesLockedWithTombstone(txn, view.BaseView, node.block.RWMutex); err != nil {
+		node.block.RUnlock()
 		return
 	}
+	node.block.RUnlock()
 
 	exist := false
 	var deleted bool

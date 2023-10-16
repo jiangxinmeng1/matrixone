@@ -352,14 +352,28 @@ func (node *memoryNode) GetRowByFilter(
 		if appendnode.IsAborted() || !appendnode.IsVisible(txn) {
 			continue
 		}
-		var deleted bool
-		deleted, err = node.block.mvcc.IsDeletedLocked(row, txn, node.block.mvcc.RWMutex)
+		existed, ts, err := node.block.GetTombstoneByRow(txn, node.block.meta.ID, row)
 		if err != nil {
-			return
+			return 0, err
 		}
-		if !deleted {
-			return
+		if !existed {
+			return row, nil
 		}
+		// for tombstone in workspace, ts is 0
+		if ts.IsEmpty() {
+			continue
+		}
+		if ts.Greater(txn.GetStartTS()) {
+			return row, nil
+		}
+		// var deleted bool
+		// deleted, err = node.block.mvcc.IsDeletedLocked(row, txn, node.block.mvcc.RWMutex)
+		// if err != nil {
+		// 	return
+		// }
+		// if !deleted {
+		// 	return
+		// }
 	}
 	return 0, moerr.NewNotFoundNoCtx()
 }
@@ -422,7 +436,7 @@ func (node *memoryNode) checkConflictAndDupClosure(
 			return moerr.GetOkExpectedDup()
 		}
 		// for tombstone in workspace, ts is 0
-		if ts.IsEmpty(){
+		if ts.IsEmpty() {
 			return nil
 		}
 		if ts.Greater(txn.GetStartTS()) {

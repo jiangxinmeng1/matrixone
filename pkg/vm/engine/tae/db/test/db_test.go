@@ -450,10 +450,10 @@ func TestNonAppendableBlock(t *testing.T) {
 		assert.Nil(t, view.DeleteMask)
 		assert.Equal(t, bat.Vecs[2].Length(), view.Length())
 
-		pkView,err:=dataBlk.GetColumnDataById(context.Background(),txn,schema,schema.GetPrimaryKey().Idx,false)
+		pkView, err := dataBlk.GetColumnDataById(context.Background(), txn, schema, schema.GetPrimaryKey().Idx, false)
 		assert.Nil(t, err)
-		pkVec:=pkView.GetData()
-		_, err = dataBlk.RangeDelete(txn, 1, 2, pkVec.CloneWindow(1,2), handle.DT_Normal)
+		pkVec := pkView.GetData()
+		_, err = dataBlk.RangeDelete(txn, 1, 2, pkVec.CloneWindow(1, 2), handle.DT_Normal)
 		assert.Nil(t, err)
 
 		view, err = dataBlk.GetColumnDataById(context.Background(), txn, readSchema, 2, true)
@@ -627,7 +627,9 @@ func TestCompactBlock1(t *testing.T) {
 		assert.Nil(t, err)
 		assert.Nil(t, err)
 		err = txn.Commit(context.Background())
-		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict))
+		// assert.True(t, moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict))
+		// compact is not used
+		assert.NoError(t, err)
 	}
 }
 
@@ -1090,7 +1092,9 @@ func TestFlushTabletail(t *testing.T) {
 	{
 		require.NoError(t, commitDeleteAfterFlush.Commit(context.Background()))
 		txn, rel := testutil.GetDefaultRelation(t, tae.DB, schema.Name)
+		logutil.Infof("lalala get by filter ******************************")
 		_, _, err := rel.GetByFilter(context.Background(), handle.NewEQFilter(bat.Vecs[2].Get(42)))
+		logutil.Infof("lalala get by filter ******************************")
 		require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotFound))
 
 		require.NoError(t, rel.Append(context.Background(), bat2))

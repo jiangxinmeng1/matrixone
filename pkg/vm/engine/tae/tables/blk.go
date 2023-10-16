@@ -232,22 +232,12 @@ func (blk *block) getPersistedRowByFilter(
 	}
 	offset = uint32(off)
 
-	blk.mvcc.RLock()
-	defer blk.mvcc.RUnlock()
-	deleted, err := blk.mvcc.IsDeletedLocked(offset, txn, blk.mvcc.RWMutex)
-	if err != nil {
-		return
-	}
-	if deleted {
-		err = moerr.NewNotFoundNoCtx()
-		return
-	}
-	deletes, err := blk.persistedCollectDeleteMaskInRange(ctx, types.TS{}, txn.GetStartTS())
-	if err != nil {
-		return
-	}
-	if deletes.Contains(uint64(offset)) {
-		err = moerr.NewNotFoundNoCtx()
+	blk.RLock()
+	view := containers.NewBlockView()
+	err = blk.FillInMemoryDeletesLockedWithTombstone(txn, view.BaseView, blk.RWMutex)
+	blk.RUnlock()
+	if view.DeleteMask.Contains(uint64(offset)) {
+		return 0, moerr.NewNotFoundNoCtx()
 	}
 	return
 }
