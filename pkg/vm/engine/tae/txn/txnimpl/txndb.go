@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
@@ -605,3 +606,23 @@ func (db *txnDB) CleanUp() {
 		tbl.CleanUp()
 	}
 }
+
+func (db *txnDB) FillInWorkSpaceDeletesByTombstone(
+	id *common.ID,
+	view *containers.BaseView) (err error) {
+	tbl, err := db.getOrSetTable(id.TableID)
+	if err != nil {
+		return
+	}
+	return tbl.FillInWorkSpaceDeletesByTombstone(&id.BlockID, view)
+}
+
+func (db *txnDB) GetWorkspaceTombstoneByRow(
+	id *common.ID,
+	row uint32) (existed bool, commitTS types.TS, err error){
+		tbl, err := db.getOrSetTable(id.TableID)
+		if err != nil {
+			return
+		}
+		return tbl.GetWorkspaceTombstoneByRow(&id.BlockID, row)
+	}

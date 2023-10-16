@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/perfcounter"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -757,4 +758,23 @@ func (store *txnStore) CleanUp() {
 	for _, db := range store.dbs {
 		db.CleanUp()
 	}
+}
+
+func (store *txnStore) FillInWorkSpaceDeletesByTombstone(
+	id *common.ID,
+	view *containers.BaseView) (err error) {
+	db, err := store.getOrSetDB(id.DbID)
+	if err != nil {
+		return
+	}
+	return db.FillInWorkSpaceDeletesByTombstone(id, view)
+}
+func (store *txnStore) GetWorkspaceTombstoneByRow(
+	id *common.ID,
+	row uint32) (existed bool, commitTS types.TS, err error) {
+	db, err := store.getOrSetDB(id.DbID)
+	if err != nil {
+		return
+	}
+	return db.GetWorkspaceTombstoneByRow(id, row)
 }
