@@ -477,12 +477,17 @@ func (mgr *TxnManager) on2PCPrepared(op *OpTxn) {
 // OPRollback:the rollback of 2PC or 1PC
 func (mgr *TxnManager) dequeuePreparing(items ...any) {
 	now := time.Now()
-	for _, item := range items {
+	for i, item := range items {
 		op := item.(*OpTxn)
 		t0 := time.Now()
 		// Idempotent check
 		if state := op.Txn.GetTxnState(false); state != txnif.TxnStateActive {
 			op.Txn.WaitDone(moerr.NewTxnNotActiveNoCtx(txnif.TxnStrState(state)), false)
+			continue
+		}
+
+		if i != len(items)-1 && op.Txn.GetStore().GetTransactionType() == txnif.TxnType_Heartbeat {
+			op.Txn.WaitDone(nil, false)
 			continue
 		}
 
@@ -533,8 +538,12 @@ func (mgr *TxnManager) dequeuePreparing(items ...any) {
 func (mgr *TxnManager) onPrepareWAL(items ...any) {
 	now := time.Now()
 
-	for _, item := range items {
+	for i, item := range items {
 		op := item.(*OpTxn)
+		if i != len(items)-1 && op.Txn.GetStore().GetTransactionType() == txnif.TxnType_Heartbeat {
+			op.Txn.WaitDone(nil, false)
+			continue
+		}
 		var t1, t2, t3, t4, t5 time.Time
 		t1 = time.Now()
 		if op.Txn.GetError() == nil && op.Op == OpCommit || op.Op == OpPrepare {
@@ -590,8 +599,12 @@ func (mgr *TxnManager) onPrepareWAL(items ...any) {
 func (mgr *TxnManager) dequeuePrepared(items ...any) {
 	var err error
 	now := time.Now()
-	for _, item := range items {
+	for i, item := range items {
 		op := item.(*OpTxn)
+		if i != len(items)-1 && op.Txn.GetStore().GetTransactionType() == txnif.TxnType_Heartbeat {
+			op.Txn.WaitDone(nil, false)
+			continue
+		}
 		//Notice that WaitPrepared do nothing when op is OpRollback
 		t0 := time.Now()
 		if err = op.Txn.WaitPrepared(op.ctx); err != nil {
