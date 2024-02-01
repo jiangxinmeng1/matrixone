@@ -671,6 +671,7 @@ func (catalog *Catalog) replayObjectByBlock(
 	needApplyCommit bool,
 	create, delete bool,
 	txn txnif.TxnReader,
+	createAt, deleteAt types.TS,
 	dataFactory DataFactory) {
 	ObjectID := blkID.Object()
 	obj, _ := tbl.GetObjectByID(ObjectID)
@@ -686,6 +687,10 @@ func (catalog *Catalog) replayObjectByBlock(
 	}
 	// delete
 	if delete {
+		if obj == nil {
+			panic(fmt.Sprintf("logic err: blkID %v, ts %v, %v, c@ %v, D@ %v, tbl:\n %v",
+				blkID.String(), start.ToString(), end.ToString(), createAt.ToString(), deleteAt.ToString(), tbl.PPString(3, 0, "")))
+		}
 		node := obj.SearchNode(
 			&MVCCNode[*ObjectMVCCNode]{
 				TxnMVCCNode: &txnbase.TxnMVCCNode{
@@ -731,6 +736,8 @@ func (catalog *Catalog) onReplayUpdateBlock(
 		cmd.mvccNode.CreatedAt.Equal(txnif.UncommitTS),
 		cmd.mvccNode.DeletedAt.Equal(txnif.UncommitTS),
 		cmd.mvccNode.Txn,
+		cmd.mvccNode.CreatedAt,
+		cmd.mvccNode.DeletedAt,
 		dataFactory)
 	obj, err := tbl.GetObjectByID(cmd.ID.ObjectID())
 	if err != nil {
@@ -836,6 +843,8 @@ func (catalog *Catalog) onReplayCreateBlock(
 		true,
 		false,
 		nil,
+		txnNode.End,
+		types.TS{},
 		dataFactory)
 	obj, err := rel.GetObjectByID(objid)
 	if err != nil {
@@ -924,6 +933,8 @@ func (catalog *Catalog) onReplayDeleteBlock(
 		false,
 		true,
 		nil,
+		types.TS{},
+		txnNode.End,
 		nil)
 	obj, err := rel.GetObjectByID(objid)
 	if err != nil {
