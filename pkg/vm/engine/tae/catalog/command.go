@@ -20,6 +20,7 @@ import (
 	"io"
 
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
@@ -188,6 +189,8 @@ func newEmptyEntryCmd[T BaseNode[T], N Node](cmdType uint16, mvccNodeFactory fun
 }
 
 func newBlockCmd(id uint32, cmdType uint16, entry *BlockEntry) *EntryCommand[*MetadataMVCCNode, *BlockNode] {
+	node := entry.GetLatestNodeLocked()
+	logutil.Infof("lalala blk %v, c@ %v, d@ %v, end %v", entry.ID.String(), node.CreatedAt.ToString(), node.DeletedAt.ToString(), node.Prepare.ToString())
 	impl := &EntryCommand[*MetadataMVCCNode, *BlockNode]{
 		ID:       entry.AsCommonID(),
 		cmdType:  cmdType,
@@ -199,6 +202,8 @@ func newBlockCmd(id uint32, cmdType uint16, entry *BlockEntry) *EntryCommand[*Me
 }
 
 func newObjectCmd(id uint32, cmdType uint16, entry *ObjectEntry) *EntryCommand[*ObjectMVCCNode, *ObjectNode] {
+	node := entry.GetLatestNodeLocked()
+	logutil.Infof("lalala obj %v, c@ %v, d@ %v, end %v", entry.ID.String(), node.CreatedAt.ToString(), node.DeletedAt.ToString(), node.Prepare.ToString())
 	impl := &EntryCommand[*ObjectMVCCNode, *ObjectNode]{
 		ID:       entry.AsCommonID(),
 		cmdType:  cmdType,
