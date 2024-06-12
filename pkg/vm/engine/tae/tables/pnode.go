@@ -56,6 +56,17 @@ func (node *persistedNode) Rows() (uint32, error) {
 	return stats.Rows(), nil
 }
 
+func (node *persistedNode) Contains(
+	ctx context.Context,
+	keys containers.Vector,
+	keysZM index.ZM,
+	bf objectio.BloomFilter,
+	txn txnif.TxnReader,
+	isCommitting bool,
+	mp *mpool.MPool,
+) (err error) {
+	panic("should not be called")
+}
 func (node *persistedNode) BatchDedup(
 	ctx context.Context,
 	txn txnif.TxnReader,
@@ -66,6 +77,21 @@ func (node *persistedNode) BatchDedup(
 	bf objectio.BloomFilter,
 ) (err error) {
 	panic("should not be called")
+}
+
+func (node *persistedNode) GetDuplicatedRows(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	maxVisibleRow uint32,
+	keys containers.Vector,
+	keysZM index.ZM,
+	rowIDs containers.Vector,
+	bf objectio.BloomFilter,
+	isCommitting bool,
+	_ bool,
+	mp *mpool.MPool,
+) (err error) {
+	panic("should not be balled")
 }
 
 func (node *persistedNode) ContainsKey(ctx context.Context, key any, blkID uint32) (ok bool, err error) {
@@ -149,6 +175,7 @@ func (node *persistedNode) GetRowByFilter(
 	txn txnif.TxnReader,
 	filter *handle.Filter,
 	mp *mpool.MPool,
+	vpool *containers.VectorPool,
 ) (blkID uint16, row uint32, err error) {
 	for blkID = uint16(0); blkID < uint16(node.object.meta.BlockCnt()); blkID++ {
 		var ok bool
@@ -192,8 +219,15 @@ func (node *persistedNode) GetRowByFilter(
 		defer commitTSVec.Close()
 
 		// Load persisted deletes
+		fullBlockID := objectio.NewBlockidWithObjectID(&node.object.meta.ID, blkID)
 		view := containers.NewColumnView(0)
-		if err = node.object.FillPersistedDeletes(ctx, blkID, txn, view.BaseView, mp); err != nil {
+		if err = node.object.meta.GetTable().FillDeletes(ctx, *fullBlockID, txn, view.BaseView, mp); err != nil {
+			return
+		}
+		id := node.object.meta.AsCommonID()
+		id.SetBlockOffset(blkID)
+		err = txn.GetStore().FillInWorkspaceDeletes(id, view.BaseView)
+		if err != nil {
 			return
 		}
 

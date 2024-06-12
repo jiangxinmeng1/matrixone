@@ -109,6 +109,7 @@ func DoMergeAndWrite(
 	ctx context.Context,
 	sortkeyPos int,
 	mergehost MergeTaskHost,
+	isTombstone bool,
 ) (err error) {
 	now := time.Now()
 	/*out args, keep the transfer infomation*/
@@ -142,7 +143,7 @@ func DoMergeAndWrite(
 	}
 
 	if hasSortKey {
-		if err := mergeObjs(ctx, mergehost, sortkeyPos); err != nil {
+		if err := mergeObjs(ctx, mergehost, sortkeyPos, isTombstone); err != nil {
 			return err
 		}
 	} else {

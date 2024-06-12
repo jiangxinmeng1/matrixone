@@ -241,7 +241,7 @@ func (c *APP1Client) CheckBound() {
 // TODO: rewrite
 func (c *APP1Client) GetGoodRepetory(goodId uint64) (id *common.ID, offset uint32, count uint64, err error) {
 	rel, _ := c.DB.GetRelationByName(repertory.Name)
-	blockIt := rel.MakeObjectIt()
+	blockIt := rel.MakeObjectIt(false, true)
 	var view *containers.ColumnView
 	found := false
 	for blockIt.Valid() {
@@ -292,7 +292,7 @@ func (c *APP1Client) GetGoodEntry(goodId uint64) (id *common.ID, offset uint32, 
 
 	entry = new(APP1Goods)
 	entry.ID = goodId
-	price, _, _ := goodRel.GetValue(id, offset, 2)
+	price, _, _ := goodRel.GetValue(id, offset, 2, false)
 	entry.Price = price.(float64)
 	return
 }
@@ -510,8 +510,7 @@ func TestApp1(t *testing.T) {
 			err := txn.Rollback(context.Background())
 			assert.Nil(t, err)
 		} else {
-			err := txn.Commit(context.Background())
-			assert.Nil(t, err)
+			txn.Commit(context.Background())
 		}
 		if txn.GetTxnState(true) == txnif.TxnStateRollbacked {
 			t.Log(txn.String())
@@ -550,7 +549,7 @@ func TestWarehouse(t *testing.T) {
 		txn, _ = db.StartTxn(nil)
 		rel, err := GetWarehouseRelation("test", txn)
 		assert.Nil(t, err)
-		it := rel.MakeObjectIt()
+		it := rel.MakeObjectIt(false, true)
 		blk := it.GetObject()
 		view, _ := blk.GetColumnDataById(context.Background(), 0, 1, common.DefaultAllocator)
 		t.Log(view.GetData().String())

@@ -33,7 +33,8 @@ import (
 )
 
 type tableSpace struct {
-	entry *catalog.ObjectEntry
+	entry       *catalog.ObjectEntry
+	isTombstone bool
 
 	appendable InsertNode
 	//index for primary key
@@ -47,18 +48,23 @@ type tableSpace struct {
 	nobj        handle.Object
 
 	stats []objectio.ObjectStats
+	// for tombstone table space
+	objs []*objectio.ObjectId
 }
 
-func newTableSpace(table *txnTable) *tableSpace {
-	return &tableSpace{
-		entry: catalog.NewStandaloneObject(
-			table.entry,
-			table.store.txn.GetStartTS()),
-		nodes:   make([]InsertNode, 0),
-		index:   NewSimpleTableIndex(),
-		appends: make([]*appendCtx, 0),
-		table:   table,
+func newTableSpace(table *txnTable, isTombstone bool) *tableSpace {
+	space := &tableSpace{
+		nodes:       make([]InsertNode, 0),
+		index:       NewSimpleTableIndex(),
+		appends:     make([]*appendCtx, 0),
+		table:       table,
+		isTombstone: isTombstone,
 	}
+	space.entry = catalog.NewStandaloneObject(
+		table.entry,
+		table.store.txn.GetStartTS(),
+		isTombstone)
+	return space
 }
 
 func (space *tableSpace) GetLocalPhysicalAxis(row uint32) (int, uint32) {
@@ -94,6 +100,7 @@ func (space *tableSpace) registerANode() {
 	n := NewANode(
 		space.table,
 		space.entry,
+		space.isTombstone,
 	)
 	space.appendable = n
 	space.nodes = append(space.nodes, n)
@@ -123,7 +130,7 @@ func (space *tableSpace) ApplyAppend() (err error) {
 			ctx.count, id)
 	}
 	if space.tableHandle != nil {
-		space.table.entry.GetTableData().ApplyHandle(space.tableHandle)
+		space.table.entry.GetTableData().ApplyHandle(space.tableHandle, space.isTombstone)
 	}
 	return
 }
@@ -148,25 +155,30 @@ func (space *tableSpace) PrepareApply() (err error) {
 	return
 }
 
-func (space *tableSpace) prepareApplyANode(node *anode) error {
+func (space *tableSpace) prepareApplyANode(node *anode, startOffset uint32) error {
 	node.Compact()
 	tableData := space.table.entry.GetTableData()
 	if space.tableHandle == nil {
-		space.tableHandle = tableData.GetHandle()
+		space.tableHandle = tableData.GetHandle(space.isTombstone)
 	}
-	appended := uint32(0)
-	vec := space.table.store.rt.VectorPool.Small.GetVector(&objectio.RowidType)
+	appended := startOffset
+	var vec containers.Vector
+	if startOffset == 0 {
+		vec = space.table.store.rt.VectorPool.Small.GetVector(&objectio.RowidType)
+	} else {
+		vec = node.data.Vecs[space.table.GetLocalSchema(space.isTombstone).PhyAddrKey.Idx]
+	}
 	for appended < node.Rows() {
 		appender, err := space.tableHandle.GetAppender()
 		if moerr.IsMoErrCode(err, moerr.ErrAppendableObjectNotFound) {
-			objH, err := space.table.CreateObject()
+			objH, err := space.table.CreateObject(space.isTombstone)
 			if err != nil {
 				return err
 			}
 			appender = space.tableHandle.SetAppender(objH.Fingerprint())
 			objH.Close()
 		}
-		if !appender.IsSameColumns(space.table.GetLocalSchema()) {
+		if !appender.IsSameColumns(space.table.GetLocalSchema(space.isTombstone)) {
 			return moerr.NewInternalErrorNoCtx("schema changed, please rollback and retry")
 		}
 
@@ -184,6 +196,7 @@ func (space *tableSpace) prepareApplyANode(node *anode) error {
 		//PrepareAppend: It is very important that appending a AppendNode into
 		// block's MVCCHandle before applying data into block.
 		anode, created, toAppend, err := appender.PrepareAppend(
+			node.isMergeCompact,
 			node.Rows()-appended,
 			space.table.store.txn)
 		if err != nil {
@@ -223,7 +236,7 @@ func (space *tableSpace) prepareApplyANode(node *anode) error {
 		id := appender.GetID()
 		space.table.store.warChecker.Insert(appender.GetMeta().(*catalog.ObjectEntry))
 		space.table.store.txn.GetMemo().AddObject(space.table.entry.GetDB().ID,
-			id.TableID, id.ObjectID())
+			id.TableID, id.ObjectID(), space.isTombstone)
 		space.appends = append(space.appends, ctx)
 		// logutil.Debugf("%s: toAppend %d, appended %d, blks=%d",
 		// 	id.String(), toAppend, appended, len(space.appends))
@@ -232,8 +245,10 @@ func (space *tableSpace) prepareApplyANode(node *anode) error {
 			break
 		}
 	}
-	node.data.Vecs[space.table.GetLocalSchema().PhyAddrKey.Idx].Close()
-	node.data.Vecs[space.table.GetLocalSchema().PhyAddrKey.Idx] = vec
+	if startOffset == 0 {
+		node.data.Vecs[space.table.GetLocalSchema(space.isTombstone).PhyAddrKey.Idx].Close()
+		node.data.Vecs[space.table.GetLocalSchema(space.isTombstone).PhyAddrKey.Idx] = vec
+	}
 	return nil
 }
 
@@ -248,7 +263,7 @@ func (space *tableSpace) prepareApplyObjectStats(stats objectio.ObjectStats) (er
 	}
 
 	if shouldCreateNewObj() {
-		space.nobj, err = space.table.CreateNonAppendableObject(new(objectio.CreateObjOpt).WithId(sid))
+		space.nobj, err = space.table.CreateNonAppendableObject(new(objectio.CreateObjOpt).WithId(sid), space.isTombstone)
 		if err != nil {
 			return
 		}
@@ -264,7 +279,7 @@ func (space *tableSpace) prepareApplyObjectStats(stats objectio.ObjectStats) (er
 
 func (space *tableSpace) prepareApplyNode(node InsertNode) (err error) {
 	if !node.IsPersisted() {
-		return space.prepareApplyANode(node.(*anode))
+		return space.prepareApplyANode(node.(*anode), 0)
 	}
 	return nil
 }
@@ -287,7 +302,7 @@ func (space *tableSpace) Append(data *containers.Batch) (err error) {
 	appended := uint32(0)
 	offset := uint32(0)
 	length := uint32(data.Length())
-	schema := space.table.GetLocalSchema()
+	schema := space.table.GetLocalSchema(space.isTombstone)
 	for {
 		h := space.appendable
 		appended, err = h.Append(data, offset)
@@ -326,7 +341,7 @@ func (space *tableSpace) AddObjsWithMetaLoc(
 		//insert primary keys into space.index
 		if pkVecs != nil && dedupType == txnif.FullDedup {
 			if err = space.index.BatchInsert(
-				space.table.GetLocalSchema().GetSingleSortKey().Name,
+				space.table.GetLocalSchema(space.isTombstone).GetSingleSortKey().Name,
 				pkVecs[i],
 				0,
 				pkVecs[i].Length(),
@@ -342,7 +357,7 @@ func (space *tableSpace) AddObjsWithMetaLoc(
 }
 
 func (space *tableSpace) DeleteFromIndex(from, to uint32, node InsertNode) (err error) {
-	schema := space.table.GetLocalSchema()
+	schema := space.table.GetLocalSchema(space.isTombstone)
 	for i := from; i <= to; i++ {
 		v, _, err := node.GetValue(schema.GetSingleSortKeyIdx(), i)
 		if err != nil {
@@ -366,7 +381,7 @@ func (space *tableSpace) RangeDelete(start, end uint32) error {
 		if err != nil {
 			return err
 		}
-		if !space.table.GetLocalSchema().HasPK() {
+		if !space.table.GetLocalSchema(space.isTombstone).HasPK() {
 			// If no pk defined
 			return err
 		}
@@ -440,7 +455,7 @@ func (space *tableSpace) Rows() (n uint32) {
 }
 
 func (space *tableSpace) GetByFilter(filter *handle.Filter) (id *common.ID, offset uint32, err error) {
-	if !space.table.GetLocalSchema().HasPK() {
+	if !space.table.GetLocalSchema(space.isTombstone).HasPK() {
 		id = space.table.entry.AsCommonID()
 		rid := filter.Val.(types.Rowid)
 		id.BlockID, offset = rid.Decode()
@@ -459,17 +474,17 @@ func (space *tableSpace) GetByFilter(filter *handle.Filter) (id *common.ID, offs
 }
 
 func (space *tableSpace) GetPKColumn() containers.Vector {
-	schema := space.table.entry.GetLastestSchemaLocked()
+	schema := space.table.entry.GetLastestSchemaLocked(false)
 	return space.index.KeyToVector(schema.GetSingleSortKeyType())
 }
 
 func (space *tableSpace) GetPKVecs() []containers.Vector {
-	schema := space.table.entry.GetLastestSchemaLocked()
+	schema := space.table.entry.GetLastestSchemaLocked(false)
 	return space.index.KeyToVectors(schema.GetSingleSortKeyType())
 }
 
 func (space *tableSpace) BatchDedup(key containers.Vector) error {
-	return space.index.BatchDedup(space.table.GetLocalSchema().GetSingleSortKey().Name, key)
+	return space.index.BatchDedup(space.table.GetLocalSchema(space.isTombstone).GetSingleSortKey().Name, key)
 }
 
 func (space *tableSpace) GetColumnDataByIds(

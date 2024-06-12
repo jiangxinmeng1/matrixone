@@ -21,7 +21,6 @@ import (
 	"time"
 
 	pkgcatalog "github.com/matrixorigin/matrixone/pkg/catalog"
-	"github.com/matrixorigin/matrixone/pkg/common/bitmap"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
@@ -38,7 +37,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/mergesort"
@@ -52,10 +50,10 @@ type TestFlushBailoutPos1 struct{}
 type TestFlushBailoutPos2 struct{}
 
 var FlushTableTailTaskFactory = func(
-	metas []*catalog.ObjectEntry, rt *dbutils.Runtime, endTs types.TS, /* end of dirty range*/
+	metas, tombstones []*catalog.ObjectEntry, rt *dbutils.Runtime, endTs types.TS, /* end of dirty range*/
 ) tasks.TxnTaskFactory {
 	return func(ctx *tasks.Context, txn txnif.AsyncTxn) (tasks.Task, error) {
-		return NewFlushTableTailTask(ctx, txn, metas, rt, endTs)
+		return NewFlushTableTailTask(ctx, txn, metas, tombstones, rt, endTs)
 	}
 }
 
@@ -65,8 +63,9 @@ type flushTableTailTask struct {
 	rt         *dbutils.Runtime
 	dirtyEndTs types.TS
 
-	scopes []common.ID
-	schema *catalog.Schema
+	scopes          []common.ID
+	schema          *catalog.Schema
+	tombstoneSchema *catalog.Schema
 
 	rel  handle.Relation
 	dbid uint64
@@ -76,16 +75,17 @@ type flushTableTailTask struct {
 	doTransfer    bool
 
 	aObjMetas         []*catalog.ObjectEntry
-	delSrcMetas       []*catalog.ObjectEntry
 	aObjHandles       []handle.Object
-	delSrcHandles     []handle.Object
 	createdObjHandles handle.Object
 
-	dirtyLen                 int
-	createdMergedObjectName  string
-	createdDeletesObjectName string
+	aTombstoneMetas         []*catalog.ObjectEntry
+	aTombstoneHandles       []handle.Object
+	createdTombstoneHandles handle.Object
 
-	mergeRowsCnt, aObjDeletesCnt, nObjDeletesCnt int
+	createdMergedObjectName    string
+	createdMergedTombstoneName string
+
+	mergeRowsCnt, aObjDeletesCnt, tombstoneMergeRowsCnt int
 }
 
 // A note about flush start timestamp
@@ -133,6 +133,7 @@ func NewFlushTableTailTask(
 	ctx *tasks.Context,
 	txn txnif.AsyncTxn,
 	objs []*catalog.ObjectEntry,
+	tombStones []*catalog.ObjectEntry,
 	rt *dbutils.Runtime,
 	dirtyEndTs types.TS,
 ) (task *flushTableTailTask, err error) {
@@ -141,46 +142,91 @@ func NewFlushTableTailTask(
 		rt:         rt,
 		dirtyEndTs: dirtyEndTs,
 	}
-	meta := objs[0]
+
+	var meta *catalog.ObjectEntry
+	if len(objs) != 0 {
+		meta = objs[0]
+	} else {
+		meta = tombStones[0]
+	}
 	dbId := meta.GetTable().GetDB().ID
 	task.dbid = dbId
-	database, err := txn.UnsafeGetDatabase(dbId)
+	var database handle.Database
+	database, err = txn.UnsafeGetDatabase(dbId)
 	if err != nil {
 		return
 	}
 	tableId := meta.GetTable().ID
-	rel, err := database.UnsafeGetRelation(tableId)
+	var rel handle.Relation
+	rel, err = database.UnsafeGetRelation(tableId)
 	task.rel = rel
 	if err != nil {
 		return
 	}
-	task.schema = rel.Schema().(*catalog.Schema)
+	task.schema = rel.Schema(false).(*catalog.Schema)
 
 	objSeen := make(map[*catalog.ObjectEntry]struct{})
 	for _, obj := range objs {
-		task.scopes = append(task.scopes, *obj.AsCommonID())
-		var hdl handle.Object
-		hdl, err = rel.GetObject(&obj.ID)
-		if err != nil {
-			return
-		}
 		if _, ok := objSeen[obj]; ok {
 			continue
 		}
-		objSeen[obj] = struct{}{}
-		if hdl.IsAppendable() && !obj.HasDropCommitted() {
-			task.aObjMetas = append(task.aObjMetas, obj)
-			task.aObjHandles = append(task.aObjHandles, hdl)
-			if obj.GetObjectData().CheckFlushTaskRetry(txn.GetStartTS()) {
-				logutil.Infof("[FlushTabletail] obj %v needs retry", obj.ID.String())
-				return nil, txnif.ErrTxnNeedRetry
-			}
-		} else {
-			task.delSrcMetas = append(task.delSrcMetas, obj)
-			task.delSrcHandles = append(task.delSrcHandles, hdl)
+		task.scopes = append(task.scopes, *obj.AsCommonID())
+		var hdl handle.Object
+		hdl, err = rel.GetObject(&obj.ID, false)
+		if err != nil {
+			return
+		}
+		if obj.IsTombstone {
+			panic(fmt.Sprintf("logic err, obj %v is tombstone", obj.ID.String()))
+		}
+		if !hdl.IsAppendable() {
+			panic(fmt.Sprintf("logic err %v is nonappendable", hdl.GetID().String()))
+		}
+		if obj.HasDropCommitted() {
+			continue
+		}
+		if obj.GetObjectData().CheckFlushTaskRetry(txn.GetStartTS()) {
+			logutil.Infof("[FlushTabletail] obj %v needs retry", obj.ID.String())
+			return nil, txnif.ErrTxnNeedRetry
+		}
+		task.aObjMetas = append(task.aObjMetas, obj)
+		task.aObjHandles = append(task.aObjHandles, hdl)
+	}
+
+	task.tombstoneSchema = rel.Schema(true).(*catalog.Schema)
+
+	for _, obj := range tombStones {
+		if _, ok := objSeen[obj]; ok {
+			continue
+		}
+		task.scopes = append(task.scopes, *obj.AsCommonID())
+		var hdl handle.Object
+		hdl, err = rel.GetObject(&obj.ID, true)
+		if err != nil {
+			return
+		}
+		if !obj.IsTombstone {
+			panic(fmt.Sprintf("logic err, obj %v is not tombstone", obj.ID.String()))
+		}
+		if !hdl.IsAppendable() {
+			panic(fmt.Sprintf("logic err %v is nonappendable", hdl.GetID().String()))
+		}
+		if obj.HasDropCommitted() {
+			continue
+		}
+		if obj.GetObjectData().CheckFlushTaskRetry(txn.GetStartTS()) {
+			logutil.Infof("[FlushTabletail] obj %v needs retry", obj.ID.String())
+			return nil, txnif.ErrTxnNeedRetry
+		}
+		task.aTombstoneMetas = append(task.aTombstoneMetas, obj)
+		task.aTombstoneHandles = append(task.aTombstoneHandles, hdl)
+		if obj.GetObjectData().CheckFlushTaskRetry(txn.GetStartTS()) {
+			logutil.Infof("[FlushTabletail] obj %v needs retry", obj.ID.String())
+			return nil, txnif.ErrTxnNeedRetry
 		}
 	}
 
+	task.transMappings = mergesort.NewBlkTransferBooking(len(task.aObjHandles))
 	task.doTransfer = !strings.Contains(task.schema.Comment, pkgcatalog.MO_COMMENT_NO_DEL_HINT)
 	if task.doTransfer {
 		task.transMappings = mergesort.NewBlkTransferBooking(len(task.aObjHandles))
@@ -188,24 +234,6 @@ func NewFlushTableTailTask(
 
 	task.BaseTask = tasks.NewBaseTask(task, tasks.DataCompactionTask, ctx)
 
-	tblEntry := rel.GetMeta().(*catalog.TableEntry)
-	tblEntry.Stats.RLock()
-	defer tblEntry.Stats.RUnlock()
-	task.dirtyLen = len(tblEntry.DeletedDirties)
-	for _, obj := range tblEntry.DeletedDirties {
-		task.scopes = append(task.scopes, *obj.AsCommonID())
-		var hdl handle.Object
-		hdl, err = rel.GetObject(&obj.ID)
-		if err != nil {
-			return
-		}
-		if _, ok := objSeen[obj]; ok {
-			continue
-		}
-		objSeen[obj] = struct{}{}
-		task.delSrcMetas = append(task.delSrcMetas, obj)
-		task.delSrcHandles = append(task.delSrcHandles, hdl)
-	}
 	return
 }
 
@@ -234,12 +262,11 @@ func (task *flushTableTailTask) MarshalLogObject(enc zapcore.ObjectEncoder) (err
 		objs = fmt.Sprintf("%s%s,", objs, obj.ID.ShortStringEx())
 	}
 	enc.AddString("a-objs", objs)
-	// delsrc := ""
-	// for _, del := range task.delSrcMetas {
-	// 	delsrc = fmt.Sprintf("%s%s,", delsrc, del.ID.ShortStringEx())
-	// }
-	// enc.AddString("deletes-src", delsrc)
-	enc.AddInt("delete-obj-ndv", len(task.delSrcMetas))
+	tombstones := ""
+	for _, obj := range task.aTombstoneMetas {
+		tombstones = fmt.Sprintf("%s%s,", tombstones, obj.ID.ShortStringEx())
+	}
+	enc.AddString("a-tombstones", tombstones)
 
 	toObjs := ""
 	if task.createdObjHandles != nil {
@@ -249,12 +276,21 @@ func (task *flushTableTailTask) MarshalLogObject(enc zapcore.ObjectEncoder) (err
 	if toObjs != "" {
 		enc.AddString("to-objs", toObjs)
 	}
+
+	toTombstones := ""
+	if task.createdTombstoneHandles != nil {
+		id := task.createdTombstoneHandles.GetID()
+		toTombstones = fmt.Sprintf("%s%s,", toTombstones, id.ShortStringEx())
+	}
+	if toTombstones != "" {
+		enc.AddString("to-tombstones", toTombstones)
+	}
 	return
 }
 
 func (task *flushTableTailTask) Execute(ctx context.Context) (err error) {
 	logutil.Info("[Start]", common.OperationField(task.Name()), common.OperandField(task),
-		common.OperandField(len(task.aObjHandles)+len(task.delSrcHandles)))
+		common.OperandField(len(task.aObjHandles)+len(task.aTombstoneHandles)))
 
 	phaseDesc := ""
 	defer func() {
@@ -271,8 +307,8 @@ func (task *flushTableTailTask) Execute(ctx context.Context) (err error) {
 	//// phase seperator
 	///////////////////
 
-	phaseDesc = "1-flushing appendable blocks for snapshot"
-	snapshotSubtasks, err := task.flushAObjsForSnapshot(ctx)
+	phaseDesc = "1-flushing appendable objects for snapshot"
+	snapshotSubtasks, err := task.flushAObjsForSnapshot(ctx, false)
 	if err != nil {
 		return
 	}
@@ -284,23 +320,39 @@ func (task *flushTableTailTask) Execute(ctx context.Context) (err error) {
 	//// phase seperator
 	///////////////////
 
-	phaseDesc = "1-write all deletes from naobjs"
-	// just collect deletes, do not soft delete it, leave that to merge task.
-	deleteTask, emptyMap, err := task.flushAllDeletesFromDelSrc(ctx)
+	phaseDesc = "1-flushing appendable tombstones for snapshot"
+	tombstoneSnapshotSubtasks, err := task.flushAObjsForSnapshot(ctx, true)
 	if err != nil {
 		return
 	}
 	defer func() {
-		relaseFlushDelTask(deleteTask, err)
+		releaseFlushObjTasks(tombstoneSnapshotSubtasks, err)
 	}()
+
 	/////////////////////
 	//// phase seperator
 	///////////////////
 
 	phaseDesc = "1-merge aobjects"
 	// merge aobjects, no need to wait, it is a sync procedure, that is why put it
-	// after flushAObjsForSnapshot and flushAllDeletesFromNObjs
-	if err = task.mergeAObjs(ctx); err != nil {
+	// after flushAObjsForSnapshot
+	if err = task.mergeAObjs(ctx, false); err != nil {
+		return
+	}
+
+	if v := ctx.Value(TestFlushBailoutPos1{}); v != nil {
+		err = moerr.NewInternalErrorNoCtx("test merge bail out")
+		return
+	}
+
+	/////////////////////
+	//// phase seperator
+	///////////////////
+
+	phaseDesc = "1-merge atombstones"
+	// merge atombstones, no need to wait, it is a sync procedure, that is why put it
+	// after flushAObjsForSnapshot
+	if err = task.mergeAObjs(ctx, true); err != nil {
 		return
 	}
 
@@ -314,7 +366,7 @@ func (task *flushTableTailTask) Execute(ctx context.Context) (err error) {
 	///////////////////
 	phaseDesc = "1-waiting flushing appendable blocks for snapshot"
 	// wait flush tasks
-	if err = task.waitFlushAObjForSnapshot(ctx, snapshotSubtasks); err != nil {
+	if err = task.waitFlushAObjForSnapshot(ctx, snapshotSubtasks, false); err != nil {
 		return
 	}
 
@@ -322,8 +374,8 @@ func (task *flushTableTailTask) Execute(ctx context.Context) (err error) {
 	//// phase seperator
 	///////////////////
 
-	phaseDesc = "1-wait flushing all deletes from naobjs"
-	if err = task.waitFlushAllDeletesFromDelSrc(ctx, deleteTask, emptyMap); err != nil {
+	phaseDesc = "1-waiting flushing appendable tombstones for snapshot"
+	if err = task.waitFlushAObjForSnapshot(ctx, tombstoneSnapshotSubtasks, true); err != nil {
 		return
 	}
 
@@ -334,15 +386,14 @@ func (task *flushTableTailTask) Execute(ctx context.Context) (err error) {
 		task.transMappings,
 		task.rel.GetMeta().(*catalog.TableEntry),
 		task.aObjMetas,
-		task.delSrcMetas,
 		task.aObjHandles,
-		task.delSrcHandles,
 		task.createdObjHandles,
-		task.createdDeletesObjectName,
 		task.createdMergedObjectName,
-		task.dirtyLen,
+		task.aTombstoneMetas,
+		task.aTombstoneHandles,
+		task.createdTombstoneHandles,
+		task.createdMergedTombstoneName,
 		task.rt,
-		task.dirtyEndTs,
 	)
 	if err != nil {
 		return err
@@ -351,6 +402,7 @@ func (task *flushTableTailTask) Execute(ctx context.Context) (err error) {
 		task.dbid,
 		task.rel.ID(),
 		txnEntry,
+		nil,
 		nil,
 	); err != nil {
 		return
@@ -362,7 +414,7 @@ func (task *flushTableTailTask) Execute(ctx context.Context) (err error) {
 		common.AnyField("txn-start-ts", task.txn.GetStartTS().ToString()),
 		zap.Int("aobj-deletes", task.aObjDeletesCnt),
 		zap.Int("aobj-merge-rows", task.mergeRowsCnt),
-		zap.Int("nobj-deletes", task.nObjDeletesCnt),
+		zap.Int("tombstone-rows", task.tombstoneMergeRowsCnt),
 		common.DurationField(duration),
 		common.OperandField(task))
 
@@ -377,13 +429,22 @@ func (task *flushTableTailTask) Execute(ctx context.Context) (err error) {
 
 // prepareAObjSortedData read the data from appendable blocks, sort them if sort key exists
 func (task *flushTableTailTask) prepareAObjSortedData(
-	ctx context.Context, objIdx int, idxs []int, sortKeyPos int,
+	ctx context.Context, objIdx int, idxs []int, sortKeyPos int, isTombstone bool,
 ) (bat *containers.Batch, empty bool, err error) {
 	if len(idxs) <= 0 {
 		logutil.Infof("[FlushTabletail] no mergeable columns")
 		return nil, true, nil
 	}
-	obj := task.aObjHandles[objIdx]
+
+	var obj handle.Object
+	var schema *catalog.Schema
+	if isTombstone {
+		obj = task.aTombstoneHandles[objIdx]
+		schema = task.tombstoneSchema
+	} else {
+		obj = task.aObjHandles[objIdx]
+		schema = task.schema
+	}
 
 	views, err := obj.GetColumnDataByIds(ctx, 0, idxs, common.MergeAllocator)
 	if err != nil {
@@ -407,7 +468,11 @@ func (task *flushTableTailTask) prepareAObjSortedData(
 			bat.Close()
 			return
 		}
-		bat.AddVector(task.schema.ColDefs[colidx].Name, vec.TryConvertConst())
+		bat.AddVector(schema.ColDefs[colidx].Name, vec.TryConvertConst())
+	}
+
+	if isTombstone && bat.Deletes != nil {
+		panic(fmt.Sprintf("logic err, tombstone %v has deletes", obj.GetID().String()))
 	}
 
 	var sortMapping []int64
@@ -423,6 +488,10 @@ func (task *flushTableTailTask) prepareAObjSortedData(
 			return
 		}
 	}
+
+	if isTombstone {
+		return
+	}
 	if task.doTransfer {
 		mergesort.AddSortPhaseMapping(task.transMappings, objIdx, totalRowCnt, sortMapping)
 	}
@@ -431,13 +500,27 @@ func (task *flushTableTailTask) prepareAObjSortedData(
 
 // mergeAObjs merge the data from appendable blocks, and write the merged data to new block,
 // recording row mapping in blkTransferBooking struct
-func (task *flushTableTailTask) mergeAObjs(ctx context.Context) (err error) {
-	if len(task.aObjMetas) == 0 {
-		return nil
+func (task *flushTableTailTask) mergeAObjs(ctx context.Context, isTombstone bool) (err error) {
+	var objMetas []*catalog.ObjectEntry
+	var objHandles []handle.Object
+	if isTombstone {
+		objHandles = task.aTombstoneHandles
+		objMetas = task.aTombstoneMetas
+	} else {
+		objHandles = task.aObjHandles
+		objMetas = task.aObjMetas
 	}
 
+	if len(objMetas) == 0 {
+		return nil
+	}
 	// prepare columns idx and sortKey to read sorted batch
-	schema := task.schema
+	var schema *catalog.Schema
+	if isTombstone {
+		schema = task.tombstoneSchema
+	} else {
+		schema = task.schema
+	}
 	seqnums := make([]uint16, 0, len(schema.ColDefs))
 	readColIdxs := make([]int, 0, len(schema.ColDefs))
 	sortKeyIdx := -1
@@ -457,16 +540,16 @@ func (task *flushTableTailTask) mergeAObjs(ctx context.Context) (err error) {
 	}
 
 	// read from aobjects
-	readedBats := make([]*containers.Batch, 0, len(task.aObjHandles))
-	for _, block := range task.aObjHandles {
+	readedBats := make([]*containers.Batch, 0, len(objHandles))
+	for _, block := range objHandles {
 		err = block.Prefetch(readColIdxs)
 		if err != nil {
 			return
 		}
 	}
 
-	for i := range task.aObjHandles {
-		bat, empty, err := task.prepareAObjSortedData(ctx, i, readColIdxs, sortKeyPos)
+	for i := range objHandles {
+		bat, empty, err := task.prepareAObjSortedData(ctx, i, readColIdxs, sortKeyPos, isTombstone)
 		if err != nil {
 			return err
 		}
@@ -488,26 +571,35 @@ func (task *flushTableTailTask) mergeAObjs(ctx context.Context) (err error) {
 		// no pk, just pick the first column to reshape
 		sortKeyPos = 0
 	}
+	mergeRowCount := 0
 	for _, bat := range readedBats {
-		task.mergeRowsCnt += bat.Vecs[sortKeyPos].Length()
+		mergeRowCount += bat.Vecs[sortKeyPos].Length()
 	}
-	task.mergeRowsCnt -= task.aObjDeletesCnt
+	if !isTombstone {
+		mergeRowCount -= task.aObjDeletesCnt
+	}
 
-	if task.mergeRowsCnt == 0 {
+	if isTombstone {
+		task.tombstoneMergeRowsCnt = mergeRowCount
+	} else {
+		task.mergeRowsCnt = mergeRowCount
+	}
+
+	if mergeRowCount == 0 {
 		// just soft delete all Objects
-		for _, obj := range task.aObjHandles {
+		for _, obj := range objHandles {
 			tbl := obj.GetRelation()
-			if err = tbl.SoftDeleteObject(obj.GetID()); err != nil {
+			if err = tbl.SoftDeleteObject(obj.GetID(), isTombstone); err != nil {
 				return err
 			}
 		}
-		if task.doTransfer {
+		if !isTombstone && task.doTransfer {
 			mergesort.CleanTransMapping(task.transMappings)
 		}
 		return nil
 	}
 
-	rowsLeft := task.mergeRowsCnt
+	rowsLeft := mergeRowCount
 	for rowsLeft > 0 {
 		if rowsLeft > int(schema.BlockMaxRows) {
 			toLayout = append(toLayout, schema.BlockMaxRows)
@@ -534,16 +626,25 @@ func (task *flushTableTailTask) mergeAObjs(ctx context.Context) (err error) {
 		}
 	}
 	defer releaseF()
-	if task.doTransfer {
+	if !isTombstone && task.doTransfer {
 		mergesort.UpdateMappingAfterMerge(task.transMappings, mapping, toLayout)
 	}
 
 	// write!
 	// create new object to hold merged blocks
-	if task.createdObjHandles, err = task.rel.CreateNonAppendableObject(nil); err != nil {
-		return
+	var createdObjectHandle handle.Object
+	if isTombstone {
+		if task.createdTombstoneHandles, err = task.rel.CreateNonAppendableObject(isTombstone, nil); err != nil {
+			return
+		}
+		createdObjectHandle = task.createdTombstoneHandles
+	} else {
+		if task.createdObjHandles, err = task.rel.CreateNonAppendableObject(isTombstone, nil); err != nil {
+			return
+		}
+		createdObjectHandle = task.createdObjHandles
 	}
-	toObjectEntry := task.createdObjHandles.GetMeta().(*catalog.ObjectEntry)
+	toObjectEntry := createdObjectHandle.GetMeta().(*catalog.ObjectEntry)
 	toObjectEntry.SetSorted()
 	name := objectio.BuildObjectNameWithObjectID(&toObjectEntry.ID)
 	writer, err := blockio.NewBlockWriterNew(task.rt.Fs.Service, name, schema.Version, seqnums)
@@ -556,32 +657,45 @@ func (task *flushTableTailTask) mergeAObjs(ctx context.Context) (err error) {
 	} else if schema.HasSortKey() {
 		writer.SetSortKey(uint16(schema.GetSingleSortKeyIdx()))
 	}
-	for _, bat := range writtenBatches {
-		_, err = writer.WriteBatch(bat)
-		if err != nil {
-			return err
+	if isTombstone {
+		for _, bat := range writtenBatches {
+			_, err = writer.WriteBatch(bat)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		for _, bat := range writtenBatches {
+			_, err = writer.WriteBatch(bat)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	_, _, err = writer.Sync(ctx)
 	if err != nil {
 		return err
 	}
-	task.createdMergedObjectName = name.String()
+	if isTombstone {
+		task.createdMergedTombstoneName = name.String()
+	} else {
+		task.createdMergedObjectName = name.String()
+	}
 
 	// update new status for created blocks
-	err = task.createdObjHandles.UpdateStats(writer.Stats())
+	err = createdObjectHandle.UpdateStats(writer.Stats())
 	if err != nil {
 		return
 	}
-	err = task.createdObjHandles.GetMeta().(*catalog.ObjectEntry).GetObjectData().Init()
+	err = createdObjectHandle.GetMeta().(*catalog.ObjectEntry).GetObjectData().Init()
 	if err != nil {
 		return
 	}
 
 	// soft delete all aobjs
-	for _, obj := range task.aObjHandles {
+	for _, obj := range objHandles {
 		tbl := obj.GetRelation()
-		if err = tbl.SoftDeleteObject(obj.GetID()); err != nil {
+		if err = tbl.SoftDeleteObject(obj.GetID(), isTombstone); err != nil {
 			return err
 		}
 	}
@@ -590,16 +704,24 @@ func (task *flushTableTailTask) mergeAObjs(ctx context.Context) (err error) {
 }
 
 // flushAObjsForSnapshot schedule io task to flush aobjects for snapshot read. this function will not release any data in io task
-func (task *flushTableTailTask) flushAObjsForSnapshot(ctx context.Context) (subtasks []*flushObjTask, err error) {
+func (task *flushTableTailTask) flushAObjsForSnapshot(ctx context.Context, isTombstone bool) (subtasks []*flushObjTask, err error) {
 	defer func() {
 		if err != nil {
 			releaseFlushObjTasks(subtasks, err)
 		}
 	}()
-	subtasks = make([]*flushObjTask, len(task.aObjMetas))
+
+	var metas []*catalog.ObjectEntry
+	if isTombstone {
+		metas = task.aTombstoneMetas
+	} else {
+		metas = task.aObjMetas
+	}
+
+	subtasks = make([]*flushObjTask, len(metas))
 	// fire flush task
-	for i, obj := range task.aObjMetas {
-		var data, deletes *containers.Batch
+	for i, obj := range metas {
+		var data *containers.Batch
 		var dataVer *containers.BatchWithVersion
 		objData := obj.GetObjectData()
 		if dataVer, err = objData.CollectAppendInRange(
@@ -614,16 +736,10 @@ func (task *flushTableTailTask) flushAObjsForSnapshot(ctx context.Context) (subt
 			continue
 		}
 		// do not close data, leave that to wait phase
-		if deletes, _, err = objData.CollectDeleteInRange(
-			ctx, types.TS{}, task.txn.GetStartTS(), true, common.MergeAllocator,
-		); err != nil {
-			return
-		}
-		if deletes != nil {
-			// make sure every batch in deltaloc object is sorted by rowid
-			_, err := mergesort.SortBlockColumns(deletes.Vecs, 0, task.rt.VectorPool.Transient)
+		if isTombstone {
+			_, err = mergesort.SortBlockColumns(data.Vecs, catalog.TombstonePrimaryKeyIdx, task.rt.VectorPool.Transient)
 			if err != nil {
-				return nil, err
+				return
 			}
 		}
 
@@ -634,7 +750,7 @@ func (task *flushTableTailTask) flushAObjsForSnapshot(ctx context.Context) (subt
 			objData.GetFs(),
 			obj,
 			data,
-			deletes,
+			nil,
 			true,
 		)
 		if err = task.rt.Scheduler.Schedule(aobjectTask); err != nil {
@@ -646,9 +762,15 @@ func (task *flushTableTailTask) flushAObjsForSnapshot(ctx context.Context) (subt
 }
 
 // waitFlushAObjForSnapshot waits all io tasks about flushing aobject for snapshot read, update locations
-func (task *flushTableTailTask) waitFlushAObjForSnapshot(ctx context.Context, subtasks []*flushObjTask) (err error) {
+func (task *flushTableTailTask) waitFlushAObjForSnapshot(ctx context.Context, subtasks []*flushObjTask, isTombstone bool) (err error) {
 	ictx, cancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer cancel()
+	var handles []handle.Object
+	if isTombstone {
+		handles = task.aTombstoneHandles
+	} else {
+		handles = task.aObjHandles
+	}
 	for i, subtask := range subtasks {
 		if subtask == nil {
 			continue
@@ -656,158 +778,11 @@ func (task *flushTableTailTask) waitFlushAObjForSnapshot(ctx context.Context, su
 		if err = subtask.WaitDone(ictx); err != nil {
 			return
 		}
-		if err = task.aObjHandles[i].UpdateStats(subtask.stat); err != nil {
+		if err = handles[i].UpdateStats(subtask.stat); err != nil {
 			return
-		}
-		if subtask.delta == nil {
-			continue
-		}
-		deltaLoc := blockio.EncodeLocation(
-			subtask.name,
-			subtask.blocks[1].GetExtent(),
-			uint32(subtask.delta.Length()),
-			subtask.blocks[1].GetID())
-
-		if err = task.aObjHandles[i].UpdateDeltaLoc(0, deltaLoc); err != nil {
-			return err
 		}
 	}
 	return nil
-}
-
-// flushAllDeletesFromDelSrc collects all deletes from objs and flush them into one obj
-func (task *flushTableTailTask) flushAllDeletesFromDelSrc(ctx context.Context) (subtask *flushDeletesTask, emtpyDelObjIdx []*bitmap.Bitmap, err error) {
-	var bufferBatch *containers.Batch
-	defer func() {
-		if err != nil && bufferBatch != nil {
-			bufferBatch.Close()
-		}
-	}()
-	emtpyDelObjIdx = make([]*bitmap.Bitmap, len(task.delSrcMetas))
-	var (
-		enableDeltaStat = task.schema.Name == "bmsql_stock"
-		tbl             *catalog.TableEntry
-		tombstone       data.Tombstone
-		locMap          = make(map[string]int)
-		now             time.Time
-	)
-
-	if enableDeltaStat {
-		tbl = task.rel.GetMeta().(*catalog.TableEntry)
-		now = time.Now()
-	}
-	for i, obj := range task.delSrcMetas {
-		objData := obj.GetObjectData()
-		var deletes *containers.Batch
-		emptyDelObjs := &bitmap.Bitmap{}
-		emptyDelObjs.InitWithSize(int64(obj.BlockCnt()))
-		if enableDeltaStat {
-			tombstone = tbl.TryGetTombstone(obj.ID)
-		}
-		for j := 0; j < obj.BlockCnt(); j++ {
-			found, _ := objData.HasDeleteIntentsPreparedInByBlock(uint16(j), types.TS{}, task.txn.GetStartTS())
-			if !found {
-				emptyDelObjs.Add(uint64(j))
-				continue
-			}
-			if enableDeltaStat && tombstone != nil {
-				loc := tombstone.GetLatestDeltaloc(uint16(j))
-				if loc != nil {
-					locMap[loc.String()]++
-				}
-			}
-			if deletes, err = objData.CollectDeleteInRangeByBlock(
-				ctx, uint16(j), types.TS{}, task.txn.GetStartTS(), true, common.MergeAllocator,
-			); err != nil {
-				return
-			}
-			if deletes == nil || deletes.Length() == 0 {
-				emptyDelObjs.Add(uint64(j))
-				continue
-			}
-			if bufferBatch == nil {
-				bufferBatch = makeDeletesTempBatch(deletes, task.rt.VectorPool.Transient)
-			}
-			task.nObjDeletesCnt += deletes.Length()
-			// deletes is closed by Extend
-			bufferBatch.Extend(deletes)
-		}
-		emtpyDelObjIdx[i] = emptyDelObjs
-	}
-	if enableDeltaStat {
-		cost := time.Since(now)
-		logutil.Infof("[FlushTabletail] task %d collect tombstone for %s cost %v, location distribution(%v):%v",
-			task.ID(), task.schema.Name, cost, len(locMap), locMap)
-	}
-	if bufferBatch != nil {
-		// make sure every batch in deltaloc object is sorted by rowid
-		_, err = mergesort.SortBlockColumns(bufferBatch.Vecs, 0, task.rt.VectorPool.Transient)
-		if err != nil {
-			return
-		}
-		subtask = NewFlushDeletesTask(tasks.WaitableCtx, task.rt.Fs, bufferBatch)
-		if err = task.rt.Scheduler.Schedule(subtask); err != nil {
-			return
-		}
-	}
-	return
-}
-
-// waitFlushAllDeletesFromDelSrc waits all io tasks about flushing deletes from objs, update locations but skip those in emtpyDelObjIdx
-func (task *flushTableTailTask) waitFlushAllDeletesFromDelSrc(ctx context.Context, subtask *flushDeletesTask, emtpyDelObjIdx []*bitmap.Bitmap) (err error) {
-	if subtask == nil {
-		return
-	}
-	ictx, cancel := context.WithTimeout(ctx, 6*time.Minute)
-	defer cancel()
-	if err = subtask.WaitDone(ictx); err != nil {
-		return err
-	}
-	task.createdDeletesObjectName = subtask.name.String()
-	deltaLoc := blockio.EncodeLocation(
-		subtask.name,
-		subtask.blocks[0].GetExtent(),
-		uint32(subtask.delta.Length()),
-		subtask.blocks[0].GetID())
-
-	v2.TaskFlushDeletesCountHistogram.Observe(float64(task.nObjDeletesCnt))
-	v2.TaskFlushDeletesSizeHistogram.Observe(float64(deltaLoc.Extent().End()))
-	logutil.Infof("[FlushTabletail] task %d update %s for approximate %d objs", task.ID(), deltaLoc, len(task.delSrcHandles))
-	for i, hdl := range task.delSrcHandles {
-		for j := 0; j < hdl.GetMeta().(*catalog.ObjectEntry).BlockCnt(); j++ {
-			if emtpyDelObjIdx[i] != nil && emtpyDelObjIdx[i].Contains(uint64(j)) {
-				continue
-			}
-			if err = hdl.UpdateDeltaLoc(uint16(j), deltaLoc); err != nil {
-				return err
-			}
-
-		}
-	}
-	return
-}
-
-func makeDeletesTempBatch(template *containers.Batch, pool *containers.VectorPool) *containers.Batch {
-	bat := containers.NewBatchWithCapacity(len(template.Attrs))
-	for i, name := range template.Attrs {
-		bat.AddVector(name, pool.GetVector(template.Vecs[i].GetType()))
-	}
-	return bat
-}
-
-func relaseFlushDelTask(task *flushDeletesTask, err error) {
-	if err != nil && task != nil {
-		logutil.Infof("[FlushTabletail] release flush del task bat because of err %v", err)
-		ictx, cancel := context.WithTimeout(
-			context.Background(),
-			10*time.Second, /*6*time.Minute,*/
-		)
-		defer cancel()
-		task.WaitDone(ictx)
-	}
-	if task != nil && task.delta != nil {
-		task.delta.Close()
-	}
 }
 
 func releaseFlushObjTasks(subtasks []*flushObjTask, err error) {

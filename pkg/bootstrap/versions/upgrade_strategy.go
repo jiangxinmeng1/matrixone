@@ -147,6 +147,7 @@ func (u *UpgradeEntry) Upgrade(txn executor.TxnExecutor, accountId uint32) error
 				return err
 			}
 			res.Close()
+			getLogger().Info("execute upgrade pre-sql completed", zap.String("upgrade entry", u.String()))
 		}
 
 		// 2. Second, Execute upgrade sql
@@ -156,6 +157,7 @@ func (u *UpgradeEntry) Upgrade(txn executor.TxnExecutor, accountId uint32) error
 			return err
 		}
 		res.Close()
+		getLogger().Info("execute upgrade sql completed", zap.String("upgrade entry", u.String()))
 
 		// 2. Third, after the upgrade is completed, judge whether there is post-sql
 		if u.PostSql != "" {
@@ -165,6 +167,7 @@ func (u *UpgradeEntry) Upgrade(txn executor.TxnExecutor, accountId uint32) error
 				return err
 			}
 			res.Close()
+			getLogger().Info("execute upgrade post-sql completed", zap.String("upgrade entry", u.String()))
 		}
 	}
 	return nil

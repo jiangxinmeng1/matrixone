@@ -20,7 +20,6 @@ import (
 	"math"
 
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
-	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
@@ -115,9 +114,9 @@ func (w *BlockWriter) WriteBatch(batch *batch.Batch) (objectio.BlockObject, erro
 		if i == 0 {
 			w.objMetaBuilder.AddRowCnt(vec.Length())
 		}
-		if vec.GetType().Oid == types.T_Rowid || vec.GetType().Oid == types.T_TS {
-			continue
-		}
+		// if vec.GetType().Oid == types.T_Rowid || vec.GetType().Oid == types.T_TS {
+		// 	continue
+		// }
 		if w.isSetPK && w.pk == uint16(i) {
 			isPK = true
 		}
@@ -168,25 +167,6 @@ func (w *BlockWriter) WriteBatch(batch *batch.Batch) (objectio.BlockObject, erro
 		if err = w.writer.WriteBF(int(block.GetID()), seqnums[i], buf, w.pkType); err != nil {
 			return nil, err
 		}
-	}
-	return block, nil
-}
-
-func (w *BlockWriter) WriteTombstoneBatch(batch *batch.Batch) (objectio.BlockObject, error) {
-	block, err := w.writer.WriteTombstone(batch)
-	if err != nil {
-		return nil, err
-	}
-	for i, vec := range batch.Vecs {
-		columnData := containers.ToTNVector(vec, common.DefaultAllocator)
-		// Build ZM
-		zm := index.NewZM(vec.GetType().Oid, vec.GetType().Scale)
-		if err = index.BatchUpdateZM(zm, columnData.GetDownstreamVector()); err != nil {
-			return nil, err
-		}
-		index.SetZMSum(zm, columnData.GetDownstreamVector())
-		// Update column meta zonemap
-		w.writer.UpdateBlockZM(objectio.SchemaTombstone, 0, uint16(i), zm)
 	}
 	return block, nil
 }

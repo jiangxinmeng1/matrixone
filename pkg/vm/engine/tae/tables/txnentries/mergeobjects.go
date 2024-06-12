@@ -45,10 +45,10 @@ type mergeObjectsEntry struct {
 
 	rt                   *dbutils.Runtime
 	pageIds              []*common.ID
+	isTombstone          bool
 	delTbls              [][]*model.TransDels
 	collectTs            types.TS
 	transCntBeforeCommit int
-	nextRoundDirties     map[*catalog.ObjectEntry]struct{}
 }
 
 func NewMergeObjectsEntry(
@@ -56,6 +56,7 @@ func NewMergeObjectsEntry(
 	relation handle.Relation,
 	droppedObjs, createdObjs []*catalog.ObjectEntry,
 	transMappings *api.BlkTransferBooking,
+	isTombstone bool,
 	rt *dbutils.Runtime,
 ) (*mergeObjectsEntry, error) {
 	totalCreatedBlkCnt := 0
@@ -70,6 +71,7 @@ func NewMergeObjectsEntry(
 		transMappings: transMappings,
 		skipTransfer:  transMappings == nil,
 		rt:            rt,
+		isTombstone:   isTombstone,
 	}
 
 	if !entry.skipTransfer && totalCreatedBlkCnt > 0 {
@@ -77,7 +79,6 @@ func NewMergeObjectsEntry(
 		for i := 0; i < len(createdObjs); i++ {
 			entry.delTbls[i] = make([]*model.TransDels, createdObjs[i].BlockCnt())
 		}
-		entry.nextRoundDirties = make(map[*catalog.ObjectEntry]struct{})
 		entry.collectTs = rt.Now()
 		var err error
 		// phase 1 transfer
@@ -91,6 +92,9 @@ func NewMergeObjectsEntry(
 }
 
 func (entry *mergeObjectsEntry) prepareTransferPage() {
+	if entry.isTombstone {
+		return
+	}
 	k := 0
 	for _, obj := range entry.droppedObjs {
 		for j := 0; j < obj.BlockCnt(); j++ {
@@ -103,7 +107,7 @@ func (entry *mergeObjectsEntry) prepareTransferPage() {
 				panic("cannot tranfer empty block")
 			}
 			tblEntry := obj.GetTable()
-			isTransient := !tblEntry.GetLastestSchema().HasPK()
+			isTransient := !tblEntry.GetLastestSchema(false).HasPK()
 			id := obj.AsCommonID()
 			id.SetBlockOffset(uint16(j))
 			page := model.NewTransferHashPage(id, time.Now(), isTransient)
@@ -165,14 +169,11 @@ func (entry *mergeObjectsEntry) transferObjectDeletes(
 	from, to types.TS,
 	blkOffsetBase int) (transCnt int, collect, transfer time.Duration, err error) {
 
-	dataBlock := dropped.GetObjectData()
-
 	inst := time.Now()
-	bat, _, err := dataBlock.CollectDeleteInRange(
+	bat, _, err := dropped.CollectDeleteInRange(
 		entry.txn.GetContext(),
 		from.Next(),
 		to,
-		false,
 		common.MergeAllocator,
 	)
 	if err != nil {
@@ -185,9 +186,7 @@ func (entry *mergeObjectsEntry) transferObjectDeletes(
 	inst = time.Now()
 	defer func() { transfer = time.Since(inst) }()
 
-	entry.nextRoundDirties[dropped] = struct{}{}
-
-	rowid := vector.MustFixedCol[types.Rowid](bat.GetVectorByName(catalog.PhyAddrColumnName).GetDownstreamVector())
+	rowid := vector.MustFixedCol[types.Rowid](bat.GetVectorByName(catalog.AttrRowID).GetDownstreamVector())
 	ts := vector.MustFixedCol[types.TS](bat.GetVectorByName(catalog.AttrCommitTs).GetDownstreamVector())
 
 	count := len(rowid)
@@ -222,12 +221,13 @@ func (entry *mergeObjectsEntry) transferObjectDeletes(
 		}
 		entry.delTbls[destpos.ObjIdx][destpos.BlkIdx].Mapping[int(destpos.RowIdx)] = ts[i]
 		var targetObj handle.Object
-		targetObj, err = entry.relation.GetObject(&entry.createdObjs[destpos.ObjIdx].ID)
+		targetObj, err = entry.relation.GetObject(&entry.createdObjs[destpos.ObjIdx].ID, entry.isTombstone)
 		if err != nil {
 			return
 		}
-		if err = targetObj.RangeDelete(
-			uint16(destpos.BlkIdx), uint32(destpos.RowIdx), uint32(destpos.RowIdx), handle.DT_MergeCompact, common.MergeAllocator,
+		id := targetObj.Fingerprint()
+		if err = targetObj.GetRelation().RangeDelete(
+			id, uint32(destpos.RowIdx), uint32(destpos.RowIdx), handle.DT_MergeCompact,
 		); err != nil {
 			return
 		}
@@ -318,20 +318,13 @@ func (entry *mergeObjectsEntry) PrepareCommit() (err error) {
 			entry.txn.GetCommitTS().ToString())
 		return
 	}
-
 	// phase 2 transfer
-	transCnt, stat, err := entry.collectDelsAndTransfer(entry.collectTs, entry.txn.GetPrepareTS())
+	transCnt, stat, err := entry.collectDelsAndTransfer(entry.collectTs, entry.txn.GetPrepareTS().Prev())
 	if err != nil {
 		return nil
 	}
 
 	inst1 := time.Now()
-	tblEntry := entry.droppedObjs[0].GetTable()
-	tblEntry.Stats.Lock()
-	for dropped := range entry.nextRoundDirties {
-		tblEntry.DeletedDirties = append(tblEntry.DeletedDirties, dropped)
-	}
-	tblEntry.Stats.Unlock()
 
 	for objIdx := range entry.delTbls {
 		for blkIdx, delTbl := range entry.delTbls[objIdx] {
@@ -342,12 +335,11 @@ func (entry *mergeObjectsEntry) PrepareCommit() (err error) {
 		}
 	}
 	rest := time.Since(inst1)
-	logutil.Infof("mergeblocks commit %v, [%v,%v], trans %d on %d objects, %d in commit queue",
+	logutil.Infof("mergeblocks commit %v, [%v,%v], trans %d, %d in commit queue",
 		entry.relation.ID(),
 		entry.txn.GetStartTS().ToString(),
 		entry.txn.GetCommitTS().ToString(),
 		entry.transCntBeforeCommit+transCnt,
-		len(entry.nextRoundDirties),
 		transCnt,
 	)
 	if total := time.Since(inst); total > 300*time.Millisecond {

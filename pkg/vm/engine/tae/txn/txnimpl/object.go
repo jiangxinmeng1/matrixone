@@ -70,9 +70,9 @@ type composedObjectIt struct {
 	uncommitted *catalog.ObjectEntry
 }
 
-func newObjectItOnSnap(table *txnTable) handle.ObjectIt {
+func newObjectItOnSnap(table *txnTable, isTombstone bool) handle.ObjectIt {
 	it := &ObjectIt{
-		linkIt: table.entry.MakeObjectIt(true),
+		linkIt: table.entry.MakeObjectIt(true, isTombstone),
 		table:  table,
 	}
 	var err error
@@ -97,9 +97,9 @@ func newObjectItOnSnap(table *txnTable) handle.ObjectIt {
 	return it
 }
 
-func newObjectIt(table *txnTable) handle.ObjectIt {
+func newObjectIt(table *txnTable, reverse bool, isTombstone bool) handle.ObjectIt {
 	it := &ObjectIt{
-		linkIt: table.entry.MakeObjectIt(true),
+		linkIt: table.entry.MakeObjectIt(reverse, isTombstone),
 		table:  table,
 	}
 	var err error
@@ -228,13 +228,13 @@ func (obj *txnObject) GetTotalChanges() int {
 	return obj.entry.GetObjectData().GetTotalChanges()
 }
 func (obj *txnObject) RangeDelete(blkID uint16, start, end uint32, dt handle.DeleteType, mp *mpool.MPool) (err error) {
-	schema := obj.table.GetLocalSchema()
+	schema := obj.table.GetLocalSchema(true)
 	pkDef := schema.GetPrimaryKey()
 	pkVec := makeWorkspaceVector(pkDef.Type)
 	defer pkVec.Close()
 	for row := start; row <= end; row++ {
 		pkVal, _, err := obj.entry.GetObjectData().GetValue(
-			obj.table.store.GetContext(), obj.Txn, schema, blkID, int(row), pkDef.Idx, mp,
+			obj.table.store.GetContext(), obj.Txn, schema, blkID, int(row), pkDef.Idx, true, mp,
 		)
 		if err != nil {
 			return err
@@ -255,23 +255,17 @@ func (obj *txnObject) IsUncommitted() bool {
 
 func (obj *txnObject) IsAppendable() bool { return obj.entry.IsAppendable() }
 
-func (obj *txnObject) SoftDeleteBlock(id types.Blockid) (err error) {
-	fp := obj.entry.AsCommonID()
-	fp.BlockID = id
-	return obj.Txn.GetStore().SoftDeleteBlock(fp)
-}
-
 func (obj *txnObject) GetRelation() (rel handle.Relation) {
 	return newRelation(obj.table)
 }
 
 func (obj *txnObject) UpdateStats(stats objectio.ObjectStats) error {
 	id := obj.entry.AsCommonID()
-	return obj.Txn.GetStore().UpdateObjectStats(id, &stats)
+	return obj.Txn.GetStore().UpdateObjectStats(id, &stats, obj.entry.IsTombstone)
 }
 
 func (obj *txnObject) Prefetch(idxes []int) error {
-	schema := obj.table.GetLocalSchema()
+	schema := obj.table.GetLocalSchema(obj.entry.IsTombstone)
 	seqnums := make([]uint16, 0, len(idxes))
 	for _, idx := range idxes {
 		seqnums = append(seqnums, schema.ColDefs[idx].SeqNum)
@@ -302,7 +296,7 @@ func (obj *txnObject) GetColumnDataById(
 	if obj.entry.IsLocal {
 		return obj.table.tableSpace.GetColumnDataById(ctx, obj.entry, colIdx, mp)
 	}
-	return obj.entry.GetObjectData().GetColumnDataById(ctx, obj.Txn, obj.table.GetLocalSchema(), blkID, colIdx, mp)
+	return obj.entry.GetObjectData().GetColumnDataById(ctx, obj.Txn, obj.table.GetLocalSchema(obj.entry.IsTombstone), blkID, colIdx, mp)
 }
 
 func (obj *txnObject) GetColumnDataByIds(
@@ -311,13 +305,13 @@ func (obj *txnObject) GetColumnDataByIds(
 	if obj.entry.IsLocal {
 		return obj.table.tableSpace.GetColumnDataByIds(obj.entry, colIdxes, mp)
 	}
-	return obj.entry.GetObjectData().GetColumnDataByIds(ctx, obj.Txn, obj.table.GetLocalSchema(), blkID, colIdxes, mp)
+	return obj.entry.GetObjectData().GetColumnDataByIds(ctx, obj.Txn, obj.table.GetLocalSchema(obj.entry.IsTombstone), blkID, colIdxes, mp)
 }
 
 func (obj *txnObject) GetColumnDataByName(
 	ctx context.Context, blkID uint16, attr string, mp *mpool.MPool,
 ) (*containers.ColumnView, error) {
-	schema := obj.table.GetLocalSchema()
+	schema := obj.table.GetLocalSchema(obj.entry.IsTombstone)
 	colIdx := schema.GetColIdx(attr)
 	if obj.entry.IsLocal {
 		return obj.table.tableSpace.GetColumnDataById(ctx, obj.entry, colIdx, mp)
@@ -328,7 +322,7 @@ func (obj *txnObject) GetColumnDataByName(
 func (obj *txnObject) GetColumnDataByNames(
 	ctx context.Context, blkID uint16, attrs []string, mp *mpool.MPool,
 ) (*containers.BlockView, error) {
-	schema := obj.table.GetLocalSchema()
+	schema := obj.table.GetLocalSchema(obj.entry.IsTombstone)
 	attrIds := make([]int, len(attrs))
 	for i, attr := range attrs {
 		attrIds[i] = schema.GetColIdx(attr)

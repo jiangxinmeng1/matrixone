@@ -17,10 +17,8 @@ package tables
 import (
 	"context"
 
-	"github.com/RoaringBitmap/roaring"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
-	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
@@ -55,13 +53,6 @@ func (obj *object) Init() (err error) {
 	return
 }
 
-func (obj *object) OnApplyDelete(
-	deleted uint64,
-	ts types.TS) (err error) {
-	obj.meta.GetTable().RemoveRows(deleted)
-	return
-}
-
 func (obj *object) PrepareCompact() bool {
 	return obj.meta.PrepareCompact()
 }
@@ -81,7 +72,7 @@ func (obj *object) Pin() *common.PinnedItem[*object] {
 
 func (obj *object) GetColumnDataByIds(
 	ctx context.Context,
-	txn txnif.AsyncTxn,
+	txn txnif.TxnReader,
 	readSchema any,
 	blkID uint16,
 	colIdxes []int,
@@ -94,13 +85,19 @@ func (obj *object) GetColumnDataByIds(
 		ctx, txn, schema, blkID, colIdxes, false, mp,
 	)
 }
+func (obj *object) GetCommitTSVector(maxRow uint32, mp *mpool.MPool) (containers.Vector, error) {
+	panic("not support")
+}
+func (obj *object) GetCommitTSVectorInRange(start, end types.TS, mp *mpool.MPool) (containers.Vector, error) {
+	panic("not support")
+}
 
 // GetColumnDataById Get the snapshot at txn's start timestamp of column data.
 // Notice that for non-appendable object, if it is visible to txn,
 // then all the object data pointed by meta location also be visible to txn;
 func (obj *object) GetColumnDataById(
 	ctx context.Context,
-	txn txnif.AsyncTxn,
+	txn txnif.TxnReader,
 	readSchema any,
 	blkID uint16,
 	col int,
@@ -124,51 +121,84 @@ func (obj *object) CoarseCheckAllRowsCommittedBefore(ts types.TS) bool {
 	return creatTS.Less(&ts)
 }
 
-func (obj *object) BatchDedup(
+func (obj *object) GetDuplicatedRows(
 	ctx context.Context,
-	txn txnif.AsyncTxn,
+	txn txnif.TxnReader,
 	keys containers.Vector,
 	keysZM index.ZM,
-	rowmask *roaring.Bitmap,
 	precommit bool,
+	checkWWConflict bool,
 	bf objectio.BloomFilter,
+	rowIDs containers.Vector,
 	mp *mpool.MPool,
 ) (err error) {
 	defer func() {
 		if moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry) {
 			logutil.Infof("BatchDedup %s (%v)obj-%s: %v",
-				obj.meta.GetTable().GetLastestSchemaLocked().Name,
+				obj.meta.GetTable().GetLastestSchemaLocked(false).Name,
 				obj.IsAppendable(),
 				obj.meta.ID.String(),
 				err)
 		}
 	}()
-	return obj.PersistedBatchDedup(
+	return obj.persistedGetDuplicatedRows(
 		ctx,
 		txn,
 		precommit,
 		keys,
 		keysZM,
-		rowmask,
+		rowIDs,
+		false,
+		0,
+		bf,
+		mp,
+	)
+}
+func (obj *object) GetMaxRowByTSLocked(ts types.TS) (uint32, error) {
+	panic("not support")
+}
+func (obj *object) Contains(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	isCommitting bool,
+	keys containers.Vector,
+	keysZM index.ZM,
+	bf objectio.BloomFilter,
+	mp *mpool.MPool) (err error) {
+	defer func() {
+		if moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry) {
+			logutil.Infof("BatchDedup %s (%v)obj-%s: %v",
+				obj.meta.GetTable().GetLastestSchemaLocked(false).Name,
+				obj.IsAppendable(),
+				obj.meta.ID.String(),
+				err)
+		}
+	}()
+	return obj.persistedContains(
+		ctx,
+		txn,
+		isCommitting,
+		keys,
+		keysZM,
 		false,
 		bf,
 		mp,
 	)
 }
-
 func (obj *object) GetValue(
 	ctx context.Context,
 	txn txnif.AsyncTxn,
 	readSchema any,
 	blkID uint16,
 	row, col int,
+	skipCheckDelete bool,
 	mp *mpool.MPool,
 ) (v any, isNull bool, err error) {
 	node := obj.PinNode()
 	defer node.Unref()
 	schema := readSchema.(*catalog.Schema)
 	return obj.getPersistedValue(
-		ctx, txn, schema, blkID, row, col, false, mp,
+		ctx, txn, schema, blkID, row, col, false, skipCheckDelete, mp,
 	)
 }
 
@@ -178,33 +208,7 @@ func (obj *object) RunCalibration() (score int, err error) {
 }
 
 func (obj *object) estimateRawScore() (score int, dropped bool) {
-	if obj.meta.HasDropCommitted() && !obj.meta.InMemoryDeletesExisted() {
-		dropped = true
-		return
-	}
-	changeCnt := uint32(0)
-	obj.RLock()
-	objectMVCC := obj.tryGetMVCC()
-	if objectMVCC != nil {
-		changeCnt = objectMVCC.GetChangeIntentionCntLocked()
-	}
-	obj.RUnlock()
-	if changeCnt == 0 {
-		// No deletes found
-		score = 0
-	} else {
-		// Any delete
-		score = 1
-	}
-
-	// If any delete found and the table or database of the object had
-	// been deleted. Force checkpoint the object
-	if score > 0 {
-		if _, terminated := obj.meta.GetTerminationTS(); terminated {
-			score = 100
-		}
-	}
-	return
+	return 0, obj.meta.HasDropCommitted()
 }
 
 func (obj *object) GetByFilter(
@@ -237,7 +241,6 @@ func (obj *object) getPersistedRowByFilter(
 	var sortKey containers.Vector
 	schema := obj.meta.GetSchema()
 	idx := schema.GetSingleSortKeyIdx()
-	objMVCC := obj.tryGetMVCC()
 	for blkID = uint16(0); blkID < uint16(obj.meta.BlockCnt()); blkID++ {
 		var ok bool
 		ok, err = pnode.ContainsKey(ctx, filter.Val, uint32(blkID))
@@ -256,26 +259,11 @@ func (obj *object) getPersistedRowByFilter(
 			continue
 		}
 		offset = uint32(off)
-
-		if objMVCC == nil {
-			return
-		}
-		objMVCC.RLock()
-		defer objMVCC.RUnlock()
+		blkid := objectio.NewBlockidWithObjectID(&obj.meta.ID, blkID)
+		rowID := objectio.NewRowid(blkid, offset)
 		var deleted bool
-		deleted, err = objMVCC.IsDeletedLocked(offset, txn, blkID)
-		if err != nil {
-			return
-		}
-		if deleted {
-			continue
-		}
-		var deletes *nulls.Nulls
-		deletes, err = obj.persistedCollectDeleteMaskInRange(ctx, blkID, types.TS{}, txn.GetStartTS(), mp)
-		if err != nil {
-			return
-		}
-		if !deletes.Contains(uint64(offset)) {
+		deleted, err = obj.meta.GetTable().IsDeleted(ctx, txn, *rowID, obj.rt.VectorPool.Small, mp)
+		if !deleted {
 			return
 		}
 
@@ -285,16 +273,7 @@ func (obj *object) getPersistedRowByFilter(
 }
 
 func (obj *object) EstimateMemSize() (int, int) {
-	node := obj.PinNode()
-	defer node.Unref()
-	obj.RLock()
-	defer obj.RUnlock()
-	objMVCC := obj.tryGetMVCC()
-	if objMVCC == nil {
-		return 0, 0
-	}
-	dsize := objMVCC.EstimateMemSizeLocked()
-	return 0, dsize
+	return 0, 0
 }
 
 func (obj *object) GetRowsOnReplay() uint64 {

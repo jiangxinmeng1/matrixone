@@ -203,11 +203,11 @@ func (h *mockDBHandle) GetCreateSql() string {
 	return h.entry.GetCreateSql()
 }
 
-func (h *mockTableHandle) MakeObjectIt() (it handle.ObjectIt) {
+func (h *mockTableHandle) MakeObjectIt(bool, bool) (it handle.ObjectIt) {
 	return new(mockObjIt)
 }
 
-func (h *mockTableHandle) MakeObjectItOnSnap() (it handle.ObjectIt) {
+func (h *mockTableHandle) MakeObjectItOnSnap(bool) (it handle.ObjectIt) {
 	return new(mockObjIt)
 }
 

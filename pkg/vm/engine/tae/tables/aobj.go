@@ -17,10 +17,10 @@ package tables
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 
-	"github.com/RoaringBitmap/roaring"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
@@ -46,6 +46,7 @@ type aobject struct {
 func newAObject(
 	meta *catalog.ObjectEntry,
 	rt *dbutils.Runtime,
+	isTombstone bool,
 ) *aobject {
 	obj := &aobject{}
 	obj.baseObject = newBaseObject(obj, meta, rt)
@@ -56,7 +57,7 @@ func newAObject(
 		obj.node.Store(node)
 		obj.FreezeAppend()
 	} else {
-		mnode := newMemoryNode(obj.baseObject)
+		mnode := newMemoryNode(obj.baseObject, isTombstone)
 		node := NewNode(mnode)
 		node.Ref()
 		obj.node.Store(node)
@@ -143,7 +144,7 @@ func (obj *aobject) Pin() *common.PinnedItem[*aobject] {
 
 func (obj *aobject) GetColumnDataByIds(
 	ctx context.Context,
-	txn txnif.AsyncTxn,
+	txn txnif.TxnReader,
 	readSchema any,
 	_ uint16,
 	colIdxes []int,
@@ -161,7 +162,7 @@ func (obj *aobject) GetColumnDataByIds(
 
 func (obj *aobject) GetColumnDataById(
 	ctx context.Context,
-	txn txnif.AsyncTxn,
+	txn txnif.TxnReader,
 	readSchema any,
 	_ uint16,
 	col int,
@@ -176,7 +177,26 @@ func (obj *aobject) GetColumnDataById(
 		mp,
 	)
 }
-
+func (obj *aobject) GetCommitTSVector(maxRow uint32, mp *mpool.MPool) (containers.Vector, error) {
+	node := obj.PinNode()
+	defer node.Unref()
+	if !node.IsPersisted() {
+		return node.MustMNode().getCommitTSVec(maxRow, mp)
+	} else {
+		vec, err := obj.LoadPersistedCommitTS(0)
+		return vec, err
+	}
+}
+func (obj *aobject) GetCommitTSVectorInRange(start, end types.TS, mp *mpool.MPool) (containers.Vector, error) {
+	node := obj.PinNode()
+	defer node.Unref()
+	if !node.IsPersisted() {
+		return node.MustMNode().getCommitTSVecInRange(start, end, mp)
+	} else {
+		vec, err := obj.LoadPersistedCommitTS(0)
+		return vec, err
+	}
+}
 func (obj *aobject) resolveColumnDatas(
 	ctx context.Context,
 	txn txnif.TxnReader,
@@ -187,6 +207,9 @@ func (obj *aobject) resolveColumnDatas(
 ) (view *containers.BlockView, err error) {
 	node := obj.PinNode()
 	defer node.Unref()
+	if obj.meta.IsTombstone {
+		skipDeletes = true
+	}
 
 	if !node.IsPersisted() {
 		return node.MustMNode().resolveInMemoryColumnDatas(
@@ -229,7 +252,9 @@ func (obj *aobject) CoarseCheckAllRowsCommittedBefore(ts types.TS) bool {
 	// it is a coarse-grained check
 	return false
 }
-
+func (obj *aobject) GetCommitVec() (containers.Vector, error) {
+	return nil, nil
+}
 func (obj *aobject) resolveColumnData(
 	ctx context.Context,
 	txn txnif.TxnReader,
@@ -241,6 +266,9 @@ func (obj *aobject) resolveColumnData(
 	node := obj.PinNode()
 	defer node.Unref()
 
+	if obj.meta.IsTombstone {
+		skipDeletes = true
+	}
 	if !node.IsPersisted() {
 		return node.MustMNode().resolveInMemoryColumnData(
 			txn, readSchema, col, skipDeletes, mp,
@@ -264,16 +292,17 @@ func (obj *aobject) GetValue(
 	readSchema any,
 	_ uint16,
 	row, col int,
+	skipCheckDelete bool,
 	mp *mpool.MPool,
 ) (v any, isNull bool, err error) {
 	node := obj.PinNode()
 	defer node.Unref()
 	schema := readSchema.(*catalog.Schema)
 	if !node.IsPersisted() {
-		return node.MustMNode().getInMemoryValue(txn, schema, row, col, mp)
+		return node.MustMNode().getInMemoryValue(txn, schema, row, col, skipCheckDelete, mp)
 	} else {
 		return obj.getPersistedValue(
-			ctx, txn, schema, 0, row, col, true, mp,
+			ctx, txn, schema, 0, row, col, true, skipCheckDelete, mp,
 		)
 	}
 }
@@ -296,17 +325,88 @@ func (obj *aobject) GetByFilter(
 
 	node := obj.PinNode()
 	defer node.Unref()
-	_, offset, err = node.GetRowByFilter(ctx, txn, filter, mp)
+	_, offset, err = node.GetRowByFilter(ctx, txn, filter, mp, obj.rt.VectorPool.Small)
 	return
 }
 
-func (obj *aobject) BatchDedup(
+func (obj *aobject) GetDuplicatedRows(
 	ctx context.Context,
-	txn txnif.AsyncTxn,
+	txn txnif.TxnReader,
 	keys containers.Vector,
 	keysZM index.ZM,
-	rowmask *roaring.Bitmap,
 	precommit bool,
+	checkWWConflict bool,
+	bf objectio.BloomFilter,
+	rowIDs containers.Vector,
+	mp *mpool.MPool,
+) (err error) {
+	defer func() {
+		if moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry) {
+			logutil.Debugf("BatchDedup obj-%s: %v", obj.meta.ID.String(), err)
+		}
+	}()
+	node := obj.PinNode()
+	defer node.Unref()
+	maxRow := uint32(math.MaxUint32)
+	if !precommit {
+		obj.RLock()
+		maxRow, err = obj.GetMaxRowByTSLocked(txn.GetStartTS())
+		obj.RUnlock()
+	}
+	if !node.IsPersisted() {
+		return node.GetDuplicatedRows(
+			ctx,
+			txn,
+			maxRow,
+			keys,
+			keysZM,
+			rowIDs,
+			bf,
+			precommit,
+			checkWWConflict,
+			mp,
+		)
+	} else {
+		return obj.persistedGetDuplicatedRows(
+			ctx,
+			txn,
+			precommit,
+			keys,
+			keysZM,
+			rowIDs,
+			true,
+			maxRow,
+			bf,
+			mp,
+		)
+	}
+}
+
+func (obj *aobject) GetMaxRowByTSLocked(ts types.TS) (uint32, error) {
+	node := obj.PinNode()
+	defer node.Unref()
+	if !node.IsPersisted() {
+		return obj.appendMVCC.GetMaxRowByTSLocked(ts), nil
+	} else {
+		vec, err := obj.LoadPersistedCommitTS(0)
+		if err != nil {
+			return 0, err
+		}
+		for i := uint32(0); i < uint32(vec.Length()); i++ {
+			commitTS := vec.Get(int(i)).(types.TS)
+			if commitTS.Greater(&ts) {
+				return i, nil
+			}
+		}
+		return uint32(vec.Length()), nil
+	}
+}
+func (obj *aobject) Contains(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	precommit bool,
+	keys containers.Vector,
+	keysZM index.ZM,
 	bf objectio.BloomFilter,
 	mp *mpool.MPool,
 ) (err error) {
@@ -318,23 +418,22 @@ func (obj *aobject) BatchDedup(
 	node := obj.PinNode()
 	defer node.Unref()
 	if !node.IsPersisted() {
-		return node.BatchDedup(
+		return node.Contains(
 			ctx,
-			txn,
-			precommit,
 			keys,
 			keysZM,
-			rowmask,
 			bf,
+			txn,
+			precommit,
+			mp,
 		)
 	} else {
-		return obj.PersistedBatchDedup(
+		return obj.persistedContains(
 			ctx,
 			txn,
 			precommit,
 			keys,
 			keysZM,
-			rowmask,
 			true,
 			bf,
 			mp,
@@ -353,7 +452,7 @@ func (obj *aobject) CollectAppendInRange(
 }
 
 func (obj *aobject) estimateRawScore() (score int, dropped bool, err error) {
-	if obj.meta.HasDropCommitted() && !obj.meta.InMemoryDeletesExisted() {
+	if obj.meta.HasDropCommitted() {
 		dropped = true
 		return
 	}
@@ -371,14 +470,7 @@ func (obj *aobject) estimateRawScore() (score int, dropped bool, err error) {
 		return
 	}
 
-	changesCnt := uint32(0)
-	obj.meta.RLock()
-	objectMVCC := obj.tryGetMVCC()
-	if objectMVCC != nil {
-		changesCnt = objectMVCC.GetChangeIntentionCntLocked()
-	}
-	obj.meta.RUnlock()
-	if changesCnt == 0 && rows == 0 {
+	if rows == 0 {
 		score = 0
 	} else {
 		score = 1
@@ -428,24 +520,17 @@ func (obj *aobject) EstimateMemSize() (int, int) {
 	defer node.Unref()
 	obj.RLock()
 	defer obj.RUnlock()
-	dsize := 0
-	objMVCC := obj.tryGetMVCC()
-	if objMVCC != nil {
-		dsize = objMVCC.EstimateMemSizeLocked()
-	}
 	asize := obj.appendMVCC.EstimateMemSizeLocked()
 	if !node.IsPersisted() {
-		asize += node.MustMNode().EstimateMemSize()
+		asize += node.MustMNode().EstimateMemSizeLocked()
 	}
-	return asize, dsize
+	return asize, 0
 }
 
 func (obj *aobject) GetRowsOnReplay() uint64 {
-	rows := uint64(obj.appendMVCC.GetTotalRow())
-	fileRows := uint64(obj.meta.GetLatestCommittedNodeLocked().
-		BaseNode.ObjectStats.Rows())
-	if rows > fileRows {
-		return rows
+	if obj.meta.HasDropCommitted() {
+		return uint64(obj.meta.GetLatestCommittedNodeLocked().
+			BaseNode.ObjectStats.Rows())
 	}
-	return fileRows
+	return uint64(obj.appendMVCC.GetTotalRow())
 }

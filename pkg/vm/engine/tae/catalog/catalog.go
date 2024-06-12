@@ -25,7 +25,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 )
 
@@ -55,7 +54,6 @@ const (
 type DataFactory interface {
 	MakeTableFactory() TableDataFactory
 	MakeObjectFactory() ObjectDataFactory
-	MakeTombstoneFactory() TombstoneFactory
 }
 
 type Catalog struct {
@@ -152,24 +150,21 @@ func (catalog *Catalog) GCByTS(ctx context.Context, ts types.TS) {
 	}
 	processor.ObjectFn = func(se *ObjectEntry) error {
 		se.RLock()
-		needGC := se.DeleteBeforeLocked(ts) && !se.InMemoryDeletesExistedLocked()
+		needGC := se.DeleteBeforeLocked(ts)
 		se.RUnlock()
-		needGC = needGC && se.IsDeletesFlushedBefore(ts)
 		if needGC {
 			tbl := se.table
 			tbl.RemoveEntry(se)
 		}
 		return nil
 	}
-	processor.TombstoneFn = func(t data.Tombstone) error {
-		obj := t.GetObject().(*ObjectEntry)
+	processor.TombstoneFn = func(obj *ObjectEntry) error {
 		obj.RLock()
-		needGC := obj.DeleteBeforeLocked(ts) && !obj.InMemoryDeletesExistedLocked()
+		needGC := obj.DeleteBeforeLocked(ts)
 		obj.RUnlock()
-		needGC = needGC && obj.IsDeletesFlushedBefore(ts)
 		if needGC {
 			tbl := obj.table
-			tbl.GCTombstone(obj.ID)
+			tbl.RemoveEntry(obj)
 		}
 		return nil
 	}
@@ -179,7 +174,6 @@ func (catalog *Catalog) GCByTS(ctx context.Context, ts types.TS) {
 	}
 	catalog.gcTS = ts
 }
-
 func (catalog *Catalog) Close() error {
 	return nil
 }

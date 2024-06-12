@@ -58,6 +58,7 @@ func newMergeTaskBuilder(db *DB) *MergeTaskBuilder {
 	op.DatabaseFn = op.onDataBase
 	op.TableFn = op.onTable
 	op.ObjectFn = op.onObject
+	op.TombstoneFn = op.onTombstone
 	op.PostObjectFn = op.onPostObject
 	op.PostTableFn = op.onPostTable
 	return op
@@ -89,7 +90,7 @@ func (s *MergeTaskBuilder) resetForTable(entry *catalog.TableEntry) {
 	if entry != nil {
 		s.tid = entry.ID
 		s.tbl = entry
-		s.name = entry.GetLastestSchemaLocked().Name
+		s.name = entry.GetLastestSchemaLocked(false).Name
 		s.tableRowCnt = 0
 		s.tableRowDel = 0
 	}
@@ -180,7 +181,9 @@ func (s *MergeTaskBuilder) onObject(objectEntry *catalog.ObjectEntry) (err error
 	objectEntry.RLock()
 	return
 }
-
+func (s *MergeTaskBuilder) onTombstone(objectEntry *catalog.ObjectEntry) (err error) {
+	return s.onObject(objectEntry)
+}
 func (s *MergeTaskBuilder) onPostObject(obj *catalog.ObjectEntry) (err error) {
 	return nil
 }

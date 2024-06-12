@@ -88,9 +88,11 @@ func LoadPersistedColumnDatas(
 	if len(cols) == 0 {
 		return vectors, nil
 	}
+	var vecs []containers.Vector
+	var err error
 	//Extend lifetime of vectors is without the function.
 	//need to copy. closeFunc will be nil.
-	vecs, _, err := blockio.LoadColumns2(
+	vecs, _, err = blockio.LoadColumns2(
 		ctx, cols,
 		typs,
 		rt.Fs.Service,
@@ -113,47 +115,6 @@ func LoadPersistedColumnDatas(
 
 func ReadPersistedBlockRow(location objectio.Location) int {
 	return int(location.Rows())
-}
-
-func LoadPersistedDeletes(
-	ctx context.Context,
-	pkName string,
-	fs *objectio.ObjectFS,
-	location objectio.Location,
-	mp *mpool.MPool,
-) (bat *containers.Batch, isPersistedByCN bool, release func(), err error) {
-	if isPersistedByCN, err = blockio.IsPersistedByCN(ctx, location, fs.Service); err != nil {
-		return
-	}
-	bat, release, err = LoadPersistedDeletesBySchema(ctx, pkName, fs, location, isPersistedByCN, mp)
-	return
-}
-
-func LoadPersistedDeletesBySchema(
-	ctx context.Context,
-	pkName string,
-	fs *objectio.ObjectFS,
-	location objectio.Location,
-	isPersistedByCN bool,
-	mp *mpool.MPool,
-) (bat *containers.Batch, release func(), err error) {
-	movbat, release, err := blockio.ReadBlockDeleteBySchema(ctx, location, fs.Service, isPersistedByCN)
-	if err != nil {
-		return
-	}
-	bat = containers.NewBatch()
-	if isPersistedByCN {
-		colNames := []string{catalog.PhyAddrColumnName, catalog.AttrPKVal}
-		for i := 0; i < 2; i++ {
-			bat.AddVector(colNames[i], containers.ToTNVector(movbat.Vecs[i], mp))
-		}
-	} else {
-		colNames := []string{catalog.PhyAddrColumnName, catalog.AttrCommitTs, catalog.AttrPKVal, catalog.AttrAborted}
-		for i := 0; i < 4; i++ {
-			bat.AddVector(colNames[i], containers.ToTNVector(movbat.Vecs[i], mp))
-		}
-	}
-	return
 }
 
 // func MakeBFLoader(

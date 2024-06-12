@@ -35,7 +35,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/updates"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/wal"
 
@@ -216,12 +215,12 @@ func (store *txnStore) IncreateWriteCnt() int {
 	return int(store.writeOps.Add(1))
 }
 
-func (store *txnStore) LogTxnEntry(dbId uint64, tableId uint64, entry txnif.TxnEntry, readed []*common.ID) (err error) {
+func (store *txnStore) LogTxnEntry(dbId uint64, tableId uint64, entry txnif.TxnEntry, readedObject, readedTombstone []*common.ID) (err error) {
 	db, err := store.getOrSetDB(dbId)
 	if err != nil {
 		return
 	}
-	return db.LogTxnEntry(tableId, entry, readed)
+	return db.LogTxnEntry(tableId, entry, readedObject, readedTombstone)
 }
 
 func (store *txnStore) LogTxnState(sync bool) (logEntry entry.Entry, err error) {
@@ -314,6 +313,7 @@ func (store *txnStore) RangeDelete(
 	id *common.ID, start, end uint32,
 	pkVec containers.Vector, dt handle.DeleteType,
 ) (err error) {
+	store.IncreateWriteCnt()
 	db, err := store.getOrSetDB(id.DbID)
 	if err != nil {
 		return err
@@ -324,23 +324,12 @@ func (store *txnStore) RangeDelete(
 func (store *txnStore) TryDeleteByDeltaloc(
 	id *common.ID, deltaloc objectio.Location,
 ) (ok bool, err error) {
+	store.IncreateWriteCnt()
 	db, err := store.getOrSetDB(id.DbID)
 	if err != nil {
 		return
 	}
 	return db.TryDeleteByDeltaloc(id, deltaloc)
-}
-
-func (store *txnStore) UpdateDeltaLoc(id *common.ID, deltaLoc objectio.Location) (err error) {
-	store.IncreateWriteCnt()
-	db, err := store.getOrSetDB(id.DbID)
-	if err != nil {
-		return err
-	}
-	// if table.IsDeleted() {
-	// 	return txnbase.ErrNotFound
-	// }
-	return db.UpdateDeltaLoc(id, deltaLoc)
 }
 
 func (store *txnStore) GetByFilter(ctx context.Context, dbId, tid uint64, filter *handle.Filter) (id *common.ID, offset uint32, err error) {
@@ -355,7 +344,7 @@ func (store *txnStore) GetByFilter(ctx context.Context, dbId, tid uint64, filter
 	return db.GetByFilter(ctx, tid, filter)
 }
 
-func (store *txnStore) GetValue(id *common.ID, row uint32, colIdx uint16) (v any, isNull bool, err error) {
+func (store *txnStore) GetValue(id *common.ID, row uint32, colIdx uint16, skipCheckDelete bool) (v any, isNull bool, err error) {
 	db, err := store.getOrSetDB(id.DbID)
 	if err != nil {
 		return
@@ -364,7 +353,7 @@ func (store *txnStore) GetValue(id *common.ID, row uint32, colIdx uint16) (v any
 	// 	err = txnbase.ErrNotFound
 	// 	return
 	// }
-	return db.GetValue(id, row, colIdx)
+	return db.GetValue(id, row, colIdx, skipCheckDelete)
 }
 
 func (store *txnStore) DatabaseNames() (names []string) {
@@ -472,10 +461,8 @@ func (store *txnStore) ObserveTxn(
 	visitDatabase func(db any),
 	visitTable func(tbl any),
 	rotateTable func(dbName, tblName string, dbid, tid uint64),
-	visitMetadata func(block any),
 	visitObject func(obj any),
-	visitAppend func(bat any),
-	visitDelete func(ctx context.Context, vnode txnif.DeleteNode)) {
+	visitAppend func(bat any, isTombstone bool)) {
 	for _, db := range store.dbs {
 		if db.createEntry != nil || db.dropEntry != nil {
 			visitDatabase(db.entry)
@@ -483,7 +470,7 @@ func (store *txnStore) ObserveTxn(
 		dbName := db.entry.GetName()
 		dbid := db.entry.ID
 		for _, tbl := range db.tables {
-			tblName := tbl.GetLocalSchema().Name
+			tblName := tbl.GetLocalSchema(false).Name
 			tid := tbl.entry.ID
 			rotateTable(dbName, tblName, dbid, tid)
 			if tbl.createEntry != nil || tbl.dropEntry != nil {
@@ -493,10 +480,6 @@ func (store *txnStore) ObserveTxn(
 				switch txnEntry := iTxnEntry.(type) {
 				case *catalog.ObjectEntry:
 					visitObject(txnEntry)
-				case *updates.DeltalocChain:
-					visitMetadata(txnEntry)
-				case *updates.DeleteNode:
-					visitDelete(store.ctx, txnEntry)
 				case *catalog.TableEntry:
 					if tbl.createEntry != nil || tbl.dropEntry != nil {
 						continue
@@ -508,14 +491,29 @@ func (store *txnStore) ObserveTxn(
 				for _, node := range tbl.tableSpace.nodes {
 					anode, ok := node.(*anode)
 					if ok {
-						schema := anode.table.GetLocalSchema()
+						schema := anode.table.GetLocalSchema(false)
 						bat := &containers.BatchWithVersion{
 							Version:    schema.Version,
 							NextSeqnum: uint16(schema.Extra.NextColSeqnum),
 							Seqnums:    schema.AllSeqnums(),
 							Batch:      anode.data,
 						}
-						visitAppend(bat)
+						visitAppend(bat, false)
+					}
+				}
+			}
+			if tbl.tombstoneTableSpace != nil {
+				for _, node := range tbl.tombstoneTableSpace.nodes {
+					anode, ok := node.(*anode)
+					if ok {
+						schema := anode.table.GetLocalSchema(true)
+						bat := &containers.BatchWithVersion{
+							Version:    schema.Version,
+							NextSeqnum: uint16(schema.Extra.NextColSeqnum),
+							Seqnums:    schema.AllSeqnums(),
+							Batch:      anode.data,
+						}
+						visitAppend(bat, true)
 					}
 				}
 			}
@@ -602,28 +600,28 @@ func (store *txnStore) GetRelationByID(dbId uint64, id uint64) (relation handle.
 	return db.GetRelationByID(id)
 }
 
-func (store *txnStore) GetObject(id *common.ID) (obj handle.Object, err error) {
+func (store *txnStore) GetObject(id *common.ID, isTombstone bool) (obj handle.Object, err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(id.DbID); err != nil {
 		return
 	}
-	return db.GetObject(id)
+	return db.GetObject(id, isTombstone)
 }
 
-func (store *txnStore) CreateObject(dbId, tid uint64) (obj handle.Object, err error) {
+func (store *txnStore) CreateObject(dbId, tid uint64, isTombstone bool) (obj handle.Object, err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(dbId); err != nil {
 		return
 	}
-	return db.CreateObject(tid)
+	return db.CreateObject(tid, isTombstone)
 }
 
-func (store *txnStore) CreateNonAppendableObject(dbId, tid uint64, opt *objectio.CreateObjOpt) (obj handle.Object, err error) {
+func (store *txnStore) CreateNonAppendableObject(dbId, tid uint64, isTombstone bool, opt *objectio.CreateObjOpt) (obj handle.Object, err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(dbId); err != nil {
 		return
 	}
-	return db.CreateNonAppendableObject(tid, opt)
+	return db.CreateNonAppendableObject(tid, opt, isTombstone)
 }
 
 func (store *txnStore) getOrSetDB(id uint64) (db *txnDB, err error) {
@@ -648,16 +646,16 @@ func (store *txnStore) getOrSetDB(id uint64) (db *txnDB, err error) {
 	store.dbs[id] = db
 	return
 }
-func (store *txnStore) UpdateObjectStats(id *common.ID, stats *objectio.ObjectStats) error {
+func (store *txnStore) UpdateObjectStats(id *common.ID, stats *objectio.ObjectStats, isTombstone bool) error {
 	db, err := store.getOrSetDB(id.DbID)
 	if err != nil {
 		return err
 	}
-	db.UpdateObjectStats(id, stats)
+	db.UpdateObjectStats(id, stats, isTombstone)
 	return nil
 }
 
-func (store *txnStore) SoftDeleteObject(id *common.ID) (err error) {
+func (store *txnStore) SoftDeleteObject(isTombstone bool, id *common.ID) (err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(id.DbID); err != nil {
 		return
@@ -665,7 +663,7 @@ func (store *txnStore) SoftDeleteObject(id *common.ID) (err error) {
 	perfcounter.Update(store.ctx, func(counter *perfcounter.CounterSet) {
 		counter.TAE.Object.SoftDelete.Add(1)
 	})
-	return db.SoftDeleteObject(id)
+	return db.SoftDeleteObject(id, isTombstone)
 }
 
 func (store *txnStore) ApplyRollback() (err error) {
@@ -825,4 +823,19 @@ func (store *txnStore) CleanUp() {
 	for _, db := range store.dbs {
 		db.CleanUp()
 	}
+}
+func (store *txnStore) FillInWorkspaceDeletes(id *common.ID, view *containers.BaseView) error {
+	db, err := store.getOrSetDB(id.DbID)
+	if err != nil {
+		return err
+	}
+	return db.FillInWorkspaceDeletes(id, view)
+}
+
+func (store *txnStore) IsDeletedInWorkSpace(id *common.ID, row uint32) (bool, error) {
+	db, err := store.getOrSetDB(id.DbID)
+	if err != nil {
+		return false, err
+	}
+	return db.IsDeletedInWorkSpace(id, row)
 }

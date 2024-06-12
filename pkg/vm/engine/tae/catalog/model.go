@@ -24,7 +24,7 @@ const (
 	PhyAddrColumnComment = "Physical address"
 	SortKeyNamePrefx     = "_SORT_"
 
-	AttrRowID    = PhyAddrColumnName
+	AttrRowID    = catalog.TableTailAttrDeleteRowID
 	AttrCommitTs = catalog.TableTailAttrCommitTs
 	AttrAborted  = catalog.TableTailAttrAborted
 	AttrPKVal    = catalog.TableTailAttrPKVal

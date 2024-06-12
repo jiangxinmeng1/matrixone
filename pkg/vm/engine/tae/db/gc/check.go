@@ -15,14 +15,11 @@
 package gc
 
 import (
-	catalog2 "github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
-	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/checkpoint"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logtail"
@@ -144,35 +141,27 @@ func (c *checker) Check() error {
 	// Collect all objects in memory
 	catalog := c.cleaner.ckpClient.GetCatalog()
 	it := catalog.MakeDBIt(true)
-	bat := makeRespBatchFromSchema(logtail.BlkMetaSchema, common.DebugAllocator)
-	defer bat.Close()
-	end := types.BuildTS(time.Now().UnixNano(), 0)
+	// end := types.BuildTS(time.Now().UnixNano(), 0)
 	for ; it.Valid(); it.Next() {
 		db := it.Get().GetPayload()
 		itTable := db.MakeTableIt(true)
 		for itTable.Valid() {
 			table := itTable.Get().GetPayload()
-			itObject := table.MakeObjectIt(true)
+			itObject := table.MakeObjectIt(true, false)
 			for itObject.Valid() {
 				objectEntry := itObject.Get().GetPayload()
 				stats := objectEntry.GetObjectStats()
 				delete(allObjects, stats.ObjectName().String())
 				itObject.Next()
 			}
-			it2 := table.GetDeleteList().Items()
-			for _, itt := range it2 {
-				_, _, _, err = itt.VisitDeletes(c.cleaner.ctx, maxTs, end, bat, nil, true)
-				if err != nil {
-					logutil.Errorf("visit deletes failed: %v", err)
-					continue
-				}
+			itObject = table.MakeObjectIt(true, true)
+			for itObject.Valid() {
+				objectEntry := itObject.Get().GetPayload()
+				stats := objectEntry.GetObjectStats()
+				delete(allObjects, stats.ObjectName().String())
+				itObject.Next()
 			}
-			itTable.Next()
 		}
-	}
-	for i := 0; i < bat.Length(); i++ {
-		deltaLoc := objectio.Location(bat.GetVectorByName(catalog2.BlockMeta_DeltaLoc).Get(i).([]byte))
-		delete(allObjects, deltaLoc.Name().String())
 	}
 
 	if len(objects) != 0 || len(tombstones) != 0 || len(unconsumedObjects) != 0 || len(unconsumedTombstones) != 0 {

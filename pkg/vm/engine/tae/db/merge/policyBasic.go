@@ -78,7 +78,7 @@ func (o *customConfigProvider) GetConfig(tbl *catalog.TableEntry) *BasicPolicyCo
 	p, ok := o.configs[tbl.ID]
 	if !ok {
 		// load from an atomic value
-		extra := tbl.GetLastestSchemaLocked().Extra
+		extra := tbl.GetLastestSchemaLocked(false).Extra
 		if extra.MaxObjOnerun != 0 || extra.MinOsizeQuailifed != 0 {
 			// compatible with old version
 			cnSize := extra.MinCnMergeSize
@@ -219,7 +219,7 @@ func (o *basic) SetConfig(tbl *catalog.TableEntry, f func() txnif.AsyncTxn, c an
 		ctx,
 		NewUpdatePolicyReq(cfg),
 	)
-	logutil.Infof("mergeblocks set %v-%v config: %v", tbl.ID, tbl.GetLastestSchemaLocked().Name, cfg)
+	logutil.Infof("mergeblocks set %v-%v config: %v", tbl.ID, tbl.GetLastestSchemaLocked(false).Name, cfg)
 	txn.Commit(ctx)
 	o.configProvider.InvalidCache(tbl)
 }
@@ -347,7 +347,7 @@ func (o *basic) controlMem(objs []*catalog.ObjectEntry, mem int64) []*catalog.Ob
 
 func (o *basic) ResetForTable(entry *catalog.TableEntry) {
 	o.id = entry.ID
-	o.schema = entry.GetLastestSchemaLocked()
+	o.schema = entry.GetLastestSchemaLocked(false)
 	o.hist = entry.Stats.GetLastMerge()
 	o.guessType = entry.Stats.GetWorkloadGuess()
 	o.objHeap.reset()

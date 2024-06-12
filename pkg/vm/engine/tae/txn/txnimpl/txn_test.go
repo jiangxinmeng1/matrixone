@@ -206,7 +206,7 @@ func TestAppend(t *testing.T) {
 	rows := uint64(MaxNodeRows) / 8 * 3
 	brows := rows / 3
 
-	bat := catalog.MockBatch(tbl.GetLocalSchema(), int(rows))
+	bat := catalog.MockBatch(tbl.GetLocalSchema(false), int(rows))
 	defer bat.Close()
 	bats := bat.Split(3)
 
@@ -610,7 +610,7 @@ func TestObject1(t *testing.T) {
 	assert.Nil(t, err)
 	rel, err := db.CreateRelation(schema)
 	assert.Nil(t, err)
-	_, err = rel.CreateObject()
+	_, err = rel.CreateObject(false)
 	assert.Nil(t, err)
 	err = txn1.Commit(context.Background())
 	assert.Nil(t, err)
@@ -620,7 +620,7 @@ func TestObject1(t *testing.T) {
 	assert.Nil(t, err)
 	rel, err = db.GetRelationByName(schema.Name)
 	assert.Nil(t, err)
-	objIt := rel.MakeObjectIt()
+	objIt := rel.MakeObjectIt(false, true)
 	cnt := 0
 	for objIt.Valid() {
 		iobj := objIt.GetObject()
@@ -630,10 +630,10 @@ func TestObject1(t *testing.T) {
 	}
 	assert.Equal(t, 1, cnt)
 
-	_, err = rel.CreateObject()
+	_, err = rel.CreateObject(false)
 	assert.Nil(t, err)
 
-	objIt = rel.MakeObjectIt()
+	objIt = rel.MakeObjectIt(false, true)
 	cnt = 0
 	for objIt.Valid() {
 		iobj := objIt.GetObject()
@@ -646,7 +646,7 @@ func TestObject1(t *testing.T) {
 	txn3, _ := mgr.StartTxn(nil)
 	db, _ = txn3.GetDatabase(name)
 	rel, _ = db.GetRelationByName(schema.Name)
-	objIt = rel.MakeObjectIt()
+	objIt = rel.MakeObjectIt(false, true)
 	cnt = 0
 	for objIt.Valid() {
 		iobj := objIt.GetObject()
@@ -659,7 +659,7 @@ func TestObject1(t *testing.T) {
 	err = txn2.Commit(context.Background())
 	assert.Nil(t, err)
 
-	objIt = rel.MakeObjectIt()
+	objIt = rel.MakeObjectIt(false, true)
 	cnt = 0
 	for objIt.Valid() {
 		iobj := objIt.GetObject()
@@ -686,11 +686,11 @@ func TestObject2(t *testing.T) {
 	rel, _ := db.CreateRelation(schema)
 	objCnt := 10
 	for i := 0; i < objCnt; i++ {
-		_, err := rel.CreateObject()
+		_, err := rel.CreateObject(false)
 		assert.Nil(t, err)
 	}
 
-	it := rel.MakeObjectIt()
+	it := rel.MakeObjectIt(false, true)
 	cnt := 0
 	for it.Valid() {
 		cnt++

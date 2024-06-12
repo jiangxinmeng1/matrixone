@@ -22,6 +22,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index/indexwrapper"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/updates"
@@ -36,10 +37,11 @@ func TestGetActiveRow(t *testing.T) {
 	schema := catalog.MockSchema(1, 0)
 	c := catalog.MockCatalog()
 	defer c.Close()
+	vpool := dbutils.MakeDefaultSmallPool("small-vector-pool")
 
 	db, _ := c.CreateDBEntry("db", "", "", nil)
 	table, _ := db.CreateTableEntry(schema, nil, nil)
-	obj, _ := table.CreateObject(nil, catalog.ES_Appendable, nil, nil)
+	obj, _ := table.CreateObject(nil, catalog.ES_Appendable, nil, nil, false)
 	mvcc := updates.NewAppendMVCCHandle(obj)
 	// blk := &dataBlock{
 	// 	mvcc: mvcc,
@@ -82,7 +84,7 @@ func TestGetActiveRow(t *testing.T) {
 	node := blk.node.Load().MustMNode()
 	// row, err := blk.GetActiveRow(int8(1), ts2)
 	_, row, err := node.GetRowByFilter(
-		context.Background(), updates.MockTxnWithStartTS(ts2), handle.NewEQFilter(int8(1)), common.DefaultAllocator,
+		context.Background(), updates.MockTxnWithStartTS(ts2), handle.NewEQFilter(int8(1)), common.DefaultAllocator, vpool,
 	)
 	assert.NoError(t, err)
 	assert.Equal(t, uint32(1), row)
@@ -91,7 +93,7 @@ func TestGetActiveRow(t *testing.T) {
 	an2.Aborted = true
 
 	_, row, err = node.GetRowByFilter(
-		context.Background(), updates.MockTxnWithStartTS(ts2), handle.NewEQFilter(int8(1)), common.DefaultAllocator,
+		context.Background(), updates.MockTxnWithStartTS(ts2), handle.NewEQFilter(int8(1)), common.DefaultAllocator, vpool,
 	)
 	// row, err = blk.GetActiveRow(int8(1), ts2)
 	assert.NoError(t, err)

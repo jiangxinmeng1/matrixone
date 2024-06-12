@@ -498,13 +498,14 @@ func (tbl *txnTable) LoadDeletesForBlock(bid types.Blockid, offsets *[]int64) (e
 			if err != nil {
 				return err
 			}
-			rowIdBat, release, err := blockio.LoadTombstoneColumns(
+			rowIdBat, release, err := blockio.LoadColumns(
 				tbl.getTxn().proc.Ctx,
 				[]uint16{0},
 				nil,
 				tbl.getTxn().engine.fs,
 				location,
-				tbl.getTxn().proc.GetMPool())
+				tbl.getTxn().proc.GetMPool(),
+				fileservice.Policy(0))
 			if err != nil {
 				return err
 			}
@@ -539,13 +540,14 @@ func (tbl *txnTable) LoadDeletesForMemBlocksIn(
 				if err != nil {
 					return err
 				}
-				rowIdBat, release, err := blockio.LoadTombstoneColumns(
+				rowIdBat, release, err := blockio.LoadColumns(
 					tbl.getTxn().proc.Ctx,
 					[]uint16{0},
 					nil,
 					tbl.getTxn().engine.fs,
 					location,
-					tbl.getTxn().proc.GetMPool())
+					tbl.getTxn().proc.GetMPool(),
+					fileservice.Policy(0))
 				if err != nil {
 					return err
 				}
@@ -2581,7 +2583,7 @@ func (tbl *txnTable) MergeObjects(ctx context.Context, objstats []objectio.Objec
 		return nil, err
 	}
 
-	err = mergesort.DoMergeAndWrite(ctx, sortkeyPos, taskHost)
+	err = mergesort.DoMergeAndWrite(ctx, sortkeyPos, taskHost, false)
 	if err != nil {
 		return nil, err
 	}
@@ -2652,7 +2654,7 @@ func dumpTransferInfo(ctx context.Context, taskHost *cnMergeTask) (err error) {
 		batch := batch.New(true, []string{"payload"})
 		batch.SetRowCount(vectorRowCnt)
 		batch.Vecs[0] = v
-		_, err = writer.WriteTombstoneBatch(batch)
+		_, err = writer.WriteBatch(batch)
 		if err != nil {
 			releasev()
 			return

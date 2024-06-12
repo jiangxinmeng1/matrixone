@@ -17,11 +17,10 @@ package tables
 import (
 	"context"
 
-	"github.com/RoaringBitmap/roaring"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
+	// "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
@@ -34,32 +33,32 @@ type NodeT interface {
 
 	IsPersisted() bool
 
-	PrepareAppend(rows uint32) (n uint32, err error)
-	ApplyAppend(
-		bat *containers.Batch,
-		txn txnif.AsyncTxn,
-	) (from int, err error)
-
-	GetDataWindow(
-		readSchema *catalog.Schema, colIdxes []int, from, to uint32, mp *mpool.MPool,
-	) (bat *containers.Batch, err error)
-
-	GetValueByRow(readSchema *catalog.Schema, row, col int) (v any, isNull bool)
-	GetRowsByKey(key any) (rows []uint32, err error)
-	BatchDedup(
+	Contains(
 		ctx context.Context,
-		txn txnif.TxnReader,
-		isCommitting bool,
 		keys containers.Vector,
 		keysZM index.ZM,
-		rowmask *roaring.Bitmap,
 		bf objectio.BloomFilter,
+		txn txnif.TxnReader,
+		isCommitting bool,
+		mp *mpool.MPool,
 	) (err error)
-	ContainsKey(ctx context.Context, key any, blkID uint32) (ok bool, err error)
+	GetDuplicatedRows(
+		ctx context.Context,
+		txn txnif.TxnReader,
+		maxVisibleRow uint32,
+		keys containers.Vector,
+		keysZM index.ZM,
+		rowIDs containers.Vector,
+		bf objectio.BloomFilter,
+		isCommitting bool,
+		checkWWConflict bool,
+		mp *mpool.MPool,
+	) (err error)
 
 	Rows() (uint32, error)
 
-	GetRowByFilter(ctx context.Context, txn txnif.TxnReader, filter *handle.Filter, mp *mpool.MPool) (bid uint16, row uint32, err error)
+	GetRowByFilter(ctx context.Context, txn txnif.TxnReader, filter *handle.Filter, mp *mpool.MPool,
+		vpool *containers.VectorPool) (bid uint16, row uint32, err error)
 	CollectAppendInRange(
 		start, end types.TS, withAborted bool, mp *mpool.MPool,
 	) (batWithVer *containers.BatchWithVersion, err error)
