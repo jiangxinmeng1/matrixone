@@ -17,6 +17,7 @@ package tables
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -650,6 +651,7 @@ type objectMemoryNode struct {
 	common.RefHelper
 	blkMemoryNodes []*memoryNode
 	writeSchema    *catalog.Schema
+	blkCount       atomic.Int32
 }
 
 func newObjectMemoryNode(obj *aobject) *objectMemoryNode {
@@ -711,6 +713,7 @@ func (node *objectMemoryNode) registerNodeLocked() *memoryNode {
 	}
 	blkNode := newMemoryNode(node.obj, uint16(len(node.blkMemoryNodes)))
 	node.blkMemoryNodes = append(node.blkMemoryNodes, blkNode)
+	node.blkCount.Store(int32(len(node.blkMemoryNodes)))
 	return blkNode
 }
 func (node *objectMemoryNode) checkBlockCountLocked() bool {
@@ -836,10 +839,23 @@ func (node *objectMemoryNode) resolveInMemoryColumnData(
 ) (view *containers.Batch, err error) {
 	return node.getMemoryNode(blkID).resolveInMemoryColumnData(txn, readSchema, col, skipDeletes, mp)
 }
-func (node *objectMemoryNode) allRowsCommittedBefore(ts types.TS) bool {
-	node.obj.RLock()
-	defer node.obj.RUnlock()
-	return node.getLastNode().allRowsCommittedBefore(ts)
+func (node *objectMemoryNode) allRowsCommittedBeforeLocked(ts types.TS, freeze bool) (allCommitted bool, firstUncommittedBlkOffset uint16) {
+	if freeze {
+		ok := node.getLastNode().allRowsCommittedBefore(ts)
+		if ok {
+			return true, 0
+		}
+	}
+	if len(node.blkMemoryNodes) == 1 {
+		return false, 0
+	}
+	lastIdx := len(node.blkMemoryNodes) - 2
+	for i := lastIdx; i >= 0; i-- {
+		if node.blkMemoryNodes[i].allRowsCommittedBefore(ts) {
+			return false, uint16(i) + 1
+		}
+	}
+	return false, 0
 }
 func (node *objectMemoryNode) resolveInMemoryColumnDatas(
 	ctx context.Context,
@@ -859,4 +875,7 @@ func (node *objectMemoryNode) getwrteSchema() *catalog.Schema {
 }
 func (node *objectMemoryNode) blockCnt() int {
 	return len(node.blkMemoryNodes)
+}
+func (node *objectMemoryNode) coarseBlockCnt() int {
+	return int(node.blkCount.Load())
 }

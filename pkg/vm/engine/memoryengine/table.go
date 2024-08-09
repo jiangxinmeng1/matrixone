@@ -415,7 +415,7 @@ func (t *Table) UpdateConstraint(context.Context, *engine.ConstraintDef) error {
 	return nil
 }
 
-func (t *Table) AlterTable(ctx context.Context, c *engine.ConstraintDef, constraint [][]byte) error {
+func (t *Table) AlterTable(ctx context.Context, c *engine.ConstraintDef, reqs []*api.AlterTableReq) error {
 	// implement me
 	return nil
 }
@@ -550,6 +550,10 @@ func (t *Table) ApproxObjectsNum(ctx context.Context) int {
 	return 0
 }
 
-func (t *Table) MergeObjects(ctx context.Context, objstats []objectio.ObjectStats, policyName string, targetObjSize uint32) (*api.MergeCommitEntry, error) {
+func (t *Table) MergeObjects(ctx context.Context, objstats []objectio.ObjectStats, targetObjSize uint32) (*api.MergeCommitEntry, error) {
+	return nil, nil
+}
+
+func (t *Table) GetNonAppendableObjectStats(ctx context.Context) ([]objectio.ObjectStats, error) {
 	return nil, nil
 }

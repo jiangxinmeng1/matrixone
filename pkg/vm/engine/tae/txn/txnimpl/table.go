@@ -1071,6 +1071,7 @@ func (tbl *txnTable) tryGetCurrentObjectBF(
 // which are visible and not dropped at txn's snapshot timestamp.
 // 2. It is called when appending data into this table.
 func (tbl *txnTable) DedupSnapByPK(ctx context.Context, keys containers.Vector, dedupAfterSnapshotTS bool) (err error) {
+	t0 := time.Now()
 	r := trace.StartRegion(ctx, "DedupSnapByPK")
 	defer r.End()
 	it := tbl.entry.MakeObjectIt(true)
@@ -1088,10 +1089,16 @@ func (tbl *txnTable) DedupSnapByPK(ctx context.Context, keys containers.Vector, 
 	)
 	objCount := 0
 	maxBlockID := uint16(0)
+	debugStr := ""
+	dedupedCount := 0
+	visibleCount := 0
+	var skipDuration, skipDuration2, skipDurationTotal, updateHintDuration, indexDuration, dedupDuration time.Duration
 	for it.Next() {
+		tSkip := time.Now()
 		obj := it.Item()
 		objCount++
 		updateObjectHintFn := func() {
+			tHint := time.Now()
 			ObjectHint := obj.SortHint
 			// the last appendable obj is appending and shouldn't be skipped
 			// the max object hint should equal id of last aobj
@@ -1109,21 +1116,40 @@ func (tbl *txnTable) DedupSnapByPK(ctx context.Context, keys containers.Vector, 
 					maxNAObjectHint = ObjectHint
 				}
 			}
+			updateHintDuration += time.Since(tHint)
 		}
 		if !obj.IsVisible(tbl.store.txn) {
 			if obj.HasDropCommitted() {
 				updateObjectHintFn()
 			}
+			skipDuration += time.Since(tSkip)
+			skipDurationTotal += time.Since(tSkip)
 			continue
 		}
+		visibleCount++
 		updateObjectHintFn()
+		skipDuration += time.Since(tSkip)
 		objData := obj.GetObjectData()
 		if objData == nil {
 			panic(fmt.Sprintf("logic error, object %v", obj.StringWithLevel(3)))
 		}
-		if dedupAfterSnapshotTS && objData.CoarseCheckAllRowsCommittedBefore(tbl.store.txn.GetSnapshotTS()) {
-			continue
+		tSnapshotDedup := time.Now()
+		var blkOffset uint16
+		if dedupAfterSnapshotTS {
+			committed, committedblkOffset := objData.CoarseCheckAllRowsCommittedBefore(tbl.store.txn.GetSnapshotTS())
+			blkOffset = committedblkOffset
+			if committed {
+				skipDuration2 += time.Since(tSnapshotDedup)
+				skipDurationTotal += time.Since(tSkip)
+				continue
+			}
 		}
+		skipDuration2 += time.Since(tSnapshotDedup)
+		skipDurationTotal += time.Since(tSkip)
+		tIndex := time.Now()
+		dedupedCount++
+		debugStr = fmt.Sprintf("%s,%v,%v,%v,%v;",
+			debugStr, obj.IsAppendable(), obj.BlockCnt(), obj.CreatedAt.ToString(), obj.DeletedAt.ToString())
 		var rowmask *roaring.Bitmap
 		if len(tbl.deleteNodes) > 0 {
 			fp := obj.AsCommonID()
@@ -1138,9 +1164,12 @@ func (tbl *txnTable) DedupSnapByPK(ctx context.Context, keys containers.Vector, 
 			if skip, err = tbl.quickSkipThisObject(ctx, keysZM, obj); err != nil {
 				return
 			} else if skip {
+				indexDuration += time.Since(tIndex)
 				continue
 			}
 		}
+		indexDuration += time.Since(tIndex)
+		tDedup := time.Now()
 		if obj.HasCommittedPersistedData() {
 			if bf, err = tbl.tryGetCurrentObjectBF(
 				ctx,
@@ -1153,6 +1182,7 @@ func (tbl *txnTable) DedupSnapByPK(ctx context.Context, keys containers.Vector, 
 		}
 		name = *stats.ObjectShortName()
 
+		t1 := time.Now()
 		if err = objData.BatchDedup(
 			ctx,
 			tbl.store.txn,
@@ -1161,12 +1191,41 @@ func (tbl *txnTable) DedupSnapByPK(ctx context.Context, keys containers.Vector, 
 			rowmask,
 			false,
 			bf,
-			0,
+			blkOffset,
 			common.WorkspaceAllocator,
 		); err != nil {
 			// logutil.Infof("%s, %s, %v", obj.String(), rowmask, err)
 			return
 		}
+		dedupDuration += time.Since(tDedup)
+		duration := time.Since(t1)
+		if duration > time.Millisecond*20 {
+			logutil.Warn(
+				"SLOW-LOG",
+				zap.String("txn", tbl.store.txn.Repr()),
+				zap.String("object", obj.StringWithLevel(3)),
+				zap.Int("blk count", obj.BlockCnt()),
+				zap.Duration("dedup", duration),
+			)
+		}
+	}
+	duration := time.Since(t0)
+	if duration > time.Millisecond*50 {
+		logutil.Warn(
+			"SLOW-LOG",
+			zap.String("txn", tbl.store.txn.Repr()),
+			zap.Int("object count", objCount),
+			zap.Int("deduped count", dedupedCount),
+			zap.Duration("dedup", duration),
+			zap.String("debugstr", debugStr),
+			zap.Duration("skip", skipDuration),
+			zap.Duration("skip2", skipDuration2),
+			zap.Duration("skip total", skipDurationTotal),
+			zap.Duration("update hint", updateHintDuration),
+			zap.Int("visible count", visibleCount),
+			zap.Duration("index", indexDuration),
+			zap.Duration("dedup", dedupDuration),
+		)
 	}
 	tbl.updateDedupedObjectHintAndBlockID(maxObjectHint, maxNAObjectHint, maxBlockID)
 	return
@@ -1203,8 +1262,8 @@ func (tbl *txnTable) DedupSnapByMetaLocs(ctx context.Context, metaLocs []objecti
 			// if it is in the incremental deduplication scenario
 			// coarse check whether all rows in this block are committed before the snapshot timestamp
 			// if true, skip this block's deduplication
-			if dedupAfterSnapshotTS &&
-				objData.CoarseCheckAllRowsCommittedBefore(tbl.store.txn.GetSnapshotTS()) {
+			committed, blkOffset := objData.CoarseCheckAllRowsCommittedBefore(tbl.store.txn.GetSnapshotTS())
+			if dedupAfterSnapshotTS && committed {
 				continue
 			}
 
@@ -1246,7 +1305,7 @@ func (tbl *txnTable) DedupSnapByMetaLocs(ctx context.Context, metaLocs []objecti
 				rowmask,
 				false,
 				objectio.BloomFilter{},
-				0,
+				blkOffset,
 				common.WorkspaceAllocator,
 			); err != nil {
 				// logutil.Infof("%s, %s, %v", obj.String(), rowmask, err)
