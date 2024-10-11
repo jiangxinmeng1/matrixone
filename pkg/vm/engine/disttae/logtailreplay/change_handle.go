@@ -574,6 +574,7 @@ type ChangeHandler struct {
 
 	duration                    time.Duration
 	tombstoneLength, dataLength int
+	lastPrint                   time.Time
 }
 
 func NewChangesHandler(state *PartitionState, start, end types.TS, mp *mpool.MPool, maxRow uint32, fs fileservice.FileService, ctx context.Context) (changeHandle *ChangeHandler, err error) {
@@ -647,6 +648,10 @@ func (p *ChangeHandler) quickNext(ctx context.Context, mp *mpool.MPool) (data, t
 	return
 }
 func (p *ChangeHandler) Next(ctx context.Context, mp *mpool.MPool) (data, tombstone *batch.Batch, hint engine.ChangesHandle_Hint, err error) {
+	if time.Since(p.lastPrint) > time.Second*10 {
+		p.lastPrint = time.Now()
+		logutil.Infof("lalala %d/%d, %v", p.dataLength, p.tombstoneLength, p.duration)
+	}
 	t0 := time.Now()
 	hint = engine.ChangesHandle_Tail_done
 	if p.quick {
