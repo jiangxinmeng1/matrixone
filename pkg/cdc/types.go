@@ -48,7 +48,7 @@ const (
 )
 
 var (
-	EnableConsoleSink = false
+	EnableConsoleSink = true
 )
 
 type Reader interface {

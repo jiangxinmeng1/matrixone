@@ -17,10 +17,12 @@ package logtailreplay
 import (
 	"context"
 	"fmt"
+	"time"
 
 	goSort "sort"
 
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/sort"
 
@@ -569,6 +571,9 @@ type ChangeHandler struct {
 	dataHandle      *baseHandle
 	coarseMaxRow    int
 	quick           bool
+
+	duration                    time.Duration
+	tombstoneLength, dataLength int
 }
 
 func NewChangesHandler(state *PartitionState, start, end types.TS, mp *mpool.MPool, maxRow uint32, fs fileservice.FileService, ctx context.Context) (changeHandle *ChangeHandler, err error) {
@@ -601,6 +606,9 @@ func NewChangesHandler(state *PartitionState, start, end types.TS, mp *mpool.MPo
 func (p *ChangeHandler) Close() error {
 	p.dataHandle.Close()
 	p.tombstoneHandle.Close()
+	if p.tombstoneLength != 0 || p.dataLength != 0 {
+		logutil.Infof("lalala %d/%d %v", p.dataLength, p.tombstoneLength, p.duration)
+	}
 	return nil
 }
 func (p *ChangeHandler) decideMode() {
@@ -639,9 +647,17 @@ func (p *ChangeHandler) quickNext(ctx context.Context, mp *mpool.MPool) (data, t
 	return
 }
 func (p *ChangeHandler) Next(ctx context.Context, mp *mpool.MPool) (data, tombstone *batch.Batch, hint engine.ChangesHandle_Hint, err error) {
+	t0 := time.Now()
 	hint = engine.ChangesHandle_Tail_done
 	if p.quick {
 		data, tombstone, err = p.quickNext(ctx, mp)
+		if data != nil {
+			p.dataLength += data.Vecs[0].Length()
+		}
+		if tombstone != nil {
+			p.tombstoneLength += tombstone.Vecs[0].Length()
+		}
+		p.duration += time.Since(t0)
 		return
 	}
 	for {
@@ -650,16 +666,37 @@ func (p *ChangeHandler) Next(ctx context.Context, mp *mpool.MPool) (data, tombst
 		case NextChangeHandle_Data:
 			err = p.dataHandle.Next(ctx, &data, mp)
 			if err == nil && data.Vecs[0].Length() >= p.coarseMaxRow {
+				if data != nil {
+					p.dataLength += data.Vecs[0].Length()
+				}
+				if tombstone != nil {
+					p.tombstoneLength += tombstone.Vecs[0].Length()
+				}
+				p.duration += time.Since(t0)
 				return
 			}
 		case NextChangeHandle_Tombstone:
 			err = p.tombstoneHandle.Next(ctx, &tombstone, mp)
 			if err == nil && tombstone.Vecs[0].Length() >= p.coarseMaxRow {
+				if data != nil {
+					p.dataLength += data.Vecs[0].Length()
+				}
+				if tombstone != nil {
+					p.tombstoneLength += tombstone.Vecs[0].Length()
+				}
+				p.duration += time.Since(t0)
 				return
 			}
 		}
 		if moerr.IsMoErrCode(err, moerr.OkExpectedEOF) {
 			err = nil
+			if data != nil {
+				p.dataLength += data.Vecs[0].Length()
+			}
+			if tombstone != nil {
+				p.tombstoneLength += tombstone.Vecs[0].Length()
+			}
+			p.duration += time.Since(t0)
 			return
 		}
 		if err != nil {
