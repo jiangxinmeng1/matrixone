@@ -60,13 +60,16 @@ type BatchHandle struct {
 	batches     *batch.Batch
 	batchLength int
 	ctx         context.Context
+
+	b *baseHandle
 }
 
-func NewRowHandle(data *batch.Batch, mp *mpool.MPool, ctx context.Context) (handle *BatchHandle) {
+func NewRowHandle(data *batch.Batch, mp *mpool.MPool, ctx context.Context, b *baseHandle) (handle *BatchHandle) {
 	handle = &BatchHandle{
 		mp:      mp,
 		batches: data,
 		ctx:     ctx,
+		b:       b,
 	}
 	if data != nil {
 		handle.batchLength = data.Vecs[0].Length()
@@ -156,14 +159,16 @@ type CNObjectHandle struct {
 	objects            []*ObjectEntry
 	fs                 fileservice.FileService
 	mp                 *mpool.MPool
+	b                  *baseHandle
 }
 
-func NewCNObjectHandle(isTombstone bool, objects []*ObjectEntry, fs fileservice.FileService, mp *mpool.MPool) *CNObjectHandle {
+func NewCNObjectHandle(isTombstone bool, objects []*ObjectEntry, fs fileservice.FileService, mp *mpool.MPool, b *baseHandle) *CNObjectHandle {
 	return &CNObjectHandle{
 		isTombstone: isTombstone,
 		objects:     objects,
 		fs:          fs,
 		mp:          mp,
+		b:           b,
 	}
 }
 func (h *CNObjectHandle) isEnd() bool {
@@ -177,6 +182,7 @@ func (h *CNObjectHandle) Next(ctx context.Context, bat **batch.Batch, mp *mpool.
 		return moerr.GetOkExpectedEOF()
 	}
 	currentObject := h.objects[h.objectOffsetCursor].ObjectStats
+	t0 := time.Now()
 	data, err := readObjects(
 		ctx,
 		h.isTombstone,
@@ -184,6 +190,8 @@ func (h *CNObjectHandle) Next(ctx context.Context, bat **batch.Batch, mp *mpool.
 		&currentObject,
 		h.fs,
 	)
+	h.b.changeHandle.readDuration += time.Since(t0)
+	t0 = time.Now()
 	if h.isTombstone {
 		updateCNTombstoneBatch(
 			data,
@@ -197,6 +205,8 @@ func (h *CNObjectHandle) Next(ctx context.Context, bat **batch.Batch, mp *mpool.
 			h.mp,
 		)
 	}
+	h.b.changeHandle.updateDuration += time.Since(t0)
+	t0 = time.Now()
 	if *bat == nil {
 		*bat = batch.NewWithSize(0)
 		(*bat).Attrs = append((*bat).Attrs, data.Attrs...)
@@ -217,6 +227,7 @@ func (h *CNObjectHandle) Next(ctx context.Context, bat **batch.Batch, mp *mpool.
 		src := data.Vecs[i]
 		vec.Union(src, sels, mp)
 	}
+	h.b.changeHandle.copyDuration += time.Since(t0)
 	h.blkOffsetCursor++
 	if h.blkOffsetCursor >= int(currentObject.BlkCnt()) {
 		h.blkOffsetCursor = 0
@@ -366,6 +377,7 @@ type baseHandle struct {
 	aobjHandle     *AObjectHandle
 	cnObjectHandle *CNObjectHandle
 	inMemoryHandle *BatchHandle
+	changeHandle   *ChangeHandler
 
 	skipTS map[types.TS]struct{}
 }
@@ -379,9 +391,10 @@ const (
 	NextChangeHandle_Data
 )
 
-func NewBaseHandler(state *PartitionState, start, end types.TS, mp *mpool.MPool, tombstone bool, fs fileservice.FileService, ctx context.Context) (p *baseHandle, err error) {
+func NewBaseHandler(state *PartitionState, start, end types.TS, mp *mpool.MPool, tombstone bool, fs fileservice.FileService, ctx context.Context, c *ChangeHandler) (p *baseHandle, err error) {
 	p = &baseHandle{
-		skipTS: make(map[types.TS]struct{}),
+		skipTS:       make(map[types.TS]struct{}),
+		changeHandle: c,
 	}
 	var iter btree.IterG[ObjectEntry]
 	if tombstone {
@@ -400,7 +413,7 @@ func NewBaseHandler(state *PartitionState, start, end types.TS, mp *mpool.MPool,
 	p.inMemoryHandle = p.newBatchHandleWithRowIterator(ctx, rowIter, start, end, tombstone, mp)
 	aobj, cnObj := p.getObjectEntries(iter, start, end)
 	p.aobjHandle = NewAObjectHandle(ctx, p, tombstone, start, end, aobj, fs, mp)
-	p.cnObjectHandle = NewCNObjectHandle(tombstone, cnObj, fs, mp)
+	p.cnObjectHandle = NewCNObjectHandle(tombstone, cnObj, fs, mp, p)
 	return
 }
 func (p *baseHandle) init(ctx context.Context, quick bool, mp *mpool.MPool) (err error) {
@@ -511,7 +524,7 @@ func (p *baseHandle) newBatchHandleWithRowIterator(ctx context.Context, iter btr
 	if bat == nil {
 		return nil
 	}
-	h = NewRowHandle(bat, mp, ctx)
+	h = NewRowHandle(bat, mp, ctx, p)
 	return
 }
 func (p *baseHandle) getBatchesFromRowIterator(iter btree.IterG[RowEntry], start, end types.TS, tombstone bool, mp *mpool.MPool) (bat *batch.Batch) {
@@ -572,9 +585,10 @@ type ChangeHandler struct {
 	coarseMaxRow    int
 	quick           bool
 
-	duration                    time.Duration
-	tombstoneLength, dataLength int
-	lastPrint                   time.Time
+	duration                                   time.Duration
+	tombstoneLength, dataLength                int
+	readDuration, copyDuration, updateDuration time.Duration
+	lastPrint                                  time.Time
 }
 
 func NewChangesHandler(state *PartitionState, start, end types.TS, mp *mpool.MPool, maxRow uint32, fs fileservice.FileService, ctx context.Context) (changeHandle *ChangeHandler, err error) {
@@ -584,11 +598,11 @@ func NewChangesHandler(state *PartitionState, start, end types.TS, mp *mpool.MPo
 	changeHandle = &ChangeHandler{
 		coarseMaxRow: int(maxRow),
 	}
-	changeHandle.tombstoneHandle, err = NewBaseHandler(state, start, end, mp, true, fs, ctx)
+	changeHandle.tombstoneHandle, err = NewBaseHandler(state, start, end, mp, true, fs, ctx, changeHandle)
 	if err != nil {
 		return
 	}
-	changeHandle.dataHandle, err = NewBaseHandler(state, start, end, mp, false, fs, ctx)
+	changeHandle.dataHandle, err = NewBaseHandler(state, start, end, mp, false, fs, ctx, changeHandle)
 	if err != nil {
 		changeHandle.tombstoneHandle.Close()
 		return
@@ -608,7 +622,7 @@ func (p *ChangeHandler) Close() error {
 	p.dataHandle.Close()
 	p.tombstoneHandle.Close()
 	if p.tombstoneLength != 0 || p.dataLength != 0 {
-		logutil.Infof("lalala %d/%d %v", p.dataLength, p.tombstoneLength, p.duration)
+		logutil.Infof("lalala %d/%d %v copy %v, read %v, update %v", p.dataLength, p.tombstoneLength, p.duration, p.copyDuration, p.readDuration, p.updateDuration)
 	}
 	return nil
 }
@@ -650,7 +664,9 @@ func (p *ChangeHandler) quickNext(ctx context.Context, mp *mpool.MPool) (data, t
 func (p *ChangeHandler) Next(ctx context.Context, mp *mpool.MPool) (data, tombstone *batch.Batch, hint engine.ChangesHandle_Hint, err error) {
 	if time.Since(p.lastPrint) > time.Second*10 {
 		p.lastPrint = time.Now()
-		logutil.Infof("lalala %d/%d, %v", p.dataLength, p.tombstoneLength, p.duration)
+		if p.dataLength != 0 || p.tombstoneLength != 0 {
+			logutil.Infof("lalala %d/%d, %v copy %v, read %v, update %v", p.dataLength, p.tombstoneLength, p.duration, p.copyDuration, p.readDuration, p.updateDuration)
+		}
 	}
 	t0 := time.Now()
 	hint = engine.ChangesHandle_Tail_done
