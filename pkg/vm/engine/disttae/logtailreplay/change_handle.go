@@ -51,6 +51,9 @@ const (
 const (
 	SmallBatchThreshold = 8192
 	CoarseMaxRow        = 8192
+
+	DefaultBlockMaxRow  = 8192
+	PrefetchObjectCount = 10
 )
 
 type BatchHandle struct {
@@ -159,6 +162,7 @@ type CNObjectHandle struct {
 	objects            []*ObjectEntry
 	fs                 fileservice.FileService
 	mp                 *mpool.MPool
+	prefetchOffset     int
 	b                  *baseHandle
 }
 
@@ -177,9 +181,29 @@ func (h *CNObjectHandle) isEnd() bool {
 func (h *CNObjectHandle) IsEmpty() bool {
 	return len(h.objects) == 0
 }
+func (h *CNObjectHandle) prefetch() {
+	end := h.prefetchOffset + PrefetchObjectCount
+	if end > len(h.objects) {
+		end = len(h.objects)
+	}
+	for i := h.prefetchOffset; i < end; i++ {
+		objStats := h.objects[i].ObjectStats
+		for i := uint32(0); i < objStats.BlkCnt(); i++ {
+			loc := objStats.BlockLocation(uint16(i), 8192)
+			err := blockio.Prefetch("", h.fs, loc)
+			if err != nil {
+				logutil.Warnf("Changes-Handle prefetch failed: %v", err)
+			}
+		}
+	}
+	h.prefetchOffset = end
+}
 func (h *CNObjectHandle) Next(ctx context.Context, bat **batch.Batch, mp *mpool.MPool) (err error) {
 	if h.isEnd() {
 		return moerr.GetOkExpectedEOF()
+	}
+	if h.objectOffsetCursor >= h.prefetchOffset {
+		h.prefetch()
 	}
 	currentObject := h.objects[h.objectOffsetCursor].ObjectStats
 	t0 := time.Now()
@@ -259,6 +283,7 @@ type AObjectHandle struct {
 	quick              bool
 	fs                 fileservice.FileService
 	mp                 *mpool.MPool
+	prefetchOffset     int
 	p                  *baseHandle
 }
 
@@ -294,6 +319,9 @@ func (h *AObjectHandle) getNextAObject(ctx context.Context) (err error) {
 		if h.isEnd() {
 			return
 		}
+		if h.objectOffsetCursor >= h.prefetchOffset {
+			h.prefetch()
+		}
 		currentObjectStats := h.objects[h.objectOffsetCursor].ObjectStats
 		h.currentBatch, err = readObjects(
 			ctx,
@@ -313,6 +341,23 @@ func (h *AObjectHandle) getNextAObject(ctx context.Context) (err error) {
 		}
 		h.objectOffsetCursor++
 	}
+}
+func (h *AObjectHandle) prefetch() {
+	end := h.prefetchOffset + PrefetchObjectCount
+	if end > len(h.objects) {
+		end = len(h.objects)
+	}
+	for i := h.prefetchOffset; i < end; i++ {
+		objStats := h.objects[i].ObjectStats
+		for i := uint32(0); i < objStats.BlkCnt(); i++ {
+			loc := objStats.BlockLocation(uint16(i), 8192)
+			err := blockio.Prefetch("", h.fs, loc)
+			if err != nil {
+				logutil.Warnf("Changes-Handle prefetch failed: %v", err)
+			}
+		}
+	}
+	h.prefetchOffset = end
 }
 func (h *AObjectHandle) isEnd() bool {
 	return h.objectOffsetCursor >= len(h.objects)
