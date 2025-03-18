@@ -430,19 +430,19 @@ func (c *checkpointCleaner) Replay(inputCtx context.Context) (err error) {
 		}
 		accountSnapshots := TransformToTSList(snapshots)
 		logtail.CloseSnapshotList(snapshots)
-		var ckpBatch *batch.Batch
-		if ckpBatch, err = ckpData.GetCheckpointData(ctx); err != nil {
+		fill := func(bat *batch.Batch) {
+			logtail.FillUsageBatOfCompacted(
+				ctx,
+				c.checkpointCli.GetCatalog().GetUsageMemo().(*logtail.TNUsageMemo),
+				bat,
+				c.mutation.snapshotMeta,
+				accountSnapshots,
+				pitrs,
+				0)
+		}
+		if err = ckpData.GetCheckpointData(ctx, fill); err != nil {
 			return
 		}
-		defer ckpBatch.Clean(c.mp)
-		logtail.FillUsageBatOfCompacted(
-			ctx,
-			c.checkpointCli.GetCatalog().GetUsageMemo().(*logtail.TNUsageMemo),
-			ckpBatch,
-			c.mutation.snapshotMeta,
-			accountSnapshots,
-			pitrs,
-			0)
 		logutil.Info("GC-REPLAY-COLLECT-SNAPSHOT-SIZE",
 			zap.String("task", c.TaskNameLocked()),
 			zap.Int("size", len(accountSnapshots)),

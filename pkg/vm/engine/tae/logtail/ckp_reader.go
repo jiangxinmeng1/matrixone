@@ -513,25 +513,33 @@ func (reader *CKPReader) PrefetchData(sid string) {
 	}
 }
 
-func (reader *CKPReader) GetCheckpointData(ctx context.Context) (ckpData *batch.Batch, err error) {
+func (reader *CKPReader) GetCheckpointData(ctx context.Context, op func(*batch.Batch)) (err error) {
 	if reader.withTableID {
 		panic("not support")
 	}
-	ckpData = ckputil.MakeDataScanTableIDBatch()
+	//ckpData = ckputil.MakeDataScanTableIDBatch()
 	tmpBatch := ckputil.MakeDataScanTableIDBatch()
 	defer tmpBatch.Clean(reader.mp)
+	rows := 0
+	count := 0
+	defer func() {
+		logutil.Infof("checkpoint data rows: %d， read count: %d, err is %v", rows, count, err.Error())
+	}()
 	for {
 		tmpBatch.CleanOnlyData()
 		var end bool
 		if end, err = reader.ckpDataReader.Read(ctx, tmpBatch, reader.mp); err != nil {
 			return
 		}
+		rows += tmpBatch.RowCount()
+		count++
 		if end {
 			return
 		}
-		if _, err = ckpData.Append(ctx, reader.mp, tmpBatch); err != nil {
-			return
-		}
+		op(tmpBatch)
+		//if _, err = ckpData.Append(ctx, reader.mp, tmpBatch); err != nil {
+		//	return
+		//}
 	}
 }
 

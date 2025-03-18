@@ -76,6 +76,7 @@ func MergeCheckpoint(
 		); err != nil {
 			return
 		}
+
 		ckpReaders = append(ckpReaders, reader)
 		var nameMeta string
 		if ckpEntry.GetType() == checkpoint.ET_Compacted {
@@ -121,19 +122,19 @@ func MergeCheckpoint(
 			return
 		default:
 		}
-		var objectBatch *batch.Batch
-		if objectBatch, err = reader.GetCheckpointData(ctx); err != nil {
+		test := func(bat *batch.Batch) {
+			statsVec := bat.Vecs[ckputil.TableObjectsAttr_ID_Idx]
+			bf.Test(statsVec,
+				func(exists bool, i int) {
+					if !exists {
+						return
+					}
+					appendValToBatchForObjectListBatch(bat, ckpData, i, pool)
+				})
+		}
+		if err = reader.GetCheckpointData(ctx, test); err != nil {
 			return
 		}
-		defer objectBatch.Clean(common.CheckpointAllocator)
-		statsVec := objectBatch.Vecs[ckputil.TableObjectsAttr_ID_Idx]
-		bf.Test(statsVec,
-			func(exists bool, i int) {
-				if !exists {
-					return
-				}
-				appendValToBatchForObjectListBatch(objectBatch, ckpData, i, pool)
-			})
 	}
 
 	sinker := ckputil.NewDataSinker(pool, fs)
