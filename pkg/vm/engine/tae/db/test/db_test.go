@@ -10102,10 +10102,11 @@ func TestCKPCollectObject(t *testing.T) {
 			reader := logtail.NewCKPReader(logtail.CheckpointCurrentVersion, loc, common.DebugAllocator, tae.Opts.Fs)
 			err = reader.ReadMeta(ctx)
 			assert.NoError(t, err)
-			bat2, err := reader.GetCheckpointData(ctx)
-			defer bat2.Clean(common.DebugAllocator)
+			check := func(bat2 *batch.Batch) {
+				assert.Equal(t, 1, bat2.RowCount())
+			}
+			err = reader.GetCheckpointData(ctx, check)
 			assert.NoError(t, err)
-			assert.Equal(t, 1, bat2.RowCount())
 			assert.NoError(t, txn.Commit(ctx))
 		},
 	)
@@ -11548,10 +11549,11 @@ func TestCheckpointCompatibility(t *testing.T) {
 	err = reader.ReadMeta(ctx)
 	assert.NoError(t, err)
 	reader.GetLocations()
-	bat2, err := reader.GetCheckpointData(ctx)
+	check := func(bat2 *batch.Batch) {
+		assert.Equal(t, bat2.RowCount(), 23)
+	}
+	err = reader.GetCheckpointData(ctx, check)
 	assert.NoError(t, err)
-	assert.Equal(t, bat2.RowCount(), 23)
-	bat2.Clean(common.DebugAllocator)
 
 	assert.NoError(t, err)
 	_, err = logtail.GetCheckpointMetaInfo(ctx, tableID, reader)
@@ -11984,7 +11986,8 @@ func Test_ReplayGlobalCheckpoint(t *testing.T) {
 	reader := logtail.NewCKPReader(logtail.CheckpointCurrentVersion, loc, common.DebugAllocator, tae.Opts.Fs)
 	err = reader.ReadMeta(ctx)
 	assert.NoError(t, err)
-	bat2, err := reader.GetCheckpointData(ctx)
+	check := func(bat2 *batch.Batch) {
+	}
+	err = reader.GetCheckpointData(ctx, check)
 	assert.NoError(t, err)
-	defer bat2.Clean(common.DebugAllocator)
 }

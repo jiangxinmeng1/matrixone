@@ -122,7 +122,7 @@ func MergeCheckpoint(
 			return
 		default:
 		}
-		test := func(bat *batch.Batch) {
+		contains := func(bat *batch.Batch) {
 			statsVec := bat.Vecs[ckputil.TableObjectsAttr_ID_Idx]
 			bf.Test(statsVec,
 				func(exists bool, i int) {
@@ -132,7 +132,7 @@ func MergeCheckpoint(
 					appendValToBatchForObjectListBatch(bat, ckpData, i, pool)
 				})
 		}
-		if err = reader.GetCheckpointData(ctx, test); err != nil {
+		if err = reader.GetCheckpointData(ctx, contains); err != nil {
 			return
 		}
 	}

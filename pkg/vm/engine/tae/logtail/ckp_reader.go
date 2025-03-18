@@ -517,13 +517,12 @@ func (reader *CKPReader) GetCheckpointData(ctx context.Context, op func(*batch.B
 	if reader.withTableID {
 		panic("not support")
 	}
-	//ckpData = ckputil.MakeDataScanTableIDBatch()
 	tmpBatch := ckputil.MakeDataScanTableIDBatch()
 	defer tmpBatch.Clean(reader.mp)
 	rows := 0
 	count := 0
 	defer func() {
-		logutil.Infof("checkpoint data rows: %d， read count: %d, err is %v", rows, count, err.Error())
+		logutil.Infof("GetCheckpointData data rows: %d， read count: %d, err is %v", rows, count, err)
 	}()
 	for {
 		tmpBatch.CleanOnlyData()
@@ -533,13 +532,12 @@ func (reader *CKPReader) GetCheckpointData(ctx context.Context, op func(*batch.B
 		}
 		rows += tmpBatch.RowCount()
 		count++
+		if tmpBatch.RowCount() > 0 {
+			op(tmpBatch)
+		}
 		if end {
 			return
 		}
-		op(tmpBatch)
-		//if _, err = ckpData.Append(ctx, reader.mp, tmpBatch); err != nil {
-		//	return
-		//}
 	}
 }
 
