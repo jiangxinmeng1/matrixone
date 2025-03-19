@@ -521,8 +521,9 @@ func (reader *CKPReader) GetCheckpointData(ctx context.Context, op func(*batch.B
 	defer tmpBatch.Clean(reader.mp)
 	rows := 0
 	count := 0
+	t0 := time.Now()
 	defer func() {
-		logutil.Infof("GetCheckpointData data rows: %d， read count: %d, err is %v", rows, count, err)
+		logutil.Infof("GetCheckpointData data rows: %d， read count: %d, err is %v, cost: %v", rows, count, err, time.Since(t0))
 	}()
 	for {
 		tmpBatch.CleanOnlyData()
