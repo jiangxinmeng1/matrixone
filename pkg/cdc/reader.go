@@ -23,6 +23,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
@@ -273,8 +274,10 @@ func (reader *tableReader) readTableWithTxn(
 		return atmBatch
 	}
 
+	batchIdx := 0
 	var curHint engine.ChangesHandle_Hint
 	for {
+		batchIdx++
 		select {
 		case <-ctx.Done():
 			return
@@ -350,6 +353,22 @@ func (reader *tableReader) readTableWithTxn(
 			insertAtmBatch.Append(packer, insertData, reader.insTsColIdx, reader.insCompositedPkColIdx)
 			deleteAtmBatch.Append(packer, deleteData, reader.delTsColIdx, reader.delCompositedPkColIdx)
 		case engine.ChangesHandle_Tail_done:
+			if reader.tableDef.Name == "bmsql_stock" {
+				if insertData != nil {
+					pkMap := make(map[string]struct{})
+					for i := 0; i < insertData.RowCount(); i++ {
+						pk := vector.GetAny(insertData.Vecs[reader.insCompositedPkColIdx], i)
+						_, ok := pkMap[string(pk.([]byte))]
+						if ok {
+							decodeVal, _, _, _ := types.DecodeTuple(pk.([]byte))
+							logutil.Fatalf("lalala duplicate pk %v(%v), batchIdx: %d, ts %v->%v, map %v", pk, decodeVal.String(), batchIdx, fromTs.ToString(), toTs.ToString(), pkMap)
+						}
+						pkMap[string(pk.([]byte))] = struct{}{}
+						// decodeVal, _, _, _ := types.DecodeTuple(pk.([]byte))
+						// logutil.Infof("lalala pk %v, batchIdx: %d, ts %v->%v", decodeVal, batchIdx, fromTs.ToString(), toTs.ToString())
+					}
+				}
+			}
 			insertAtmBatch = allocateAtomicBatchIfNeed(insertAtmBatch)
 			deleteAtmBatch = allocateAtomicBatchIfNeed(deleteAtmBatch)
 			insertAtmBatch.Append(packer, insertData, reader.insTsColIdx, reader.insCompositedPkColIdx)
