@@ -223,6 +223,9 @@ func (reader *tableReader) readTableWithTxn(
 
 	start := time.Now()
 	changes, err = CollectChanges(ctx, rel, fromTs, toTs, reader.mp)
+	if reader.tableDef.Name == "bmsql_stock" {
+		logutil.Infof("lalala create changes handle %v->%v", fromTs.ToString(), toTs.ToString())
+	}
 	v2.CdcReadDurationHistogram.Observe(time.Since(start).Seconds())
 	if err != nil {
 		return

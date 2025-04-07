@@ -27,6 +27,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
@@ -509,10 +510,20 @@ func (s *mysqlSinker) sinkTail(ctx context.Context, insertBatch, deleteBatch *At
 
 	// output sql until one iterator reach the end
 	insertIterHasNext, deleteIterHasNext := insertIter.Next(), deleteIter.Next()
+	totalSqlCount := 0
+	// if s.dbTblInfo.SourceTblName == "bmsql_stock" {
+	// 	logutil.Infof("lalala sinkTail %d %d", insertBatch.RowCount(), deleteBatch.RowCount())
+	// 	if deleteBatch.RowCount() > 2 {
+	// 		logutil.Fatalf("lalala deleteCount %d", deleteBatch.RowCount())
+	// 	}
+	// }
 	for insertIterHasNext && deleteIterHasNext {
 		insertItem, deleteItem := insertIter.Item(), deleteIter.Item()
 		// compare ts, ignore pk
 		if insertItem.Ts.LT(&deleteItem.Ts) {
+			if s.preRowType != InsertRow {
+				totalSqlCount++
+			}
 			if err = s.sinkInsert(ctx, insertIter); err != nil {
 				s.err.Store(err)
 				return
@@ -520,6 +531,9 @@ func (s *mysqlSinker) sinkTail(ctx context.Context, insertBatch, deleteBatch *At
 			// get next item
 			insertIterHasNext = insertIter.Next()
 		} else {
+			if s.preRowType == InsertRow {
+				totalSqlCount++
+			}
 			if err = s.sinkDelete(ctx, deleteIter); err != nil {
 				s.err.Store(err)
 				return
@@ -528,7 +542,19 @@ func (s *mysqlSinker) sinkTail(ctx context.Context, insertBatch, deleteBatch *At
 			deleteIterHasNext = deleteIter.Next()
 		}
 	}
-
+	if s.dbTblInfo.SourceTblName == "bmsql_stock" {
+		logutil.Infof("lalala sinkTail %d %d, totalSqlCount: %d", insertBatch.RowCount(), deleteBatch.RowCount(), totalSqlCount)
+		if deleteBatch.RowCount() > 50 {
+			for i := 0; i < deleteBatch.RowCount(); i++ {
+				pk := vector.GetAny(deleteBatch.Batches[0].Vecs[0], i)
+				logutil.Infof("lalala pk %v", pk)
+			}
+			logutil.Fatalf("lalala deleteCount %d", deleteBatch.RowCount())
+		}
+	}
+	if totalSqlCount > 50 && s.dbTblInfo.SourceTblName != "bmsql_new_order" {
+		logutil.Fatalf("lalala sinkTail: totalSqlCount: %d, sql %v", totalSqlCount, string(s.sqlBuf))
+	}
 	// output the rest of insert iterator
 	for insertIterHasNext {
 		if err = s.sinkInsert(ctx, insertIter); err != nil {
@@ -548,6 +574,7 @@ func (s *mysqlSinker) sinkTail(ctx context.Context, insertBatch, deleteBatch *At
 		// get next item
 		deleteIterHasNext = deleteIter.Next()
 	}
+	s.tryFlushSqlBuf()
 }
 
 func (s *mysqlSinker) sinkInsert(ctx context.Context, insertIter *atomicBatchRowIter) (err error) {
@@ -608,6 +635,27 @@ func (s *mysqlSinker) sinkDelete(ctx context.Context, deleteIter *atomicBatchRow
 	return
 }
 
+func (s *mysqlSinker) tryFlushSqlBuf() (err error) {
+	if s.isNonEmptyInsertStmt() {
+		s.sqlBuf = appendBytes(s.sqlBuf, s.insertSuffix)
+		s.preSqlBufLen = len(s.sqlBuf)
+	}
+	if s.isNonEmptyDeleteStmt() {
+		s.sqlBuf = appendBytes(s.sqlBuf, s.deleteSuffix)
+		s.preSqlBufLen = len(s.sqlBuf)
+	}
+	// send it to downstream
+	s.sqlBufSendCh <- s.sqlBuf[:s.preSqlBufLen]
+	logutil.Infof("lalala send sql %v", string(s.sqlBuf[:s.preSqlBufLen]))
+	s.curBufIdx ^= 1
+	s.sqlBuf = s.sqlBufs[s.curBufIdx]
+
+	s.preSqlBufLen = sqlBufReserved
+	s.sqlBuf = s.sqlBuf[:s.preSqlBufLen]
+	s.preRowType = NoOp
+	return
+}
+
 // appendSqlBuf appends rowBuf to sqlBuf if not exceed its cap
 // otherwise, send sql to downstream first, then reset sqlBuf and append
 func (s *mysqlSinker) appendSqlBuf(rowType RowType) (err error) {
@@ -630,6 +678,7 @@ func (s *mysqlSinker) appendSqlBuf(rowType RowType) (err error) {
 
 		// send it to downstream
 		s.sqlBufSendCh <- s.sqlBuf[:s.preSqlBufLen]
+		logutil.Infof("lalala send sql %v", string(s.sqlBuf[:s.preSqlBufLen]))
 		s.curBufIdx ^= 1
 		s.sqlBuf = s.sqlBufs[s.curBufIdx]
 

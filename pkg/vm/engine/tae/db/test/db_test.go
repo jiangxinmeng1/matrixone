@@ -9901,6 +9901,12 @@ func TestFlushAndAppend(t *testing.T) {
 
 }
 
+func TestTemp(t *testing.T) {
+	buf := []byte{58, 21, 10, 58, 23, 1, 90, 236}
+	tuple, _, _, _ := types.DecodeTuple(buf)
+	t.Log(tuple.String())
+}
+
 func TestFlushAndAppend2(t *testing.T) {
 	defer testutils.AfterTest(t)()
 	ctx := context.Background()

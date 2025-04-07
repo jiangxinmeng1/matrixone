@@ -15,6 +15,9 @@
 package tables
 
 import (
+	"strings"
+
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
@@ -117,6 +120,23 @@ func (appender *objectAppender) ApplyAppend(
 	appender.obj.Lock()
 	defer appender.obj.Unlock()
 	from, err = node.ApplyAppendLocked(bat, txn)
+
+	tbl := appender.obj.meta.Load().GetTable()
+	if strings.Contains(tbl.GetFullName(), "bmsql_stock") && tbl.GetDB().GetName() == "tpcc" {
+			ts := txn.GetPrepareTS()
+		if appender.obj.meta.Load().IsTombstone {
+			for i := 0; i < bat.Length(); i++ {
+				pk := bat.Vecs[1].Get(i)
+				logutil.Infof("lalala delete %v at %v", pk, ts.ToString())
+			}
+		} else {
+			pkDef := node.writeSchema.GetPrimaryKey()
+			for i := 0; i < bat.Length(); i++ {
+				pk := bat.Vecs[pkDef.Idx].Get(i)
+				logutil.Infof("lalala append %v at %v", pk, ts.ToString())
+			}
+		}
+	}
 
 	schema := node.writeSchema
 	for _, colDef := range schema.ColDefs {
