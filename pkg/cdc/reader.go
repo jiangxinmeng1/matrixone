@@ -358,15 +358,16 @@ func (reader *tableReader) readTableWithTxn(
 					pkMap := make(map[string]struct{})
 					for i := 0; i < insertData.RowCount(); i++ {
 						pk := vector.GetAny(insertData.Vecs[reader.insCompositedPkColIdx], i)
-						_, ok := pkMap[string(pk.([]byte))]
+						decodeVal, _, _, _ := types.DecodeTuple(pk.([]byte))
+						_, ok := pkMap[decodeVal.String()]
 						if ok {
-							decodeVal, _, _, _ := types.DecodeTuple(pk.([]byte))
 							logutil.Fatalf("lalala duplicate pk %v(%v), batchIdx: %d, ts %v->%v, map %v", pk, decodeVal.String(), batchIdx, fromTs.ToString(), toTs.ToString(), pkMap)
 						}
-						pkMap[string(pk.([]byte))] = struct{}{}
+						pkMap[decodeVal.String()] = struct{}{}
 						// decodeVal, _, _, _ := types.DecodeTuple(pk.([]byte))
 						// logutil.Infof("lalala pk %v, batchIdx: %d, ts %v->%v", decodeVal, batchIdx, fromTs.ToString(), toTs.ToString())
 					}
+					logutil.Infof("lalala debug insertData %v", pkMap)
 				}
 			}
 			insertAtmBatch = allocateAtomicBatchIfNeed(insertAtmBatch)
