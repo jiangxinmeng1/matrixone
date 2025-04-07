@@ -40,7 +40,7 @@ backend = "TAE"
 log-backend = "logservice"
 
 [tn.Ckp]
-flush-interval = "60s"
+flush-interval = "5s"
 min-count = 100
 scan-interval = "5s"
 incremental-interval = "180s"

@@ -140,7 +140,7 @@ func (m *objOverlapPolicy) revise(rc *resourceController) []reviseResult {
 		}
 
 		points := makeEndPoints(m.leveledObjects[i])
-		if res := objectsWithGivenOverlaps(points, 5); len(res) != 0 {
+		if res := objectsWithGivenOverlaps(points, 2); len(res) != 0 {
 			for _, objs := range res {
 				objs = removeOversize(objs)
 				if len(objs) < 2 || score(objs) < 1.1 {
