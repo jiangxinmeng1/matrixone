@@ -50,8 +50,9 @@ func (tbl *txnTable) CollectChanges(
 		ctx,
 		state,
 		from, to,
-		objectio.BlockMaxRows,
+		objectio.BlockMaxRows*2,
 		tbl.primarySeqnum,
+		tbl.tableName,
 		mp,
 		tbl.getTxn().engine.fs,
 	)

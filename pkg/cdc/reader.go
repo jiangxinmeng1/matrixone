@@ -299,6 +299,14 @@ func (reader *tableReader) readTableWithTxn(
 		if err != nil {
 			return
 		}
+		if reader.tableDef.Name == "bmsql_district" {
+			if insertData != nil {
+				logutil.Infof("lalala misuxi insertData %v", insertData.RowCount())
+			}
+			if deleteData != nil {
+				logutil.Infof("lalala misuxi deleteData %v", deleteData.RowCount())
+			}
+		}
 
 		// both nil denote no more data (end of this tail)
 		if insertData == nil && deleteData == nil {
@@ -353,21 +361,20 @@ func (reader *tableReader) readTableWithTxn(
 			insertAtmBatch.Append(packer, insertData, reader.insTsColIdx, reader.insCompositedPkColIdx)
 			deleteAtmBatch.Append(packer, deleteData, reader.delTsColIdx, reader.delCompositedPkColIdx)
 		case engine.ChangesHandle_Tail_done:
-			if reader.tableDef.Name == "bmsql_stock" {
+			if reader.tableDef.Name == "bmsql_district" {
 				if insertData != nil {
-					pkMap := make(map[string]struct{})
+					pkMap := make(map[string]int)
 					for i := 0; i < insertData.RowCount(); i++ {
 						pk := vector.GetAny(insertData.Vecs[reader.insCompositedPkColIdx], i)
 						decodeVal, _, _, _ := types.DecodeTuple(pk.([]byte))
 						_, ok := pkMap[decodeVal.String()]
 						if ok {
-							logutil.Fatalf("lalala duplicate pk %v(%v), batchIdx: %d, ts %v->%v, map %v", pk, decodeVal.String(), batchIdx, fromTs.ToString(), toTs.ToString(), pkMap)
+							logutil.Fatalf("lalala misuxi duplicate pk %v(%v), row id %d %d, batchIdx: %d, ts %v->%v", pk, decodeVal.String(), i, pkMap[decodeVal.String()], batchIdx, fromTs.ToString(), toTs.ToString(), pkMap)
 						}
-						pkMap[decodeVal.String()] = struct{}{}
+						pkMap[decodeVal.String()] = i
 						// decodeVal, _, _, _ := types.DecodeTuple(pk.([]byte))
 						// logutil.Infof("lalala pk %v, batchIdx: %d, ts %v->%v", decodeVal, batchIdx, fromTs.ToString(), toTs.ToString())
 					}
-					logutil.Infof("lalala debug insertData %v", pkMap)
 				}
 			}
 			insertAtmBatch = allocateAtomicBatchIfNeed(insertAtmBatch)

@@ -705,6 +705,7 @@ type ChangeHandler struct {
 	primarySeqnum   int
 	scheduler       tasks.JobScheduler
 	mp              *mpool.MPool
+	tableName       string
 
 	readDuration, copyDuration    time.Duration
 	updateDuration, totalDuration time.Duration
@@ -724,6 +725,7 @@ func NewChangesHandler(
 	start, end types.TS,
 	maxRow uint32,
 	primarySeqnum int,
+	tableName string,
 	mp *mpool.MPool,
 	fs fileservice.FileService,
 ) (changeHandle *ChangeHandler, err error) {
@@ -738,6 +740,7 @@ func NewChangesHandler(
 		minTS:         state.start,
 		LogThreshold:  LogThreshold,
 		primarySeqnum: primarySeqnum,
+		tableName:     tableName,
 		mp:            mp,
 		scheduler:     tasks.NewParallelJobScheduler(LoadParallism),
 	}
@@ -819,7 +822,7 @@ func (p *ChangeHandler) quickNext(ctx context.Context, mp *mpool.MPool) (data, t
 //
 // This ensures that for any pk, we only keep the most recent operation,
 // whether it's an insert/update from data batch or a delete from tombstone batch.
-func filterBatch(data, tombstone *batch.Batch, primarySeqnum int) (err error) {
+func filterBatch(data, tombstone *batch.Batch, primarySeqnum int, tableName string) (err error) {
 	if data == nil || tombstone == nil {
 		return
 	}
@@ -940,6 +943,9 @@ func filterBatch(data, tombstone *batch.Batch, primarySeqnum int) (err error) {
 	})
 	tombstone.Shrink(tombstoneRowsToDelete, true)
 	data.Shrink(dataRowsToDelete, true)
+	if tableName == "bmsql_district" {
+		logutil.Infof("lalala misuxi data length %d, tombstone length %d", data.RowCount(), tombstone.RowCount())
+	}
 	return
 }
 func (p *ChangeHandler) Next(ctx context.Context, mp *mpool.MPool) (data, tombstone *batch.Batch, hint engine.ChangesHandle_Hint, err error) {
@@ -965,6 +971,9 @@ func (p *ChangeHandler) Next(ctx context.Context, mp *mpool.MPool) (data, tombst
 			)
 		}
 	}
+	if p.tableName == "bmsql_district" {
+		defer logutil.Infof("lalala")
+	}
 	defer func() {
 		if data != nil && data.RowCount() == 0 {
 			data.Clean(p.mp)
@@ -982,7 +991,7 @@ func (p *ChangeHandler) Next(ctx context.Context, mp *mpool.MPool) (data, tombst
 			return
 		}
 		p.totalDuration += time.Since(t0)
-		if err = filterBatch(data, tombstone, p.primarySeqnum); err != nil {
+		if err = filterBatch(data, tombstone, p.primarySeqnum, p.tableName); err != nil {
 			return
 		}
 		if data != nil {
@@ -991,6 +1000,7 @@ func (p *ChangeHandler) Next(ctx context.Context, mp *mpool.MPool) (data, tombst
 		if tombstone != nil {
 			p.tombstoneLength += tombstone.Vecs[0].Length()
 		}
+		logutil.Infof("lalala misuxi data length %d, tombstone length %d", data.RowCount(), tombstone.RowCount())
 		return
 	}
 	for {
@@ -999,7 +1009,7 @@ func (p *ChangeHandler) Next(ctx context.Context, mp *mpool.MPool) (data, tombst
 		case NextChangeHandle_Data:
 			err = p.dataHandle.Next(ctx, &data, mp)
 			if err == nil && data.Vecs[0].Length() >= p.coarseMaxRow*2 {
-				if err = filterBatch(data, tombstone, p.primarySeqnum); err != nil {
+				if err = filterBatch(data, tombstone, p.primarySeqnum, p.tableName); err != nil {
 					return
 				}
 				if data.Vecs[0].Length() > p.coarseMaxRow {
@@ -1016,7 +1026,7 @@ func (p *ChangeHandler) Next(ctx context.Context, mp *mpool.MPool) (data, tombst
 		case NextChangeHandle_Tombstone:
 			err = p.tombstoneHandle.Next(ctx, &tombstone, mp)
 			if err == nil && tombstone.Vecs[0].Length() >= p.coarseMaxRow*2 {
-				if err = filterBatch(data, tombstone, p.primarySeqnum); err != nil {
+				if err = filterBatch(data, tombstone, p.primarySeqnum, p.tableName); err != nil {
 					return
 				}
 				if tombstone.Vecs[0].Length() > p.coarseMaxRow {
@@ -1033,7 +1043,7 @@ func (p *ChangeHandler) Next(ctx context.Context, mp *mpool.MPool) (data, tombst
 		}
 		if moerr.IsMoErrCode(err, moerr.OkExpectedEOF) {
 			err = nil
-			if err = filterBatch(data, tombstone, p.primarySeqnum); err != nil {
+			if err = filterBatch(data, tombstone, p.primarySeqnum, p.tableName); err != nil {
 				return
 			}
 			p.totalDuration += time.Since(t0)
