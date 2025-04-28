@@ -284,7 +284,9 @@ func NewStandaloneObject(table *TableEntry, ts types.TS, isTombstone bool) *Obje
 	}
 	return e
 }
-
+func (entry *ObjectEntry) SetTable(table *TableEntry) {
+	entry.table = table
+}
 func (entry *ObjectEntry) GetLocation() objectio.Location {
 	location := entry.ObjectStats.ObjectLocation()
 	return location

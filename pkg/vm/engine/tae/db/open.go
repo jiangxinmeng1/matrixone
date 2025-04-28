@@ -26,6 +26,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	// "github.com/google/uuid"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
@@ -358,8 +359,193 @@ func Open(ctx context.Context, dirname string, opts *options.Options) (db *DB, e
 
 	go TaeMetricsTask(ctx)
 
+	// database, err := db.Catalog.GetDatabaseByID(272515)
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// table, err := database.GetTableEntryByID(272516)
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	// segID, err := uuid.Parse("0195f99d-6d8f-7e7d-9672-0372dd368fa2")
+	// var objectID objectio.ObjectId
+	// copy(objectID[:types.UuidSize], segID[:])
+	// stats := objectio.NewObjectStatsWithObjectID(&objectID, false, true, false)
+	// objectio.SetObjectStatsExtent(stats, objectio.NewExtent(1, 7542, 1165, 8279))
+	// objectio.SetObjectStatsRowCnt(stats, 1)
+	// objectio.SetObjectStatsBlkCnt(stats, 1)
+	// objectio.SetObjectStatsSize(stats, 8771)
+	// objectio.SetObjectStatsOriginSize(stats, 17967)
+	// zm := objectio.NewZM(types.T_varchar, types.T_varchar.ToType().Scale)
+	// zm.Update([]byte("CID-0886783ec7de"))
+	// zm.Update([]byte("CID-0886783ec7de"))
+	// objectio.SetObjectStatsSortKeyZoneMap(stats, zm)
+	// objectio.SetObjectStatsObjectName(stats, objectio.BuildObjectNameWithObjectID(&objectID))
+	// e := &catalog.ObjectEntry{
+	// 	ObjectNode: catalog.ObjectNode{
+	// 		SortHint:    db.Catalog.NextObject(),
+	// 		IsTombstone: false,
+	// 	},
+	// 	EntryMVCCNode: catalog.EntryMVCCNode{
+	// 		CreatedAt: types.BuildTS(1743649598915390142, 0),
+	// 	},
+	// 	CreateNode: txnbase.TxnMVCCNode{
+	// 		Start:   types.BuildTS(1743649598863585565, 0),
+	// 		Prepare: types.BuildTS(1743649598915390142, 0),
+	// 		End:     types.BuildTS(1743649598915390142, 0),
+	// 	},
+	// 	ObjectState: catalog.ObjectState_Create_ApplyCommit,
+	// 	ObjectMVCCNode: catalog.ObjectMVCCNode{
+	// 		ObjectStats: *stats,
+	// 	},
+	// }
+	// e.SetTable(table)
+	// table.AddEntryLocked(e)
+
+	// segID2, err := uuid.Parse("019610b9-b08e-7cfc-97e0-6ccf6d055848")
+	// var objectID2 objectio.ObjectId
+	// copy(objectID2[:types.UuidSize], segID2[:])
+	// stats2 := objectio.NewObjectStatsWithObjectID(&objectID2, false, true, false)
+	// objectio.SetObjectStatsExtent(stats2, objectio.NewExtent(1, 2629, 1317, 8279))
+	// objectio.SetObjectStatsRowCnt(stats2, 1)
+	// objectio.SetObjectStatsBlkCnt(stats2, 1)
+	// objectio.SetObjectStatsSize(stats2, 4010)
+	// objectio.SetObjectStatsOriginSize(stats2, 12636)
+	// zm2 := objectio.NewZM(types.T_varchar, types.T_varchar.ToType().Scale)
+	// zm2.Update([]byte("CID-585ae638bd68"))
+	// zm2.Update([]byte("CID-585ae638bd68"))
+	// objectio.SetObjectStatsSortKeyZoneMap(stats2, zm2)
+	// objectio.SetObjectStatsObjectName(stats2, objectio.BuildObjectNameWithObjectID(&objectID2))
+	// e2 := &catalog.ObjectEntry{
+	// 	ObjectNode: catalog.ObjectNode{
+	// 		SortHint:    db.Catalog.NextObject(),
+	// 		IsTombstone: false,
+	// 	},
+	// 	EntryMVCCNode: catalog.EntryMVCCNode{
+	// 		CreatedAt: types.BuildTS(1744037327046535626, 0),
+	// 	},
+	// 	CreateNode: txnbase.TxnMVCCNode{
+	// 		Start:   types.BuildTS(1744037326988921478, 0),
+	// 		Prepare: types.BuildTS(1744037327046535626, 0),
+	// 		End:     types.BuildTS(1744037327046535626, 0),
+	// 	},
+	// 	ObjectState: catalog.ObjectState_Create_ApplyCommit,
+	// 	ObjectMVCCNode: catalog.ObjectMVCCNode{
+	// 		ObjectStats: *stats2,
+	// 	},
+	// }
+	// e2.SetTable(table)
+	// table.AddEntryLocked(e2)
+
+	// segID3, err := uuid.Parse("019610b9-d3fa-79b2-b13d-6db4c4140843")
+	// var objectID3 objectio.ObjectId
+	// copy(objectID3[:types.UuidSize], segID3[:])
+	// stats3 := objectio.NewObjectStatsWithObjectID(&objectID3, true, false, false)
+	// objectio.SetObjectStatsExtent(stats3, objectio.NewExtent(1, 3337, 1385, 8775))
+	// objectio.SetObjectStatsRowCnt(stats3, 5)
+	// objectio.SetObjectStatsBlkCnt(stats3, 1)
+	// objectio.SetObjectStatsSize(stats3, 4786)
+	// objectio.SetObjectStatsOriginSize(stats3, 17140)
+	// zm3 := objectio.NewZM(types.T_varchar, types.T_varchar.ToType().Scale)
+	// zm3.Update([]byte("CID-585ae638bd68"))
+	// zm3.Update([]byte("CID-585ae638bd68"))
+	// objectio.SetObjectStatsSortKeyZoneMap(stats3, zm3)
+	// objectio.SetObjectStatsObjectName(stats3, objectio.BuildObjectNameWithObjectID(&objectID3))
+	// e3 := &catalog.ObjectEntry{
+	// 	ObjectNode: catalog.ObjectNode{
+	// 		SortHint:    db.Catalog.NextObject(),
+	// 		IsTombstone: false,
+	// 	},
+	// 	EntryMVCCNode: catalog.EntryMVCCNode{
+	// 		CreatedAt: types.BuildTS(1744037327018917818, 0),
+	// 	},
+	// 	CreateNode: txnbase.TxnMVCCNode{
+	// 		Start:   types.BuildTS(1744037326988921478, 1),
+	// 		Prepare: types.BuildTS(1744037327018917818, 0),
+	// 		End:     types.BuildTS(1744037327018917818, 0),
+	// 	},
+	// 	ObjectState: catalog.ObjectState_Create_ApplyCommit,
+	// 	ObjectMVCCNode: catalog.ObjectMVCCNode{
+	// 		ObjectStats: *stats3,
+	// 	},
+	// }
+	// e3.SetTable(table)
+	// table.AddEntryLocked(e3)
+
+	// segID4, err := uuid.Parse("019610b9-b08e-7c97-98c1-f734beeee2f2")
+	// var objectID4 objectio.ObjectId
+	// copy(objectID4[:types.UuidSize], segID4[:])
+	// stats4 := objectio.NewObjectStatsWithObjectID(&objectID4, false, true, false)
+	// objectio.SetObjectStatsExtent(stats4, objectio.NewExtent(1, 675, 396, 1335))
+	// objectio.SetObjectStatsRowCnt(stats4, 4)
+	// objectio.SetObjectStatsBlkCnt(stats4, 1)
+	// objectio.SetObjectStatsSize(stats4, 1135)
+	// objectio.SetObjectStatsOriginSize(stats4, 2231)
+	// zm4 := objectio.NewZM(types.T_Rowid, types.T_Rowid.ToType().Scale)
+	// objectio.SetObjectStatsSortKeyZoneMap(stats4, zm4)
+	// objectio.SetObjectStatsObjectName(stats4, objectio.BuildObjectNameWithObjectID(&objectID4))
+	// e4 := &catalog.ObjectEntry{
+	// 	ObjectNode: catalog.ObjectNode{
+	// 		SortHint:    db.Catalog.NextObject(),
+	// 		IsTombstone: true,
+	// 	},
+	// 	EntryMVCCNode: catalog.EntryMVCCNode{
+	// 		CreatedAt: types.BuildTS(1744037327018917818, 0),
+	// 	},
+	// 	CreateNode: txnbase.TxnMVCCNode{
+	// 		Start:   types.BuildTS(1744037326988921478, 0),
+	// 		Prepare: types.BuildTS(1744037327018917818, 0),
+	// 		End:     types.BuildTS(1744037327018917818, 0),
+	// 	},
+	// 	ObjectState: catalog.ObjectState_Create_ApplyCommit,
+	// 	ObjectMVCCNode: catalog.ObjectMVCCNode{
+	// 		ObjectStats: *stats4,
+	// 	},
+	// }
+	// e4.SetTable(table)
+	// table.AddEntryLocked(e4)
+
+	// segID5, err := uuid.Parse("019610b9-d3fa-7a66-855b-c64aa8285f41")
+	// var objectID5 objectio.ObjectId
+	// copy(objectID5[:types.UuidSize], segID5[:])
+	// stats5 := objectio.NewObjectStatsWithObjectID(&objectID5, true, true, false)
+	// objectio.SetObjectStatsExtent(stats5, objectio.NewExtent(1, 669, 404, 1335))
+	// objectio.SetObjectStatsRowCnt(stats5, 5)
+	// objectio.SetObjectStatsBlkCnt(stats5, 1)
+	// objectio.SetObjectStatsSize(stats5, 1137)
+	// objectio.SetObjectStatsOriginSize(stats5, 2291)
+	// zm5 := objectio.NewZM(types.T_Rowid, types.T_Rowid.ToType().Scale)
+	// minRowID := types.NewRowIDWithObjectIDBlkNumAndRowID(objectID2, 0, 0)
+	// zm5.Update(minRowID)
+	// maxRowID := types.NewRowIDWithObjectIDBlkNumAndRowID(objectID3, 0, 3)
+	// zm5.Update(maxRowID)
+	// objectio.SetObjectStatsSortKeyZoneMap(stats5, zm5)
+	// objectio.SetObjectStatsObjectName(stats5, objectio.BuildObjectNameWithObjectID(&objectID5))
+	// e5 := &catalog.ObjectEntry{
+	// 	ObjectNode: catalog.ObjectNode{
+	// 		SortHint:    db.Catalog.NextObject(),
+	// 		IsTombstone: true,
+	// 	},
+	// 	EntryMVCCNode: catalog.EntryMVCCNode{
+	// 		CreatedAt: types.BuildTS(1744037336058707664, 0),
+	// 	},
+	// 	CreateNode: txnbase.TxnMVCCNode{
+	// 		Start:   types.BuildTS(1744037336052462982, 1),
+	// 		Prepare: types.BuildTS(1744037336058707664, 0),
+	// 		End:     types.BuildTS(1744037336058707664, 0),
+	// 	},
+	// 	ObjectState: catalog.ObjectState_Create_ApplyCommit,
+	// 	ObjectMVCCNode: catalog.ObjectMVCCNode{
+	// 		ObjectStats: *stats5,
+	// 	},
+	// }
+	// e5.SetTable(table)
+	// table.AddEntryLocked(e5)
+
 	// For debug or test
-	//fmt.Println(db.Catalog.SimplePPString(common.PPL3))
+
+	fmt.Println(db.Catalog.SimplePPString(common.PPL3))
 	return
 }
 
