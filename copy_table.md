@@ -41,7 +41,7 @@ endpoint = "DISK"
 bucket = "mo-data/shared"
 ```
 
-必须关闭checkpoint，不然从客户端读数据的时候会缺数据，在dn.toml里配置：
+必须关闭checkpoint，不然从客户端读数据的时候会缺数据，在tn.toml里配置：
 ```
 [tn.Ckp]
 flush-interval = "60s"
