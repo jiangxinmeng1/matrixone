@@ -22,7 +22,7 @@ select mo_ctl('dn','inspect','copy-table -d 272515 -t 272516 -o t1');
 
 ### 设置EnableApplyTableData和FileService配置
 
-在目标MO实例的tn.toml里配置：
+打开EnableApplyTableData：
 
 ```
 [debug]
