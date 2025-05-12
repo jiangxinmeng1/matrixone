@@ -6,7 +6,7 @@
 从拷贝出来的文件，在另一个mo实例上应用数据。
 应用数据的时候会完全按照原来的表。
 内存中的数据会在mnode里，刷盘的数据会在磁盘上。object id不会改变。
-保留object和anode上的commitTS，startTS设置成commitTS.prev()。
+保留object entry和anode上的commitTS，startTS设置成commitTS.prev()。
 
 ## 流程
 
