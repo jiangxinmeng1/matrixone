@@ -40,6 +40,16 @@ endpoint = "DISK"
 bucket = "mo-data/shared"
 ```
 
+必须关闭checkpoint，不然从客户端读数据的时候会缺数据
+```
+[tn.Ckp]
+flush-interval = "60s"
+min-count = 1000000
+scan-interval = "5s"
+incremental-interval = "180000s"
+global-min-count = 60
+```
+
 ### 应用数据
 
 ```
