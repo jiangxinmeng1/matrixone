@@ -15,14 +15,15 @@
 ```
 select mo_ctl('dn','inspect','copy-table -d 272515 -t 272516 -o t1');
 
--d database id
--t table id
--o 目录，这个目录在mo-data/shared下，e.g.如果设置-o t1，拷贝出来的数据会在mo-data/shared/t1下。
 ```
 
-### 设置EnableApplyTableData和FileService配置
+* -d database id
+* -t table id
+* -o 目录，这个目录在mo-data/shared下，e.g.如果设置-o t1，拷贝出来的数据会在mo-data/shared/t1下。
 
-打开EnableApplyTableData：
+### 修改配置
+
+目标MO要打开EnableApplyTableData,在tn.toml里配置：
 
 ```
 [debug]
@@ -30,7 +31,7 @@ enable-apply-table-data = true
 ```
 
 目标MO的fileservice配置要和原来的一样，
-如果从s3上拷贝文件，要配置：
+如果从s3上拷贝文件，在tn.toml和cn.toml里配置：
 ```
 [[fileservice]]
 name = "SHARED"
@@ -40,7 +41,7 @@ endpoint = "DISK"
 bucket = "mo-data/shared"
 ```
 
-必须关闭checkpoint，不然从客户端读数据的时候会缺数据
+必须关闭checkpoint，不然从客户端读数据的时候会缺数据，在dn.toml里配置：
 ```
 [tn.Ckp]
 flush-interval = "60s"
@@ -54,7 +55,8 @@ global-min-count = 60
 
 ```
 select mo_ctl('dn','inspect','apply-table-data -d test2 -t t1 -o t1');
--d database name，如果database不存在就建一个，如果存在就用这个database。
--t table name，如果table name存在会报错。
--o 目录，这个目录在mo-data/shared下，e.g.如果设置-o t1，就从mo-data/shared/t1下读取数据。
 ```
+
+*-d database name，如果database不存在就建一个，如果存在就用这个database。
+* -t table name，如果table name存在会报错。
+* -o 目录，这个目录在mo-data/shared下，e.g.如果设置-o t1，就从mo-data/shared/t1下读取数据。
