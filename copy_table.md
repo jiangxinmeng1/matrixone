@@ -1,0 +1,47 @@
+# Copy Table
+
+## 需求
+
+拷贝一张表的数据到指定目录。
+从拷贝出来的文件，在另一个mo实例上按原来的格式应用数据。
+
+## 流程
+
+### 拷贝表
+
+```
+select mo_ctl('dn','inspect','copy-table -d 272515 -t 272516 -o t1');
+
+-d database id
+-t table id
+-o 目录，这个目录在mo-data/shared下，e.g.如果设置-o t1，拷贝出来的数据会在mo-data/shared/t1下。
+```
+
+### 设置EnableApplyTableData和FileService配置
+
+在目标MO实例的tn.toml里配置：
+
+```
+[debug]
+enable-apply-table-data = true
+```
+
+目标MO的fileservice配置要和原来的一样，
+如果从s3上拷贝文件，要配置：
+```
+[[fileservice]]
+name = "SHARED"
+backend = "S3"
+[fileservice.s3]
+endpoint = "DISK"
+bucket = "mo-data/shared"
+```
+
+### 应用数据
+
+```
+select mo_ctl('dn','inspect','apply-table-data -d test2 -t t1 -o t1');
+-d database name，如果database不存在就建一个，如果存在就用这个database。
+-t table name，如果table name存在会报错。
+-o 目录，这个目录在mo-data/shared下，e.g.如果设置-o t1，就从mo-data/shared/t1下读取数据。
+```
