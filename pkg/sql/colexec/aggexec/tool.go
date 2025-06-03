@@ -18,10 +18,12 @@ import (
 	"bytes"
 	io "io"
 	"math"
+	"runtime/debug"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 )
 
 // vectorAppendWildly is a more efficient version of vector.AppendFixed.
@@ -133,6 +135,7 @@ func NewVectors[T numeric | types.Decimal64 | types.Decimal128](typ types.Type) 
 }
 
 func (vs *Vectors[T]) MarshalBinary() ([]byte, error) {
+	logutil.Infof("lalala unmarshal %v", string(debug.Stack()))
 	var bbuf bytes.Buffer
 	length := int64(len(vs.vecs))
 	if _, err := bbuf.Write(types.EncodeInt64(&length)); err != nil {
@@ -150,6 +153,29 @@ func (vs *Vectors[T]) MarshalBinary() ([]byte, error) {
 	}
 	return bbuf.Bytes(), nil
 }
+
+// func (vs *Vectors[T]) Unmarshal(data []byte, typ types.Type, mp *mpool.MPool) (*Vectors[T], error) {
+// 	logutil.Infof("lalala unmarshal %v", string(debug.Stack()))
+// 	bbuf := bytes.NewBuffer(data)
+// 	length := int64(0)
+// 	if _, err := bbuf.Read(types.EncodeInt64(&length)); err != nil {
+// 		return nil, err
+// 	}
+// 	vs := Vectors[T]{vecs: make([]*vector.Vector, 0, length)}
+// 	for i := int64(0); i < length; i++ {
+// 		var buf []byte
+// 		var err error
+// 		if buf, _, err = ReadBytes(bbuf); err != nil {
+// 			return nil, err
+// 		}
+// 		vec := vector.NewVec(typ)
+// 		if err := vectorUnmarshal(vec, buf, mp); err != nil {
+// 			return nil, err
+// 		}
+// 		vs.vecs = append(vs.vecs, vec)
+// 	}
+// 	return &vs, nil
+// }
 
 func (vs *Vectors[T]) Length() int {
 	length := 0
@@ -399,6 +425,7 @@ func AppendMultiFixed[T numeric | types.Decimal64 | types.Decimal128](vecs *Vect
 }
 
 func vectorsUnmarshal[T numeric | types.Decimal64 | types.Decimal128](data []byte, typ types.Type, mp *mpool.MPool) (*Vectors[T], error) {
+	logutil.Infof("lalala unmarshal %v", string(debug.Stack()))
 	bbuf := bytes.NewBuffer(data)
 	length := int64(0)
 	if _, err := bbuf.Read(types.EncodeInt64(&length)); err != nil {
