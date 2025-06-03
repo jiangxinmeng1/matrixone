@@ -173,22 +173,28 @@ func (vs *Vectors[T]) Union(other *Vectors[T], mp *mpool.MPool) error {
 	if len(other.vecs) == 0 {
 		return nil
 	}
-	vec := vs.getAppendableVector()
-	if vec.Length()+other.Length() < MaxVectorLength {
-		for _, otherVec := range other.vecs {
-			vs := vector.MustFixedColWithTypeCheck[T](otherVec)
-			vector.AppendFixedList(vec, vs, nil, mp)
-		}
-		return nil
-	}
+	vals := make([]T, 0)
 	for _, vec := range other.vecs {
-		var clonedVec *vector.Vector
-		var err error
-		if clonedVec, err = vec.CloneWindow(0, vec.Length(), mp); err != nil {
+		vals = append(vals, vector.MustFixedColWithTypeCheck[T](vec)...)
+	}
+	left := len(vals)
+	for {
+		vec := vs.getAppendableVector()
+		appendableCount := MaxVectorLength - vec.Length()
+		if appendableCount > left {
+			appendableCount = left
+		}
+
+		if err := vector.AppendFixedList(vec, vals[:appendableCount], nil, mp); err != nil {
 			return err
 		}
-		vs.vecs = append(vs.vecs, clonedVec)
+		left -= appendableCount
+		vals = vals[appendableCount:]
+		if left == 0 {
+			break
+		}
 	}
+
 	return nil
 }
 
