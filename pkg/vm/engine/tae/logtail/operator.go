@@ -57,6 +57,10 @@ func (c *BoundTableOperator) processTableData() error {
 	if err != nil {
 		return err
 	}
+	name:=tbl.GetLastestSchema(false).Name
+	if name == "device_info"||name=="product_plan"{
+		return tbl.RecurLoop(c.visitor)
+	}
 	dirty := c.reader.GetDirtyByTable(c.dbID, c.tableID)
 	for _, dirtyObj := range dirty.Objs {
 		obj, err := tbl.GetObjectByID(dirtyObj.ID, false)

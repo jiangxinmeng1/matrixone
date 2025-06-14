@@ -252,6 +252,7 @@ func (b *TableLogtailRespBuilder) VisitObj(e *catalog.ObjectEntry) error {
 	}
 }
 func (b *TableLogtailRespBuilder) visitObjMeta(e *catalog.ObjectEntry) (bool, error) {
+	logutil.Infof("lalala visitObjMeta %v", e.ID().String())
 	mvccNodes := e.GetMVCCNodeInRange(b.start, b.end)
 	if len(mvccNodes) == 0 {
 		return false, nil
@@ -288,6 +289,7 @@ func (b *TableLogtailRespBuilder) visitObjData(e *catalog.ObjectEntry) error {
 	return nil
 }
 func visitObject(batch *containers.Batch, entry *catalog.ObjectEntry, txnMVCCNode *txnbase.TxnMVCCNode, create bool, push bool, committs types.TS) {
+	logutil.Infof("lalala get object %v", entry.ID().String())
 	var rowid types.Rowid
 	batch.GetVectorByName(catalog.PhyAddrColumnName).Append(rowid, false)
 	if push {

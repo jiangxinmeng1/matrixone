@@ -105,7 +105,12 @@ func MockCreatedObjectEntry2List(
 	}
 	return object
 }
-
+func (entry *ObjectEntry) SetTable(table *TableEntry) {
+	entry.table = table
+}
+func (entry *ObjectEntry) SetObjectData(data data.Object) {
+	entry.objData = data
+}
 func (entry *ObjectEntry) ID() *objectio.ObjectId {
 	return entry.ObjectStats.ObjectName().ObjectId()
 }

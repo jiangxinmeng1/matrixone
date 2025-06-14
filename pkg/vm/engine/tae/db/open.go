@@ -16,6 +16,7 @@ package db
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"sync/atomic"
@@ -23,7 +24,9 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
@@ -34,6 +37,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/options"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 )
 
 const (
@@ -165,9 +169,148 @@ func Open(
 	}
 	db.Controller.Start()
 
+	database, _ := db.Catalog.GetDatabaseByID(272515)
+	table1, _ := database.GetTableEntryByID(272516)
+	replayObjects(table1, db.Catalog, db.Runtime.Now())
+	table2, _ := database.GetTableEntryByID(272518)
+	replayObjects2(table2, db.Catalog, db.Runtime.Now())
 	// For debug or test
-	//fmt.Println(db.Catalog.SimplePPString(common.PPL3))
+	fmt.Println(db.Catalog.SimplePPString(common.PPL3))
 	return
+}
+
+func replayObjects(table *catalog.TableEntry, ctlg *catalog.Catalog, now types.TS) {
+	//dd4d2138bb4d_0
+	replayObject(
+		false,
+		"AZY4VpgOflKLXd1NITi7TQAAMDE5NjM4NTYtOTgwZS03ZTUyLThiNWQtZGQ0ZDIxMzhiYjRkXzAwMDAwAc8iAAApBAAAvxMAAIgAAAABAAAAZAAAAAAAAAD8WAAAAAAAAAAAAAAAAAAAAAAAAAAACOsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAi/FzgnAABQ+gAAAg==",
+		now,
+		types.TS{},
+		table,
+		ctlg,
+	)
+	//8a80b5b99599_0
+	replayObject(
+		false,
+		"AZY4hUkvew60DIqAtbmVmQAAMDE5NjM4ODUtNDkyZi03YjBlLWI0MGMtOGE4MGI1Yjk5NTk5XzAwMDAwASwJAACpAwAAvxMAAAYAAAABAAAAcgAAAAAAAACDAwAAAAAAAAAAAAAAAAAAAAAAAAAACLkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAi/FxUNAAC7JgAAAg==",
+		now,
+		types.TS{},
+		table,
+		ctlg,
+	)
+	//23db6ff21c6c_0
+	replayObject(
+		false,
+		"AZY4gKHGffi+ByPbb/IcbAAAMDE5NjM4ODAtYTFjNi03ZGY4LWJlMDctMjNkYjZmZjIxYzZjXzAwMDAwAf4FAABsAwAAvxMAAAEAAAABAAAAhgAAAAAAAACGAAAAAAAAAAAAAAAAAAAAAAAAAAAACIYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAi/F6oJAABjHQAAAg==",
+		now,
+		types.TS{},
+		table,
+		ctlg,
+	)
+	//1e4c1b5047de_0
+	replayObject(
+		false,
+		"AZbW/jxld4Kpbx5MG1BH3gAAMDE5NmQ2ZmUtM2M2NS03NzgyLWE5NmYtMWU0YzFiNTA0N2RlXzAwMDAwASMGAABsAwAAvxMAAAEAAAABAAAAAlCt0GCYsBoCUK3QYJiwGgAAAAAAAAAAAAAAAAAACAJQrdBgmLAaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAi/F88JAADKHQAAAg==",
+		now,
+		types.TS{},
+		table,
+		ctlg,
+	)
+	//5c85c630eeee_0
+	replayObject(
+		false,
+		"AZbW8vHmfLufJVyFxjDu7gAAMDE5NmQ2ZjItZjFlNi03Y2JiLTlmMjUtNWM4NWM2MzBlZWVlXzAwMDAwAYAHAADhAwAAvxMAAAIAAAABAAAAAlCt0GCYsBoDoBrB8TBhNQAAAAAAAAAAAAAAAAAACAFQbfCQmLAaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAi/F6ELAACZHwAAAg==",
+		now,
+		types.TS{},
+		table,
+		ctlg,
+	)
+	//f91d730f2b6b_0
+	replayObject(
+		false,
+		"AZbXApWtffq69vkdcw8rawAAMDE5NmQ3MDItOTVhZC03ZGZhLWJhZjYtZjkxZDczMGYyYjZiXzAwMDAwAZ4JAADyAwAAvxMAAAUAAAABAAAAAlCt0GCYsBoAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAJQ7YpMnbAaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAi/F9ANAAA0JQAAAg==",
+		now,
+		types.TS{},
+		table,
+		ctlg,
+	)
+	//bd1cf4ccfca5_0
+	replayObject(
+		false,
+		"AZbXB3etc7OMVr0c9Mz8pQAAMDE5NmQ3MDctNzdhZC03M2IzLThjNTYtYmQxY2Y0Y2NmY2E1XzAwMDAwAQkIAACuAwAAvxMAAAUAAAABAAAAAVCtcGydsBoAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAJQLan/nbAaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAi/F/cLAAAfJAAAAg==",
+		now,
+		types.TS{},
+		table,
+		ctlg,
+	)
+	//f410eccc2068_0
+	replayObject(
+		true,
+		"AZbXApcVcIahxfQQ7MwgaAAAMDE5NmQ3MDItOTcxNS03MDg2LWExYzUtZjQxMGVjY2MyMDY4XzAwMDAwAT8DAACWAQAANwUAAAkAAAABAAAAAZY4VpgOflKLXd1NITi7TQAAAAAOAAAAAAAAAAAAGAGW1v48ZXeCqW8eTBtQR94AAAAAAAAAAAAAAAAAABiAZRUFAACbCQAAAg==",
+		now,
+		types.TS{},
+		table,
+		ctlg,
+	)
+
+}
+
+func replayObjects2(table *catalog.TableEntry, ctlg *catalog.Catalog, now types.TS) {
+	//172e6e4893e8_0
+	replayObject(
+		false,
+		"AZdof+OwdM+pSBcubkiT6AAAMDE5NzY4N2YtZTNiMC03NGNmLWE5NDgtMTcyZTZlNDg5M2U4XzAwMDAwAXE9AAB+BAAApxYAAPUAAAABAAAAAqD/nG0CqhkAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAKwrMKO/NQaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAi/Fy9CAADvXwEAAg==",
+		now,
+		types.TS{},
+		table,
+		ctlg,
+	)
+	//c786ad9d3330_0
+	replayObject(
+		true,
+		"AZdof+OwdnmDpceGrZ0zMAAAMDE5NzY4N2YtZTNiMC03Njc5LTgzYTUtYzc4NmFkOWQzMzMwXzAwMDAwAVcKAACZAQAANwUAADcAAAABAAAAAZavSgZue3y2vBdV7GvLygAAAACgAAAAAAAAAAAAGAGXaHC73nGMp35SJVIyPWwAAAAAAQAAAAAAAAAAABiAZTAMAAATEgAAAg==",
+		now,
+		types.TS{},
+		table,
+		ctlg,
+	)
+}
+
+func replayObject(
+	isTombstone bool,
+	statsString string,
+	create, delete types.TS,
+	table *catalog.TableEntry,
+	ctlg *catalog.Catalog,
+) {
+
+	decodedData, err := base64.StdEncoding.DecodeString(statsString)
+	if err != nil {
+		logutil.Infof(err.Error())
+	}
+
+	stats := objectio.ObjectStats(decodedData)
+
+	createEntry := &catalog.ObjectEntry{
+		ObjectNode: catalog.ObjectNode{IsTombstone: isTombstone},
+		EntryMVCCNode: catalog.EntryMVCCNode{
+			CreatedAt: create,
+			DeletedAt: delete,
+		},
+		CreateNode:  txnbase.NewTxnMVCCNodeWithTS(create),
+		ObjectState: catalog.ObjectState_Create_ApplyCommit,
+	}
+	if !stats.GetAppendable() {
+		createEntry.ObjectStats = stats
+	} else {
+		emptyStats := objectio.NewObjectStatsWithObjectID(
+			stats.ObjectName().ObjectId(), stats.GetAppendable(), stats.GetSorted(), stats.GetCNCreated(),
+		)
+		createEntry.ObjectStats = *emptyStats
+	}
+	createEntry.SetTable(table)
+	createEntry.SetObjectData(ctlg.MakeObjectFactory()(createEntry))
+	table.AddEntryLocked(createEntry)
 }
 
 // TODO: remove it
