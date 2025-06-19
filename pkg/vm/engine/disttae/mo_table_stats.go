@@ -2790,6 +2790,38 @@ func correctAccountForCatalogTables(
 	return nil
 }
 
+func GetChangedTableList(
+	ctx context.Context,
+	service string,
+	eng engine.Engine,
+	accs []uint64,
+	dbs []uint64,
+	tbls []uint64,
+	ts []timestamp.Timestamp,
+	to *types.TS,
+	typ cmd_util.ChangedListType,
+	forEachTable func(
+		accountID int64,
+		databaseID int64,
+		tableID int64,
+		tableName string,
+		dbName string,
+		relKind string,
+		pkSequence int,
+		snapshot types.TS,
+	),
+) (err error) {
+	pairs := make([]tablePair, 0, len(accs))
+	err = getChangedTableList(ctx, service, eng, accs, dbs, tbls, ts, &pairs, to, typ)
+	if err != nil {
+		return
+	}
+	for _, tbl := range pairs {
+		forEachTable(tbl.acc, tbl.db, tbl.tbl, tbl.tblName, tbl.dbName, tbl.relKind, tbl.pkSequence, tbl.snapshot)
+	}
+	return
+}
+
 func getChangedTableList(
 	ctx context.Context,
 	service string,

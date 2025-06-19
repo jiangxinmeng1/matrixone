@@ -191,6 +191,39 @@ const (
 		"WHERE " +
 		" relkind = '%s' " +
 		" AND reldatabase NOT IN (%s)"
+		/*
+		   CREATE TABLE mo_async_index_log (
+		       id INT AUTO_INCREMENT PRIMARY KEY,
+		       account_id INT NOT NULL,
+		       table_id INT NOT NULL,
+		       index_id INT NOT NULL,
+		       last_sync_txn_ts VARCHAR(32)  NOT NULL,
+		       err_code INT NOT NULL,
+		       error_msg VARCHAR(255) NOT NULL,
+		       info VARCHAR(255) NOT NULL,
+		       drop_at VARCHAR(32) NULL,
+		   );
+		*/
+	CDCInsertMOAsyncIndexLogSqlTemplate = `INSERT INTO mo_catalog.mo_async_index_log(` +
+		`%d,` + // id
+		`%d,` + // account_id
+		`%d,` + // table_id
+		`%d,` + // index_id
+		`%s,` + // last_sync_txn_ts
+		`%d,` + // err_code
+		`%s,` + // error_msg
+		`%s,` + // info
+		`%s` + // drop_at
+		`)`
+	CDCUpdateMOAsyncIndexLogSqlTemplate = `UPDATE mo_catalog.mo_async_index_log SET ` +
+		`err_code = %d,` +
+		`error_msg = '%s',` +
+		`info = '%s',` +
+		`drop_at = '%s'` +
+		`WHERE` +
+		` account_id = %d ` +
+		`AND table_id = %d ` +
+		`AND index_id = %d`
 )
 
 const (
