@@ -32,7 +32,7 @@ func CollectChanges_2(
 	initSnapshotSplitTxn bool,
 	packer *types.Packer,
 	mp *mpool.MPool,
-) {
+)(err error) {
 	changes, err := CollectChanges(ctx, rel, fromTs, toTs, mp)
 	if err != nil {
 		return
@@ -79,10 +79,10 @@ func CollectChanges_2(
 		select {
 		case <-ctx.Done():
 			return
-		case <-ar.Pause:
-			return
-		case <-ar.Cancel:
-			return
+		// case <-ar.Pause:
+		// 	return
+		// case <-ar.Cancel:
+		// 	return
 		default:
 		}
 		// check sinker error of last round

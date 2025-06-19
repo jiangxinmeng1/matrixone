@@ -210,6 +210,22 @@ type DecoderOutput struct {
 	deleteAtmBatch *AtomicBatch
 }
 
+func (output *DecoderOutput) GetInsertAtmBatch() *batch.Batch {
+	if output.checkpointBat != nil {
+		return output.checkpointBat
+	}
+	if output.insertAtmBatch != nil {
+		return output.insertAtmBatch.Batches[0]
+	}
+	return nil
+}
+func (output *DecoderOutput) GetDeleteAtmBatch() *batch.Batch {
+	if output.deleteAtmBatch != nil {
+		return output.deleteAtmBatch.Batches[0]
+	}
+	return nil
+}
+
 type RowType int
 
 const (

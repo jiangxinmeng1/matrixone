@@ -193,7 +193,6 @@ const (
 		" AND reldatabase NOT IN (%s)"
 		/*
 		   CREATE TABLE mo_async_index_log (
-		       id INT AUTO_INCREMENT PRIMARY KEY,
 		       account_id INT NOT NULL,
 		       table_id INT NOT NULL,
 		       index_id INT NOT NULL,
@@ -205,7 +204,6 @@ const (
 		   );
 		*/
 	CDCInsertMOAsyncIndexLogSqlTemplate = `INSERT INTO mo_catalog.mo_async_index_log(` +
-		`%d,` + // id
 		`%d,` + // account_id
 		`%d,` + // table_id
 		`%d,` + // index_id
@@ -218,7 +216,7 @@ const (
 	CDCUpdateMOAsyncIndexLogSqlTemplate = `UPDATE mo_catalog.mo_async_index_log SET ` +
 		`err_code = %d,` +
 		`error_msg = '%s',` +
-		`info = '%s',` +
+		`last_sync_txn_ts = '%s',` +
 		`drop_at = '%s'` +
 		`WHERE` +
 		` account_id = %d ` +
@@ -243,8 +241,10 @@ const (
 	CDCDeleteWatermarkByTableSqlTemplate_Idx = 13
 	CDCGetDataKeySQL_Idx                     = 14
 	CDCCollectTableInfoSqlTemplate_Idx       = 15
+	CDCInsertMOAsyncIndexLogSqlTemplate_Idx  = 16
+	CDCUpdateMOAsyncIndexLogSqlTemplate_Idx  = 17
 
-	CDCSqlTemplateCount = 16
+	CDCSqlTemplateCount = 18
 )
 
 var CDCSQLTemplates = [CDCSqlTemplateCount]struct {
@@ -340,6 +340,12 @@ var CDCSQLTemplates = [CDCSqlTemplateCount]struct {
 			"rel_createsql",
 			"account_id",
 		},
+	},
+	CDCInsertMOAsyncIndexLogSqlTemplate_Idx: {
+		SQL: CDCInsertMOAsyncIndexLogSqlTemplate,
+	},
+	CDCUpdateMOAsyncIndexLogSqlTemplate_Idx: {
+		SQL: CDCUpdateMOAsyncIndexLogSqlTemplate,
 	},
 }
 
@@ -616,6 +622,44 @@ func (b cdcSQLBuilder) UpdateWatermarkSQL(
 		taskId,
 		dbName,
 		tableName,
+	)
+}
+
+func (b cdcSQLBuilder) IndexUpdateWatermarkSQL(
+	accountID uint64,
+	tableID uint64,
+	indexID uint64,
+	newWatermark string,
+	errorCode int,
+	errorMsg string,
+) string {
+	return fmt.Sprintf(
+		CDCSQLTemplates[CDCUpdateMOAsyncIndexLogSqlTemplate_Idx].SQL,
+		errorCode,
+		errorMsg,
+		newWatermark,
+		"",
+		accountID,
+		tableID,
+		indexID,
+	)
+}
+
+func (b cdcSQLBuilder) IndexInsertLogSQL(
+	accountID uint64,
+	tableID uint64,
+	indexID uint64,
+) string {
+	return fmt.Sprintf(
+		CDCSQLTemplates[CDCInsertMOAsyncIndexLogSqlTemplate_Idx].SQL,
+		accountID,
+		tableID,
+		indexID,
+		"",
+		0,
+		"",
+		"",
+		"",
 	)
 }
 

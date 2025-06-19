@@ -1010,6 +1010,7 @@ var (
 		MoCatalogMoCacheDDL,
 		MoCatalogMoCdcTaskDDL,
 		MoCatalogMoCdcWatermarkDDL,
+		MoCatalogMoCdcWatermarkDDL,
 		MoCatalogMoDataKeyDDL,
 		MoCatalogMoTableStatsDDL,
 		MoCatalogMoAccountLockDDL,

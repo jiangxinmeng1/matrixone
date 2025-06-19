@@ -23,14 +23,17 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/frontend"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
+	"github.com/matrixorigin/matrixone/pkg/pb/task"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae/logtailreplay"
@@ -42,6 +45,8 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/jobs"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils/config"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/test/testutil"
+
+	ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
 )
 
 func TestChangesHandle1(t *testing.T) {
@@ -1338,4 +1343,84 @@ func TestChangesHandle7(t *testing.T) {
 		assert.Equal(t, totalRowCount, 8192*2)
 		assert.NoError(t, handle.Close())
 	}
+}
+
+func TestCDCExecutor(t *testing.T) {
+	catalog.SetupDefines("")
+
+	var (
+		accountId    = catalog.System_Account
+		tableName    = "test1"
+		databaseName = "db1"
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx = context.WithValue(ctx, defines.TenantIDKey{}, accountId)
+
+	disttaeEngine, taeHandler, rpcAgent, _ := testutil.CreateEngines(ctx, testutil.TestOptions{}, t)
+	defer func() {
+		disttaeEngine.Close(ctx)
+		taeHandler.Close(true)
+		rpcAgent.Close()
+	}()
+
+	mockSpec := &task.CreateCdcDetails{
+		TaskName: "cdc_task",
+	}
+
+	ieFactory := func() ie.InternalExecutor {
+		return frontend.NewInternalExecutor(disttaeEngine.Engine.GetService())
+	}
+
+	txnFactory := func() (client.TxnOperator, error) {
+		return disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Now())
+	}
+
+	sinkerFactory := func(dbName, tableName string) (cdc.Sinker, error) {
+		return frontend.MockCNSinker(
+			func() (engine.Relation, client.TxnOperator, error) {
+				_, rel, txn, err := disttaeEngine.GetTable(ctx, dbName, tableName)
+				return rel, txn, err
+			},
+		)
+	}
+
+	cdcExecutor := frontend.NewCDCTaskExecutor2(
+		ctx,
+		uint64(accountId),
+		mockSpec,
+		ieFactory,
+		sinkerFactory,
+		txnFactory,
+		disttaeEngine.Engine,
+		disttaeEngine.Engine.GetService(),
+		common.DebugAllocator,
+	)
+
+	table := cdc.PatternTuple{
+		Source: cdc.PatternTable{
+			Database: "db",
+			Table:    "table",
+		},
+		Sink: cdc.PatternTable{
+			Database: "db",
+			Table:    "table2",
+		},
+	}
+	var tablesPatternTuples cdc.PatternTuples
+	tablesPatternTuples.Append(&table)
+	tableStr, err := cdc.JsonEncode(tablesPatternTuples)
+	require.NoError(t, err)
+
+	cdcExecutor.Start()
+	defer cdcExecutor.Stop()
+
+	err=cdcExecutor.RegisterNewTables(
+		ctx,
+		frontend.CDCCreateTaskOptions{
+			PitrTables: tableStr,
+		},
+	)
+	assert.NoError(t, err)
 }
