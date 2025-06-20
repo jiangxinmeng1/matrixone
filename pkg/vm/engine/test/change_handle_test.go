@@ -1350,8 +1350,9 @@ func TestCDCExecutor(t *testing.T) {
 
 	var (
 		accountId    = catalog.System_Account
-		tableName    = "test1"
-		databaseName = "db1"
+		dbName = "db"
+		srcTableName = "src_table"
+		dstTableName = "dst_table"
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1377,15 +1378,79 @@ func TestCDCExecutor(t *testing.T) {
 		return disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Now())
 	}
 
+	schemaFn:=func() *catalog2.Schema {
+		schema := catalog2.MockSchemaAll(10, -1)
+		return schema
+	}
+
+	
+	dstSchema := schemaFn()
+	dstSchema.Name = dstTableName
+	dstDefs, err := testutil.EngineTableDefBySchema(dstSchema)
+	require.Nil(t, err)
+
 	sinkerFactory := func(dbName, tableName string) (cdc.Sinker, error) {
 		return frontend.MockCNSinker(
 			func() (engine.Relation, client.TxnOperator, error) {
 				_, rel, txn, err := disttaeEngine.GetTable(ctx, dbName, tableName)
 				return rel, txn, err
 			},
+			func() error {
+				txn, err := disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Now())
+				if err != nil {
+					return err
+				}
+				db, err := disttaeEngine.Engine.Database(ctx, dbName, txn)
+				if err != nil {
+					return err
+				}
+
+				err = db.Create(ctx, dstTableName, dstDefs)
+				if err != nil {
+					return err
+				}
+				return nil
+			},
 		)
 	}
 
+	// create database and table
+	txn, err := disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Now())
+	require.Nil(t, err)
+	
+	err = disttaeEngine.Engine.Create(ctx, dbName, txn)
+	require.Nil(t, err)
+
+	srcSchema := schemaFn()
+	srcSchema.Name = srcTableName
+
+	defs, err := testutil.EngineTableDefBySchema(srcSchema)
+	require.Nil(t, err)
+
+	db, err := disttaeEngine.Engine.Database(ctx, dbName, txn)
+	require.Nil(t, err)
+
+	err = db.Create(ctx, srcTableName, defs)
+	require.Nil(t, err)
+
+	txn.Commit(ctx)
+
+	// write data
+	txn, err = disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Now())
+	require.Nil(t, err)
+
+	db, err = disttaeEngine.Engine.Database(ctx, dbName, txn)
+	require.Nil(t, err)
+	rel, err := db.Relation(ctx, srcTableName, nil)
+	require.Nil(t, err)
+
+	bat := catalog2.MockBatch(srcSchema, 10)
+	err = rel.Write(ctx, containers.ToCNBatch(bat))
+	require.Nil(t, err)
+
+	txn.Commit(ctx)
+
+	// create cdc executor
 	cdcExecutor := frontend.NewCDCTaskExecutor2(
 		ctx,
 		uint64(accountId),
@@ -1423,4 +1488,6 @@ func TestCDCExecutor(t *testing.T) {
 		},
 	)
 	assert.NoError(t, err)
+
+	time.Sleep(time.Second * 10)
 }

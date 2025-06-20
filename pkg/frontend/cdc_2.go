@@ -38,19 +38,26 @@ import (
 )
 
 type CNSinker struct {
+	initTableFn func()error
 	relFactory relationFactory
 	currentTxn client.TxnOperator
 	currentRel engine.Relation
 }
 
 // TODO stop sinker, drop table
-func MockCNSinker(relFactory relationFactory) (cdc.Sinker, error) {
+func MockCNSinker(relFactory relationFactory, initTableFn func() error) (cdc.Sinker, error) {
 	return &CNSinker{
 		relFactory: relFactory,
+		initTableFn: initTableFn,
 	}, nil
 }
 
-func (sinker *CNSinker) Run(ctx context.Context, ar *cdc.ActiveRoutine) {}
+func (sinker *CNSinker) Run(ctx context.Context, ar *cdc.ActiveRoutine) {
+	err := sinker.initTableFn()
+	if err != nil {
+		panic(fmt.Sprintf("lalala init table failed, err %v", err))
+	}
+}
 func (sinker *CNSinker) Sink(ctx context.Context, data *cdc.DecoderOutput) {
 	var initSnapshotSplitTxn bool
 	var txn client.TxnOperator
@@ -316,6 +323,7 @@ func (exec *CDCTaskExecutor2) RegisterNewTables(
 			return err
 		}
 		exec.worker.Submit(ctx, task)
+		exec.tables[tableInfo.tableID] = tableInfo
 	}
 	return
 }
@@ -376,6 +384,8 @@ func (exec *CDCTaskExecutor2) getTableInfoWithTableName(
 	if err != nil {
 		return
 	}
+
+	sinker.Run(ctx,nil)
 
 	tableInfo = &TableInfo_2{
 		dbID:      def.DbId,
