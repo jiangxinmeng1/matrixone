@@ -1358,6 +1358,8 @@ func TestCDCExecutor(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ctx = context.WithValue(ctx, defines.TenantIDKey{}, accountId)
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Minute*5)
+	defer cancel()
 
 	disttaeEngine, taeHandler, rpcAgent, _ := testutil.CreateEngines(ctx, testutil.TestOptions{}, t)
 	defer func() {
@@ -1415,10 +1417,10 @@ func TestCDCExecutor(t *testing.T) {
 	}
 
 	// create database and table
-	txn, err := disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Now())
+	txn, err := disttaeEngine.NewTxnOperator(ctxWithTimeout, disttaeEngine.Now())
 	require.Nil(t, err)
 	
-	err = disttaeEngine.Engine.Create(ctx, dbName, txn)
+	err = disttaeEngine.Engine.Create(ctxWithTimeout, dbName, txn)
 	require.Nil(t, err)
 
 	srcSchema := schemaFn()
@@ -1427,32 +1429,32 @@ func TestCDCExecutor(t *testing.T) {
 	defs, err := testutil.EngineTableDefBySchema(srcSchema)
 	require.Nil(t, err)
 
-	db, err := disttaeEngine.Engine.Database(ctx, dbName, txn)
+	db, err := disttaeEngine.Engine.Database(ctxWithTimeout, dbName, txn)
 	require.Nil(t, err)
 
-	err = db.Create(ctx, srcTableName, defs)
+	err = db.Create(ctxWithTimeout, srcTableName, defs)
 	require.Nil(t, err)
 
-	txn.Commit(ctx)
+	txn.Commit(ctxWithTimeout)
 
 	// write data
-	txn, err = disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Now())
+	txn, err = disttaeEngine.NewTxnOperator(ctxWithTimeout, disttaeEngine.Now())
 	require.Nil(t, err)
 
-	db, err = disttaeEngine.Engine.Database(ctx, dbName, txn)
+	db, err = disttaeEngine.Engine.Database(ctxWithTimeout, dbName, txn)
 	require.Nil(t, err)
-	rel, err := db.Relation(ctx, srcTableName, nil)
+	rel, err := db.Relation(ctxWithTimeout, srcTableName, nil)
 	require.Nil(t, err)
 
 	bat := catalog2.MockBatch(srcSchema, 10)
-	err = rel.Write(ctx, containers.ToCNBatch(bat))
+	err = rel.Write(ctxWithTimeout, containers.ToCNBatch(bat))
 	require.Nil(t, err)
 
-	txn.Commit(ctx)
+	txn.Commit(ctxWithTimeout)
 
 	// create cdc executor
 	cdcExecutor := frontend.NewCDCTaskExecutor2(
-		ctx,
+		ctxWithTimeout,
 		uint64(accountId),
 		mockSpec,
 		ieFactory,
@@ -1465,12 +1467,12 @@ func TestCDCExecutor(t *testing.T) {
 
 	table := cdc.PatternTuple{
 		Source: cdc.PatternTable{
-			Database: "db",
-			Table:    "table",
+			Database: dbName,
+			Table:    srcTableName,
 		},
 		Sink: cdc.PatternTable{
-			Database: "db",
-			Table:    "table2",
+			Database: dbName,
+			Table:    dstTableName,
 		},
 	}
 	var tablesPatternTuples cdc.PatternTuples
@@ -1482,7 +1484,7 @@ func TestCDCExecutor(t *testing.T) {
 	defer cdcExecutor.Stop()
 
 	err=cdcExecutor.RegisterNewTables(
-		ctx,
+		ctxWithTimeout,
 		frontend.CDCCreateTaskOptions{
 			PitrTables: tableStr,
 		},
