@@ -38,17 +38,20 @@ import (
 )
 
 type CNSinker struct {
-	initTableFn func()error
-	relFactory relationFactory
-	currentTxn client.TxnOperator
-	currentRel engine.Relation
+	initTableFn func() error
+	relFactory  relationFactory
+	currentTxn  client.TxnOperator
+	currentRel  engine.Relation
+
+	mp *mpool.MPool
 }
 
 // TODO stop sinker, drop table
-func MockCNSinker(relFactory relationFactory, initTableFn func() error) (cdc.Sinker, error) {
+func MockCNSinker(relFactory relationFactory, initTableFn func() error, mp *mpool.MPool) (cdc.Sinker, error) {
 	return &CNSinker{
-		relFactory: relFactory,
+		relFactory:  relFactory,
 		initTableFn: initTableFn,
+		mp:          mp,
 	}, nil
 }
 
@@ -76,12 +79,16 @@ func (sinker *CNSinker) Sink(ctx context.Context, data *cdc.DecoderOutput) {
 	insertBat := data.GetInsertAtmBatch()
 	deleteBat := data.GetDeleteAtmBatch()
 	if insertBat != nil {
+		insertBat.Vecs[len(insertBat.Vecs)-1].Free(sinker.mp)
+		insertBat.Vecs = insertBat.Vecs[:len(insertBat.Vecs)-1]
 		err := rel.Write(ctx, insertBat)
 		if err != nil {
 			panic(fmt.Sprintf("lalala insert error %v", err))
 		}
 	}
 	if deleteBat != nil {
+		deleteBat.Vecs[len(deleteBat.Vecs)-1].Free(sinker.mp)
+		deleteBat.Vecs = deleteBat.Vecs[:len(deleteBat.Vecs)-1]
 		err := rel.Delete(ctx, deleteBat, catalog.Row_ID)
 		if err != nil {
 			panic(fmt.Sprintf("lalala delete error %v", err))
@@ -385,7 +392,7 @@ func (exec *CDCTaskExecutor2) getTableInfoWithTableName(
 		return
 	}
 
-	sinker.Run(ctx,nil)
+	sinker.Run(ctx, nil)
 
 	tableInfo = &TableInfo_2{
 		dbID:      def.DbId,

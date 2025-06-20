@@ -1350,7 +1350,7 @@ func TestCDCExecutor(t *testing.T) {
 
 	var (
 		accountId    = catalog.System_Account
-		dbName = "db"
+		dbName       = "db"
 		srcTableName = "src_table"
 		dstTableName = "dst_table"
 	)
@@ -1380,12 +1380,11 @@ func TestCDCExecutor(t *testing.T) {
 		return disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Now())
 	}
 
-	schemaFn:=func() *catalog2.Schema {
-		schema := catalog2.MockSchemaAll(10, -1)
+	schemaFn := func() *catalog2.Schema {
+		schema := catalog2.MockSchemaAll(10, 1)
 		return schema
 	}
 
-	
 	dstSchema := schemaFn()
 	dstSchema.Name = dstTableName
 	dstDefs, err := testutil.EngineTableDefBySchema(dstSchema)
@@ -1394,32 +1393,34 @@ func TestCDCExecutor(t *testing.T) {
 	sinkerFactory := func(dbName, tableName string) (cdc.Sinker, error) {
 		return frontend.MockCNSinker(
 			func() (engine.Relation, client.TxnOperator, error) {
-				_, rel, txn, err := disttaeEngine.GetTable(ctx, dbName, tableName)
+				t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
+				_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, dbName, tableName)
 				return rel, txn, err
 			},
 			func() error {
-				txn, err := disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Now())
+				txn, err := disttaeEngine.NewTxnOperator(ctxWithTimeout, disttaeEngine.Now())
 				if err != nil {
 					return err
 				}
-				db, err := disttaeEngine.Engine.Database(ctx, dbName, txn)
+				db, err := disttaeEngine.Engine.Database(ctxWithTimeout, dbName, txn)
 				if err != nil {
 					return err
 				}
 
-				err = db.Create(ctx, dstTableName, dstDefs)
+				err = db.Create(ctxWithTimeout, tableName, dstDefs)
 				if err != nil {
 					return err
 				}
-				return nil
+				return txn.Commit(ctxWithTimeout)
 			},
+			common.DebugAllocator,
 		)
 	}
 
 	// create database and table
 	txn, err := disttaeEngine.NewTxnOperator(ctxWithTimeout, disttaeEngine.Now())
 	require.Nil(t, err)
-	
+
 	err = disttaeEngine.Engine.Create(ctxWithTimeout, dbName, txn)
 	require.Nil(t, err)
 
@@ -1447,7 +1448,8 @@ func TestCDCExecutor(t *testing.T) {
 	require.Nil(t, err)
 
 	bat := catalog2.MockBatch(srcSchema, 10)
-	err = rel.Write(ctxWithTimeout, containers.ToCNBatch(bat))
+	bats := bat.Split(10)
+	err = rel.Write(ctxWithTimeout, containers.ToCNBatch(bats[0]))
 	require.Nil(t, err)
 
 	txn.Commit(ctxWithTimeout)
@@ -1483,7 +1485,7 @@ func TestCDCExecutor(t *testing.T) {
 	cdcExecutor.Start()
 	defer cdcExecutor.Stop()
 
-	err=cdcExecutor.RegisterNewTables(
+	err = cdcExecutor.RegisterNewTables(
 		ctxWithTimeout,
 		frontend.CDCCreateTaskOptions{
 			PitrTables: tableStr,
