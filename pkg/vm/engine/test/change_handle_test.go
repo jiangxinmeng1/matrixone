@@ -1365,7 +1365,9 @@ func getCDCExecutor(
 		return cnTestEngine.NewTxnOperator(ctx, cnTestEngine.Now())
 	}
 	sinkerFactory := func(dbName, tableName string, tableDefs []engine.TableDef) (cdc.Sinker, error) {
+		ctx = context.WithValue(ctx, defines.TenantIDKey{}, accountID)
 		return frontend.MockCNSinker(
+			ctx,
 			func(ctx context.Context) (engine.Relation, client.TxnOperator, error) {
 				_, rel, txn, err := cnTestEngine.GetTable(ctx, dbName, tableName)
 				return rel, txn, err

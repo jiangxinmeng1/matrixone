@@ -24,6 +24,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/pb/task"
@@ -39,6 +40,7 @@ import (
 )
 
 type CNSinker struct {
+	ctx context.Context
 	initTableFn func(context.Context, []engine.TableDef) error
 	relFactory  relationFactory
 	currentTxn  client.TxnOperator
@@ -50,6 +52,7 @@ type CNSinker struct {
 
 // TODO stop sinker, drop table
 func MockCNSinker(
+	ctx context.Context,
 	relFactory relationFactory,
 	initTableFn func(context.Context, []engine.TableDef) error,
 	def []engine.TableDef,
@@ -59,6 +62,7 @@ func MockCNSinker(
 		relFactory:  relFactory,
 		initTableFn: initTableFn,
 		def:         def,
+		ctx:         ctx,
 		mp:          mp,
 	}, nil
 }
@@ -108,18 +112,18 @@ func (sinker *CNSinker) Sink(ctx context.Context, data *cdc.DecoderOutput) {
 }
 func (sinker *CNSinker) SendBegin() {
 	var err error
-	sinker.currentRel, sinker.currentTxn, err = sinker.relFactory(context.Background())
+	sinker.currentRel, sinker.currentTxn, err = sinker.relFactory(sinker.ctx)
 	if err != nil {
 		panic(fmt.Sprintf("lalala get relation failed, err %v", err))
 	}
 }
 func (sinker *CNSinker) SendCommit() {
-	sinker.currentTxn.Commit(context.Background())
+	sinker.currentTxn.Commit(sinker.ctx)
 	sinker.currentRel = nil
 	sinker.currentTxn = nil
 }
 func (sinker *CNSinker) SendRollback() {
-	sinker.currentTxn.Rollback(context.Background())
+	sinker.currentTxn.Rollback(sinker.ctx)
 	sinker.currentRel = nil
 	sinker.currentTxn = nil
 }
@@ -271,6 +275,7 @@ func NewCDCTaskExecutor2(
 ) *CDCTaskExecutor2 {
 	ctx, cancel := context.WithCancel(ctx)
 	worker := NewWorker()
+	ctx = context.WithValue(ctx, defines.TenantIDKey{}, uint32(accountID))
 	return &CDCTaskExecutor2{
 		ctx:                ctx,
 		cancel:             cancel,
@@ -464,7 +469,8 @@ func (exec *CDCTaskExecutor2) getDirtyTables(
 		tbls = append(tbls, t.tableID)
 		ts = append(ts, t.watermark.ToTimestamp())
 	}
-	tmpTS:=types.TimestampToTS(exec.txnEngine.LatestLogtailAppliedTime())
+	tmpTS := types.TimestampToTS(exec.txnEngine.LatestLogtailAppliedTime())
+	dirtyTables := make(map[uint64]struct{})
 	disttae.GetChangedTableList(
 		ctx,
 		service,
@@ -485,14 +491,15 @@ func (exec *CDCTaskExecutor2) getDirtyTables(
 			pkSequence int,
 			snapshot types.TS,
 		) {
-			tables = append(tables, TableInfo_2{
-				dbID:      uint64(databaseID),
-				tableID:   uint64(tableID),
-				watermark: snapshot,
-			})
+			dirtyTables[uint64(tableID)] = struct{}{}
 		},
 		exec.rpcHandleFn,
 	)
+	for _, table := range candidateTables {
+		if _, ok := dirtyTables[table.tableID]; ok {
+			tables = append(tables, table)
+		}
+	}
 	return
 }
 
@@ -510,7 +517,6 @@ func (exec *CDCTaskExecutor2) getIterationTask(
 	}
 
 	return func() error {
-		table.state = TableState_Running
 		err := cdc.CollectChanges_2(
 			ctx,
 			rel,
@@ -525,7 +531,7 @@ func (exec *CDCTaskExecutor2) getIterationTask(
 		var errorMsg string
 		if err == nil {
 			table.watermark = toTs
-		}else {
+		} else {
 			errorMsg = err.Error()
 		}
 		table.state = TableState_Finished
