@@ -40,7 +40,7 @@ import (
 )
 
 type CNSinker struct {
-	ctx context.Context
+	ctx         context.Context
 	initTableFn func(context.Context, []engine.TableDef) error
 	relFactory  relationFactory
 	currentTxn  client.TxnOperator
@@ -314,24 +314,23 @@ func (exec *CDCTaskExecutor2) run() {
 			return
 		case <-trigger.C:
 			candidateTables := exec.getCandidateTables()
-			tables, err := exec.getDirtyTables(exec.ctx, candidateTables, exec.cnUUID, exec.txnEngine)
+			tables, toTS, err := exec.getDirtyTables(exec.ctx, candidateTables, exec.cnUUID, exec.txnEngine)
 			if err != nil {
 				logutil.Errorf("cdc task %s get dirty tables failed, err: %v", exec.spec.TaskName, err)
 				continue
 			}
-			txnOp, err := exec.txnFactory()
-			if err != nil {
-				logutil.Errorf("cdc task %s get txn op failed, err: %v", exec.spec.TaskName, err)
-				return
-			}
-			to := types.TimestampToTS(txnOp.SnapshotTS())
-			for _, table := range tables {
-				task, err := exec.getIterationTask(exec.ctx, &table, to)
-				if err != nil {
-					logutil.Errorf("cdc task %s get dirty tables failed, err: %v", exec.spec.TaskName, err)
-					continue
+			for _, table := range candidateTables {
+				_, ok := tables[table.tableID]
+				if ok {
+					task, err := exec.getIterationTask(exec.ctx, table, toTS)
+					if err != nil {
+						logutil.Errorf("cdc task %s get dirty tables failed, err: %v", exec.spec.TaskName, err)
+						continue
+					}
+					exec.worker.Submit(exec.ctx, task)
+				} else {
+					table.watermark = toTS
 				}
-				exec.worker.Submit(exec.ctx, task)
 			}
 		}
 	}
@@ -440,37 +439,35 @@ func (exec *CDCTaskExecutor2) getTableInfoWithTableName(
 	}
 	return
 }
-func (exec *CDCTaskExecutor2) getCandidateTables() []TableInfo_2 {
-	ret := make([]TableInfo_2, 0, len(exec.tables))
+func (exec *CDCTaskExecutor2) getCandidateTables() []*TableInfo_2 {
+	ret := make([]*TableInfo_2, 0, len(exec.tables))
 	for _, t := range exec.tables {
 		if t.state == TableState_Running {
 			continue
 		}
-		ret = append(ret, *t)
+		ret = append(ret, t)
 	}
 	return ret
 }
 func (exec *CDCTaskExecutor2) getDirtyTables(
 	ctx context.Context,
-	candidateTables []TableInfo_2,
+	candidateTables []*TableInfo_2,
 	service string,
 	eng engine.Engine,
-) (tables []TableInfo_2, err error) {
+) (tables map[uint64]struct{}, toTS types.TS, err error) {
 
 	accs := make([]uint64, 0, len(candidateTables))
 	dbs := make([]uint64, 0, len(candidateTables))
 	tbls := make([]uint64, 0, len(candidateTables))
 	ts := make([]timestamp.Timestamp, 0, len(candidateTables))
-
-	tables = make([]TableInfo_2, 0, len(candidateTables))
 	for _, t := range candidateTables {
 		accs = append(accs, uint64(exec.accountID))
 		dbs = append(dbs, t.dbID)
 		tbls = append(tbls, t.tableID)
 		ts = append(ts, t.watermark.ToTimestamp())
 	}
-	tmpTS := types.TimestampToTS(exec.txnEngine.LatestLogtailAppliedTime())
-	dirtyTables := make(map[uint64]struct{})
+	// tmpTS := types.TimestampToTS(exec.txnEngine.LatestLogtailAppliedTime())
+	tables = make(map[uint64]struct{})
 	disttae.GetChangedTableList(
 		ctx,
 		service,
@@ -479,7 +476,7 @@ func (exec *CDCTaskExecutor2) getDirtyTables(
 		dbs,
 		tbls,
 		ts,
-		&tmpTS,
+		&toTS,
 		cmd_util.CheckChanged,
 		func(
 			accountID int64,
@@ -491,15 +488,10 @@ func (exec *CDCTaskExecutor2) getDirtyTables(
 			pkSequence int,
 			snapshot types.TS,
 		) {
-			dirtyTables[uint64(tableID)] = struct{}{}
+			tables[uint64(tableID)] = struct{}{}
 		},
 		exec.rpcHandleFn,
 	)
-	for _, table := range candidateTables {
-		if _, ok := dirtyTables[table.tableID]; ok {
-			tables = append(tables, table)
-		}
-	}
 	return
 }
 
