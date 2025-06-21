@@ -38,25 +38,32 @@ import (
 )
 
 type CNSinker struct {
-	initTableFn func() error
+	initTableFn func(context.Context, []engine.TableDef) error
 	relFactory  relationFactory
 	currentTxn  client.TxnOperator
 	currentRel  engine.Relation
+	def         []engine.TableDef
 
 	mp *mpool.MPool
 }
 
 // TODO stop sinker, drop table
-func MockCNSinker(relFactory relationFactory, initTableFn func() error, mp *mpool.MPool) (cdc.Sinker, error) {
+func MockCNSinker(
+	relFactory relationFactory,
+	initTableFn func(context.Context, []engine.TableDef) error,
+	def []engine.TableDef,
+	mp *mpool.MPool,
+) (cdc.Sinker, error) {
 	return &CNSinker{
 		relFactory:  relFactory,
 		initTableFn: initTableFn,
+		def:         def,
 		mp:          mp,
 	}, nil
 }
 
 func (sinker *CNSinker) Run(ctx context.Context, ar *cdc.ActiveRoutine) {
-	err := sinker.initTableFn()
+	err := sinker.initTableFn(ctx, sinker.def)
 	if err != nil {
 		panic(fmt.Sprintf("lalala init table failed, err %v", err))
 	}
@@ -68,7 +75,7 @@ func (sinker *CNSinker) Sink(ctx context.Context, data *cdc.DecoderOutput) {
 	var err error
 	if sinker.currentRel == nil {
 		initSnapshotSplitTxn = true
-		rel, txn, err = sinker.relFactory()
+		rel, txn, err = sinker.relFactory(ctx)
 		if err != nil {
 			panic(fmt.Sprintf("lalala get relation failed, err %v", err))
 		}
@@ -100,7 +107,7 @@ func (sinker *CNSinker) Sink(ctx context.Context, data *cdc.DecoderOutput) {
 }
 func (sinker *CNSinker) SendBegin() {
 	var err error
-	sinker.currentRel, sinker.currentTxn, err = sinker.relFactory()
+	sinker.currentRel, sinker.currentTxn, err = sinker.relFactory(context.Background())
 	if err != nil {
 		panic(fmt.Sprintf("lalala get relation failed, err %v", err))
 	}
@@ -135,7 +142,7 @@ const (
 	TableState_Finished
 )
 
-type relationFactory func() (engine.Relation, client.TxnOperator, error)
+type relationFactory func(context.Context) (engine.Relation, client.TxnOperator, error)
 
 type TableInfo_2 struct {
 	dbID      uint64
@@ -227,7 +234,7 @@ type CDCTaskExecutor2 struct {
 	// ts                 taskservice.TaskService
 	// fs                 fileservice.FileService
 	txnFactory    func() (client.TxnOperator, error)
-	sinkerFactory func(dbName, tableName string) (cdc.Sinker, error)
+	sinkerFactory func(dbName, tableName string, tableDef []engine.TableDef) (cdc.Sinker, error)
 	txnEngine     engine.Engine
 
 	ctx    context.Context
@@ -242,7 +249,7 @@ func NewCDCTaskExecutor2(
 	accountID uint64,
 	spec *task.CreateCdcDetails,
 	sqlExecutorFactory func() ie.InternalExecutor,
-	sinkerFactory func(dbName, tableName string) (cdc.Sinker, error),
+	sinkerFactory func(dbName, tableName string, tableDef []engine.TableDef) (cdc.Sinker, error),
 	txnFactory TxnFactory,
 	txnEngine engine.Engine,
 	cdUUID string,
@@ -267,7 +274,10 @@ func NewCDCTaskExecutor2(
 	}
 }
 
-func (exec *CDCTaskExecutor2) Start() {}
+func (exec *CDCTaskExecutor2) Start() {
+	exec.wg.Add(1)
+	go exec.run()
+}
 
 func (exec *CDCTaskExecutor2) Stop() {
 	exec.cancel()
@@ -305,6 +315,10 @@ func (exec *CDCTaskExecutor2) run() {
 			}
 		}
 	}
+}
+
+func (exec *CDCTaskExecutor2) GetWatermark(srcTableID uint64) types.TS {
+	return exec.tables[srcTableID].watermark
 }
 
 func (exec *CDCTaskExecutor2) RegisterNewTables(
@@ -387,7 +401,11 @@ func (exec *CDCTaskExecutor2) getTableInfoWithTableName(
 	defer txn.Commit(ctx)
 	def := table.CopyTableDef(ctx)
 
-	sinker, err := exec.sinkerFactory(sinkeDBName, sinkeTableName)
+	sinker, err := exec.sinkerFactory(
+		sinkeDBName,
+		sinkeTableName,
+		engine.PlanColsToExeCols(def.Cols),
+	)
 	if err != nil {
 		return
 	}
@@ -400,7 +418,7 @@ func (exec *CDCTaskExecutor2) getTableInfoWithTableName(
 		tableDef:  def,
 		watermark: types.TS{},
 		err:       nil,
-		rel: func() (engine.Relation, client.TxnOperator, error) {
+		rel: func(ctx context.Context) (engine.Relation, client.TxnOperator, error) {
 			rel, txn, err := exec.getRelation(ctx, dbName, tableName)
 			return rel, txn, err
 		},
@@ -475,7 +493,7 @@ func (exec *CDCTaskExecutor2) getIterationTask(
 	from := types.TimestampToTS(table.watermark.ToTimestamp())
 
 	table.state = TableState_Running
-	rel, txn, err := table.rel()
+	rel, txn, err := table.rel(ctx)
 	if err != nil {
 		return nil, err
 	}

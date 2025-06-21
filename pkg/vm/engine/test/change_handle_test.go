@@ -43,6 +43,7 @@ import (
 	testutil2 "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/testutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/jobs"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils/config"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/test/testutil"
 
@@ -1345,6 +1346,86 @@ func TestChangesHandle7(t *testing.T) {
 	}
 }
 
+func getCDCExecutor(
+	ctx context.Context,
+	accountID uint32,
+	cnTestEngine *testutil.TestDisttaeEngine,
+) *frontend.CDCTaskExecutor2 {
+
+	mockSpec := &task.CreateCdcDetails{
+		TaskName: "cdc_task",
+	}
+
+	ieFactory := func() ie.InternalExecutor {
+		return frontend.NewInternalExecutor(cnTestEngine.Engine.GetService())
+	}
+
+	txnFactory := func() (client.TxnOperator, error) {
+		return cnTestEngine.NewTxnOperator(ctx, cnTestEngine.Now())
+	}
+	sinkerFactory := func(dbName, tableName string, tableDefs []engine.TableDef) (cdc.Sinker, error) {
+		return frontend.MockCNSinker(
+			func(ctx context.Context) (engine.Relation, client.TxnOperator, error) {
+				_, rel, txn, err := cnTestEngine.GetTable(ctx, dbName, tableName)
+				return rel, txn, err
+			},
+			func(ctx context.Context, dstDefs []engine.TableDef) error {
+				txn, err := cnTestEngine.NewTxnOperator(ctx, cnTestEngine.Now())
+				if err != nil {
+					return err
+				}
+				db, err := cnTestEngine.Engine.Database(ctx, dbName, txn)
+				if err != nil {
+					return err
+				}
+
+				err = db.Create(ctx, tableName, dstDefs)
+				if err != nil {
+					return err
+				}
+				return txn.Commit(ctx)
+			},
+			tableDefs,
+			common.DebugAllocator,
+		)
+	}
+	cdcExecutor := frontend.NewCDCTaskExecutor2(
+		ctx,
+		uint64(accountID),
+		mockSpec,
+		ieFactory,
+		sinkerFactory,
+		txnFactory,
+		cnTestEngine.Engine,
+		cnTestEngine.Engine.GetService(),
+		common.DebugAllocator,
+	)
+	return cdcExecutor
+}
+
+func getCDCPitrTablesString(
+	srcDB, srcTable string,
+	dstDB, dstTable string,
+) string {
+	table := cdc.PatternTuple{
+		Source: cdc.PatternTable{
+			Database: srcDB,
+			Table:    srcTable,
+		},
+		Sink: cdc.PatternTable{
+			Database: dstDB,
+			Table:    dstTable,
+		},
+	}
+	var tablesPatternTuples cdc.PatternTuples
+	tablesPatternTuples.Append(&table)
+	tableStr, err := cdc.JsonEncode(tablesPatternTuples)
+	if err != nil {
+		panic(err)
+	}
+	return tableStr
+}
+
 func TestCDCExecutor(t *testing.T) {
 	catalog.SetupDefines("")
 
@@ -1368,53 +1449,9 @@ func TestCDCExecutor(t *testing.T) {
 		rpcAgent.Close()
 	}()
 
-	mockSpec := &task.CreateCdcDetails{
-		TaskName: "cdc_task",
-	}
-
-	ieFactory := func() ie.InternalExecutor {
-		return frontend.NewInternalExecutor(disttaeEngine.Engine.GetService())
-	}
-
-	txnFactory := func() (client.TxnOperator, error) {
-		return disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Now())
-	}
-
 	schemaFn := func() *catalog2.Schema {
 		schema := catalog2.MockSchemaAll(10, 1)
 		return schema
-	}
-
-	dstSchema := schemaFn()
-	dstSchema.Name = dstTableName
-	dstDefs, err := testutil.EngineTableDefBySchema(dstSchema)
-	require.Nil(t, err)
-
-	sinkerFactory := func(dbName, tableName string) (cdc.Sinker, error) {
-		return frontend.MockCNSinker(
-			func() (engine.Relation, client.TxnOperator, error) {
-				t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
-				_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, dbName, tableName)
-				return rel, txn, err
-			},
-			func() error {
-				txn, err := disttaeEngine.NewTxnOperator(ctxWithTimeout, disttaeEngine.Now())
-				if err != nil {
-					return err
-				}
-				db, err := disttaeEngine.Engine.Database(ctxWithTimeout, dbName, txn)
-				if err != nil {
-					return err
-				}
-
-				err = db.Create(ctxWithTimeout, tableName, dstDefs)
-				if err != nil {
-					return err
-				}
-				return txn.Commit(ctxWithTimeout)
-			},
-			common.DebugAllocator,
-		)
 	}
 
 	// create database and table
@@ -1436,51 +1473,32 @@ func TestCDCExecutor(t *testing.T) {
 	err = db.Create(ctxWithTimeout, srcTableName, defs)
 	require.Nil(t, err)
 
-	txn.Commit(ctxWithTimeout)
-
-	// write data
-	txn, err = disttaeEngine.NewTxnOperator(ctxWithTimeout, disttaeEngine.Now())
-	require.Nil(t, err)
-
-	db, err = disttaeEngine.Engine.Database(ctxWithTimeout, dbName, txn)
-	require.Nil(t, err)
 	rel, err := db.Relation(ctxWithTimeout, srcTableName, nil)
 	require.Nil(t, err)
+	tableID := rel.GetTableID(ctxWithTimeout)
+
+	txn.Commit(ctxWithTimeout)
 
 	bat := catalog2.MockBatch(srcSchema, 10)
 	bats := bat.Split(10)
-	err = rel.Write(ctxWithTimeout, containers.ToCNBatch(bats[0]))
-	require.Nil(t, err)
+	appendFn := func(rowIdx int) {
+		txn, err = disttaeEngine.NewTxnOperator(ctxWithTimeout, disttaeEngine.Now())
+		require.Nil(t, err)
 
-	txn.Commit(ctxWithTimeout)
+		db, err = disttaeEngine.Engine.Database(ctxWithTimeout, dbName, txn)
+		require.Nil(t, err)
+		rel, err := db.Relation(ctxWithTimeout, srcTableName, nil)
+		require.Nil(t, err)
 
-	// create cdc executor
-	cdcExecutor := frontend.NewCDCTaskExecutor2(
-		ctxWithTimeout,
-		uint64(accountId),
-		mockSpec,
-		ieFactory,
-		sinkerFactory,
-		txnFactory,
-		disttaeEngine.Engine,
-		disttaeEngine.Engine.GetService(),
-		common.DebugAllocator,
-	)
+		err = rel.Write(ctxWithTimeout, containers.ToCNBatch(bats[rowIdx]))
+		require.Nil(t, err)
 
-	table := cdc.PatternTuple{
-		Source: cdc.PatternTable{
-			Database: dbName,
-			Table:    srcTableName,
-		},
-		Sink: cdc.PatternTable{
-			Database: dbName,
-			Table:    dstTableName,
-		},
+		txn.Commit(ctxWithTimeout)
 	}
-	var tablesPatternTuples cdc.PatternTuples
-	tablesPatternTuples.Append(&table)
-	tableStr, err := cdc.JsonEncode(tablesPatternTuples)
-	require.NoError(t, err)
+
+	appendFn(0)
+
+	cdcExecutor := getCDCExecutor(ctxWithTimeout, accountId, disttaeEngine)
 
 	cdcExecutor.Start()
 	defer cdcExecutor.Stop()
@@ -1488,10 +1506,23 @@ func TestCDCExecutor(t *testing.T) {
 	err = cdcExecutor.RegisterNewTables(
 		ctxWithTimeout,
 		frontend.CDCCreateTaskOptions{
-			PitrTables: tableStr,
+			PitrTables: getCDCPitrTablesString(
+				dbName,
+				srcTableName,
+				dbName,
+				dstTableName,
+			),
 		},
 	)
 	assert.NoError(t, err)
 
-	time.Sleep(time.Second * 10)
+	appendFn(1)
+
+	now := taeHandler.GetDB().TxnMgr.Now()
+	testutils.WaitExpect(4000, func() bool {
+		watermark := cdcExecutor.GetWatermark(tableID)
+		return watermark.GE(&now)
+	})
+
+	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
 }
