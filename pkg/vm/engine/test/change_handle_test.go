@@ -1519,10 +1519,15 @@ func TestCDCExecutor(t *testing.T) {
 		},
 	)
 	assert.NoError(t, err)
+	now := taeHandler.GetDB().TxnMgr.Now()
+	testutils.WaitExpect(4000, func() bool {
+		watermark := cdcExecutor.GetWatermark(tableID)
+		return watermark.GE(&now)
+	})
 
 	appendFn(1)
 
-	now := taeHandler.GetDB().TxnMgr.Now()
+	now = taeHandler.GetDB().TxnMgr.Now()
 	testutils.WaitExpect(4000, func() bool {
 		watermark := cdcExecutor.GetWatermark(tableID)
 		return watermark.GE(&now)
