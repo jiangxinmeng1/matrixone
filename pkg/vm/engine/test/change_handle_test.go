@@ -1350,6 +1350,7 @@ func getCDCExecutor(
 	ctx context.Context,
 	accountID uint32,
 	cnTestEngine *testutil.TestDisttaeEngine,
+	taeHandler *testutil.TestTxnStorage,
 ) *frontend.CDCTaskExecutor2 {
 
 	mockSpec := &task.CreateCdcDetails{
@@ -1398,6 +1399,7 @@ func getCDCExecutor(
 		txnFactory,
 		cnTestEngine.Engine,
 		cnTestEngine.Engine.GetService(),
+		taeHandler.GetRPCHandle().HandleGetChangedTableList,
 		common.DebugAllocator,
 	)
 	return cdcExecutor
@@ -1498,7 +1500,7 @@ func TestCDCExecutor(t *testing.T) {
 
 	appendFn(0)
 
-	cdcExecutor := getCDCExecutor(ctxWithTimeout, accountId, disttaeEngine)
+	cdcExecutor := getCDCExecutor(ctxWithTimeout, accountId, disttaeEngine, taeHandler)
 
 	cdcExecutor.Start()
 	defer cdcExecutor.Stop()

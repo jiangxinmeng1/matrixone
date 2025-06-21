@@ -28,6 +28,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/pb/task"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
+	"github.com/matrixorigin/matrixone/pkg/pb/txn"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
@@ -237,6 +238,13 @@ type CDCTaskExecutor2 struct {
 	sinkerFactory func(dbName, tableName string, tableDef []engine.TableDef) (cdc.Sinker, error)
 	txnEngine     engine.Engine
 
+	rpcHandleFn func(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.GetChangedTableListReq,
+		resp *cmd_util.GetChangedTableListResp,
+	) (func(), error) // for test
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -253,6 +261,12 @@ func NewCDCTaskExecutor2(
 	txnFactory TxnFactory,
 	txnEngine engine.Engine,
 	cdUUID string,
+	rpcHandleFn func(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.GetChangedTableListReq,
+		resp *cmd_util.GetChangedTableListResp,
+	) (func(), error),
 	mp *mpool.MPool,
 ) *CDCTaskExecutor2 {
 	ctx, cancel := context.WithCancel(ctx)
@@ -270,6 +284,7 @@ func NewCDCTaskExecutor2(
 		txnEngine:          txnEngine,
 		worker:             worker,
 		wg:                 sync.WaitGroup{},
+		rpcHandleFn:        rpcHandleFn,
 		mp:                 mp,
 	}
 }
@@ -455,6 +470,7 @@ func (exec *CDCTaskExecutor2) getDirtyTables(
 		tbls = append(tbls, t.tableID)
 		ts = append(ts, t.watermark.ToTimestamp())
 	}
+	tmpTS:=types.TS{}
 	disttae.GetChangedTableList(
 		ctx,
 		service,
@@ -463,7 +479,7 @@ func (exec *CDCTaskExecutor2) getDirtyTables(
 		dbs,
 		tbls,
 		ts,
-		nil,
+		&tmpTS,
 		cmd_util.CheckChanged,
 		func(
 			accountID int64,
@@ -481,6 +497,7 @@ func (exec *CDCTaskExecutor2) getDirtyTables(
 				watermark: snapshot,
 			})
 		},
+		exec.rpcHandleFn,
 	)
 	return
 }
