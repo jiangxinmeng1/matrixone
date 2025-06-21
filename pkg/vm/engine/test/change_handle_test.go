@@ -1527,4 +1527,14 @@ func TestCDCExecutor(t *testing.T) {
 	})
 
 	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
+
+
+	tnTxn,err:=taeHandler.GetDB().StartTxn(nil)
+	assert.NoError(t,err)
+	tnDatabase,err:=tnTxn.GetDatabase(dbName)
+	assert.NoError(t,err)
+	tnRel,err := tnDatabase.GetRelationByName(dstTableName)
+	assert.NoError(t,err)
+	testutil2.CheckAllColRowsByScan(t,tnRel,2,false)
+	assert.NoError(t,tnTxn.Commit(ctxWithTimeout))
 }

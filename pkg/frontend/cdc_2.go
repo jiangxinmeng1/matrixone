@@ -342,13 +342,7 @@ func (exec *CDCTaskExecutor2) RegisterNewTables(
 ) (err error) {
 	var tablesPatternTuples cdc.PatternTuples
 	cdc.JsonDecode(opts.PitrTables, &tablesPatternTuples)
-	//TODO: use txnOp from task to decide to ts
-	txnOp, err := exec.txnFactory()
-	if err != nil {
-		logutil.Errorf("cdc task %s get txn op failed, err: %v", exec.spec.TaskName, err)
-		return
-	}
-	to := types.TimestampToTS(txnOp.SnapshotTS())
+	to := types.TimestampToTS(exec.txnEngine.LatestLogtailAppliedTime())
 	for _, table := range tablesPatternTuples.Pts {
 		var tableInfo *TableInfo_2
 		if tableInfo, err = exec.getTableInfoWithPattern(ctx, table, exec.txnEngine); err != nil {
@@ -470,7 +464,7 @@ func (exec *CDCTaskExecutor2) getDirtyTables(
 		tbls = append(tbls, t.tableID)
 		ts = append(ts, t.watermark.ToTimestamp())
 	}
-	tmpTS:=types.TS{}
+	tmpTS:=types.TimestampToTS(exec.txnEngine.LatestLogtailAppliedTime())
 	disttae.GetChangedTableList(
 		ctx,
 		service,
@@ -528,9 +522,11 @@ func (exec *CDCTaskExecutor2) getIterationTask(
 			exec.mp,
 		)
 		txn.Commit(ctx)
+		var errorMsg string
 		if err == nil {
 			table.watermark = toTs
-			return nil
+		}else {
+			errorMsg = err.Error()
 		}
 		table.state = TableState_Finished
 		table.FlushWatermark(
@@ -538,7 +534,7 @@ func (exec *CDCTaskExecutor2) getIterationTask(
 			exec.sqlExecutorFactory(),
 			exec.accountID,
 			getErrorCode(err),
-			err.Error(),
+			errorMsg,
 		)
 		return nil
 	}, nil
