@@ -151,13 +151,29 @@ const (
 type relationFactory func(context.Context) (engine.Relation, client.TxnOperator, error)
 
 type TableInfo_2 struct {
-	dbID      uint64
-	tableID   uint64
-	state     TableState
-	watermark types.TS
-	err       error
-	rel       relationFactory
-	sinker    cdc.Sinker
+	dbID             uint64
+	tableID          uint64
+	state            TableState
+	watermark        types.TS
+	err              error
+	rel              relationFactory
+	sinker           cdc.Sinker
+	flushWatermarkFn func(
+		ctx context.Context,
+		tableID uint64,
+		watermark types.TS,
+		accountID int32,
+		indexID int32,
+		errorCode int,
+		info string,
+		errorMsg string,
+	) error
+	insertWatermarkFn func(
+		ctx context.Context,
+		tableID uint64,
+		accountID int32,
+		indexID int32,
+	) error
 
 	mu sync.RWMutex
 }
@@ -166,18 +182,49 @@ func NewTableInfo_2(
 	dbID, tableID uint64,
 	rel relationFactory,
 	sinker cdc.Sinker,
+	flushWatermarkFn func(
+		ctx context.Context,
+		tableID uint64,
+		watermark types.TS,
+		accountID int32,
+		indexID int32,
+		errorCode int,
+		info string,
+		errorMsg string,
+	) error,
+	insertWatermarkFn func(
+		ctx context.Context,
+		tableID uint64,
+		accountID int32,
+		indexID int32,
+	) error,
 ) *TableInfo_2 {
 	return &TableInfo_2{
-		dbID:    dbID,
-		tableID: tableID,
-		rel:     rel,
-		sinker:  sinker,
-		mu:      sync.RWMutex{},
+		dbID:              dbID,
+		tableID:           tableID,
+		rel:               rel,
+		sinker:            sinker,
+		mu:                sync.RWMutex{},
+		flushWatermarkFn:  flushWatermarkFn,
+		insertWatermarkFn: insertWatermarkFn,
 	}
 }
 
 func tableInfoLess(a, b *TableInfo_2) bool {
 	return a.tableID < b.tableID
+}
+
+func (t *TableInfo_2) Resume() error {
+	return nil
+}
+func (t *TableInfo_2) Pause() error {
+	return nil
+}
+func (t *TableInfo_2) Cancel() error {
+	return nil
+}
+func (t *TableInfo_2) Restart() error {
+	return nil
 }
 func (t *TableInfo_2) GetWatermark() types.TS {
 	t.mu.RLock()
@@ -209,6 +256,9 @@ func (t *TableInfo_2) FlushWatermark(
 	errorCode int,
 	errorMsg string,
 ) error {
+	if t.flushWatermarkFn != nil {
+		return t.flushWatermarkFn(ctx, t.tableID, t.GetWatermark(), int32(accountID), 0, errorCode, "", errorMsg)
+	}
 	sql := cdc.CDCSQLBuilder.IndexUpdateWatermarkSQL(
 		accountID,
 		t.tableID,
@@ -225,6 +275,9 @@ func (t *TableInfo_2) InsertIndexWatermark(
 	internalExecutor ie.InternalExecutor,
 	accountID uint64,
 ) error {
+	if t.insertWatermarkFn != nil {
+		return t.insertWatermarkFn(ctx, t.tableID, int32(accountID), 0)
+	}
 	sql := cdc.CDCSQLBuilder.IndexInsertLogSQL(
 		accountID,
 		t.tableID,
@@ -267,9 +320,25 @@ func (w *worker) Stop() {
 type TxnFactory func() (client.TxnOperator, error)
 
 type CDCTaskExecutor2 struct {
-	accountID uint64
-	tables    *btree.BTreeG[*TableInfo_2]
-	tableMu   sync.RWMutex
+	accountID            uint64
+	tables               *btree.BTreeG[*TableInfo_2]
+	tableMu              sync.RWMutex
+	getInsertWatermarkFn func(
+		ctx context.Context,
+		tableID uint64,
+		accountID int32,
+		indexID int32,
+	) error
+	getFlushWatermarkFn func(
+		ctx context.Context,
+		tableID uint64,
+		watermark types.TS,
+		accountID int32,
+		indexID int32,
+		errorCode int,
+		info string,
+		errorMsg string,
+	) error
 
 	packer *types.Packer
 	mp     *mpool.MPool
@@ -314,27 +383,45 @@ func NewCDCTaskExecutor2(
 		req *cmd_util.GetChangedTableListReq,
 		resp *cmd_util.GetChangedTableListResp,
 	) (func(), error),
+	getInsertWatermarkFn func(
+		ctx context.Context,
+		tableID uint64,
+		accountID int32,
+		indexID int32,
+	) error,
+	getFlushWatermarkFn func(
+		ctx context.Context,
+		tableID uint64,
+		watermark types.TS,
+		accountID int32,
+		indexID int32,
+		errorCode int,
+		info string,
+		errorMsg string,
+	) error,
 	mp *mpool.MPool,
 ) *CDCTaskExecutor2 {
 	ctx, cancel := context.WithCancel(ctx)
 	worker := NewWorker()
 	ctx = context.WithValue(ctx, defines.TenantIDKey{}, uint32(accountID))
 	return &CDCTaskExecutor2{
-		ctx:                ctx,
-		cancel:             cancel,
-		packer:             types.NewPacker(),
-		tables:             btree.NewBTreeGOptions(tableInfoLess, btree.Options{NoLocks: true}),
-		spec:               spec,
-		sqlExecutorFactory: sqlExecutorFactory,
-		cnUUID:             cdUUID,
-		txnFactory:         txnFactory,
-		sinkerFactory:      sinkerFactory,
-		txnEngine:          txnEngine,
-		worker:             worker,
-		wg:                 sync.WaitGroup{},
-		rpcHandleFn:        rpcHandleFn,
-		tableMu:            sync.RWMutex{},
-		mp:                 mp,
+		ctx:                  ctx,
+		cancel:               cancel,
+		packer:               types.NewPacker(),
+		tables:               btree.NewBTreeGOptions(tableInfoLess, btree.Options{NoLocks: true}),
+		spec:                 spec,
+		sqlExecutorFactory:   sqlExecutorFactory,
+		cnUUID:               cdUUID,
+		txnFactory:           txnFactory,
+		sinkerFactory:        sinkerFactory,
+		txnEngine:            txnEngine,
+		worker:               worker,
+		wg:                   sync.WaitGroup{},
+		rpcHandleFn:          rpcHandleFn,
+		tableMu:              sync.RWMutex{},
+		getInsertWatermarkFn: getInsertWatermarkFn,
+		getFlushWatermarkFn:  getFlushWatermarkFn,
+		mp:                   mp,
 	}
 }
 
@@ -367,8 +454,8 @@ func (exec *CDCTaskExecutor2) Start() {
 }
 
 func (exec *CDCTaskExecutor2) Stop() {
-	exec.cancel()
 	exec.worker.Stop()
+	exec.cancel()
 	exec.wg.Wait()
 }
 
@@ -421,6 +508,9 @@ func (exec *CDCTaskExecutor2) RegisterNewTables(
 	for _, table := range tablesPatternTuples.Pts {
 		var tableInfo *TableInfo_2
 		if tableInfo, err = exec.getTableInfoWithPattern(ctx, table, exec.txnEngine); err != nil {
+			return err
+		}
+		if err = tableInfo.InsertIndexWatermark(ctx, exec.sqlExecutorFactory(), exec.accountID); err != nil {
 			return err
 		}
 		task, err := exec.getIterationTask(ctx, tableInfo, to)
@@ -507,6 +597,8 @@ func (exec *CDCTaskExecutor2) getTableInfoWithTableName(
 			return exec.getRelation(ctx, dbName, tableName)
 		},
 		sinker,
+		exec.getFlushWatermarkFn,
+		exec.getInsertWatermarkFn,
 	)
 	return
 }

@@ -1348,8 +1348,215 @@ func TestChangesHandle7(t *testing.T) {
 	}
 }
 
+type idAllocator interface {
+	Alloc() uint64
+}
+
+func newMoAsyncIndexLogBatch(
+	mp *mpool.MPool,
+	withRowID bool,
+) *batch.Batch {
+	bat := batch.New(
+		[]string{
+			"id",
+			"account_id",
+			"table_id",
+			"index_id",
+			"last_sync_txn_ts",
+			"err_code",
+			"error_msg",
+			"info",
+			"drop_at",
+		},
+	)
+	bat.Vecs[0] = vector.NewVec(types.T_int32.ToType())   //id
+	bat.Vecs[1] = vector.NewVec(types.T_uint64.ToType())  //account_id
+	bat.Vecs[2] = vector.NewVec(types.T_int32.ToType())   //table_id
+	bat.Vecs[3] = vector.NewVec(types.T_int32.ToType())   //index_id
+	bat.Vecs[4] = vector.NewVec(types.T_varchar.ToType()) //last_sync_txn_ts
+	bat.Vecs[5] = vector.NewVec(types.T_int32.ToType())   //err_code
+	bat.Vecs[6] = vector.NewVec(types.T_varchar.ToType()) //error_msg
+	bat.Vecs[7] = vector.NewVec(types.T_varchar.ToType()) //info
+	bat.Vecs[8] = vector.NewVec(types.T_varchar.ToType()) //drop_at
+	if withRowID {
+		bat.Attrs = append(bat.Attrs, objectio.PhysicalAddr_Attr)
+		bat.Vecs = append(bat.Vecs, vector.NewVec(types.T_Rowid.ToType())) //row_id
+	}
+	return bat
+}
+
+func getInsertWatermarkFn(
+	t *testing.T,
+	idAllocator idAllocator,
+	de *testutil.TestDisttaeEngine,
+	mp *mpool.MPool,
+) func(
+	ctx context.Context,
+	tableID uint64,
+	accountID int32,
+	indexID int32,
+) error {
+	return func(
+		ctx context.Context,
+		tableID uint64,
+		accountID int32,
+		indexID int32,
+	) error {
+		_, rel, txn, err := de.GetTable(ctx, "mo_catalog", "mo_async_index_log")
+		assert.NoError(t, err)
+		bat := batch.New(
+			[]string{
+				"id",
+				"account_id",
+				"table_id",
+				"index_id",
+				"last_sync_txn_ts",
+				"err_code",
+				"error_msg",
+				"info",
+				"drop_at",
+			},
+		)
+		bat.Vecs[0] = vector.NewVec(types.T_int32.ToType()) //id
+		vector.AppendFixed(bat.Vecs[0], int32(idAllocator.Alloc()), false, mp)
+		bat.Vecs[1] = vector.NewVec(types.T_int32.ToType()) //account_id
+		vector.AppendFixed(bat.Vecs[1], accountID, false, mp)
+		bat.Vecs[2] = vector.NewVec(types.T_int32.ToType()) //table_id
+		vector.AppendFixed(bat.Vecs[2], tableID, false, mp)
+		bat.Vecs[3] = vector.NewVec(types.T_int32.ToType()) //index_id
+		vector.AppendFixed(bat.Vecs[3], indexID, false, mp)
+		bat.Vecs[4] = vector.NewVec(types.T_varchar.ToType()) //last_sync_txn_ts
+		vector.AppendBytes(bat.Vecs[4], []byte(""), false, mp)
+		bat.Vecs[5] = vector.NewVec(types.T_int32.ToType()) //err_code
+		vector.AppendFixed(bat.Vecs[5], int32(0), false, mp)
+		bat.Vecs[6] = vector.NewVec(types.T_varchar.ToType()) //error_msg
+		vector.AppendFixed(bat.Vecs[6], []byte(""), false, mp)
+		bat.Vecs[7] = vector.NewVec(types.T_varchar.ToType()) //info
+		vector.AppendBytes(bat.Vecs[7], []byte(""), false, mp)
+		bat.Vecs[8] = vector.NewVec(types.T_varchar.ToType()) //drop_at
+		vector.AppendBytes(bat.Vecs[8], []byte(""), false, mp)
+		bat.SetRowCount(1)
+
+		assert.NoError(t, err)
+		err = rel.Write(ctx, bat)
+		assert.NoError(t, err)
+		assert.NoError(t, txn.Commit(ctx))
+		return nil
+	}
+
+}
+
+func getFlushWatermarkFn(
+	t *testing.T,
+	de *testutil.TestDisttaeEngine,
+	mp *mpool.MPool,
+) func(
+	ctx context.Context,
+	tableID uint64,
+	watermark types.TS,
+	accountID int32,
+	indexID int32,
+	errorCode int,
+	info string,
+	errorMsg string,
+) error {
+	return func(
+		ctx context.Context,
+		tableID uint64,
+		watermark types.TS,
+		accountID int32,
+		indexID int32,
+		errorCode int,
+		info string,
+		errorMsg string,
+	) error {
+		txn, rel, reader, err := testutil.GetTableTxnReader(ctx, de, "mo_catalog", "mo_async_index_log", nil, mp, t)
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, reader.Close())
+		}()
+
+		bat := newMoAsyncIndexLogBatch(mp, true)
+
+		done := false
+		deleteRowIDs := make([]types.Rowid, 0)
+		deletePks := make([]int32, 0)
+		for !done {
+			done, err = reader.Read(ctx, bat.Attrs, nil, mp, bat)
+			assert.NoError(t, err)
+			tableIDs := vector.MustFixedColNoTypeCheck[uint64](bat.Vecs[2])
+			accountIDs := vector.MustFixedColNoTypeCheck[int32](bat.Vecs[1])
+			indexIDs := vector.MustFixedColNoTypeCheck[int32](bat.Vecs[3])
+			rowIDs := vector.MustFixedColNoTypeCheck[types.Rowid](bat.Vecs[9])
+			pks := vector.MustFixedColNoTypeCheck[int32](bat.Vecs[0])
+			for i := 0; i < bat.Vecs[0].Length(); i++ {
+				if tableIDs[i] == tableID && accountIDs[i] == accountID && indexIDs[i] == indexID {
+					deleteRowIDs = append(deleteRowIDs, rowIDs[i])
+					deletePks = append(deletePks, pks[i])
+				}
+			}
+		}
+		if len(deleteRowIDs) != 1 {
+			panic(fmt.Sprintf("logic err: rowCount:%d,tableID:%d,accountID:%d,indexID:%d, ts %v", len(deleteRowIDs), tableID, accountID, indexID,txn.SnapshotTS()))
+		}
+
+		deleteBatch := batch.New([]string{catalog.Row_ID, objectio.TombstoneAttr_PK_Attr})
+		deleteBatch.Vecs[0] = vector.NewVec(types.T_Rowid.ToType())
+		deleteBatch.Vecs[1] = vector.NewVec(types.T_int32.ToType())
+		vector.AppendFixed(deleteBatch.Vecs[0], deleteRowIDs[0], false, mp)
+		vector.AppendFixed(deleteBatch.Vecs[1], deletePks[0], false, mp)
+		deleteBatch.SetRowCount(1)
+
+		_, rel, txn, err = de.GetTable(ctx, "mo_catalog", "mo_async_index_log")
+		assert.NoError(t, err)
+		assert.NoError(t, rel.Delete(ctx, deleteBatch, catalog.Row_ID))
+
+		bat = batch.New(
+			[]string{
+				"id",
+				"account_id",
+				"table_id",
+				"index_id",
+				"last_sync_txn_ts",
+				"err_code",
+				"error_msg",
+				"info",
+				"drop_at",
+			},
+		)
+		bat.Vecs[0] = vector.NewVec(types.T_int32.ToType()) //id
+		vector.AppendFixed(bat.Vecs[0], deletePks[0], false, mp)
+		bat.Vecs[1] = vector.NewVec(types.T_int32.ToType()) //account_id
+		vector.AppendFixed(bat.Vecs[1], accountID, false, mp)
+		bat.Vecs[2] = vector.NewVec(types.T_int32.ToType()) //table_id
+		vector.AppendFixed(bat.Vecs[2], tableID, false, mp)
+		bat.Vecs[3] = vector.NewVec(types.T_int32.ToType()) //index_id
+		vector.AppendFixed(bat.Vecs[3], indexID, false, mp)
+		bat.Vecs[4] = vector.NewVec(types.T_varchar.ToType()) //last_sync_txn_ts
+		vector.AppendBytes(bat.Vecs[4], []byte(watermark.ToString()), false, mp)
+		bat.Vecs[5] = vector.NewVec(types.T_int32.ToType()) //err_code
+		vector.AppendFixed(bat.Vecs[5], int32(errorCode), false, mp)
+		bat.Vecs[6] = vector.NewVec(types.T_varchar.ToType()) //error_msg
+		vector.AppendFixed(bat.Vecs[6], []byte(errorMsg), false, mp)
+		bat.Vecs[7] = vector.NewVec(types.T_varchar.ToType()) //info
+		vector.AppendBytes(bat.Vecs[7], []byte(info), false, mp)
+		bat.Vecs[8] = vector.NewVec(types.T_varchar.ToType()) //drop_at
+		vector.AppendBytes(bat.Vecs[8], []byte(errorMsg), false, mp)
+		bat.SetRowCount(1)
+
+		assert.NoError(t, err)
+		err = rel.Write(ctx, bat)
+		assert.NoError(t, err)
+		assert.NoError(t, txn.Commit(ctx))
+		return nil
+	}
+
+}
+
 func getCDCExecutor(
 	ctx context.Context,
+	t *testing.T,
+	idAllocator idAllocator,
 	accountID uint32,
 	cnTestEngine *testutil.TestDisttaeEngine,
 	taeHandler *testutil.TestTxnStorage,
@@ -1408,6 +1615,8 @@ func getCDCExecutor(
 		cnTestEngine.Engine,
 		cnTestEngine.Engine.GetService(),
 		taeHandler.GetRPCHandle().HandleGetChangedTableList,
+		getInsertWatermarkFn(t, idAllocator, cnTestEngine, common.DebugAllocator),
+		getFlushWatermarkFn(t, cnTestEngine, common.DebugAllocator),
 		common.DebugAllocator,
 	)
 	return cdcExecutor
@@ -1543,6 +1752,8 @@ func addCDCTask(
 func TestCDCExecutor(t *testing.T) {
 	catalog.SetupDefines("")
 
+	idAllocator := common.NewIdAllocator(1000)
+
 	var (
 		accountId = catalog.System_Account
 	)
@@ -1605,7 +1816,7 @@ func TestCDCExecutor(t *testing.T) {
 		appendFn(dbNames[i], srcTables[i], 0)
 	}
 
-	cdcExecutor := getCDCExecutor(ctxWithTimeout, accountId, disttaeEngine, taeHandler)
+	cdcExecutor := getCDCExecutor(ctxWithTimeout, t, idAllocator, accountId, disttaeEngine, taeHandler)
 
 	cdcExecutor.Start()
 	defer cdcExecutor.Stop()
