@@ -22,11 +22,11 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/cdc"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
-	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/pb/task"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
@@ -36,6 +36,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/cmd_util"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/sm"
+	"github.com/tidwall/btree"
 	"go.uber.org/zap"
 )
 
@@ -152,12 +153,53 @@ type relationFactory func(context.Context) (engine.Relation, client.TxnOperator,
 type TableInfo_2 struct {
 	dbID      uint64
 	tableID   uint64
-	tableDef  *plan.TableDef
 	state     TableState
 	watermark types.TS
 	err       error
 	rel       relationFactory
 	sinker    cdc.Sinker
+
+	mu sync.RWMutex
+}
+
+func NewTableInfo_2(
+	dbID, tableID uint64,
+	rel relationFactory,
+	sinker cdc.Sinker,
+) *TableInfo_2 {
+	return &TableInfo_2{
+		dbID:    dbID,
+		tableID: tableID,
+		rel:     rel,
+		sinker:  sinker,
+		mu:      sync.RWMutex{},
+	}
+}
+
+func tableInfoLess(a, b *TableInfo_2) bool {
+	return a.tableID < b.tableID
+}
+func (t *TableInfo_2) GetWatermark() types.TS {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.watermark
+}
+
+func (t *TableInfo_2) SetWatermark(watermark types.TS) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.watermark = watermark
+}
+func (t *TableInfo_2) GetState() TableState {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.state
+}
+
+func (t *TableInfo_2) SetState(state TableState) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.state = state
 }
 
 func (t *TableInfo_2) FlushWatermark(
@@ -171,7 +213,7 @@ func (t *TableInfo_2) FlushWatermark(
 		accountID,
 		t.tableID,
 		0, //TODO
-		t.watermark.ToString(),
+		t.GetWatermark().ToString(),
 		errorCode,
 		errorMsg,
 	)
@@ -226,7 +268,8 @@ type TxnFactory func() (client.TxnOperator, error)
 
 type CDCTaskExecutor2 struct {
 	accountID uint64
-	tables    map[uint64]*TableInfo_2 // tableID -> table info
+	tables    *btree.BTreeG[*TableInfo_2]
+	tableMu   sync.RWMutex
 
 	packer *types.Packer
 	mp     *mpool.MPool
@@ -280,7 +323,7 @@ func NewCDCTaskExecutor2(
 		ctx:                ctx,
 		cancel:             cancel,
 		packer:             types.NewPacker(),
-		tables:             make(map[uint64]*TableInfo_2),
+		tables:             btree.NewBTreeGOptions(tableInfoLess, btree.Options{NoLocks: true}),
 		spec:               spec,
 		sqlExecutorFactory: sqlExecutorFactory,
 		cnUUID:             cdUUID,
@@ -290,8 +333,32 @@ func NewCDCTaskExecutor2(
 		worker:             worker,
 		wg:                 sync.WaitGroup{},
 		rpcHandleFn:        rpcHandleFn,
+		tableMu:            sync.RWMutex{},
 		mp:                 mp,
 	}
+}
+
+func (exec *CDCTaskExecutor2) getAllTables() []*TableInfo_2 {
+	exec.tableMu.RLock()
+	defer exec.tableMu.RUnlock()
+	ret := make([]*TableInfo_2, 0)
+	items := exec.tables.Items()
+	for _, t := range items {
+		ret = append(ret, t)
+	}
+	return ret
+}
+
+func (exec *CDCTaskExecutor2) getTable(tableID uint64) (*TableInfo_2, bool) {
+	exec.tableMu.RLock()
+	defer exec.tableMu.RUnlock()
+	return exec.tables.Get(&TableInfo_2{tableID: tableID})
+}
+
+func (exec *CDCTaskExecutor2) setTable(table *TableInfo_2) {
+	exec.tableMu.Lock()
+	defer exec.tableMu.Unlock()
+	exec.tables.Set(table)
 }
 
 func (exec *CDCTaskExecutor2) Start() {
@@ -329,7 +396,7 @@ func (exec *CDCTaskExecutor2) run() {
 					}
 					exec.worker.Submit(exec.ctx, task)
 				} else {
-					table.watermark = toTS
+					table.SetWatermark(toTS)
 				}
 			}
 		}
@@ -337,7 +404,11 @@ func (exec *CDCTaskExecutor2) run() {
 }
 
 func (exec *CDCTaskExecutor2) GetWatermark(srcTableID uint64) types.TS {
-	return exec.tables[srcTableID].watermark
+	table, ok := exec.getTable(srcTableID)
+	if !ok {
+		return types.TS{}
+	}
+	return table.GetWatermark()
 }
 
 func (exec *CDCTaskExecutor2) RegisterNewTables(
@@ -357,7 +428,11 @@ func (exec *CDCTaskExecutor2) RegisterNewTables(
 			return err
 		}
 		exec.worker.Submit(ctx, task)
-		exec.tables[tableInfo.tableID] = tableInfo
+		_, ok := exec.getTable(tableInfo.tableID)
+		if ok {
+			return moerr.NewInternalError(ctx, "table already registered")
+		}
+		exec.setTable(tableInfo)
 	}
 	return
 }
@@ -425,24 +500,21 @@ func (exec *CDCTaskExecutor2) getTableInfoWithTableName(
 
 	sinker.Run(ctx, nil)
 
-	tableInfo = &TableInfo_2{
-		dbID:      def.DbId,
-		tableID:   def.TblId,
-		tableDef:  def,
-		watermark: types.TS{},
-		err:       nil,
-		rel: func(ctx context.Context) (engine.Relation, client.TxnOperator, error) {
-			rel, txn, err := exec.getRelation(ctx, dbName, tableName)
-			return rel, txn, err
+	tableInfo = NewTableInfo_2(
+		def.DbId,
+		def.TblId,
+		func(ctx context.Context) (engine.Relation, client.TxnOperator, error) {
+			return exec.getRelation(ctx, dbName, tableName)
 		},
-		sinker: sinker,
-	}
+		sinker,
+	)
 	return
 }
 func (exec *CDCTaskExecutor2) getCandidateTables() []*TableInfo_2 {
-	ret := make([]*TableInfo_2, 0, len(exec.tables))
-	for _, t := range exec.tables {
-		if t.state == TableState_Running {
+	ret := make([]*TableInfo_2, 0)
+	items := exec.getAllTables()
+	for _, t := range items {
+		if t.GetState() == TableState_Running {
 			continue
 		}
 		ret = append(ret, t)
@@ -464,7 +536,7 @@ func (exec *CDCTaskExecutor2) getDirtyTables(
 		accs = append(accs, uint64(exec.accountID))
 		dbs = append(dbs, t.dbID)
 		tbls = append(tbls, t.tableID)
-		ts = append(ts, t.watermark.ToTimestamp())
+		ts = append(ts, t.GetWatermark().ToTimestamp())
 	}
 	// tmpTS := types.TimestampToTS(exec.txnEngine.LatestLogtailAppliedTime())
 	tables = make(map[uint64]struct{})
@@ -500,9 +572,9 @@ func (exec *CDCTaskExecutor2) getIterationTask(
 	table *TableInfo_2,
 	toTs types.TS,
 ) (task func() error, err error) {
-	from := types.TimestampToTS(table.watermark.ToTimestamp())
+	from := types.TimestampToTS(table.GetWatermark().ToTimestamp())
 
-	table.state = TableState_Running
+	table.SetState(TableState_Running)
 	rel, txn, err := table.rel(ctx)
 	if err != nil {
 		return nil, err
@@ -527,11 +599,11 @@ func (exec *CDCTaskExecutor2) getIterationTask(
 		}
 		var errorMsg string
 		if err == nil {
-			table.watermark = toTs
+			table.SetWatermark(toTs)
 		} else {
 			errorMsg = err.Error()
 		}
-		table.state = TableState_Finished
+		table.SetState(TableState_Finished)
 		table.FlushWatermark(
 			ctx,
 			exec.sqlExecutorFactory(),

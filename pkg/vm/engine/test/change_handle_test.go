@@ -16,6 +16,7 @@ package test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -1430,14 +1431,31 @@ func getCDCPitrTablesString(
 	return tableStr
 }
 
+func addCDCTask(
+	ctx context.Context,
+	exec *frontend.CDCTaskExecutor2,
+	srcDB, srcTable string,
+	dstDB, dstTable string,
+) error {
+	err := exec.RegisterNewTables(
+		ctx,
+		frontend.CDCCreateTaskOptions{
+			PitrTables: getCDCPitrTablesString(
+				srcDB,
+				srcTable,
+				dstDB,
+				dstTable,
+			),
+		},
+	)
+	return err
+}
+
 func TestCDCExecutor(t *testing.T) {
 	catalog.SetupDefines("")
 
 	var (
-		accountId    = catalog.System_Account
-		dbName       = "db"
-		srcTableName = "src_table"
-		dstTableName = "dst_table"
+		accountId     = catalog.System_Account
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1453,45 +1471,36 @@ func TestCDCExecutor(t *testing.T) {
 		rpcAgent.Close()
 	}()
 
-	schemaFn := func() *catalog2.Schema {
-		schema := catalog2.MockSchemaAll(10, 1)
-		return schema
+	schema := catalog2.MockSchemaAll(10, 1)
+	tableCount := 10
+	rowCount := 10
+
+	tableIDs := make([]uint64, 0, tableCount)
+	dbNames := make([]string, 0, tableCount)
+	srcTables := make([]string, 0, tableCount)
+	dstTables := make([]string, 0, tableCount)
+
+	for i := 0; i < tableCount; i++ {
+		dbNames = append(dbNames, fmt.Sprintf("db%d", i))
+		srcTables = append(srcTables, fmt.Sprintf("src_table%d", i))
+		dstTables = append(dstTables, fmt.Sprintf("dst_table%d", i))
 	}
+	bat := catalog2.MockBatch(schema, rowCount)
+	bats := bat.Split(rowCount)
 
 	// create database and table
-	txn, err := disttaeEngine.NewTxnOperator(ctxWithTimeout, disttaeEngine.Now())
-	require.Nil(t, err)
 
-	err = disttaeEngine.Engine.Create(ctxWithTimeout, dbName, txn)
-	require.Nil(t, err)
+	for i := 0; i < tableCount; i++ {
+		disttaeEngine.CreateDatabaseAndTable(ctxWithTimeout, dbNames[i], srcTables[i], schema)
 
-	srcSchema := schemaFn()
-	srcSchema.Name = srcTableName
-
-	defs, err := testutil.EngineTableDefBySchema(srcSchema)
-	require.Nil(t, err)
-
-	db, err := disttaeEngine.Engine.Database(ctxWithTimeout, dbName, txn)
-	require.Nil(t, err)
-
-	err = db.Create(ctxWithTimeout, srcTableName, defs)
-	require.Nil(t, err)
-
-	rel, err := db.Relation(ctxWithTimeout, srcTableName, nil)
-	require.Nil(t, err)
-	tableID := rel.GetTableID(ctxWithTimeout)
-
-	txn.Commit(ctxWithTimeout)
-
-	bat := catalog2.MockBatch(srcSchema, 10)
-	bats := bat.Split(10)
-	appendFn := func(rowIdx int) {
-		txn, err = disttaeEngine.NewTxnOperator(ctxWithTimeout, disttaeEngine.Now())
+		_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, dbNames[i], srcTables[i])
 		require.Nil(t, err)
+		tableIDs = append(tableIDs, rel.GetTableID(ctxWithTimeout))
+		txn.Commit(ctxWithTimeout)
+	}
 
-		db, err = disttaeEngine.Engine.Database(ctxWithTimeout, dbName, txn)
-		require.Nil(t, err)
-		rel, err := db.Relation(ctxWithTimeout, srcTableName, nil)
+	appendFn := func(db, table string, rowIdx int) {
+		_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, db, table)
 		require.Nil(t, err)
 
 		err = rel.Write(ctxWithTimeout, containers.ToCNBatch(bats[rowIdx]))
@@ -1500,43 +1509,47 @@ func TestCDCExecutor(t *testing.T) {
 		txn.Commit(ctxWithTimeout)
 	}
 
-	appendFn(0)
+	for i := 0; i < tableCount; i++ {
+		appendFn(dbNames[i], srcTables[i], 0)
+	}
 
 	cdcExecutor := getCDCExecutor(ctxWithTimeout, accountId, disttaeEngine, taeHandler)
 
 	cdcExecutor.Start()
 	defer cdcExecutor.Stop()
 
-	err = cdcExecutor.RegisterNewTables(
-		ctxWithTimeout,
-		frontend.CDCCreateTaskOptions{
-			PitrTables: getCDCPitrTablesString(
-				dbName,
-				srcTableName,
-				dbName,
-				dstTableName,
-			),
-		},
-	)
-	assert.NoError(t, err)
+	for i := 0; i < tableCount; i++ {
+		err := addCDCTask(ctxWithTimeout, cdcExecutor, dbNames[i], srcTables[i], dbNames[i], dstTables[i])
+		assert.NoError(t, err)
+	}
 
-	appendFn(1)
+	for i := 1; i < rowCount; i++ {
+		for j := 0; j < tableCount; j++ {
+			appendFn(dbNames[j], srcTables[j], i)
+		}
+	}
 
 	now := taeHandler.GetDB().TxnMgr.Now()
 	testutils.WaitExpect(4000, func() bool {
-		watermark := cdcExecutor.GetWatermark(tableID)
-		return watermark.GE(&now)
+		for i := 0; i < tableCount; i++ {
+			watermark := cdcExecutor.GetWatermark(tableIDs[i])
+			if !watermark.GE(&now) {
+				return false
+			}
+		}
+		return true
 	})
 
 	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
 
-
-	tnTxn,err:=taeHandler.GetDB().StartTxn(nil)
-	assert.NoError(t,err)
-	tnDatabase,err:=tnTxn.GetDatabase(dbName)
-	assert.NoError(t,err)
-	tnRel,err := tnDatabase.GetRelationByName(dstTableName)
-	assert.NoError(t,err)
-	testutil2.CheckAllColRowsByScan(t,tnRel,2,false)
-	assert.NoError(t,tnTxn.Commit(ctxWithTimeout))
+	for i := 0; i < tableCount; i++ {
+		tnTxn, err := taeHandler.GetDB().StartTxn(nil)
+		assert.NoError(t, err)
+		tnDatabase, err := tnTxn.GetDatabase(dbNames[i])
+		assert.NoError(t, err)
+		tnRel, err := tnDatabase.GetRelationByName(dstTables[i])
+		assert.NoError(t, err)
+		testutil2.CheckAllColRowsByScan(t, tnRel, rowCount, false)
+		assert.NoError(t, tnTxn.Commit(ctxWithTimeout))
+	}
 }
