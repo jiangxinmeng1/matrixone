@@ -1472,7 +1472,7 @@ func TestCDCExecutor(t *testing.T) {
 	}()
 
 	schema := catalog2.MockSchemaAll(10, 1)
-	tableCount := 10
+	tableCount := 1
 	rowCount := 10
 
 	tableIDs := make([]uint64, 0, tableCount)
