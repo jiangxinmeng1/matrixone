@@ -34,6 +34,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/frontend"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/pb/task"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
@@ -1383,6 +1384,10 @@ func getCDCExecutor(
 					return err
 				}
 
+				if _, err = db.Relation(ctx, tableName, nil); err == nil {
+					return nil
+				}
+
 				err = db.Create(ctx, tableName, dstDefs)
 				if err != nil {
 					return err
@@ -1406,6 +1411,90 @@ func getCDCExecutor(
 		common.DebugAllocator,
 	)
 	return cdcExecutor
+}
+
+/*
+CREATE TABLE mo_async_index_log (
+
+	id INT AUTO_INCREMENT PRIMARY KEY,
+	account_id INT NOT NULL,
+	table_id INT NOT NULL,
+	index_id INT NOT NULL,
+	last_sync_txn_ts VARCHAR(32)  NOT NULL,
+	err_code INT NOT NULL,
+	error_msg VARCHAR(255) NOT NULL,
+	info VARCHAR(255) NOT NULL,
+	drop_at VARCHAR(32) NULL,
+
+);
+*/
+func mock_mo_async_index_log(
+	de *testutil.TestDisttaeEngine,
+	ctx context.Context,
+) (err error) {
+	var defs = make([]engine.TableDef, 0)
+
+	addDefFn := func(name string, typ types.Type, idx int) {
+		defs = append(defs, &engine.AttributeDef{
+			Attr: engine.Attribute{
+				Type:          typ,
+				IsRowId:       false,
+				Name:          name,
+				ID:            uint64(idx),
+				Primary:       name == "id",
+				IsHidden:      false,
+				Seqnum:        uint16(idx),
+				ClusterBy:     false,
+				AutoIncrement: name == "id",
+			},
+		})
+	}
+
+	addDefFn("id", types.T_int32.ToType(), 0)
+	addDefFn("account_id", types.T_int32.ToType(), 1)
+	addDefFn("table_id", types.T_int32.ToType(), 2)
+	addDefFn("index_id", types.T_int32.ToType(), 3)
+	addDefFn("last_sync_txn_ts", types.T_varchar.ToType(), 4)
+	addDefFn("err_code", types.T_int32.ToType(), 5)
+	addDefFn("error_msg", types.T_varchar.ToType(), 6)
+	addDefFn("info", types.T_varchar.ToType(), 7)
+	addDefFn("drop_at", types.T_varchar.ToType(), 8)
+
+	defs = append(defs,
+		&engine.ConstraintDef{
+			Cts: []engine.Constraint{
+				&engine.PrimaryKeyDef{
+					Pkey: &plan.PrimaryKeyDef{
+						PkeyColName: "id",
+						Names:       []string{"id"},
+					},
+				},
+			},
+		},
+	)
+	dbName := "mo_catalog"
+	tableName := "mo_async_index_log"
+	var txn client.TxnOperator
+	if txn, err = de.NewTxnOperator(ctx, de.Now()); err != nil {
+		return
+	}
+
+	var database engine.Database
+	if database, err = de.Engine.Database(ctx, dbName, txn); err != nil {
+		return
+	}
+	if err = database.Create(ctx, tableName, defs); err != nil {
+		return
+	}
+
+	if _, err = database.Relation(ctx, tableName, nil); err != nil {
+		return
+	}
+
+	if err = txn.Commit(ctx); err != nil {
+		return
+	}
+	return
 }
 
 func getCDCPitrTablesString(
@@ -1455,7 +1544,7 @@ func TestCDCExecutor(t *testing.T) {
 	catalog.SetupDefines("")
 
 	var (
-		accountId     = catalog.System_Account
+		accountId = catalog.System_Account
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1470,6 +1559,9 @@ func TestCDCExecutor(t *testing.T) {
 		taeHandler.Close(true)
 		rpcAgent.Close()
 	}()
+
+	err := mock_mo_async_index_log(disttaeEngine, ctxWithTimeout)
+	require.NoError(t, err)
 
 	schema := catalog2.MockSchemaAll(10, 1)
 	tableCount := 1
