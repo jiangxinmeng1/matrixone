@@ -520,6 +520,11 @@ func (exec *CDCTaskExecutor2) getIterationTask(
 			exec.mp,
 		)
 		txn.Commit(ctx)
+		// when collect from 0, changes_handle collect all data,
+		// so we need to update toTs to the latest snapshot ts
+		if from.IsEmpty() {
+			toTs = types.TimestampToTS(txn.SnapshotTS())
+		}
 		var errorMsg string
 		if err == nil {
 			table.watermark = toTs
