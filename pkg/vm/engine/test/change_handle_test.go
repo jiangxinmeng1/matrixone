@@ -1497,7 +1497,7 @@ func getFlushWatermarkFn(
 			}
 		}
 		if len(deleteRowIDs) != 1 {
-			panic(fmt.Sprintf("logic err: rowCount:%d,tableID:%d,accountID:%d,indexID:%d, ts %v", len(deleteRowIDs), tableID, accountID, indexID,txn.SnapshotTS()))
+			panic(fmt.Sprintf("logic err: rowCount:%d,tableID:%d,accountID:%d,indexID:%d, ts %v", len(deleteRowIDs), tableID, accountID, indexID, txn.SnapshotTS()))
 		}
 
 		deleteBatch := batch.New([]string{catalog.Row_ID, objectio.TombstoneAttr_PK_Attr})
@@ -1550,9 +1550,131 @@ func getFlushWatermarkFn(
 		assert.NoError(t, txn.Commit(ctx))
 		return nil
 	}
+}
+func getReplayFn(
+	t *testing.T,
+	de *testutil.TestDisttaeEngine,
+	mp *mpool.MPool,
+) func(
+	ctx context.Context,
+	tableID uint64,
+	accountID uint32,
+	indexID int32,
+) (
+	watermark types.TS,
+	errorCode int,
+	errorMsg string,
+	err error,
+) {
+	return func(
+		ctx context.Context,
+		tableID uint64,
+		accountID uint32,
+		indexID int32,
+	) (
+		watermark types.TS,
+		errorCode int,
+		errorMsg string,
+		err error,
+	) {
+		txn, _, reader, err := testutil.GetTableTxnReader(ctx, de, "mo_catalog", "mo_async_index_log", nil, mp, t)
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, reader.Close())
+		}()
 
+		bat := newMoAsyncIndexLogBatch(mp, true)
+
+		done := false
+		rowcount := 0
+		for !done {
+			done, err = reader.Read(ctx, bat.Attrs, nil, mp, bat)
+			assert.NoError(t, err)
+			tableIDs := vector.MustFixedColNoTypeCheck[uint64](bat.Vecs[2])
+			accountIDs := vector.MustFixedColNoTypeCheck[int32](bat.Vecs[1])
+			indexIDs := vector.MustFixedColNoTypeCheck[int32](bat.Vecs[3])
+			errors := vector.MustFixedColNoTypeCheck[int32](bat.Vecs[5])
+			for i := 0; i < bat.Vecs[0].Length(); i++ {
+				if tableIDs[i] == tableID && accountIDs[i] == int32(accountID) && indexIDs[i] == indexID {
+					rowcount++
+					watermarkStr := bat.Vecs[4].GetStringAt(i)
+					watermark = types.StringToTS(watermarkStr)
+					errorCode = int(errors[i])
+					errorMsg = bat.Vecs[6].GetStringAt(i)
+				}
+			}
+		}
+		if rowcount != 1 {
+			err = moerr.NewInternalError(ctx, fmt.Sprintf("row count not match, row count %d", rowcount))
+			return
+		}
+		assert.NoError(t, txn.Commit(ctx))
+		return watermark, errorCode, errorMsg, err
+	}
 }
 
+func getDeleteFn(
+	t *testing.T,
+	de *testutil.TestDisttaeEngine,
+	mp *mpool.MPool,
+) func(
+	ctx context.Context,
+	tableID uint64,
+	accountID uint32,
+	indexID int32,
+) (
+	err error,
+) {
+	return func(
+		ctx context.Context,
+		tableID uint64,
+		accountID uint32,
+		indexID int32,
+	) (
+		err error,
+	) {
+		txn, rel, reader, err := testutil.GetTableTxnReader(ctx, de, "mo_catalog", "mo_async_index_log", nil, mp, t)
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, reader.Close())
+		}()
+
+		bat := newMoAsyncIndexLogBatch(mp, true)
+
+		done := false
+		deleteRowIDs := make([]types.Rowid, 0)
+		deletePks := make([]int32, 0)
+		for !done {
+			done, err = reader.Read(ctx, bat.Attrs, nil, mp, bat)
+			assert.NoError(t, err)
+			tableIDs := vector.MustFixedColNoTypeCheck[uint64](bat.Vecs[2])
+			accountIDs := vector.MustFixedColNoTypeCheck[int32](bat.Vecs[1])
+			indexIDs := vector.MustFixedColNoTypeCheck[int32](bat.Vecs[3])
+			rowIDs := vector.MustFixedColNoTypeCheck[types.Rowid](bat.Vecs[9])
+			pks := vector.MustFixedColNoTypeCheck[int32](bat.Vecs[0])
+			for i := 0; i < bat.Vecs[0].Length(); i++ {
+				if tableIDs[i] == tableID && accountIDs[i] == int32(accountID) && indexIDs[i] == indexID {
+					deleteRowIDs = append(deleteRowIDs, rowIDs[i])
+					deletePks = append(deletePks, pks[i])
+				}
+			}
+		}
+		if len(deleteRowIDs) != 1 {
+			panic(fmt.Sprintf("logic err: rowCount:%d,tableID:%d,accountID:%d,indexID:%d, ts %v", len(deleteRowIDs), tableID, accountID, indexID, txn.SnapshotTS()))
+		}
+
+		deleteBatch := batch.New([]string{catalog.Row_ID, objectio.TombstoneAttr_PK_Attr})
+		deleteBatch.Vecs[0] = vector.NewVec(types.T_Rowid.ToType())
+		deleteBatch.Vecs[1] = vector.NewVec(types.T_int32.ToType())
+		vector.AppendFixed(deleteBatch.Vecs[0], deleteRowIDs[0], false, mp)
+		vector.AppendFixed(deleteBatch.Vecs[1], deletePks[0], false, mp)
+		deleteBatch.SetRowCount(1)
+
+		assert.NoError(t, rel.Delete(ctx, deleteBatch, catalog.Row_ID))
+		assert.NoError(t, txn.Commit(ctx))
+		return err
+	}
+}
 func getCDCExecutor(
 	ctx context.Context,
 	t *testing.T,
@@ -1617,6 +1739,8 @@ func getCDCExecutor(
 		taeHandler.GetRPCHandle().HandleGetChangedTableList,
 		getInsertWatermarkFn(t, idAllocator, cnTestEngine, common.DebugAllocator),
 		getFlushWatermarkFn(t, cnTestEngine, common.DebugAllocator),
+		getReplayFn(t, cnTestEngine, common.DebugAllocator),
+		getDeleteFn(t, cnTestEngine, common.DebugAllocator),
 		common.DebugAllocator,
 	)
 	return cdcExecutor
@@ -1735,7 +1859,47 @@ func addCDCTask(
 	srcDB, srcTable string,
 	dstDB, dstTable string,
 ) error {
-	err := exec.RegisterNewTables(
+	err := exec.StartTables(
+		ctx,
+		frontend.CDCCreateTaskOptions{
+			PitrTables: getCDCPitrTablesString(
+				srcDB,
+				srcTable,
+				dstDB,
+				dstTable,
+			),
+		},
+	)
+	return err
+}
+
+func pauseCDCTask(
+	ctx context.Context,
+	exec *frontend.CDCTaskExecutor2,
+	srcDB, srcTable string,
+	dstDB, dstTable string,
+) error {
+	err := exec.PauseTables(
+		ctx,
+		frontend.CDCCreateTaskOptions{
+			PitrTables: getCDCPitrTablesString(
+				srcDB,
+				srcTable,
+				dstDB,
+				dstTable,
+			),
+		},
+	)
+	return err
+}
+
+func dropCDCTask(
+	ctx context.Context,
+	exec *frontend.CDCTaskExecutor2,
+	srcDB, srcTable string,
+	dstDB, dstTable string,
+) error {
+	err := exec.DropTables(
 		ctx,
 		frontend.CDCCreateTaskOptions{
 			PitrTables: getCDCPitrTablesString(
@@ -1826,10 +1990,8 @@ func TestCDCExecutor(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	for i := 1; i < rowCount; i++ {
-		for j := 0; j < tableCount; j++ {
-			appendFn(dbNames[j], srcTables[j], i)
-		}
+	for j := 0; j < tableCount; j++ {
+		appendFn(dbNames[j], srcTables[j], 1)
 	}
 
 	now := taeHandler.GetDB().TxnMgr.Now()
@@ -1852,7 +2014,60 @@ func TestCDCExecutor(t *testing.T) {
 		assert.NoError(t, err)
 		tnRel, err := tnDatabase.GetRelationByName(dstTables[i])
 		assert.NoError(t, err)
-		testutil2.CheckAllColRowsByScan(t, tnRel, rowCount, false)
+		testutil2.CheckAllColRowsByScan(t, tnRel, 2, false)
 		assert.NoError(t, tnTxn.Commit(ctxWithTimeout))
+	}
+
+	for i := 0; i < tableCount; i++ {
+		err := pauseCDCTask(ctxWithTimeout, cdcExecutor, dbNames[i], srcTables[i], dbNames[i], dstTables[i])
+		assert.NoError(t, err)
+	}
+
+	for i := 0; i < tableCount; i++ {
+		appendFn(dbNames[i], srcTables[i], 2)
+	}
+
+	time.Sleep(time.Second)
+
+	for i := 0; i < tableCount; i++ {
+		tnTxn, err := taeHandler.GetDB().StartTxn(nil)
+		assert.NoError(t, err)
+		tnDatabase, err := tnTxn.GetDatabase(dbNames[i])
+		assert.NoError(t, err)
+		tnRel, err := tnDatabase.GetRelationByName(dstTables[i])
+		assert.NoError(t, err)
+		testutil2.CheckAllColRowsByScan(t, tnRel, 2, false)
+		assert.NoError(t, tnTxn.Commit(ctxWithTimeout))
+	}
+
+	for i := 0; i < tableCount; i++ {
+		err := addCDCTask(ctxWithTimeout, cdcExecutor, dbNames[i], srcTables[i], dbNames[i], dstTables[i])
+		assert.NoError(t, err)
+	}
+	now = taeHandler.GetDB().TxnMgr.Now()
+	testutils.WaitExpect(4000, func() bool {
+		for i := 0; i < tableCount; i++ {
+			watermark := cdcExecutor.GetWatermark(tableIDs[i])
+			if !watermark.GE(&now) {
+				return false
+			}
+		}
+		return true
+	})
+
+	for i := 0; i < tableCount; i++ {
+		tnTxn, err := taeHandler.GetDB().StartTxn(nil)
+		assert.NoError(t, err)
+		tnDatabase, err := tnTxn.GetDatabase(dbNames[i])
+		assert.NoError(t, err)
+		tnRel, err := tnDatabase.GetRelationByName(dstTables[i])
+		assert.NoError(t, err)
+		testutil2.CheckAllColRowsByScan(t, tnRel, 3, false)
+		assert.NoError(t, tnTxn.Commit(ctxWithTimeout))
+	}
+
+	for i := 0; i < tableCount; i++ {
+		err := dropCDCTask(ctxWithTimeout, cdcExecutor, dbNames[i], srcTables[i], dbNames[i], dstTables[i])
+		assert.NoError(t, err)
 	}
 }

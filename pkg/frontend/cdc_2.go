@@ -22,7 +22,6 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/cdc"
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
@@ -83,7 +82,7 @@ func (sinker *CNSinker) Sink(ctx context.Context, data *cdc.DecoderOutput) {
 		initSnapshotSplitTxn = true
 		rel, txn, err = sinker.relFactory(ctx)
 		if err != nil {
-			panic(fmt.Sprintf("lalala get relation failed, err %v", err))
+			panic(err)
 		}
 	} else {
 		txn = sinker.currentTxn
@@ -96,7 +95,7 @@ func (sinker *CNSinker) Sink(ctx context.Context, data *cdc.DecoderOutput) {
 		insertBat.Vecs = insertBat.Vecs[:len(insertBat.Vecs)-1]
 		err := rel.Write(ctx, insertBat)
 		if err != nil {
-			panic(fmt.Sprintf("lalala insert error %v", err))
+			panic(err)
 		}
 	}
 	if deleteBat != nil {
@@ -104,7 +103,7 @@ func (sinker *CNSinker) Sink(ctx context.Context, data *cdc.DecoderOutput) {
 		deleteBat.Vecs = deleteBat.Vecs[:len(deleteBat.Vecs)-1]
 		err := rel.Delete(ctx, deleteBat, catalog.Row_ID)
 		if err != nil {
-			panic(fmt.Sprintf("lalala delete error %v", err))
+			panic(err)
 		}
 	}
 	if initSnapshotSplitTxn {
@@ -150,6 +149,12 @@ const (
 
 type relationFactory func(context.Context) (engine.Relation, client.TxnOperator, error)
 
+type replayFn func(
+	ctx context.Context, tableID uint64, accountID uint32, indexID int32,
+) (watermark types.TS, errorCode int, errorMsg string, err error)
+
+type deleteFn func(ctx context.Context, tableID uint64, accountID uint32, indexID int32) error
+
 type TableInfo_2 struct {
 	dbID             uint64
 	tableID          uint64
@@ -174,6 +179,8 @@ type TableInfo_2 struct {
 		accountID int32,
 		indexID int32,
 	) error
+	replayFn replayFn
+	deleteFn deleteFn
 
 	mu sync.RWMutex
 }
@@ -198,6 +205,8 @@ func NewTableInfo_2(
 		accountID int32,
 		indexID int32,
 	) error,
+	replayFn replayFn,
+	deleteFn deleteFn,
 ) *TableInfo_2 {
 	return &TableInfo_2{
 		dbID:              dbID,
@@ -207,6 +216,8 @@ func NewTableInfo_2(
 		mu:                sync.RWMutex{},
 		flushWatermarkFn:  flushWatermarkFn,
 		insertWatermarkFn: insertWatermarkFn,
+		replayFn:          replayFn,
+		deleteFn:          deleteFn,
 	}
 }
 
@@ -286,6 +297,33 @@ func (t *TableInfo_2) InsertIndexWatermark(
 	return internalExecutor.Exec(ctx, sql, ie.SessionOverrideOptions{})
 }
 
+func (t *TableInfo_2) ReplayWatermark(
+	ctx context.Context,
+	internalExecutor ie.InternalExecutor,
+	accountID uint64,
+) error {
+	if t.replayFn != nil {
+		watermark, _, _, err := t.replayFn(ctx, t.tableID, uint32(accountID), 0)
+		if err != nil {
+			return err
+		}
+		t.watermark = watermark
+		return nil
+	}
+	panic("todo")
+}
+
+func (t *TableInfo_2) Delete(
+	ctx context.Context,
+	internalExecutor ie.InternalExecutor,
+	accountID uint64,
+) error {
+	if t.deleteFn != nil {
+		return t.deleteFn(ctx, t.tableID, uint32(accountID), 0)
+	}
+	panic("todo")
+}
+
 type Worker interface {
 	Submit(ctx context.Context, task func() error) error
 	Stop()
@@ -339,7 +377,8 @@ type CDCTaskExecutor2 struct {
 		info string,
 		errorMsg string,
 	) error
-
+	replayFn replayFn
+	deleteFn deleteFn
 	packer *types.Packer
 	mp     *mpool.MPool
 	spec   *task.CreateCdcDetails
@@ -399,6 +438,8 @@ func NewCDCTaskExecutor2(
 		info string,
 		errorMsg string,
 	) error,
+	replayFn replayFn,
+	deleteFn deleteFn,
 	mp *mpool.MPool,
 ) *CDCTaskExecutor2 {
 	ctx, cancel := context.WithCancel(ctx)
@@ -421,10 +462,13 @@ func NewCDCTaskExecutor2(
 		tableMu:              sync.RWMutex{},
 		getInsertWatermarkFn: getInsertWatermarkFn,
 		getFlushWatermarkFn:  getFlushWatermarkFn,
+		replayFn:             replayFn,
+		deleteFn:             deleteFn,
 		mp:                   mp,
 	}
 }
 
+// scan candidates
 func (exec *CDCTaskExecutor2) getAllTables() []*TableInfo_2 {
 	exec.tableMu.RLock()
 	defer exec.tableMu.RUnlock()
@@ -436,6 +480,7 @@ func (exec *CDCTaskExecutor2) getAllTables() []*TableInfo_2 {
 	return ret
 }
 
+// get watermark, register new table
 func (exec *CDCTaskExecutor2) getTable(tableID uint64) (*TableInfo_2, bool) {
 	exec.tableMu.RLock()
 	defer exec.tableMu.RUnlock()
@@ -447,7 +492,29 @@ func (exec *CDCTaskExecutor2) setTable(table *TableInfo_2) {
 	defer exec.tableMu.Unlock()
 	exec.tables.Set(table)
 }
+func (exec *CDCTaskExecutor2) deleteTableEntry(table *TableInfo_2) {
+	exec.tableMu.Lock()
+	defer exec.tableMu.Unlock()
+	exec.tables.Delete(table)
+}
 
+func (exec *CDCTaskExecutor2) Resume() error {
+	// restart
+	return nil
+}
+func (exec *CDCTaskExecutor2) Pause() error {
+	// stop
+	return nil
+}
+func (exec *CDCTaskExecutor2) Cancel() error {
+	// stop
+	return nil
+}
+func (exec *CDCTaskExecutor2) Restart() error {
+	// stop
+	// restart
+	return nil
+}
 func (exec *CDCTaskExecutor2) Start() {
 	exec.wg.Add(1)
 	go exec.run()
@@ -498,31 +565,99 @@ func (exec *CDCTaskExecutor2) GetWatermark(srcTableID uint64) types.TS {
 	return table.GetWatermark()
 }
 
-func (exec *CDCTaskExecutor2) RegisterNewTables(
+func (exec *CDCTaskExecutor2) startTable(ctx context.Context, table *cdc.PatternTuple) (err error) {
+	var tableInfo *TableInfo_2
+	if tableInfo, err = exec.getTableInfoWithPattern(ctx, table, exec.txnEngine); err != nil {
+		return err
+	}
+	err = tableInfo.ReplayWatermark(ctx, exec.sqlExecutorFactory(), exec.accountID)
+	if err != nil {
+		//TODO: check error
+		err = exec.initTable(ctx, tableInfo)
+		if err != nil {
+			return err
+		}
+	}
+	exec.setTable(tableInfo)
+	return
+}
+
+func (exec *CDCTaskExecutor2) initTable(ctx context.Context, tableInfo *TableInfo_2) (err error) {
+	to := types.TimestampToTS(exec.txnEngine.LatestLogtailAppliedTime())
+	if err = tableInfo.InsertIndexWatermark(ctx, exec.sqlExecutorFactory(), exec.accountID); err != nil {
+		return err
+	}
+	task, err := exec.getIterationTask(ctx, tableInfo, to)
+	if err != nil {
+		return err
+	}
+	exec.worker.Submit(ctx, task)
+	return
+}
+
+func (exec *CDCTaskExecutor2) pauseTable(ctx context.Context, table *cdc.PatternTuple) (err error) {
+	var tableInfo *TableInfo_2
+	if tableInfo, err = exec.getTableInfoWithPattern(ctx, table, exec.txnEngine); err != nil {
+		return err
+	}
+	exec.deleteTableEntry(tableInfo)
+	return nil
+}
+func (exec *CDCTaskExecutor2) dropTable(ctx context.Context, table *cdc.PatternTuple) (err error) {
+	var tableInfo *TableInfo_2
+	if tableInfo, err = exec.getTableInfoWithPattern(ctx, table, exec.txnEngine); err != nil {
+		return err
+	}
+	err = tableInfo.Delete(ctx, exec.sqlExecutorFactory(), exec.accountID)
+	if err != nil {
+		return err
+	}
+	exec.deleteTableEntry(tableInfo)
+	return nil
+}
+
+
+func (exec *CDCTaskExecutor2) StartTables(
 	ctx context.Context,
 	opts CDCCreateTaskOptions,
 ) (err error) {
 	var tablesPatternTuples cdc.PatternTuples
 	cdc.JsonDecode(opts.PitrTables, &tablesPatternTuples)
-	to := types.TimestampToTS(exec.txnEngine.LatestLogtailAppliedTime())
 	for _, table := range tablesPatternTuples.Pts {
-		var tableInfo *TableInfo_2
-		if tableInfo, err = exec.getTableInfoWithPattern(ctx, table, exec.txnEngine); err != nil {
-			return err
-		}
-		if err = tableInfo.InsertIndexWatermark(ctx, exec.sqlExecutorFactory(), exec.accountID); err != nil {
-			return err
-		}
-		task, err := exec.getIterationTask(ctx, tableInfo, to)
+		err = exec.startTable(ctx, table)
 		if err != nil {
 			return err
 		}
-		exec.worker.Submit(ctx, task)
-		_, ok := exec.getTable(tableInfo.tableID)
-		if ok {
-			return moerr.NewInternalError(ctx, "table already registered")
+	}
+	return
+}
+
+func (exec *CDCTaskExecutor2) PauseTables(
+	ctx context.Context,
+	opts CDCCreateTaskOptions,
+) (err error) {
+	var tablesPatternTuples cdc.PatternTuples
+	cdc.JsonDecode(opts.PitrTables, &tablesPatternTuples)
+	for _, table := range tablesPatternTuples.Pts {
+		err = exec.startTable(ctx, table)
+		if err != nil {
+			return err
 		}
-		exec.setTable(tableInfo)
+	}
+	return
+}
+
+func (exec *CDCTaskExecutor2) DropTables(
+	ctx context.Context,
+	opts CDCCreateTaskOptions,
+) (err error) {
+	var tablesPatternTuples cdc.PatternTuples
+	cdc.JsonDecode(opts.PitrTables, &tablesPatternTuples)
+	for _, table := range tablesPatternTuples.Pts {
+		err = exec.startTable(ctx, table)
+		if err != nil {
+			return err
+		}
 	}
 	return
 }
@@ -599,6 +734,8 @@ func (exec *CDCTaskExecutor2) getTableInfoWithTableName(
 		sinker,
 		exec.getFlushWatermarkFn,
 		exec.getInsertWatermarkFn,
+		exec.replayFn,
+		exec.deleteFn,
 	)
 	return
 }
