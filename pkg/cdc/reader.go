@@ -227,7 +227,7 @@ func (reader *tableReader) readTableWithTxn(
 	if err != nil {
 		return
 	}
-	defer changes.Close()
+	defer changes.Close().
 
 	//step3: pull data
 	var insertData, deleteData *batch.Batch
