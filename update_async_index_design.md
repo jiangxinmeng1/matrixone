@@ -80,18 +80,11 @@ CREATE TABLE mo_async_index_iterations (
 
 Since only tasks with the same watermark can be collected together, the newly added index must catch up to the table’s current watermark. First, data from time 0 to t1 (the subscription time) will be collected for the index. This step might be slow and is performed outside the queue. Then, data from t1 to the current watermark is collected within the queue. Once caught up, the new index will be collected together with the other indexes of the table.
 
-Indexes of different tables added in the same batch will have the same watermark (i.e., the same "from" and "to" values). However, each "from-to" interval may contain a large amount of data and will be sent in multiple `DecoderOutput`, the time order between different tables is not guaranteed.
-
 ## Interface
 ```golang
-types IndexInfo struct{
-  dbName string
-  tableName string
-  indexName string
-}
 // Multiple tables can share a single sinker.
 // Changes to table IDs are not monitored — if a truncate occurs, the task needs to be rebuilt.
-Createtask(taskName string,accountid int,sinker Sinker,index []*IndexInfo)(error)
+Createtask(taskName string,accountid int,sinker Sinker,dbName, tableName, indexName)(error)
 Deletetask(taskName string)
 
 type Sinker interface{
