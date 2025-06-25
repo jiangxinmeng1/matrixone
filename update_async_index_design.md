@@ -84,7 +84,7 @@ Since only tasks with the same watermark can be collected together, the newly ad
 ```golang
 // Multiple tables can share a single sinker.
 // Changes to table IDs are not monitored — if a truncate occurs, the task needs to be rebuilt.
-Createtask(taskName string,accountid int,sinker Sinker,dbName, tableName, indexName)(error)
+Createtask(taskName string,accountid int,sinker Sinker,tableDef TableDef, indexName string)(error)
 Deletetask(taskName string)
 
 type Sinker interface{
