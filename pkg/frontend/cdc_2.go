@@ -16,12 +16,12 @@ package frontend
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/cdc"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
@@ -70,7 +70,7 @@ func MockCNSinker(
 func (sinker *CNSinker) Run(ctx context.Context, ar *cdc.ActiveRoutine) {
 	err := sinker.initTableFn(ctx, sinker.def)
 	if err != nil {
-		panic(fmt.Sprintf("lalala init table failed, err %v", err))
+		panic(err)
 	}
 }
 func (sinker *CNSinker) Sink(ctx context.Context, data *cdc.DecoderOutput) {
@@ -114,7 +114,7 @@ func (sinker *CNSinker) SendBegin() {
 	var err error
 	sinker.currentRel, sinker.currentTxn, err = sinker.relFactory(sinker.ctx)
 	if err != nil {
-		panic(fmt.Sprintf("lalala get relation failed, err %v", err))
+		panic(err)
 	}
 }
 func (sinker *CNSinker) SendCommit() {
@@ -161,6 +161,7 @@ type TableInfo_2 struct {
 	state            TableState
 	watermark        types.TS
 	err              error
+	pause            bool
 	rel              relationFactory
 	sinker           cdc.Sinker
 	flushWatermarkFn func(
@@ -379,9 +380,9 @@ type CDCTaskExecutor2 struct {
 	) error
 	replayFn replayFn
 	deleteFn deleteFn
-	packer *types.Packer
-	mp     *mpool.MPool
-	spec   *task.CreateCdcDetails
+	packer   *types.Packer
+	mp       *mpool.MPool
+	spec     *task.CreateCdcDetails
 
 	logger             *zap.Logger //todo: replace logutil.Infof
 	sqlExecutorFactory func() ie.InternalExecutor
@@ -570,6 +571,10 @@ func (exec *CDCTaskExecutor2) startTable(ctx context.Context, table *cdc.Pattern
 	if tableInfo, err = exec.getTableInfoWithPattern(ctx, table, exec.txnEngine); err != nil {
 		return err
 	}
+	_, ok := exec.getTable(tableInfo.tableID)
+	if ok {
+		return moerr.NewInternalError(ctx, "table already started")
+	}
 	err = tableInfo.ReplayWatermark(ctx, exec.sqlExecutorFactory(), exec.accountID)
 	if err != nil {
 		//TODO: check error
@@ -616,7 +621,6 @@ func (exec *CDCTaskExecutor2) dropTable(ctx context.Context, table *cdc.PatternT
 	return nil
 }
 
-
 func (exec *CDCTaskExecutor2) StartTables(
 	ctx context.Context,
 	opts CDCCreateTaskOptions,
@@ -639,7 +643,7 @@ func (exec *CDCTaskExecutor2) PauseTables(
 	var tablesPatternTuples cdc.PatternTuples
 	cdc.JsonDecode(opts.PitrTables, &tablesPatternTuples)
 	for _, table := range tablesPatternTuples.Pts {
-		err = exec.startTable(ctx, table)
+		err = exec.pauseTable(ctx, table)
 		if err != nil {
 			return err
 		}
@@ -654,7 +658,7 @@ func (exec *CDCTaskExecutor2) DropTables(
 	var tablesPatternTuples cdc.PatternTuples
 	cdc.JsonDecode(opts.PitrTables, &tablesPatternTuples)
 	for _, table := range tablesPatternTuples.Pts {
-		err = exec.startTable(ctx, table)
+		err = exec.dropTable(ctx, table)
 		if err != nil {
 			return err
 		}
