@@ -23,12 +23,12 @@ import (
 )
 
 type TableInfo_2 struct {
+	exec *CDCTaskExecutor2
 	accountID int32
 	dbID      uint64
 	tableID   uint64
 	state     TableState
 	sinkers   []SinkerEntry
-	rel       relationFactory
 	mu        sync.RWMutex
 }
 
@@ -39,9 +39,11 @@ add new sinker,flush snapshot, to last wm of the table
 // get candidate
 // iteration:1.merge sinkers or update watermark, update sinker
 func NewTableInfo_2(
+	exec *CDCTaskExecutor2,
+	accountID int32,
 	dbID, tableID uint64,
 	rel relationFactory,
-	sinkers []SinkerEntry,
+	watermarkUpdater WatermarkUpdater,
 ) *TableInfo_2 {
 	return &TableInfo_2{
 		dbID:              dbID,
@@ -55,23 +57,9 @@ func NewTableInfo_2(
 		deleteFn:          deleteFn,
 	}
 }
-
-func tableInfoLess(a, b *TableInfo_2) bool {
-	return a.tableID < b.tableID
-}
-
-func (t *TableInfo_2) Resume() error {
-	return nil
-}
-func (t *TableInfo_2) Pause() error {
-	return nil
-}
-func (t *TableInfo_2) Cancel() error {
-	return nil
-}
-func (t *TableInfo_2) Restart() error {
-	return nil
-}
+func (t *TableInfo_2) AddSinker(
+	sinker
+)
 func (t *TableInfo_2) GetWatermark() types.TS {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

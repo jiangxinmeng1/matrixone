@@ -189,7 +189,6 @@ func (w *worker) Stop() {
 type TxnFactory func() (client.TxnOperator, error)
 
 type CDCTaskExecutor2 struct {
-	accountID            uint64
 	tables               *btree.BTreeG[*TableInfo_2]
 	tableMu              sync.RWMutex
 	getInsertWatermarkFn func(
