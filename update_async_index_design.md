@@ -96,7 +96,6 @@ func CreateTask(taskName string,accountid int, pitr_id int, sinkerinfo_json Sink
 func Deletetask(taskName string)
 
 func NewSinker(
-    proc       *process.Process,
   	cnUUID     string,
   	dbTblInfo  *DbTableInfo,
     tableDef   *plan.TableDef,
