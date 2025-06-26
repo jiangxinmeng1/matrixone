@@ -164,6 +164,7 @@ type TableInfo_2 struct {
 	pause            bool
 	rel              relationFactory
 	sinker           cdc.Sinker
+	newSinkers       []cdc.Sinker
 	flushWatermarkFn func(
 		ctx context.Context,
 		tableID uint64,
@@ -186,6 +187,21 @@ type TableInfo_2 struct {
 	mu sync.RWMutex
 }
 
+type SinkerEntry struct {
+	sinker cdc.Sinker
+	config SinkerConfig
+	watermark types.TS
+	err error
+	flushFN func()
+	insertFN func()
+	replayFN func()
+	deleteFN func()
+}
+/*
+add new sinker, to last wm of the table
+*/
+// get candidate
+// iteration:1.merge sinkers or update watermark, update sinker
 func NewTableInfo_2(
 	dbID, tableID uint64,
 	rel relationFactory,
