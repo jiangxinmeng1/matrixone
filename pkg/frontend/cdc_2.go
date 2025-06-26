@@ -16,12 +16,11 @@ package frontend
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/cdc"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
@@ -34,118 +33,10 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/cmd_util"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/sm"
 	"github.com/tidwall/btree"
 	"go.uber.org/zap"
 )
 
-type CNSinker struct {
-	ctx         context.Context
-	initTableFn func(context.Context, []engine.TableDef) error
-	relFactory  relationFactory
-	currentTxn  client.TxnOperator
-	currentRel  engine.Relation
-	def         []engine.TableDef
-
-	mp *mpool.MPool
-}
-
-// TODO stop sinker, drop table
-func MockCNSinker(
-	ctx context.Context,
-	relFactory relationFactory,
-	initTableFn func(context.Context, []engine.TableDef) error,
-	def []engine.TableDef,
-	mp *mpool.MPool,
-) (cdc.Sinker, error) {
-	return &CNSinker{
-		relFactory:  relFactory,
-		initTableFn: initTableFn,
-		def:         def,
-		ctx:         ctx,
-		mp:          mp,
-	}, nil
-}
-
-func (sinker *CNSinker) Run(ctx context.Context, ar *cdc.ActiveRoutine) {
-	err := sinker.initTableFn(ctx, sinker.def)
-	if err != nil {
-		panic(fmt.Sprintf("lalala init table failed, err %v", err))
-	}
-}
-func (sinker *CNSinker) Sink(ctx context.Context, data *cdc.DecoderOutput) {
-	var initSnapshotSplitTxn bool
-	var txn client.TxnOperator
-	var rel engine.Relation
-	var err error
-	if sinker.currentRel == nil {
-		initSnapshotSplitTxn = true
-		rel, txn, err = sinker.relFactory(ctx)
-		if err != nil {
-			panic(err)
-		}
-	} else {
-		txn = sinker.currentTxn
-		rel = sinker.currentRel
-	}
-	insertBat := data.GetInsertAtmBatch()
-	deleteBat := data.GetDeleteAtmBatch()
-	if insertBat != nil {
-		insertBat.Vecs[len(insertBat.Vecs)-1].Free(sinker.mp)
-		insertBat.Vecs = insertBat.Vecs[:len(insertBat.Vecs)-1]
-		err := rel.Write(ctx, insertBat)
-		if err != nil {
-			panic(err)
-		}
-	}
-	if deleteBat != nil {
-		deleteBat.Vecs[len(deleteBat.Vecs)-1].Free(sinker.mp)
-		deleteBat.Vecs = deleteBat.Vecs[:len(deleteBat.Vecs)-1]
-		err := rel.Delete(ctx, deleteBat, catalog.Row_ID)
-		if err != nil {
-			panic(err)
-		}
-	}
-	if initSnapshotSplitTxn {
-		txn.Commit(ctx)
-	}
-}
-func (sinker *CNSinker) SendBegin() {
-	var err error
-	sinker.currentRel, sinker.currentTxn, err = sinker.relFactory(sinker.ctx)
-	if err != nil {
-		panic(fmt.Sprintf("lalala get relation failed, err %v", err))
-	}
-}
-func (sinker *CNSinker) SendCommit() {
-	sinker.currentTxn.Commit(sinker.ctx)
-	sinker.currentRel = nil
-	sinker.currentTxn = nil
-}
-func (sinker *CNSinker) SendRollback() {
-	sinker.currentTxn.Rollback(sinker.ctx)
-	sinker.currentRel = nil
-	sinker.currentTxn = nil
-}
-
-// SendDummy to guarantee the last sql is sent
-func (sinker *CNSinker) SendDummy() {}
-
-// Error must be called after Sink
-func (sinker *CNSinker) Error() error {
-	return nil
-}
-func (sinker *CNSinker) ClearError() {}
-func (sinker *CNSinker) Reset()      {}
-func (sinker *CNSinker) Close()      {}
-
-type TableState int8
-
-const (
-	TableState_Invalid TableState = iota
-	TableState_Running
-	TableState_Finished
-)
 
 type relationFactory func(context.Context) (engine.Relation, client.TxnOperator, error)
 
@@ -155,210 +46,10 @@ type replayFn func(
 
 type deleteFn func(ctx context.Context, tableID uint64, accountID uint32, indexID int32) error
 
-type TableInfo_2 struct {
-	dbID             uint64
-	tableID          uint64
-	state            TableState
-	watermark        types.TS
-	err              error
-	rel              relationFactory
-	sinker           cdc.Sinker
-	flushWatermarkFn func(
-		ctx context.Context,
-		tableID uint64,
-		watermark types.TS,
-		accountID int32,
-		indexID int32,
-		errorCode int,
-		info string,
-		errorMsg string,
-	) error
-	insertWatermarkFn func(
-		ctx context.Context,
-		tableID uint64,
-		accountID int32,
-		indexID int32,
-	) error
-	replayFn replayFn
-	deleteFn deleteFn
-
-	mu sync.RWMutex
-}
-
-func NewTableInfo_2(
-	dbID, tableID uint64,
-	rel relationFactory,
-	sinker cdc.Sinker,
-	flushWatermarkFn func(
-		ctx context.Context,
-		tableID uint64,
-		watermark types.TS,
-		accountID int32,
-		indexID int32,
-		errorCode int,
-		info string,
-		errorMsg string,
-	) error,
-	insertWatermarkFn func(
-		ctx context.Context,
-		tableID uint64,
-		accountID int32,
-		indexID int32,
-	) error,
-	replayFn replayFn,
-	deleteFn deleteFn,
-) *TableInfo_2 {
-	return &TableInfo_2{
-		dbID:              dbID,
-		tableID:           tableID,
-		rel:               rel,
-		sinker:            sinker,
-		mu:                sync.RWMutex{},
-		flushWatermarkFn:  flushWatermarkFn,
-		insertWatermarkFn: insertWatermarkFn,
-		replayFn:          replayFn,
-		deleteFn:          deleteFn,
-	}
-}
-
-func tableInfoLess(a, b *TableInfo_2) bool {
-	return a.tableID < b.tableID
-}
-
-func (t *TableInfo_2) Resume() error {
-	return nil
-}
-func (t *TableInfo_2) Pause() error {
-	return nil
-}
-func (t *TableInfo_2) Cancel() error {
-	return nil
-}
-func (t *TableInfo_2) Restart() error {
-	return nil
-}
-func (t *TableInfo_2) GetWatermark() types.TS {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.watermark
-}
-
-func (t *TableInfo_2) SetWatermark(watermark types.TS) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.watermark = watermark
-}
-func (t *TableInfo_2) GetState() TableState {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.state
-}
-
-func (t *TableInfo_2) SetState(state TableState) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.state = state
-}
-
-func (t *TableInfo_2) FlushWatermark(
-	ctx context.Context,
-	internalExecutor ie.InternalExecutor,
-	accountID uint64,
-	errorCode int,
-	errorMsg string,
-) error {
-	if t.flushWatermarkFn != nil {
-		return t.flushWatermarkFn(ctx, t.tableID, t.GetWatermark(), int32(accountID), 0, errorCode, "", errorMsg)
-	}
-	sql := cdc.CDCSQLBuilder.IndexUpdateWatermarkSQL(
-		accountID,
-		t.tableID,
-		0, //TODO
-		t.GetWatermark().ToString(),
-		errorCode,
-		errorMsg,
-	)
-	return internalExecutor.Exec(ctx, sql, ie.SessionOverrideOptions{})
-}
-
-func (t *TableInfo_2) InsertIndexWatermark(
-	ctx context.Context,
-	internalExecutor ie.InternalExecutor,
-	accountID uint64,
-) error {
-	if t.insertWatermarkFn != nil {
-		return t.insertWatermarkFn(ctx, t.tableID, int32(accountID), 0)
-	}
-	sql := cdc.CDCSQLBuilder.IndexInsertLogSQL(
-		accountID,
-		t.tableID,
-		0, //TODO
-	)
-	return internalExecutor.Exec(ctx, sql, ie.SessionOverrideOptions{})
-}
-
-func (t *TableInfo_2) ReplayWatermark(
-	ctx context.Context,
-	internalExecutor ie.InternalExecutor,
-	accountID uint64,
-) error {
-	if t.replayFn != nil {
-		watermark, _, _, err := t.replayFn(ctx, t.tableID, uint32(accountID), 0)
-		if err != nil {
-			return err
-		}
-		t.watermark = watermark
-		return nil
-	}
-	panic("todo")
-}
-
-func (t *TableInfo_2) Delete(
-	ctx context.Context,
-	internalExecutor ie.InternalExecutor,
-	accountID uint64,
-) error {
-	if t.deleteFn != nil {
-		return t.deleteFn(ctx, t.tableID, uint32(accountID), 0)
-	}
-	panic("todo")
-}
-
-type Worker interface {
-	Submit(ctx context.Context, task func() error) error
-	Stop()
-}
-
-type worker struct {
-	queue sm.Queue
-}
-
-func NewWorker() Worker {
-	worker := &worker{}
-	worker.queue = sm.NewSafeQueue(10000, 100, worker.onItem)
-	worker.queue.Start()
-	return worker
-}
-
-func (w *worker) Submit(ctx context.Context, task func() error) error {
-	_, err := w.queue.Enqueue(task)
-	return err
-}
-
-func (w *worker) onItem(items ...any) {
-	for _, item := range items {
-		item.(func() error)()
-	}
-}
-
-func (w *worker) Stop() {
-	w.queue.Stop()
-}
 
 type TxnFactory func() (client.TxnOperator, error)
 
 type CDCTaskExecutor2 struct {
-	accountID            uint64
 	tables               *btree.BTreeG[*TableInfo_2]
 	tableMu              sync.RWMutex
 	getInsertWatermarkFn func(
@@ -379,9 +70,9 @@ type CDCTaskExecutor2 struct {
 	) error
 	replayFn replayFn
 	deleteFn deleteFn
-	packer *types.Packer
-	mp     *mpool.MPool
-	spec   *task.CreateCdcDetails
+	packer   *types.Packer
+	mp       *mpool.MPool
+	spec     *task.CreateCdcDetails
 
 	logger             *zap.Logger //todo: replace logutil.Infof
 	sqlExecutorFactory func() ie.InternalExecutor
@@ -570,6 +261,10 @@ func (exec *CDCTaskExecutor2) startTable(ctx context.Context, table *cdc.Pattern
 	if tableInfo, err = exec.getTableInfoWithPattern(ctx, table, exec.txnEngine); err != nil {
 		return err
 	}
+	_, ok := exec.getTable(tableInfo.tableID)
+	if ok {
+		return moerr.NewInternalError(ctx, "table already started")
+	}
 	err = tableInfo.ReplayWatermark(ctx, exec.sqlExecutorFactory(), exec.accountID)
 	if err != nil {
 		//TODO: check error
@@ -616,7 +311,6 @@ func (exec *CDCTaskExecutor2) dropTable(ctx context.Context, table *cdc.PatternT
 	return nil
 }
 
-
 func (exec *CDCTaskExecutor2) StartTables(
 	ctx context.Context,
 	opts CDCCreateTaskOptions,
@@ -639,7 +333,7 @@ func (exec *CDCTaskExecutor2) PauseTables(
 	var tablesPatternTuples cdc.PatternTuples
 	cdc.JsonDecode(opts.PitrTables, &tablesPatternTuples)
 	for _, table := range tablesPatternTuples.Pts {
-		err = exec.startTable(ctx, table)
+		err = exec.pauseTable(ctx, table)
 		if err != nil {
 			return err
 		}
@@ -654,7 +348,7 @@ func (exec *CDCTaskExecutor2) DropTables(
 	var tablesPatternTuples cdc.PatternTuples
 	cdc.JsonDecode(opts.PitrTables, &tablesPatternTuples)
 	for _, table := range tablesPatternTuples.Pts {
-		err = exec.startTable(ctx, table)
+		err = exec.dropTable(ctx, table)
 		if err != nil {
 			return err
 		}
@@ -717,7 +411,8 @@ func (exec *CDCTaskExecutor2) getTableInfoWithTableName(
 	sinker, err := exec.sinkerFactory(
 		sinkeDBName,
 		sinkeTableName,
-		engine.PlanColsToExeCols(def.Cols),
+		engine.PlanColsToExeCols(
+			def.Cols),
 	)
 	if err != nil {
 		return
@@ -799,8 +494,9 @@ func (exec *CDCTaskExecutor2) getDirtyTables(
 func (exec *CDCTaskExecutor2) getIterationTask(
 	ctx context.Context,
 	table *TableInfo_2,
+	sinkers []*SinkerEntry,
 	toTs types.TS,
-) (task func() error, err error) {
+) (task func() , err error) {
 	from := types.TimestampToTS(table.GetWatermark().ToTimestamp())
 
 	table.SetState(TableState_Running)
@@ -809,7 +505,7 @@ func (exec *CDCTaskExecutor2) getIterationTask(
 		return nil, err
 	}
 
-	return func() error {
+	return func()  {
 		err := cdc.CollectChanges_2(
 			ctx,
 			rel,

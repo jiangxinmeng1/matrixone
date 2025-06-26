@@ -1435,6 +1435,8 @@ func getInsertWatermarkFn(
 		vector.AppendBytes(bat.Vecs[7], []byte(""), false, mp)
 		bat.Vecs[8] = vector.NewVec(types.T_varchar.ToType()) //drop_at
 		vector.AppendBytes(bat.Vecs[8], []byte(""), false, mp)
+		bat.Vecs[9] = vector.NewVec(types.T_bool.ToType()) //pause
+		vector.AppendFixed(bat.Vecs[9], false, false, mp)
 		bat.SetRowCount(1)
 
 		assert.NoError(t, err)
@@ -1454,6 +1456,7 @@ func getFlushWatermarkFn(
 	ctx context.Context,
 	tableID uint64,
 	watermark types.TS,
+	pause bool,
 	accountID int32,
 	indexID int32,
 	errorCode int,
@@ -1464,6 +1467,7 @@ func getFlushWatermarkFn(
 		ctx context.Context,
 		tableID uint64,
 		watermark types.TS,
+		pause bool,
 		accountID int32,
 		indexID int32,
 		errorCode int,
@@ -1542,6 +1546,8 @@ func getFlushWatermarkFn(
 		vector.AppendBytes(bat.Vecs[7], []byte(info), false, mp)
 		bat.Vecs[8] = vector.NewVec(types.T_varchar.ToType()) //drop_at
 		vector.AppendBytes(bat.Vecs[8], []byte(errorMsg), false, mp)
+		bat.Vecs[9] = vector.NewVec(types.T_bool.ToType()) //pause
+		vector.AppendFixed(bat.Vecs[9], pause, false, mp)
 		bat.SetRowCount(1)
 
 		assert.NoError(t, err)
@@ -1564,6 +1570,7 @@ func getReplayFn(
 	watermark types.TS,
 	errorCode int,
 	errorMsg string,
+	pause bool,
 	err error,
 ) {
 	return func(
@@ -1575,6 +1582,7 @@ func getReplayFn(
 		watermark types.TS,
 		errorCode int,
 		errorMsg string,
+		pause bool,
 		err error,
 	) {
 		txn, _, reader, err := testutil.GetTableTxnReader(ctx, de, "mo_catalog", "mo_async_index_log", nil, mp, t)
@@ -1594,6 +1602,7 @@ func getReplayFn(
 			accountIDs := vector.MustFixedColNoTypeCheck[int32](bat.Vecs[1])
 			indexIDs := vector.MustFixedColNoTypeCheck[int32](bat.Vecs[3])
 			errors := vector.MustFixedColNoTypeCheck[int32](bat.Vecs[5])
+			pauses := vector.MustFixedColNoTypeCheck[bool](bat.Vecs[9])
 			for i := 0; i < bat.Vecs[0].Length(); i++ {
 				if tableIDs[i] == tableID && accountIDs[i] == int32(accountID) && indexIDs[i] == indexID {
 					rowcount++
@@ -1601,6 +1610,7 @@ func getReplayFn(
 					watermark = types.StringToTS(watermarkStr)
 					errorCode = int(errors[i])
 					errorMsg = bat.Vecs[6].GetStringAt(i)
+					pause = pauses[i]
 				}
 			}
 		}
@@ -1609,7 +1619,7 @@ func getReplayFn(
 			return
 		}
 		assert.NoError(t, txn.Commit(ctx))
-		return watermark, errorCode, errorMsg, err
+		return watermark, errorCode, errorMsg, pause, err
 	}
 }
 
@@ -1758,7 +1768,7 @@ CREATE TABLE mo_async_index_log (
 	error_msg VARCHAR(255) NOT NULL,
 	info VARCHAR(255) NOT NULL,
 	drop_at VARCHAR(32) NULL,
-
+	pause bool NULL,
 );
 */
 func mock_mo_async_index_log(
@@ -1792,6 +1802,7 @@ func mock_mo_async_index_log(
 	addDefFn("error_msg", types.T_varchar.ToType(), 6)
 	addDefFn("info", types.T_varchar.ToType(), 7)
 	addDefFn("drop_at", types.T_varchar.ToType(), 8)
+	addDefFn("pause", types.T_bool.ToType(), 9)
 
 	defs = append(defs,
 		&engine.ConstraintDef{
