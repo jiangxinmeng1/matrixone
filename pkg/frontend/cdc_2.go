@@ -143,6 +143,7 @@ type TableState int8
 
 const (
 	TableState_Invalid TableState = iota
+	TableState_Init
 	TableState_Running
 	TableState_Finished
 )
@@ -156,7 +157,7 @@ type replayFn func(
 type deleteFn func(ctx context.Context, tableID uint64, accountID uint32, indexID int32) error
 
 type Worker interface {
-	Submit(ctx context.Context, task func() error) error
+	Submit(ctx context.Context, task func()) error
 	Stop()
 }
 
@@ -171,14 +172,14 @@ func NewWorker() Worker {
 	return worker
 }
 
-func (w *worker) Submit(ctx context.Context, task func() error) error {
+func (w *worker) Submit(ctx context.Context, task func()) error {
 	_, err := w.queue.Enqueue(task)
 	return err
 }
 
 func (w *worker) onItem(items ...any) {
 	for _, item := range items {
-		item.(func() error)()
+		item.(func())()
 	}
 }
 
@@ -550,7 +551,8 @@ func (exec *CDCTaskExecutor2) getTableInfoWithTableName(
 	sinker, err := exec.sinkerFactory(
 		sinkeDBName,
 		sinkeTableName,
-		engine.PlanColsToExeCols(def.Cols),
+		engine.PlanColsToExeCols(
+			def.Cols),
 	)
 	if err != nil {
 		return
@@ -632,8 +634,9 @@ func (exec *CDCTaskExecutor2) getDirtyTables(
 func (exec *CDCTaskExecutor2) getIterationTask(
 	ctx context.Context,
 	table *TableInfo_2,
+	sinkers []*SinkerEntry,
 	toTs types.TS,
-) (task func() error, err error) {
+) (task func() , err error) {
 	from := types.TimestampToTS(table.GetWatermark().ToTimestamp())
 
 	table.SetState(TableState_Running)
@@ -642,7 +645,7 @@ func (exec *CDCTaskExecutor2) getIterationTask(
 		return nil, err
 	}
 
-	return func() error {
+	return func()  {
 		err := cdc.CollectChanges_2(
 			ctx,
 			rel,

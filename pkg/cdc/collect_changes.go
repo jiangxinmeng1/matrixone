@@ -28,13 +28,17 @@ func CollectChanges_2(
 	rel engine.Relation,
 	fromTs types.TS,
 	toTs types.TS,
-	sinker Sinker,
+	sinkers []Sinker,
 	initSnapshotSplitTxn bool,
 	packer *types.Packer,
 	mp *mpool.MPool,
-)(err error) {
+) (errs []error) {
+	errs = make([]error, len(sinkers))
 	changes, err := CollectChanges(ctx, rel, fromTs, toTs, mp)
 	if err != nil {
+		for i := range sinkers {
+			errs[i] = err
+		}
 		return
 	}
 	defer changes.Close()
@@ -86,7 +90,17 @@ func CollectChanges_2(
 		default:
 		}
 		// check sinker error of last round
-		if err = sinker.Error(); err != nil {
+		ok := false
+		for i := range sinkers {
+			if errs[i] != nil {
+				continue
+			}
+			errs[i] = sinkers[i].Error()
+			if errs[i] == nil {
+				ok = true
+			}
+		}
+		if !ok {
 			return
 		}
 
@@ -95,83 +109,86 @@ func CollectChanges_2(
 			return
 		}
 
-		// both nil denote no more data (end of this tail)
-		if insertData == nil && deleteData == nil {
-			// heartbeat, send remaining data in sinker
-			sinker.Sink(ctx, &DecoderOutput{
-				noMoreData: true,
-				fromTs:     fromTs,
-				toTs:       toTs,
-			})
+		for i, sinker := range sinkers {
+			if errs[i] != nil {
+				continue
+			}
 
-			// send a dummy to guarantee last piece of snapshot/tail send successfully
-			sinker.SendDummy()
-			if err = sinker.Error(); err == nil {
-				if hasBegin {
-					// error may not be caught immediately
-					sinker.SendCommit()
-					// so send a dummy sql to guarantee previous commit is sent successfully
-					sinker.SendDummy()
-					err = sinker.Error()
+			// both nil denote no more data (end of this tail)
+			if insertData == nil && deleteData == nil {
+				// heartbeat, send remaining data in sinker
+				sinker.Sink(ctx, &DecoderOutput{
+					noMoreData: true,
+					fromTs:     fromTs,
+					toTs:       toTs,
+				})
+
+				// send a dummy to guarantee last piece of snapshot/tail send successfully
+				sinker.SendDummy()
+				if err = sinker.Error(); err == nil {
+					if hasBegin {
+						// error may not be caught immediately
+						sinker.SendCommit()
+						// so send a dummy sql to guarantee previous commit is sent successfully
+						sinker.SendDummy()
+						err = sinker.Error()
+					}
 				}
-			}
-			return
-		}
-
-		switch currentHint {
-		case engine.ChangesHandle_Snapshot:
-			// output sql in a txn
-			if !hasBegin && !initSnapshotSplitTxn {
-				sinker.SendBegin()
-				hasBegin = true
+				continue
 			}
 
-			// transform into insert instantly
-			sinker.Sink(ctx, &DecoderOutput{
-				outputTyp:     OutputTypeSnapshot,
-				checkpointBat: insertData,
-				fromTs:        fromTs,
-				toTs:          toTs,
-			})
-			insertData.Clean(mp)
-		case engine.ChangesHandle_Tail_wip:
-			insertAtmBatch = allocateAtomicBatchIfNeed(insertAtmBatch)
-			deleteAtmBatch = allocateAtomicBatchIfNeed(deleteAtmBatch)
-			insertAtmBatch.Append(packer, insertData, insTSColIdx, insCompositedPkColIdx)
-			deleteAtmBatch.Append(packer, deleteData, delTSColIdx, delCompositedPkColIdx)
-		case engine.ChangesHandle_Tail_done:
-			insertAtmBatch = allocateAtomicBatchIfNeed(insertAtmBatch)
-			deleteAtmBatch = allocateAtomicBatchIfNeed(deleteAtmBatch)
-			insertAtmBatch.Append(packer, insertData, insTSColIdx, insCompositedPkColIdx)
-			deleteAtmBatch.Append(packer, deleteData, delTSColIdx, delCompositedPkColIdx)
+			switch currentHint {
+			case engine.ChangesHandle_Snapshot:
+				// output sql in a txn
+				if !hasBegin && !initSnapshotSplitTxn {
+					sinker.SendBegin()
+					hasBegin = true
+				}
 
-			//if !strings.Contains(reader.info.SourceTblName, "order") {
-			//	logutil.Errorf("tableReader(%s)[%s, %s], insertAtmBatch: %s, deleteAtmBatch: %s",
-			//		reader.info.SourceTblName, fromTs.ToString(), toTs.ToString(),
-			//		insertAtmBatch.DebugString(reader.tableDef, false),
-			//		deleteAtmBatch.DebugString(reader.tableDef, true))
-			//}
+				// transform into insert instantly
+				sinker.Sink(ctx, &DecoderOutput{
+					outputTyp:     OutputTypeSnapshot,
+					checkpointBat: insertData,
+					fromTs:        fromTs,
+					toTs:          toTs,
+				})
+				insertData.Clean(mp)
+			case engine.ChangesHandle_Tail_wip:
+				panic("logic error")
+			case engine.ChangesHandle_Tail_done:
+				insertAtmBatch = allocateAtomicBatchIfNeed(insertAtmBatch)
+				deleteAtmBatch = allocateAtomicBatchIfNeed(deleteAtmBatch)
+				insertAtmBatch.Append(packer, insertData, insTSColIdx, insCompositedPkColIdx)
+				deleteAtmBatch.Append(packer, deleteData, delTSColIdx, delCompositedPkColIdx)
 
-			// output sql in a txn
-			if !hasBegin {
-				sinker.SendBegin()
-				hasBegin = true
+				//if !strings.Contains(reader.info.SourceTblName, "order") {
+				//	logutil.Errorf("tableReader(%s)[%s, %s], insertAtmBatch: %s, deleteAtmBatch: %s",
+				//		reader.info.SourceTblName, fromTs.ToString(), toTs.ToString(),
+				//		insertAtmBatch.DebugString(reader.tableDef, false),
+				//		deleteAtmBatch.DebugString(reader.tableDef, true))
+				//}
+
+				// output sql in a txn
+				if !hasBegin {
+					sinker.SendBegin()
+					hasBegin = true
+				}
+
+				sinker.Sink(ctx, &DecoderOutput{
+					outputTyp:      OutputTypeTail,
+					insertAtmBatch: insertAtmBatch,
+					deleteAtmBatch: deleteAtmBatch,
+					fromTs:         fromTs,
+					toTs:           toTs,
+				})
+				addTailEndMetrics(insertAtmBatch)
+				addTailEndMetrics(deleteAtmBatch)
+				insertAtmBatch.Close()
+				deleteAtmBatch.Close()
+				// reset, allocate new when next wip/done
+				insertAtmBatch = nil
+				deleteAtmBatch = nil
 			}
-
-			sinker.Sink(ctx, &DecoderOutput{
-				outputTyp:      OutputTypeTail,
-				insertAtmBatch: insertAtmBatch,
-				deleteAtmBatch: deleteAtmBatch,
-				fromTs:         fromTs,
-				toTs:           toTs,
-			})
-			addTailEndMetrics(insertAtmBatch)
-			addTailEndMetrics(deleteAtmBatch)
-			insertAtmBatch.Close()
-			deleteAtmBatch.Close()
-			// reset, allocate new when next wip/done
-			insertAtmBatch = nil
-			deleteAtmBatch = nil
 		}
 	}
 }

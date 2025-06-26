@@ -17,132 +17,207 @@ package frontend
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/matrixorigin/matrixone/pkg/cdc"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 )
 
 type TableInfo_2 struct {
-	exec *CDCTaskExecutor2
+	exec      *CDCTaskExecutor2
+	tableDef  *plan.TableDef
 	accountID int32
 	dbID      uint64
 	tableID   uint64
+	tableName string
+	dbName    string
 	state     TableState
-	sinkers   []SinkerEntry
+	inited    atomic.Bool
+	sinkers   []*SinkerEntry
+	watermark types.TS
 	mu        sync.RWMutex
 }
 
-
-/*
-add new sinker,flush snapshot, to last wm of the table
-*/
-// get candidate
-// iteration:1.merge sinkers or update watermark, update sinker
 func NewTableInfo_2(
 	exec *CDCTaskExecutor2,
 	accountID int32,
 	dbID, tableID uint64,
-	rel relationFactory,
+	dbName, tableName string,
 	watermarkUpdater WatermarkUpdater,
 ) *TableInfo_2 {
 	return &TableInfo_2{
-		dbID:              dbID,
-		tableID:           tableID,
-		rel:               rel,
-		sinker:            sinker,
-		mu:                sync.RWMutex{},
-		flushWatermarkFn:  flushWatermarkFn,
-		insertWatermarkFn: insertWatermarkFn,
-		replayFn:          replayFn,
-		deleteFn:          deleteFn,
+		exec:      exec,
+		accountID: accountID,
+		sinkers:   make([]*SinkerEntry, 0),
+		dbID:      dbID,
+		tableID:   tableID,
+		dbName:    dbName,
+		tableName: tableName,
+		state:     TableState_Finished,
+		mu:        sync.RWMutex{},
 	}
 }
 func (t *TableInfo_2) AddSinker(
-	sinker
-)
-func (t *TableInfo_2) GetWatermark() types.TS {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.watermark
-}
-
-func (t *TableInfo_2) SetWatermark(watermark types.TS) {
+	sinkConfig *SinkerConfig,
+	dbTblInfo *cdc.DbTableInfo,
+	watermarkUpdater WatermarkUpdater,
+) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.watermark = watermark
-}
-func (t *TableInfo_2) GetState() TableState {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.state
+	sinkerEntry := NewSinkerEntry(t.exec.cnUUID, dbTblInfo, t.tableDef, t, sinkConfig, watermarkUpdater)
+	t.sinkers = append(t.sinkers, sinkerEntry)
+	return nil
 }
 
-func (t *TableInfo_2) SetState(state TableState) {
+func (t *TableInfo_2) DeleteSinker(
+	ctx context.Context,
+	indexName string,
+) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.state = state
-}
-
-func (t *TableInfo_2) FlushWatermark(
-	ctx context.Context,
-	internalExecutor ie.InternalExecutor,
-	accountID uint64,
-	errorCode int,
-	errorMsg string,
-) error {
-	if t.flushWatermarkFn != nil {
-		return t.flushWatermarkFn(ctx, t.tableID, t.GetWatermark(), int32(accountID), 0, errorCode, "", errorMsg)
-	}
-	sql := cdc.CDCSQLBuilder.IndexUpdateWatermarkSQL(
-		accountID,
-		t.tableID,
-		0, //TODO
-		t.GetWatermark().ToString(),
-		errorCode,
-		errorMsg,
-	)
-	return internalExecutor.Exec(ctx, sql, ie.SessionOverrideOptions{})
-}
-
-func (t *TableInfo_2) InsertIndexWatermark(
-	ctx context.Context,
-	internalExecutor ie.InternalExecutor,
-	accountID uint64,
-) error {
-	if t.insertWatermarkFn != nil {
-		return t.insertWatermarkFn(ctx, t.tableID, int32(accountID), 0)
-	}
-	sql := cdc.CDCSQLBuilder.IndexInsertLogSQL(
-		accountID,
-		t.tableID,
-		0, //TODO
-	)
-	return internalExecutor.Exec(ctx, sql, ie.SessionOverrideOptions{})
-}
-
-func (t *TableInfo_2) ReplayWatermark(
-	ctx context.Context,
-	internalExecutor ie.InternalExecutor,
-	accountID uint64,
-) error {
-	if t.replayFn != nil {
-		watermark, _, _, err := t.replayFn(ctx, t.tableID, uint32(accountID), 0)
-		if err != nil {
-			return err
+	for i, sinker := range t.sinkers {
+		if sinker.indexName == indexName {
+			sinker.Delete()
 		}
-		t.watermark = watermark
+		t.sinkers = append(t.sinkers[:i], t.sinkers[i+1:]...)
 		return nil
 	}
-	panic("todo")
+	return moerr.NewInternalError(ctx, "sinker not found")
 }
 
-func (t *TableInfo_2) Delete(
-	ctx context.Context,
-	internalExecutor ie.InternalExecutor,
-	accountID uint64,
-) error {
-	if t.deleteFn != nil {
-		return t.deleteFn(ctx, t.tableID, uint32(accountID), 0)
+func (t *TableInfo_2) IsInitedAndFinished() bool {
+	if !t.inited.Load() {
+		return false
 	}
-	panic("todo")
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	hasActiveSinker := false
+	for _, sinker := range t.sinkers {
+		if !sinker.PermanentError() {
+			hasActiveSinker = true
+			break
+		}
+	}
+	return hasActiveSinker && t.state == TableState_Finished
+}
+
+func (t *TableInfo_2) GetMinWaterMark() types.TS {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	minWatermark := t.watermark
+	for _, sinker := range t.sinkers {
+		if !sinker.inited.Load() {
+			continue
+		}
+		if sinker.PermanentError() {
+			continue
+		}
+		if sinker.watermark.LT(&minWatermark) {
+			minWatermark = sinker.watermark
+		}
+	}
+	return minWatermark
+}
+
+func (t *TableInfo_2) GetSyncTask(ctx context.Context, toTS types.TS) *Iteration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	dirtySinker := t.getNewSinkersLocked()
+	if dirtySinker != nil {
+		if dirtySinker.watermark.GE(&t.watermark) {
+			panic("logic error")
+		}
+		t.state = TableState_Running
+		return &Iteration{
+			table:   t,
+			sinkers: []*SinkerEntry{dirtySinker},
+			to:      t.watermark,
+			from:    dirtySinker.watermark,
+		}
+	}
+	if t.watermark.GE(&toTS) {
+		panic("logic error")
+	}
+	t.state = TableState_Running
+	return &Iteration{
+		table:   t,
+		sinkers: t.sinkers,
+		to:      toTS,
+		from:    t.watermark,
+	}
+}
+
+// TODO
+func toErrorCode(err error) int {
+	return 0
+}
+
+func (t *TableInfo_2) onIterationFinished(iter *Iteration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// init sinker
+	if len(iter.sinkers) == 1 && !iter.sinkers[0].inited.Load() {
+		iter.sinkers[0].inited.Store(true)
+		t.inited.Store(true)
+		if t.watermark.LT(&iter.to) {
+			t.watermark = iter.to
+		}
+		return
+	}
+	if t.state != TableState_Running {
+		panic("logic error")
+	}
+	// dirty sinkers
+	if t.watermark.EQ(&iter.to) {
+		if len(iter.sinkers) != 1 {
+			panic("logic error")
+		}
+		sinker := iter.sinkers[0]
+		var errCode int
+		var errMsg string
+		if iter.err[0] != nil {
+			sinker.err = iter.err[0]
+			errCode = toErrorCode(iter.err[0])
+			errMsg = iter.err[0].Error()
+		} else {
+			sinker.watermark = iter.to
+		}
+		//TODO: async
+		sinker.watermarkUpdater.Update(sinker.watermark, errCode, errMsg, t.tableID, t.accountID, sinker.indexName)
+		t.state = TableState_Finished
+		return
+	}
+	// all sinkers
+	if t.watermark.LT(&iter.to) {
+		panic("logic error")
+	}
+	t.state = TableState_Finished
+	t.watermark = iter.to
+	for i, sinker := range iter.sinkers {
+		var errCode int
+		var errMsg string
+		if iter.err[i] != nil {
+			sinker.err = iter.err[i]
+			errCode = toErrorCode(iter.err[i])
+			errMsg = iter.err[i].Error()
+		} else {
+			sinker.watermark = iter.to
+		}
+		//TODO: async
+		sinker.watermarkUpdater.Update(sinker.watermark, errCode, errMsg, t.tableID, t.accountID, sinker.indexName)
+	}
+}
+
+func (t *TableInfo_2) getNewSinkersLocked() *SinkerEntry {
+	for _, sinker := range t.sinkers {
+		if !sinker.inited.Load() {
+			continue
+		}
+		if sinker.watermark.LE(&t.watermark) {
+			return sinker
+		}
+	}
+	return nil
 }

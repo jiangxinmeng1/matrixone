@@ -15,9 +15,19 @@
 package frontend
 
 import (
+	"sync/atomic"
+
 	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+)
+
+type SinkerState int8
+
+const (
+	SinkerState_Invalid SinkerState = iota
+	SinkerState_Running
+	SinkerState_Finished
 )
 
 type SinkerConfig struct {
@@ -37,14 +47,11 @@ func NewSinker(
 	panic("todo")
 }
 
-type WatermarkUpdater interface {
-	Update(watermark types.TS, errCode int, errMsg string, tableID uint64, accountID int32, indexName string) error
-	Insert(tableID uint64, accountID int32, indexName string) error
-	Delete(tableID uint64, accountID int32, indexName string) error
-}
 
 type SinkerEntry struct {
 	tableInfo        *TableInfo_2
+	indexName        string
+	inited             atomic.Bool
 	sinker           cdc.Sinker
 	sinkerType       string
 	watermark        types.TS
@@ -75,4 +82,11 @@ func (sinkerEntry *SinkerEntry) init() {
 	/*
 		1. sink snapshot
 	*/
+}
+//TODO
+func (sinkerEntry *SinkerEntry) PermanentError() bool{
+	return false
+}
+func (sinkerEntry *SinkerEntry) Delete() {
+	sinkerEntry.watermarkUpdater.Delete(sinkerEntry.tableInfo.tableID,sinkerEntry.tableInfo.accountID,sinkerEntry.indexName)
 }
