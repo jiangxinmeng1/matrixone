@@ -16,8 +16,10 @@ package frontend
 
 import "github.com/matrixorigin/matrixone/pkg/container/types"
 
+// TODO: if insert or delete rollback
 type WatermarkUpdater interface {
 	Update(watermark types.TS, errCode int, errMsg string, tableID uint64, accountID int32, indexName string) error
 	Insert(tableID uint64, accountID int32, indexName string) error
 	Delete(tableID uint64, accountID int32, indexName string) error
+	Select(tableID uint64, accountID int32, indexName string) (watermark types.TS, errorCode int, errMsg string, err error)
 }

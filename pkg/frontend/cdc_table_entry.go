@@ -33,6 +33,7 @@ const (
 	TableState_Running
 	TableState_Finished
 )
+
 type TableInfo_2 struct {
 	exec      *CDCTaskExecutor2
 	tableDef  *plan.TableDef
@@ -53,7 +54,6 @@ func NewTableInfo_2(
 	accountID int32,
 	dbID, tableID uint64,
 	dbName, tableName string,
-	watermarkUpdater WatermarkUpdater,
 ) *TableInfo_2 {
 	return &TableInfo_2{
 		exec:      exec,
@@ -68,17 +68,26 @@ func NewTableInfo_2(
 	}
 }
 func (t *TableInfo_2) AddSinker(
-	sinkConfig *SinkerConfig,
+	sinkConfig *SinkerInfo,
 	dbTblInfo *cdc.DbTableInfo,
-	watermarkUpdater WatermarkUpdater,
 ) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	sinkerEntry := NewSinkerEntry(t.exec.cnUUID, dbTblInfo, t.tableDef, t, sinkConfig, watermarkUpdater)
+	sinkerEntry := NewSinkerEntry(t.exec.cnUUID, dbTblInfo, t.tableDef, t, sinkConfig)
 	t.sinkers = append(t.sinkers, sinkerEntry)
 	return nil
 }
 
+func (t *TableInfo_2) GetWatermark(indexName string) (types.TS,error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for _, sinker := range t.sinkers {
+		if sinker.indexName == indexName {
+			return sinker.watermark,nil
+		}
+	}
+	return types.TS{},moerr.NewInternalError(context.Background(),"sinker not found")
+}
 func (t *TableInfo_2) DeleteSinker(
 	ctx context.Context,
 	indexName string,
@@ -162,7 +171,25 @@ func toErrorCode(err error) int {
 	return 0
 }
 
-func (t *TableInfo_2) onIterationFinished(iter *Iteration) {
+func (t *TableInfo_2) UpdateWatermark(from, to types.TS) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	maxWatermark := types.TS{}
+	for _, sinker := range t.sinkers {
+		if sinker.watermark.GE(&to) {
+			panic("logic error")
+		}
+		if sinker.watermark.GE(&from) {
+			sinker.watermark = to
+		}
+		if sinker.watermark.GT(&maxWatermark) {
+			maxWatermark = sinker.watermark
+		}
+	}
+	t.watermark = maxWatermark
+}
+
+func (t *TableInfo_2) OnIterationFinished(iter *Iteration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	// init sinker

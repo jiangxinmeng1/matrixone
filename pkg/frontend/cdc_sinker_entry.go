@@ -30,30 +30,28 @@ const (
 	SinkerState_Finished
 )
 
-type SinkerConfig struct {
-	sinkerType string
-	accountID  int32
-	tableID    uint64
-	dbID       uint64
-	indexName  string
+type SinkerInfo struct {
+	SinkerType int8
+	TableName  string
+	DBName     string
+	IndexName  string
 }
 
 func NewSinker(
 	cnUUID string,
 	dbTblInfo *cdc.DbTableInfo,
 	tableDef *plan.TableDef,
-	sinkerConfig *SinkerConfig,
+	sinkerConfig *SinkerInfo,
 ) cdc.Sinker {
 	panic("todo")
 }
 
-
 type SinkerEntry struct {
 	tableInfo        *TableInfo_2
 	indexName        string
-	inited             atomic.Bool
+	inited           atomic.Bool
 	sinker           cdc.Sinker
-	sinkerType       string
+	sinkerType       int8
 	watermark        types.TS
 	err              error
 	watermarkUpdater WatermarkUpdater
@@ -64,15 +62,13 @@ func NewSinkerEntry(
 	dbTblInfo *cdc.DbTableInfo,
 	tableDef *plan.TableDef,
 	tableInfo *TableInfo_2,
-	sinkerConfig *SinkerConfig,
-	watermarkUpdater WatermarkUpdater,
+	sinkerConfig *SinkerInfo,
 ) *SinkerEntry {
 	sinker := NewSinker(cnUUID, dbTblInfo, tableDef, sinkerConfig)
 	sinkerEntry := &SinkerEntry{
 		tableInfo:        tableInfo,
 		sinker:           sinker,
-		sinkerType:       sinkerConfig.sinkerType,
-		watermarkUpdater: watermarkUpdater,
+		sinkerType:       sinkerConfig.SinkerType,
 	}
 	sinkerEntry.init()
 	return sinkerEntry
@@ -83,10 +79,11 @@ func (sinkerEntry *SinkerEntry) init() {
 		1. sink snapshot
 	*/
 }
-//TODO
-func (sinkerEntry *SinkerEntry) PermanentError() bool{
+
+// TODO
+func (sinkerEntry *SinkerEntry) PermanentError() bool {
 	return false
 }
 func (sinkerEntry *SinkerEntry) Delete() {
-	sinkerEntry.watermarkUpdater.Delete(sinkerEntry.tableInfo.tableID,sinkerEntry.tableInfo.accountID,sinkerEntry.indexName)
+	sinkerEntry.watermarkUpdater.Delete(sinkerEntry.tableInfo.tableID, sinkerEntry.tableInfo.accountID, sinkerEntry.indexName)
 }

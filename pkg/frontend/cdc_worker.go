@@ -21,12 +21,40 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/sm"
+	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 )
 
+func ExecuteSql(
+	ctx context.Context,
+	txn client.TxnOperator,
+	cnServiceID string, 
+	sql string,
+	) (executor.Result, error){
+	v, ok := moruntime.ServiceRuntime(cnServiceID).GetGlobalVariables(moruntime.InternalSQLExecutor)
+	if !ok {
+		panic("missing lock service")
+	}
+
+	lower := c.getLower()
+
+	exec := v.(executor.SQLExecutor)
+	opts := executor.Options{}.
+	// All runSql and runSqlWithResult is a part of input sql, can not incr statement.
+	// All these sub-sql's need to be rolled back and retried en masse when they conflict in pessimistic mode
+	WithDisableIncrStatement().
+	WithTxn(txn).
+	WithDatabase(c.db).
+	WithTimeZone(c.proc.GetSessionInfo().TimeZone)
+	// WithLowerCaseTableNames(&lower)
+
+	return exec.Exec(ctx, sql, opts)
+}
+
 type Worker interface {
-	Submit(ctx context.Context, task func()) error
+	Submit(iteration *Iteration) error
 	Stop()
 }
 
@@ -41,8 +69,8 @@ func NewWorker() Worker {
 	return worker
 }
 
-func (w *worker) Submit(ctx context.Context, task func()) error {
-	_, err := w.queue.Enqueue(task)
+func (w *worker) Submit(iteration *Iteration) error {
+	_, err := w.queue.Enqueue(iteration)
 	return err
 }
 
