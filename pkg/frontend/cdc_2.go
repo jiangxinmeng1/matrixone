@@ -73,7 +73,7 @@ type CDCTaskExecutor2 struct {
 	mp       *mpool.MPool
 	spec     *task.CreateCdcDetails
 
-	watermarkUpdater WatermarkUpdater
+	watermarkUpdater   WatermarkUpdater
 	logger             *zap.Logger //todo: replace logutil.Infof
 	sqlExecutorFactory func() ie.InternalExecutor
 	// attachToTask       func(context.Context, uint64, taskservice.ActiveRoutine) error
@@ -150,7 +150,7 @@ func NewCDCTaskExecutor2(
 		worker:               worker,
 		wg:                   sync.WaitGroup{},
 		rpcHandleFn:          rpcHandleFn,
-		watermarkUpdater:     newWatermarkUpdater(),//TODO
+		watermarkUpdater:     newWatermarkUpdater(), //TODO
 		tableMu:              sync.RWMutex{},
 		getInsertWatermarkFn: getInsertWatermarkFn,
 		getFlushWatermarkFn:  getFlushWatermarkFn,
@@ -220,7 +220,7 @@ func (exec *CDCTaskExecutor2) Stop() {
 
 func (exec *CDCTaskExecutor2) run() {
 	defer exec.wg.Done()
-	trigger := time.NewTicker(time.Millisecond * 200)
+	trigger := time.NewTicker(time.Second * 10)
 	for {
 		select {
 		case <-exec.ctx.Done():
@@ -255,186 +255,47 @@ func (exec *CDCTaskExecutor2) GetWatermark(srcTableID uint64, indexName string) 
 	return table.GetWatermark(indexName)
 }
 
+// insert into mo_async_index_log
 func (exec *CDCTaskExecutor2) CreateTask(
-	taskName string,
-	accountid int,
-	pitr_id int,
-	sinkerinfo_json SinkerInfo, dbTblInfo *cdc.DbTableInfo) error {
-
+	ctx context.Context,
+	txn client.TxnOperator,
+	pitrID int,
+	sinkInfo *SinkerInfo,
+) (ok bool, err error) {
+	return true, nil
 }
 
-//todo async delete task
-//read mo_async_index_iterations, if row does not exist, delete it
-func (exec *CDCTaskExecutor2) deletetable()
-
-func (exec *CDCTaskExecutor2) addTable(
+func (exec *CDCTaskExecutor2) addIndex(
 	ctx context.Context,
-	accountID int32,
+	accountID uint32,
 	sinkInfo *SinkerInfo,
-	dbTblInfo *cdc.DbTableInfo,
 	tableDef *plan.TableDef,
 	indexName string,
-	) (err error) {
-	/*
-	get or create table entry
-	replay watermark and error
-	create sinker
-	submit task
-	*/
-	table,ok:=exec.getTable(dbTblInfo.SourceTblId)
-	if !ok{
-		table:=NewTableInfo_2(
+	watermark types.TS,
+	iterationErr error,
+) (indexCreated bool, err error) {
+	var table *TableInfo_2
+	table, ok := exec.getTable(tableDef.TblId)
+	if !ok {
+		table := NewTableInfo_2(
 			exec,
 			accountID,
-			dbTblInfo.SourceDbId,
-			dbTblInfo.SourceTblId,
-			dbTblInfo.SourceDbName,
-			dbTblInfo.SourceTblName,
-			exec.watermarkUpdater,
+			tableDef.DbId,
+			tableDef.TblId,
+			tableDef.DbName,
+			tableDef.Name,
 		)
 		exec.setTable(table)
 	}
-	watermark,errorCode,errMsg,err:=exec.watermarkUpdater.Select(dbTblInfo.SourceTblId,accountID,indexName)
-	if err!=nil{
-		return err
-	}
-	sinkerEntry:=NewSinkerEntry(
-		exec.cnUUID,
-		dbTblInfo,
-		table.tableDef,
-		table,
-		sinkerConfig,
-	)
-	
-	return
-}
-// 	var tableInfo *TableInfo_2
-// 	if tableInfo, err = exec.getTableInfoWithPattern(ctx, table, exec.txnEngine); err != nil {
-// 		return err
-// 	}
-// 	_, ok := exec.getTable(tableInfo.tableID)
-// 	if ok {
-// 		return moerr.NewInternalError(ctx, "table already started")
-// 	}
-// 	err = tableInfo.ReplayWatermark(ctx, exec.sqlExecutorFactory(), exec.accountID)
-// 	if err != nil {
-// 		//TODO: check error
-// 		err = exec.initTable(ctx, tableInfo)
-// 		if err != nil {
-// 			return err
-// 		}
-// 	}
-// 	exec.setTable(tableInfo)
-// 	return
-// }
-
-func (exec *CDCTaskExecutor2) initTable(ctx context.Context, tableInfo *TableInfo_2) (err error) {
-	to := types.TimestampToTS(exec.txnEngine.LatestLogtailAppliedTime())
-	if err = tableInfo.InsertIndexWatermark(ctx, exec.sqlExecutorFactory(), exec.accountID); err != nil {
-		return err
-	}
-	task, err := exec.getIterationTask(ctx, tableInfo, to)
-	if err != nil {
-		return err
-	}
-	exec.worker.Submit(ctx, task)
+	indexCreated, err = table.AddSinker(sinkInfo, watermark, iterationErr)
 	return
 }
 
-func (exec *CDCTaskExecutor2) pauseTable(ctx context.Context, table *cdc.PatternTuple) (err error) {
-	var tableInfo *TableInfo_2
-	if tableInfo, err = exec.getTableInfoWithPattern(ctx, table, exec.txnEngine); err != nil {
-		return err
-	}
-	exec.deleteTableEntry(tableInfo)
-	return nil
-}
-func (exec *CDCTaskExecutor2) dropTable(ctx context.Context, table *cdc.PatternTuple) (err error) {
-	var tableInfo *TableInfo_2
-	if tableInfo, err = exec.getTableInfoWithPattern(ctx, table, exec.txnEngine); err != nil {
-		return err
-	}
-	err = tableInfo.Delete(ctx, exec.sqlExecutorFactory(), exec.accountID)
-	if err != nil {
-		return err
-	}
-	exec.deleteTableEntry(tableInfo)
-	return nil
-}
-
-func (exec *CDCTaskExecutor2) StartTables(
-	ctx context.Context,
-	opts CDCCreateTaskOptions,
-) (err error) {
-	var tablesPatternTuples cdc.PatternTuples
-	cdc.JsonDecode(opts.PitrTables, &tablesPatternTuples)
-	for _, table := range tablesPatternTuples.Pts {
-		err = exec.startTable(ctx, table)
-		if err != nil {
-			return err
-		}
-	}
-	return
-}
-
-func (exec *CDCTaskExecutor2) PauseTables(
-	ctx context.Context,
-	opts CDCCreateTaskOptions,
-) (err error) {
-	var tablesPatternTuples cdc.PatternTuples
-	cdc.JsonDecode(opts.PitrTables, &tablesPatternTuples)
-	for _, table := range tablesPatternTuples.Pts {
-		err = exec.pauseTable(ctx, table)
-		if err != nil {
-			return err
-		}
-	}
-	return
-}
-
-func (exec *CDCTaskExecutor2) DropTables(
-	ctx context.Context,
-	opts CDCCreateTaskOptions,
-) (err error) {
-	var tablesPatternTuples cdc.PatternTuples
-	cdc.JsonDecode(opts.PitrTables, &tablesPatternTuples)
-	for _, table := range tablesPatternTuples.Pts {
-		err = exec.dropTable(ctx, table)
-		if err != nil {
-			return err
-		}
-	}
-	return
-}
-
-func (exec *CDCTaskExecutor2) getTableInfoWithPattern(
-	ctx context.Context,
-	tablePattern *cdc.PatternTuple,
-	txnEngine engine.Engine,
-) (tableInfo *TableInfo_2, err error) {
-	if tablePattern.Source.Database == cdc.CDCPitrGranularity_All ||
-		tablePattern.Source.Table == cdc.CDCPitrGranularity_All {
-		panic("not support")
-		//for each table in mo tables
-	}
-	return exec.getTableInfoWithTableName(
-		ctx,
-		tablePattern.Source.Database,
-		tablePattern.Source.Table,
-		tablePattern.Sink.Database,
-		tablePattern.Sink.Table,
-	)
-
-}
 func (exec *CDCTaskExecutor2) getRelation(
 	ctx context.Context,
+	txnOp client.TxnOperator,
 	dbName, tableName string,
-) (table engine.Relation, txnOp client.TxnOperator, err error) {
-	txnOp, err = exec.txnFactory()
-	if err != nil {
-		logutil.Errorf("cdc task %s get txn op failed, err: %v", exec.spec.TaskName, err)
-		return
-	}
+) (table engine.Relation, err error) {
 	var db engine.Database
 	if db, err = exec.txnEngine.Database(ctx, dbName, txnOp); err != nil {
 		return
@@ -443,46 +304,6 @@ func (exec *CDCTaskExecutor2) getRelation(
 	if table, err = db.Relation(ctx, tableName, nil); err != nil {
 		return
 	}
-	return
-}
-func (exec *CDCTaskExecutor2) getTableInfoWithTableName(
-	ctx context.Context,
-	dbName, tableName string,
-	sinkeDBName, sinkeTableName string,
-) (tableInfo *TableInfo_2, err error) {
-
-	var table engine.Relation
-	var txn client.TxnOperator
-	if table, txn, err = exec.getRelation(ctx, dbName, tableName); err != nil {
-		return
-	}
-	defer txn.Commit(ctx)
-	def := table.CopyTableDef(ctx)
-
-	sinker, err := exec.sinkerFactory(
-		sinkeDBName,
-		sinkeTableName,
-		engine.PlanColsToExeCols(
-			def.Cols),
-	)
-	if err != nil {
-		return
-	}
-
-	sinker.Run(ctx, nil)
-
-	tableInfo = NewTableInfo_2(
-		def.DbId,
-		def.TblId,
-		func(ctx context.Context) (engine.Relation, client.TxnOperator, error) {
-			return exec.getRelation(ctx, dbName, tableName)
-		},
-		sinker,
-		exec.getFlushWatermarkFn,
-		exec.getInsertWatermarkFn,
-		exec.replayFn,
-		exec.deleteFn,
-	)
 	return
 }
 func (exec *CDCTaskExecutor2) getCandidateTables() []*TableInfo_2 {
@@ -540,58 +361,4 @@ func (exec *CDCTaskExecutor2) getDirtyTables(
 		exec.rpcHandleFn,
 	)
 	return
-}
-
-func (exec *CDCTaskExecutor2) getIterationTask(
-	ctx context.Context,
-	table *TableInfo_2,
-	sinkers []*SinkerEntry,
-	toTs types.TS,
-) (task func(), err error) {
-	from := types.TimestampToTS(table.GetWatermark().ToTimestamp())
-
-	table.SetState(TableState_Running)
-	rel, txn, err := table.rel(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	return func() {
-		err := cdc.CollectChanges_2(
-			ctx,
-			rel,
-			from,
-			toTs,
-			table.sinker,
-			true,
-			exec.packer,
-			exec.mp,
-		)
-		txn.Commit(ctx)
-		// when collect from 0, changes_handle collect all data,
-		// so we need to update toTs to the latest snapshot ts
-		if from.IsEmpty() {
-			toTs = types.TimestampToTS(txn.SnapshotTS())
-		}
-		var errorMsg string
-		if err == nil {
-			table.SetWatermark(toTs)
-		} else {
-			errorMsg = err.Error()
-		}
-		table.SetState(TableState_Finished)
-		table.FlushWatermark(
-			ctx,
-			exec.sqlExecutorFactory(),
-			exec.accountID,
-			getErrorCode(err),
-			errorMsg,
-		)
-		return nil
-	}, nil
-}
-
-func getErrorCode(err error) int {
-	//TODO
-	return 0
 }

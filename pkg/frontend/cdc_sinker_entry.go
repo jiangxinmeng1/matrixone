@@ -39,10 +39,9 @@ type SinkerInfo struct {
 
 func NewSinker(
 	cnUUID string,
-	dbTblInfo *cdc.DbTableInfo,
 	tableDef *plan.TableDef,
 	sinkerConfig *SinkerInfo,
-) cdc.Sinker {
+) (cdc.Sinker,error) {
 	panic("todo")
 }
 
@@ -54,24 +53,30 @@ type SinkerEntry struct {
 	sinkerType       int8
 	watermark        types.TS
 	err              error
-	watermarkUpdater WatermarkUpdater
 }
 
 func NewSinkerEntry(
 	cnUUID string,
-	dbTblInfo *cdc.DbTableInfo,
 	tableDef *plan.TableDef,
 	tableInfo *TableInfo_2,
 	sinkerConfig *SinkerInfo,
-) *SinkerEntry {
-	sinker := NewSinker(cnUUID, dbTblInfo, tableDef, sinkerConfig)
+	watermark types.TS,
+	err error,
+) (*SinkerEntry,error) {
+	sinker,err := NewSinker(cnUUID, tableDef, sinkerConfig)
+	if err != nil {
+		return nil, err
+	}
 	sinkerEntry := &SinkerEntry{
 		tableInfo:        tableInfo,
+		indexName:        sinkerConfig.IndexName,
 		sinker:           sinker,
 		sinkerType:       sinkerConfig.SinkerType,
+		watermark:        watermark,
+		err:              err,
 	}
 	sinkerEntry.init()
-	return sinkerEntry
+	return sinkerEntry, nil
 }
 
 func (sinkerEntry *SinkerEntry) init() {
@@ -83,7 +88,4 @@ func (sinkerEntry *SinkerEntry) init() {
 // TODO
 func (sinkerEntry *SinkerEntry) PermanentError() bool {
 	return false
-}
-func (sinkerEntry *SinkerEntry) Delete() {
-	sinkerEntry.watermarkUpdater.Delete(sinkerEntry.tableInfo.tableID, sinkerEntry.tableInfo.accountID, sinkerEntry.indexName)
 }

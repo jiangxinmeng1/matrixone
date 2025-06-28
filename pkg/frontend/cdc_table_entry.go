@@ -19,7 +19,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
@@ -37,7 +36,7 @@ const (
 type TableInfo_2 struct {
 	exec      *CDCTaskExecutor2
 	tableDef  *plan.TableDef
-	accountID int32
+	accountID uint32
 	dbID      uint64
 	tableID   uint64
 	tableName string
@@ -51,7 +50,7 @@ type TableInfo_2 struct {
 
 func NewTableInfo_2(
 	exec *CDCTaskExecutor2,
-	accountID int32,
+	accountID uint32,
 	dbID, tableID uint64,
 	dbName, tableName string,
 ) *TableInfo_2 {
@@ -69,24 +68,33 @@ func NewTableInfo_2(
 }
 func (t *TableInfo_2) AddSinker(
 	sinkConfig *SinkerInfo,
-	dbTblInfo *cdc.DbTableInfo,
-) error {
+	watermark types.TS,
+	iterationErr error,
+) (existed bool, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	sinkerEntry := NewSinkerEntry(t.exec.cnUUID, dbTblInfo, t.tableDef, t, sinkConfig)
+	for _, sinker := range t.sinkers {
+		if sinker.indexName == sinkConfig.IndexName {
+			return false, nil
+		}
+	}
+	sinkerEntry, err := NewSinkerEntry(t.exec.cnUUID, t.tableDef, t, sinkConfig, watermark, iterationErr)
+	if err != nil {
+		return false, err
+	}
 	t.sinkers = append(t.sinkers, sinkerEntry)
-	return nil
+	return true, nil
 }
 
-func (t *TableInfo_2) GetWatermark(indexName string) (types.TS,error) {
+func (t *TableInfo_2) GetWatermark(indexName string) (types.TS, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	for _, sinker := range t.sinkers {
 		if sinker.indexName == indexName {
-			return sinker.watermark,nil
+			return sinker.watermark, nil
 		}
 	}
-	return types.TS{},moerr.NewInternalError(context.Background(),"sinker not found")
+	return types.TS{}, moerr.NewInternalError(context.Background(), "sinker not found")
 }
 func (t *TableInfo_2) DeleteSinker(
 	ctx context.Context,
@@ -96,9 +104,8 @@ func (t *TableInfo_2) DeleteSinker(
 	defer t.mu.Unlock()
 	for i, sinker := range t.sinkers {
 		if sinker.indexName == indexName {
-			sinker.Delete()
+			t.sinkers = append(t.sinkers[:i], t.sinkers[i+1:]...)
 		}
-		t.sinkers = append(t.sinkers[:i], t.sinkers[i+1:]...)
 		return nil
 	}
 	return moerr.NewInternalError(ctx, "sinker not found")
@@ -210,17 +217,11 @@ func (t *TableInfo_2) OnIterationFinished(iter *Iteration) {
 			panic("logic error")
 		}
 		sinker := iter.sinkers[0]
-		var errCode int
-		var errMsg string
 		if iter.err[0] != nil {
 			sinker.err = iter.err[0]
-			errCode = toErrorCode(iter.err[0])
-			errMsg = iter.err[0].Error()
 		} else {
 			sinker.watermark = iter.to
 		}
-		//TODO: async
-		sinker.watermarkUpdater.Update(sinker.watermark, errCode, errMsg, t.tableID, t.accountID, sinker.indexName)
 		t.state = TableState_Finished
 		return
 	}
@@ -231,17 +232,11 @@ func (t *TableInfo_2) OnIterationFinished(iter *Iteration) {
 	t.state = TableState_Finished
 	t.watermark = iter.to
 	for i, sinker := range iter.sinkers {
-		var errCode int
-		var errMsg string
 		if iter.err[i] != nil {
 			sinker.err = iter.err[i]
-			errCode = toErrorCode(iter.err[i])
-			errMsg = iter.err[i].Error()
 		} else {
 			sinker.watermark = iter.to
 		}
-		//TODO: async
-		sinker.watermarkUpdater.Update(sinker.watermark, errCode, errMsg, t.tableID, t.accountID, sinker.indexName)
 	}
 }
 

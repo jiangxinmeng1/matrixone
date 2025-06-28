@@ -14,7 +14,11 @@
 
 package frontend
 
-import "github.com/matrixorigin/matrixone/pkg/container/types"
+import (
+	"context"
+
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+)
 
 // TODO: if insert or delete rollback
 type WatermarkUpdater interface {
@@ -23,3 +27,72 @@ type WatermarkUpdater interface {
 	Delete(tableID uint64, accountID int32, indexName string) error
 	Select(tableID uint64, accountID int32, indexName string) (watermark types.TS, errorCode int, errMsg string, err error)
 }
+
+/*
+1. scan table
+2. iteration finished
+*/
+
+func InsertAsyncIndexLogTableState(
+	ctx context.Context,
+	accountID uint32,
+	tableID uint64,
+	tableName string,
+	dbName string,
+	indexName string,
+	sinkerConfig *SinkerInfo,
+){}
+
+func DeleteAsyncIndexLogTableState(
+	ctx context.Context,
+	accountIDs []int32,
+	tableIDs []uint64,
+	indexNames []string,
+){}
+
+func UpdateAsyncIndexLogDropAt(
+	ctx context.Context,
+	accountID uint32,
+	tableID uint64,
+	indexName string,
+	deleteAt types.TS,
+){}
+
+func UpdateAsyncIndexLogTableState(
+	ctx context.Context,
+	accountIDs []uint32,
+	tableIDs []uint64,
+	indexNames []string,
+)
+
+func UpdateAsyncIndexLogIterationResult(
+	ctx context.Context,
+	accountID uint32,
+	tableID uint64,
+	indexNames []string,
+	newWatermark types.TS,
+	errorCode []int,
+	errorMsgs []string,
+)
+
+func InsertAsyncIndexIterations(
+	ctx context.Context,
+	accountID uint32,
+	tableID uint64,
+	indexNames []string,
+	fromTS types.TS,
+	toTS types.TS,
+	errorCode []int,
+	errorMsgs []string,
+	startAt types.TS,
+	endAt types.TS,
+)
+
+func DeleteAsyncIndexIterations(
+	ctx context.Context,
+	accountIDs []uint32,
+	tableIDs []uint64,
+	indexNames []string,
+	fromTSes []types.TS,
+	toTSes []types.TS,
+)
