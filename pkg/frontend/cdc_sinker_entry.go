@@ -41,18 +41,37 @@ func NewSinker(
 	cnUUID string,
 	tableDef *plan.TableDef,
 	sinkerConfig *SinkerInfo,
-) (cdc.Sinker,error) {
+) (cdc.Sinker, error) {
 	panic("todo")
+
+// type Consumer interface{
+//   Next()(insertBatch *batch.Batch, deleteBatch *batch.Batch, noMoreDate bool, err error)
+//   SetError(err error)
+//   UpdateWatermark(txn client.TxnOperator)
+// }
+	txn := NewTXN
+	for {
+		insert, delete, noMoreData, err := consumer.Next()
+		//	......
+		//
+		// consume insert&delete in txn
+		//
+		//	......
+		if noMoreData {
+			consumer.UpdateWatermark(txn)
+			txn = NewTxn()
+		}
+	}
 }
 
 type SinkerEntry struct {
-	tableInfo        *TableInfo_2
-	indexName        string
-	inited           atomic.Bool
-	sinker           cdc.Sinker
-	sinkerType       int8
-	watermark        types.TS
-	err              error
+	tableInfo  *TableInfo_2
+	indexName  string
+	inited     atomic.Bool
+	sinker     cdc.Sinker
+	sinkerType int8
+	watermark  types.TS
+	err        error
 }
 
 func NewSinkerEntry(
@@ -62,18 +81,18 @@ func NewSinkerEntry(
 	sinkerConfig *SinkerInfo,
 	watermark types.TS,
 	err error,
-) (*SinkerEntry,error) {
-	sinker,err := NewSinker(cnUUID, tableDef, sinkerConfig)
+) (*SinkerEntry, error) {
+	sinker, err := NewSinker(cnUUID, tableDef, sinkerConfig)
 	if err != nil {
 		return nil, err
 	}
 	sinkerEntry := &SinkerEntry{
-		tableInfo:        tableInfo,
-		indexName:        sinkerConfig.IndexName,
-		sinker:           sinker,
-		sinkerType:       sinkerConfig.SinkerType,
-		watermark:        watermark,
-		err:              err,
+		tableInfo:  tableInfo,
+		indexName:  sinkerConfig.IndexName,
+		sinker:     sinker,
+		sinkerType: sinkerConfig.SinkerType,
+		watermark:  watermark,
+		err:        err,
 	}
 	sinkerEntry.init()
 	return sinkerEntry, nil
