@@ -16,14 +16,17 @@ package cdc
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/pb/task"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
@@ -80,7 +83,7 @@ type CDCTaskExecutor2 struct {
 	// ts                 taskservice.TaskService
 	// fs                 fileservice.FileService
 	txnFactory    func() (client.TxnOperator, error)
-	sinkerFactory func(dbName, tableName string, tableDef []engine.TableDef) (cdc.Sinker, error)
+	sinkerFactory func(dbName, tableName string, tableDef []engine.TableDef) (Sinker, error)
 	txnEngine     engine.Engine
 
 	rpcHandleFn func(
@@ -102,7 +105,7 @@ func NewCDCTaskExecutor2(
 	accountID uint64,
 	spec *task.CreateCdcDetails,
 	sqlExecutorFactory func() ie.InternalExecutor,
-	sinkerFactory func(dbName, tableName string, tableDef []engine.TableDef) (cdc.Sinker, error),
+	sinkerFactory func(dbName, tableName string, tableDef []engine.TableDef) (Sinker, error),
 	txnFactory TxnFactory,
 	txnEngine engine.Engine,
 	cdUUID string,
@@ -135,6 +138,7 @@ func NewCDCTaskExecutor2(
 	ctx, cancel := context.WithCancel(ctx)
 	worker := NewWorker()
 	ctx = context.WithValue(ctx, defines.TenantIDKey{}, uint32(accountID))
+	//TODO: subscribe mo_catalog.mo_async_index_log
 	return &CDCTaskExecutor2{
 		ctx:                  ctx,
 		cancel:               cancel,
@@ -254,25 +258,72 @@ func (exec *CDCTaskExecutor2) GetWatermark(srcTableID uint64, indexName string) 
 	return table.GetWatermark(indexName)
 }
 
-// insert into mo_async_index_log
-func (exec *CDCTaskExecutor2) CreateTask(
-	ctx context.Context,
-	txn client.TxnOperator,
-	pitrID int,
-	sinkInfo *SinkerInfo,
-) (ok bool, err error) {
-	return true, nil
+func (exec *CDCTaskExecutor2) onAsyncIndexLogInsert(ctx context.Context, input *api.Batch) {
+	accountIDVector, err := vector.ProtoVectorToVector(input.Vecs[1])
+	if err != nil {
+		panic(err)
+	}
+	accountIDs := vector.MustFixedColWithTypeCheck[uint32](accountIDVector)
+	tableIDVector, err := vector.ProtoVectorToVector(input.Vecs[2])
+	if err != nil {
+		panic(err)
+	}
+	tableIDs := vector.MustFixedColWithTypeCheck[uint64](tableIDVector)
+	indexNameVector, err := vector.ProtoVectorToVector(input.Vecs[3])
+	if err != nil {
+		panic(err)
+	}
+	watermarkVector, err := vector.ProtoVectorToVector(input.Vecs[4])
+	if err != nil {
+		panic(err)
+	}
+	errorCodeVector, err := vector.ProtoVectorToVector(input.Vecs[5])
+	if err != nil {
+		panic(err)
+	}
+	errorCodes := vector.MustFixedColWithTypeCheck[int32](errorCodeVector)
+	consumerInfoVector, err := vector.ProtoVectorToVector(input.Vecs[9])
+	if err != nil {
+		panic(err)
+	}
+	dropAtVector, err := vector.ProtoVectorToVector(input.Vecs[8])
+	if err != nil {
+		panic(err)
+	}
+	for i, tid := range tableIDs {
+		watermarkStr := watermarkVector.GetStringAt(i)
+		watermark := types.StringToTS(watermarkStr)
+		if watermark.IsEmpty() && errorCodes[i] == 0 {
+			consumerInfoStr := consumerInfoVector.GetStringAt(i)
+			go exec.addIndex(ctx, accountIDs[i], tid, watermarkStr, int(errorCodes[i]), consumerInfoStr)
+		}
+		if dropAtVector.IsNull(uint64(i)) {
+			indexName := indexNameVector.GetStringAt(i)
+			go exec.deleteIndex(ctx, accountIDs[i], tid, indexName)
+		}
+	}
+
 }
 
 func (exec *CDCTaskExecutor2) addIndex(
 	ctx context.Context,
 	accountID uint32,
-	sinkInfo *SinkerInfo,
-	tableDef *plan.TableDef,
-	indexName string,
-	watermark types.TS,
-	iterationErr error,
-) (indexCreated bool, err error) {
+	tableID uint64,
+	watermarkStr string,
+	errorCode int,
+	consumerInfoStr string,
+) (err error) {
+	consumerInfo := &ConsumerInfo{}
+	err = json.Unmarshal([]byte(consumerInfoStr), consumerInfo)
+	if err != nil {
+		return
+	}
+	rel, err := exec.getTableByID(ctx, tableID)
+	if err != nil {
+		return
+	}
+	watermark := types.StringToTS(watermarkStr)
+	tableDef := rel.GetTableDef(ctx)
 	var table *TableInfo_2
 	table, ok := exec.getTable(tableDef.TblId)
 	if !ok {
@@ -286,7 +337,30 @@ func (exec *CDCTaskExecutor2) addIndex(
 		)
 		exec.setTable(table)
 	}
-	indexCreated, err = table.AddSinker(sinkInfo, watermark, iterationErr)
+	if errorCode != 0 {
+		panic("logic error") // TODO: convert error
+	}
+	_, err = table.AddSinker(consumerInfo, watermark, nil)
+	return
+}
+
+func (exec *CDCTaskExecutor2) deleteIndex(
+	ctx context.Context,
+	accountID uint32,
+	tableID uint64,
+	indexName string,
+) (err error) {
+	table, ok := exec.getTable(tableID)
+	if !ok {
+		return moerr.NewInternalError(ctx, "table not found")
+	}
+	empty, err := table.DeleteSinker(ctx, indexName)
+	if err != nil {
+		return
+	}
+	if empty {
+		exec.deleteTableEntry(table)
+	}
 	return
 }
 
@@ -304,6 +378,17 @@ func (exec *CDCTaskExecutor2) getRelation(
 		return
 	}
 	return
+}
+func (exec *CDCTaskExecutor2) getTableByID(ctx context.Context, tableID uint64) (table engine.Relation, err error) {
+	txn, err := exec.txnFactory()
+	if err != nil {
+		return
+	}
+	dbName, tableName, err := exec.txnEngine.GetNameById(ctx, txn, tableID)
+	if err != nil {
+		return
+	}
+	return exec.getRelation(ctx, txn, dbName, tableName)
 }
 func (exec *CDCTaskExecutor2) getCandidateTables() []*TableInfo_2 {
 	ret := make([]*TableInfo_2, 0)

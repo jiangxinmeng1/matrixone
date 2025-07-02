@@ -67,7 +67,7 @@ func NewTableInfo_2(
 	}
 }
 func (t *TableInfo_2) AddSinker(
-	sinkConfig *SinkerInfo,
+	sinkConfig *ConsumerInfo,
 	watermark types.TS,
 	iterationErr error,
 ) (existed bool, err error) {
@@ -99,16 +99,16 @@ func (t *TableInfo_2) GetWatermark(indexName string) (types.TS, error) {
 func (t *TableInfo_2) DeleteSinker(
 	ctx context.Context,
 	indexName string,
-) error {
+) (isEmpty bool, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for i, sinker := range t.sinkers {
 		if sinker.indexName == indexName {
 			t.sinkers = append(t.sinkers[:i], t.sinkers[i+1:]...)
 		}
-		return nil
+		return len(t.sinkers) == 0, nil
 	}
-	return moerr.NewInternalError(ctx, "sinker not found")
+	return false, moerr.NewInternalError(ctx, "sinker not found")
 }
 
 func (t *TableInfo_2) IsInitedAndFinished() bool {

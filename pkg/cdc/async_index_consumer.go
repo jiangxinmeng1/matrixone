@@ -34,17 +34,17 @@ const (
 	SinkerState_Finished
 )
 
-type SinkerInfo struct {
+type ConsumerInfo struct {
 	SinkerType int8
 	TableName  string
-	DBName     string
-	IndexName  string
+	DBName     string 
+	IndexName  string 
 }
 
 func NewConsumer(
 	cnUUID string,
 	tableDef *plan.TableDef,
-	sinkerConfig *SinkerInfo,
+	sinkerConfig *ConsumerInfo,
 ) (Consumer, error) {
 	panic("todo")
 }
@@ -63,7 +63,7 @@ func NewSinkerEntry(
 	cnUUID string,
 	tableDef *plan.TableDef,
 	tableInfo *TableInfo_2,
-	sinkerConfig *SinkerInfo,
+	sinkerConfig *ConsumerInfo,
 	watermark types.TS,
 	err error,
 ) (*SinkerEntry, error) {

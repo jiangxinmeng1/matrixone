@@ -145,7 +145,6 @@ func CollectChanges_2(
 					insertAtmBatch = nil
 					deleteAtmBatch = nil
 				}
-
 			}
 
 			if data.noMoreData {
@@ -167,6 +166,7 @@ func CollectChanges_2(
 	for i, txn := range txns {
 		err := txn.Commit(ctx)
 		if err != nil {
+			// TODO: flush error and error msg
 			errs[i] = err
 		}
 	}

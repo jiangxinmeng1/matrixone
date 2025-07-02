@@ -16,6 +16,8 @@ package cdc
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
@@ -32,10 +34,13 @@ type Iteration struct {
 	from    types.TS
 	to      types.TS
 	err     []error
+	startAt time.Time
+	endAt   time.Time
 }
 
 func (iter *Iteration) Run() {
 	txn:=iter.txnFN()
+	iter.startAt=time.Now()
 	table, err := iter.table.exec.getRelation(
 		iter.ctx,
 		txn,
@@ -61,4 +66,34 @@ func (iter *Iteration) Run() {
 		iter.table.exec.packer,
 		iter.table.exec.mp,
 	)
+	iter.endAt=time.Now()
+}
+
+func (iter *Iteration) insertAsyncIndexIterations()error{
+	indexNames:=""
+	for _,sinker:=range iter.sinkers{
+		indexNames= fmt.Sprintf("%s%s, ",indexNames,sinker.indexName)
+	}
+
+	errorStr:=""
+	for _,err:=range iter.err{
+		errorStr= fmt.Sprintf("%s%s, ",errorStr,err.Error())
+	}
+
+	sql := CDCSQLBuilder.AsyncIndexIterationsInsertSQL(
+		iter.table.accountID,
+		iter.table.tableID,
+		indexNames,
+		iter.from,
+		iter.to,
+		errorStr,
+		iter.startAt,
+		iter.endAt,
+	)
+	txn:=iter.txnFN()
+	_,err:=ExecWithResult(iter.ctx,sql,iter.table.exec.cnUUID,txn)
+	if err!=nil{
+		return err
+	}
+	return txn.Commit(iter.ctx)
 }

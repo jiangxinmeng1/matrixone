@@ -15,7 +15,6 @@
 package cdc
 
 import (
-	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/util/executor"
 )
@@ -79,12 +78,11 @@ func (r *DataRetrieverImpl) UpdateWatermark(exec executor.TxnExecutor, opts exec
 	if r.typ == CDCDataType_Snapshot {
 		return nil
 	}
-	updateWatermarkSQL := CDCSQLBuilder.IndexUpdateWatermarkSQL(
+	updateWatermarkSQL := CDCSQLBuilder.AsyncIndexLogUpdateResultSQL(
 		r.tableInfo.accountID,
 		r.tableInfo.tableID,
 		r.indexName,
 		r.to,
-		types.TS{},
 		0,
 		"",
 	)

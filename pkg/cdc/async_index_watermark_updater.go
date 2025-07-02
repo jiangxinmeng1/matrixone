@@ -16,11 +16,13 @@ package cdc
 
 import (
 	"context"
+	"encoding/json"
 
 	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
-	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/util/executor"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 )
 
 func ExecWithResult(
@@ -28,7 +30,7 @@ func ExecWithResult(
 	sql string,
 	cnUUID string,
 	txn client.TxnOperator,
-) (executor.Result, error){
+) (executor.Result, error) {
 	v, ok := moruntime.ServiceRuntime(cnUUID).GetGlobalVariables(moruntime.InternalSQLExecutor)
 	if !ok {
 		panic("missing lock service")
@@ -41,31 +43,64 @@ func ExecWithResult(
 		WithDisableIncrStatement().
 		WithTxn(txn)
 
-	return exec.Exec(ctx,sql,opts)
+	return exec.Exec(ctx, sql, opts)
 }
 
-func UpdateResult(
+// return true if create, return false if task already exists, return error when error
+func RegisterJob(
 	ctx context.Context,
-	cnUUID string,
 	txn client.TxnOperator,
-	tableID uint64,
-	accountID uint32,
-	indexName string,
-	newWatermark types.TS,
-	errCode int,
-	errMsg string,
-) (err error) {
-	sql := cdc.CDCSQLBuilder.IndexUpdateWatermarkSQL(
-		accountID,
-		tableID,
-		indexName,
-		newWatermark,
-		types.TS{},
-		errCode,
-		errMsg,
-	)
-	if _,err= ExecWithResult(ctx, sql, cnUUID, txn);err!=nil{
-		return err
+	cnUUID string,
+	pitr_name string,
+	sinkerinfo_json *ConsumerInfo,
+) (ok bool, err error) {
+	tenantId, err := defines.GetAccountId(ctx)
+	//todo get relation
+	var rel engine.Relation
+	tableDef := rel.GetTableDef(ctx)
+	consumerInfoJson, err := json.Marshal(sinkerinfo_json)
+	if err != nil {
+		return false, err
 	}
-	
+
+	sql := CDCSQLBuilder.AsyncIndexLogInsertSQL(
+		tenantId,
+		tableDef.TblId,
+		tableDef.DbId,
+		sinkerinfo_json.IndexName,
+		"",
+		string(consumerInfoJson),
+	)
+	_, err = ExecWithResult(ctx, sql, cnUUID, txn)
+	if err != nil {
+		// TODO: if duplicate, update ok
+		return false, err
+	}
+	return true, nil
+}
+
+// return true if delete success, return false if no task found, return error when delete failed.
+func UnregisterJob(
+	ctx context.Context,
+	txn client.TxnOperator,
+	cnUUID string,
+	consumerInfo *ConsumerInfo,
+) (bool, error) {
+	tenantId, err := defines.GetAccountId(ctx)
+	if err != nil {
+		return false, err
+	}
+	var rel engine.Relation
+	tableDef := rel.GetTableDef(ctx)
+	sql := CDCSQLBuilder.AsyncIndexLogUpdateDropAtSQL(
+		tenantId,
+		tableDef.TblId,
+		consumerInfo.IndexName,
+	)
+	_, err = ExecWithResult(ctx, sql, cnUUID, txn)
+	if err != nil {
+		// TODO: if duplicate, update ok
+		return false, err
+	}
+	return true, nil
 }
