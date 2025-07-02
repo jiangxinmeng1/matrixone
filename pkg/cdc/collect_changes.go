@@ -28,7 +28,7 @@ func CollectChanges_2(
 	rel engine.Relation,
 	fromTs types.TS,
 	toTs types.TS,
-	sinkers []Sinker,
+	sinkers []Consumer,
 	initSnapshotSplitTxn bool,
 	packer *types.Packer,
 	mp *mpool.MPool,

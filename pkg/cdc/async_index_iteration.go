@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package frontend
+package cdc
 
 import (
 	"context"
 
-	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 )
 
@@ -34,12 +33,12 @@ type Iteration struct {
 }
 
 func (iter *Iteration) Run() {
-	table, txnOp, err := iter.table.exec.getRelation(
+	table, err := iter.table.exec.getRelation(
 		iter.ctx,
+		txn,
 		iter.table.dbName,
 		iter.table.tableName,
 	)
-	defer txnOp.Commit(iter.ctx)
 	if err != nil {
 		iter.err = make([]error, len(iter.sinkers))
 		for i := range iter.sinkers {
@@ -47,11 +46,11 @@ func (iter *Iteration) Run() {
 		}
 		return
 	}
-	sinker := make([]cdc.Sinker, 0)
+	sinker := make([]Consumer, 0)
 	for _, sinkerEntry := range iter.sinkers {
-		sinker = append(sinker, sinkerEntry.sinker)
+		sinker = append(sinker, sinkerEntry.consumer)
 	}
-	iter.err = cdc.CollectChanges_2(
+	iter.err = CollectChanges_2(
 		iter.ctx,
 		table,
 		iter.from,

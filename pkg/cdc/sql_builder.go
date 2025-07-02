@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 )
 
 const (
@@ -221,7 +222,39 @@ const (
 		`WHERE` +
 		` account_id = %d ` +
 		`AND table_id = %d ` +
-		`AND index_id = %d`
+		`AND index_name = '%s'`
+	/*
+	CREATE TABLE mo_async_index_iterations (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    account_id INT NOT NULL,
+    table_id INT,
+    index_names VARCHAR(255),--multiple indexes
+    from_ts VARCHAR(32) NOT NULL,
+    to_ts VARCHAR(32) NOT NULL,
+    error_json VARCHAR(255) NOT NULL,--Multiple errors are stored. Different consumers may have different errors.
+    start_at VARCHAR(32) NULL,
+    end_at VARCHAR(32) NULL,
+);
+	*/
+	CDCInsertMOAsyncIndexIterationsTemplate = `INSERT INTO mo_catalog.mo_async_index_iterations(` +
+		`account_id,` +
+		`table_id,` +
+		`index_names,` +
+		`from_ts,` +
+		`to_ts,` +
+		`error_json,` +
+		`start_at,` +
+		`end_at` +
+		`) VALUES (` +
+		`%d,` + // account_id
+		`%d,` + // table_id
+		`%s,` + // index_names
+		`%s,` + // from_ts
+		`%s,` + // to_ts
+		`%s,` + // error_json
+		`%s,` + // start_at
+		`%s,` + // end_at
+		`)`
 )
 
 const (
@@ -243,8 +276,9 @@ const (
 	CDCCollectTableInfoSqlTemplate_Idx       = 15
 	CDCInsertMOAsyncIndexLogSqlTemplate_Idx  = 16
 	CDCUpdateMOAsyncIndexLogSqlTemplate_Idx  = 17
+	CDCInsertMOAsyncIndexIterationsTemplate_Idx = 18
 
-	CDCSqlTemplateCount = 18
+	CDCSqlTemplateCount = 19
 )
 
 var CDCSQLTemplates = [CDCSqlTemplateCount]struct {
@@ -346,6 +380,9 @@ var CDCSQLTemplates = [CDCSqlTemplateCount]struct {
 	},
 	CDCUpdateMOAsyncIndexLogSqlTemplate_Idx: {
 		SQL: CDCUpdateMOAsyncIndexLogSqlTemplate,
+	},
+	CDCInsertMOAsyncIndexIterationsTemplate_Idx: {
+		SQL: CDCInsertMOAsyncIndexIterationsTemplate,
 	},
 }
 
@@ -626,10 +663,11 @@ func (b cdcSQLBuilder) UpdateWatermarkSQL(
 }
 
 func (b cdcSQLBuilder) IndexUpdateWatermarkSQL(
-	accountID uint64,
+	accountID uint32,
 	tableID uint64,
-	indexID uint64,
-	newWatermark string,
+	indexName string,
+	newWatermark types.TS,
+	dropAt types.TS,
 	errorCode int,
 	errorMsg string,
 ) string {
@@ -637,11 +675,35 @@ func (b cdcSQLBuilder) IndexUpdateWatermarkSQL(
 		CDCSQLTemplates[CDCUpdateMOAsyncIndexLogSqlTemplate_Idx].SQL,
 		errorCode,
 		errorMsg,
-		newWatermark,
-		"",
+		newWatermark.ToString(),
+		dropAt.ToString(),
 		accountID,
 		tableID,
-		indexID,
+		indexName,
+	)
+}
+
+func (b cdcSQLBuilder) IndexInsertIterationsSQL(
+
+	accountID uint64,
+	tableID uint64,
+	indexNames string,
+	fromTs types.TS,
+	toTs types.TS,
+	errorJson string,
+	startAt types.TS,
+	endAt types.TS,
+) string {
+	return fmt.Sprintf(
+		CDCSQLTemplates[CDCInsertMOAsyncIndexIterationsTemplate_Idx].SQL,
+		accountID,
+		tableID,
+		indexNames,
+		fromTs.ToString(),
+		toTs.ToString(),
+		errorJson,
+		startAt.ToString(),
+		endAt.ToString(),
 	)
 }
 

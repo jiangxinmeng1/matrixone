@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package frontend
+package cdc
 
 import (
+	"context"
 	"sync/atomic"
 
-	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 )
+
+type Consumer interface{
+	Consume(context.Context, DataRetriever) error
+  }
 
 type SinkerState int8
 
@@ -37,39 +41,20 @@ type SinkerInfo struct {
 	IndexName  string
 }
 
-func NewSinker(
+func NewConsumer(
 	cnUUID string,
 	tableDef *plan.TableDef,
 	sinkerConfig *SinkerInfo,
-) (cdc.Sinker, error) {
+) (Consumer, error) {
 	panic("todo")
-
-// type Consumer interface{
-//   Next()(insertBatch *batch.Batch, deleteBatch *batch.Batch, noMoreDate bool, err error)
-//   SetError(err error)
-//   UpdateWatermark(txn client.TxnOperator)
-// }
-	txn := NewTXN
-	for {
-		insert, delete, noMoreData, err := consumer.Next()
-		//	......
-		//
-		// consume insert&delete in txn
-		//
-		//	......
-		if noMoreData {
-			consumer.UpdateWatermark(txn)
-			txn = NewTxn()
-		}
-	}
 }
 
 type SinkerEntry struct {
 	tableInfo  *TableInfo_2
 	indexName  string
 	inited     atomic.Bool
-	sinker     cdc.Sinker
-	sinkerType int8
+	consumer     Consumer
+	consumerType int8
 	watermark  types.TS
 	err        error
 }
@@ -82,15 +67,15 @@ func NewSinkerEntry(
 	watermark types.TS,
 	err error,
 ) (*SinkerEntry, error) {
-	sinker, err := NewSinker(cnUUID, tableDef, sinkerConfig)
+	consumer, err := NewConsumer(cnUUID, tableDef, sinkerConfig)
 	if err != nil {
 		return nil, err
 	}
 	sinkerEntry := &SinkerEntry{
 		tableInfo:  tableInfo,
 		indexName:  sinkerConfig.IndexName,
-		sinker:     sinker,
-		sinkerType: sinkerConfig.SinkerType,
+		consumer:     consumer,
+		consumerType: sinkerConfig.SinkerType,
 		watermark:  watermark,
 		err:        err,
 	}
