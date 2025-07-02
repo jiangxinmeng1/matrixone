@@ -18,6 +18,7 @@ import (
 	"context"
 
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/txn/client"
 )
 
 // 1. init sinker
@@ -26,6 +27,7 @@ import (
 type Iteration struct {
 	ctx     context.Context
 	table   *TableInfo_2
+	txnFN   func() client.TxnOperator
 	sinkers []*SinkerEntry
 	from    types.TS
 	to      types.TS
@@ -33,6 +35,7 @@ type Iteration struct {
 }
 
 func (iter *Iteration) Run() {
+	txn:=iter.txnFN()
 	table, err := iter.table.exec.getRelation(
 		iter.ctx,
 		txn,
@@ -46,16 +49,14 @@ func (iter *Iteration) Run() {
 		}
 		return
 	}
-	sinker := make([]Consumer, 0)
-	for _, sinkerEntry := range iter.sinkers {
-		sinker = append(sinker, sinkerEntry.consumer)
-	}
+	defer txn.Commit(iter.ctx)
 	iter.err = CollectChanges_2(
 		iter.ctx,
+		iter,
 		table,
 		iter.from,
 		iter.to,
-		sinker,
+		iter.sinkers,
 		false,
 		iter.table.exec.packer,
 		iter.table.exec.mp,

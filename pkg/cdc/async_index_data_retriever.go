@@ -25,7 +25,7 @@ type DataRetriever interface {
 	//TAIL can use INSERT, SNAPSHOT need REPLACE INTO
 	//in SNAPSHOT, deleteBatch is nil
 	  Next() (insertBatch *AtomicBatch, deleteBatch *AtomicBatch, noMoreData bool, err error)
-	  UpdateWatermarker(executor.TxnExecutor,executor.StatementOption)error
+	  UpdateWatermark(executor.TxnExecutor,executor.StatementOption)error
 	  GetDataType() int8
   }
 type CDCData struct {
@@ -36,7 +36,7 @@ type CDCData struct {
 }
 
 const (
-	CDCDataType_Snapshot = iota
+	CDCDataType_Snapshot int8 = iota
 	CDCDataType_Tail
 )
 
@@ -44,9 +44,27 @@ type DataRetrieverImpl struct {
 	*SinkerEntry
 	*Iteration
 	txn          client.TxnOperator
-	insertDataCh <-chan CDCData
+	insertDataCh <-chan *CDCData
 	ackChan      chan<- struct{}
 	typ          int8
+}
+
+func NewDataRetriever(
+	consumer *SinkerEntry,
+	iteration *Iteration,
+	txn client.TxnOperator,
+	insertDataCh <-chan *CDCData,
+	ackChan chan<- struct{},
+	dataType int8,
+) *DataRetrieverImpl {
+	return &DataRetrieverImpl{
+		SinkerEntry: consumer,
+		Iteration: iteration,
+		txn: txn,
+		insertDataCh: insertDataCh,
+		ackChan: ackChan,
+		typ: dataType,
+	}
 }
 
 func (r *DataRetrieverImpl) Next() (insertBatch, deleteBatch *AtomicBatch, noMoreDate bool, err error) {
@@ -74,6 +92,6 @@ func (r *DataRetrieverImpl) UpdateWatermark(exec executor.TxnExecutor, opts exec
 	return err
 }
 
-func (r *DataRetrieverImpl) GetType() int8 {
+func (r *DataRetrieverImpl) GetDataType() int8 {
 	return r.typ
 }

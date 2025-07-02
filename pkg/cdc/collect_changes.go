@@ -16,27 +16,30 @@ package cdc
 
 import (
 	"context"
+	"sync"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 )
 
 func CollectChanges_2(
 	ctx context.Context,
+	iter *Iteration,
 	rel engine.Relation,
 	fromTs types.TS,
 	toTs types.TS,
-	sinkers []Consumer,
+	consumers []*SinkerEntry,
 	initSnapshotSplitTxn bool,
 	packer *types.Packer,
 	mp *mpool.MPool,
 ) (errs []error) {
-	errs = make([]error, len(sinkers))
+	errs = make([]error, len(consumers))
 	changes, err := CollectChanges(ctx, rel, fromTs, toTs, mp)
 	if err != nil {
-		for i := range sinkers {
+		for i := range consumers {
 			errs[i] = err
 		}
 		return
@@ -45,7 +48,6 @@ func CollectChanges_2(
 	//step3: pull data
 	var insertData, deleteData *batch.Batch
 	var insertAtmBatch, deleteAtmBatch *AtomicBatch
-	var hasBegin bool
 
 	tableDef := rel.CopyTableDef(ctx)
 	insTSColIdx := len(tableDef.Cols) - 1
@@ -78,117 +80,96 @@ func CollectChanges_2(
 		return atomicBatch
 	}
 
-	var currentHint engine.ChangesHandle_Hint
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		// case <-ar.Pause:
-		// 	return
-		// case <-ar.Cancel:
-		// 	return
-		default:
-		}
-		// check sinker error of last round
-		ok := false
-		for i := range sinkers {
-			if errs[i] != nil {
-				continue
-			}
-			errs[i] = sinkers[i].Error()
-			if errs[i] == nil {
-				ok = true
-			}
-		}
-		if !ok {
-			return
-		}
+	dataRetrievers := make([]DataRetriever, len(consumers))
+	insertDataChs := make([]chan *CDCData, len(consumers))
+	ackChs := make([]chan struct{}, len(consumers))
+	typ := CDCDataType_Tail
+	if fromTs.IsEmpty() {
+		typ = CDCDataType_Snapshot
+	}
+	txns := make([]client.TxnOperator, len(consumers))
+	for i, consumer := range consumers {
+		insertDataChs[i] = make(chan *CDCData, 1)
+		ackChs[i] = make(chan struct{}, 1)
+		txns[i] = iter.txnFN()
+		dataRetrievers[i] = NewDataRetriever(consumer, iter, txns[i], insertDataChs[i], ackChs[i], typ)
+	}
 
-		insertData, deleteData, currentHint, err = changes.Next(ctx, mp)
-		if err != nil {
-			return
-		}
-
-		for i, sinker := range sinkers {
-			if errs[i] != nil {
-				continue
+	go func() {
+		for {
+			insertData, deleteData, currentHint, err := changes.Next(ctx, mp)
+			if err != nil {
+				return
+			}
+			if typ != int8(currentHint) {
+				panic("logic error")
 			}
 
+			var data *CDCData
 			// both nil denote no more data (end of this tail)
 			if insertData == nil && deleteData == nil {
-				// heartbeat, send remaining data in sinker
-				sinker.Sink(ctx, &DecoderOutput{
-					noMoreData: true,
-					fromTs:     fromTs,
-					toTs:       toTs,
-				})
-
-				// send a dummy to guarantee last piece of snapshot/tail send successfully
-				sinker.SendDummy()
-				if err = sinker.Error(); err == nil {
-					if hasBegin {
-						// error may not be caught immediately
-						sinker.SendCommit()
-						// so send a dummy sql to guarantee previous commit is sent successfully
-						sinker.SendDummy()
-						err = sinker.Error()
-					}
+				data = &CDCData{
+					noMoreData:  true,
+					insertBatch: nil,
+					deleteBatch: nil,
 				}
-				continue
+			} else {
+				switch currentHint {
+				case engine.ChangesHandle_Snapshot:
+					insertAtmBatch = allocateAtomicBatchIfNeed(insertAtmBatch)
+					insertAtmBatch.Append(packer, insertData, insTSColIdx, insCompositedPkColIdx)
+					data = &CDCData{
+						noMoreData:  false,
+						insertBatch: insertAtmBatch,
+						deleteBatch: nil,
+					}
+					insertAtmBatch.Close()
+					insertAtmBatch = nil
+				case engine.ChangesHandle_Tail_wip:
+					panic("logic error")
+				case engine.ChangesHandle_Tail_done:
+					insertAtmBatch = allocateAtomicBatchIfNeed(insertAtmBatch)
+					deleteAtmBatch = allocateAtomicBatchIfNeed(deleteAtmBatch)
+					insertAtmBatch.Append(packer, insertData, insTSColIdx, insCompositedPkColIdx)
+					deleteAtmBatch.Append(packer, deleteData, delTSColIdx, delCompositedPkColIdx)
+					data = &CDCData{
+						noMoreData:  false,
+						insertBatch: insertAtmBatch,
+						deleteBatch: nil,
+					}
+
+					addTailEndMetrics(insertAtmBatch)
+					addTailEndMetrics(deleteAtmBatch)
+					insertAtmBatch.Close()
+					deleteAtmBatch.Close()
+					insertAtmBatch = nil
+					deleteAtmBatch = nil
+				}
+
 			}
 
-			switch currentHint {
-			case engine.ChangesHandle_Snapshot:
-				// output sql in a txn
-				if !hasBegin && !initSnapshotSplitTxn {
-					sinker.SendBegin()
-					hasBegin = true
-				}
-
-				// transform into insert instantly
-				sinker.Sink(ctx, &DecoderOutput{
-					outputTyp:     OutputTypeSnapshot,
-					checkpointBat: insertData,
-					fromTs:        fromTs,
-					toTs:          toTs,
-				})
-				insertData.Clean(mp)
-			case engine.ChangesHandle_Tail_wip:
-				panic("logic error")
-			case engine.ChangesHandle_Tail_done:
-				insertAtmBatch = allocateAtomicBatchIfNeed(insertAtmBatch)
-				deleteAtmBatch = allocateAtomicBatchIfNeed(deleteAtmBatch)
-				insertAtmBatch.Append(packer, insertData, insTSColIdx, insCompositedPkColIdx)
-				deleteAtmBatch.Append(packer, deleteData, delTSColIdx, delCompositedPkColIdx)
-
-				//if !strings.Contains(reader.info.SourceTblName, "order") {
-				//	logutil.Errorf("tableReader(%s)[%s, %s], insertAtmBatch: %s, deleteAtmBatch: %s",
-				//		reader.info.SourceTblName, fromTs.ToString(), toTs.ToString(),
-				//		insertAtmBatch.DebugString(reader.tableDef, false),
-				//		deleteAtmBatch.DebugString(reader.tableDef, true))
-				//}
-
-				// output sql in a txn
-				if !hasBegin {
-					sinker.SendBegin()
-					hasBegin = true
-				}
-
-				sinker.Sink(ctx, &DecoderOutput{
-					outputTyp:      OutputTypeTail,
-					insertAtmBatch: insertAtmBatch,
-					deleteAtmBatch: deleteAtmBatch,
-					fromTs:         fromTs,
-					toTs:           toTs,
-				})
-				addTailEndMetrics(insertAtmBatch)
-				addTailEndMetrics(deleteAtmBatch)
-				insertAtmBatch.Close()
-				deleteAtmBatch.Close()
-				// reset, allocate new when next wip/done
-				insertAtmBatch = nil
-				deleteAtmBatch = nil
+			if data.noMoreData {
+				return
 			}
 		}
+	}()
+
+	waitGroup := sync.WaitGroup{}
+	for i, consumerEntry := range consumers {
+		waitGroup.Add(1)
+		go func(i int) {
+			defer waitGroup.Done()
+			consumerEntry.consumer.Consume(ctx, dataRetrievers[i])
+		}(i)
 	}
+	waitGroup.Wait()
+
+	for i, txn := range txns {
+		err := txn.Commit(ctx)
+		if err != nil {
+			errs[i] = err
+		}
+	}
+
+	return
 }
