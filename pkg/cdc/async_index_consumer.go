@@ -41,6 +41,10 @@ type ConsumerInfo struct {
 	IndexName  string 
 }
 
+const (
+	ConsumerType_UT int8 = iota
+)
+
 func NewConsumer(
 	cnUUID string,
 	tableDef *plan.TableDef,
