@@ -66,7 +66,6 @@ func RegisterJob(
 	sql := CDCSQLBuilder.AsyncIndexLogInsertSQL(
 		tenantId,
 		tableDef.TblId,
-		tableDef.DbId,
 		sinkerinfo_json.IndexName,
 		"",
 		string(consumerInfoJson),

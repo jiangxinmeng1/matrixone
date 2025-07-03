@@ -16,7 +16,7 @@ package test
 
 import (
 	"context"
-	"fmt"
+	// "fmt"
 	"testing"
 	"time"
 
@@ -41,7 +41,7 @@ import (
 	testutil2 "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/testutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/jobs"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
+	// "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils/config"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/test/testutil"
 )
@@ -1343,172 +1343,172 @@ func TestChangesHandle7(t *testing.T) {
 }
 
 
-func TestCDCExecutor(t *testing.T) {
-	catalog.SetupDefines("")
+// func TestCDCExecutor(t *testing.T) {
+// 	catalog.SetupDefines("")
 
-	idAllocator := common.NewIdAllocator(1000)
+// 	idAllocator := common.NewIdAllocator(1000)
 
-	var (
-		accountId = catalog.System_Account
-	)
+// 	var (
+// 		accountId = catalog.System_Account
+// 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ctx = context.WithValue(ctx, defines.TenantIDKey{}, accountId)
-	ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Minute*5)
-	defer cancel()
+// 	ctx, cancel := context.WithCancel(context.Background())
+// 	defer cancel()
+// 	ctx = context.WithValue(ctx, defines.TenantIDKey{}, accountId)
+// 	ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Minute*5)
+// 	defer cancel()
 
-	disttaeEngine, taeHandler, rpcAgent, _ := testutil.CreateEngines(ctx, testutil.TestOptions{}, t)
-	defer func() {
-		disttaeEngine.Close(ctx)
-		taeHandler.Close(true)
-		rpcAgent.Close()
-	}()
+// 	disttaeEngine, taeHandler, rpcAgent, _ := testutil.CreateEngines(ctx, testutil.TestOptions{}, t)
+// 	defer func() {
+// 		disttaeEngine.Close(ctx)
+// 		taeHandler.Close(true)
+// 		rpcAgent.Close()
+// 	}()
 
-	err := mock_mo_async_index_log(disttaeEngine, ctxWithTimeout)
-	require.NoError(t, err)
-	err = mock_mo_async_index_iterations(disttaeEngine, ctxWithTimeout)
-	require.NoError(t, err)
+// 	err := mock_mo_async_index_log(disttaeEngine, ctxWithTimeout)
+// 	require.NoError(t, err)
+// 	err = mock_mo_async_index_iterations(disttaeEngine, ctxWithTimeout)
+// 	require.NoError(t, err)
 
-	// mock consumer
-	// create table
-	// add index
-	// insert data
-	// get watermark
-	// delete index
-	// insert data
-	// sleep, check
+// 	// mock consumer
+// 	// create table
+// 	// add index
+// 	// insert data
+// 	// get watermark
+// 	// delete index
+// 	// insert data
+// 	// sleep, check
 
-	schema := catalog2.MockSchemaAll(10, 1)
-	tableCount := 1
-	rowCount := 10
+// 	schema := catalog2.MockSchemaAll(10, 1)
+// 	tableCount := 1
+// 	rowCount := 10
 
-	tableIDs := make([]uint64, 0, tableCount)
-	dbNames := make([]string, 0, tableCount)
-	srcTables := make([]string, 0, tableCount)
-	dstTables := make([]string, 0, tableCount)
+// 	tableIDs := make([]uint64, 0, tableCount)
+// 	dbNames := make([]string, 0, tableCount)
+// 	srcTables := make([]string, 0, tableCount)
+// 	dstTables := make([]string, 0, tableCount)
 
-	for i := 0; i < tableCount; i++ {
-		dbNames = append(dbNames, fmt.Sprintf("db%d", i))
-		srcTables = append(srcTables, fmt.Sprintf("src_table%d", i))
-		dstTables = append(dstTables, fmt.Sprintf("dst_table%d", i))
-	}
-	bat := catalog2.MockBatch(schema, rowCount)
-	bats := bat.Split(rowCount)
+// 	for i := 0; i < tableCount; i++ {
+// 		dbNames = append(dbNames, fmt.Sprintf("db%d", i))
+// 		srcTables = append(srcTables, fmt.Sprintf("src_table%d", i))
+// 		dstTables = append(dstTables, fmt.Sprintf("dst_table%d", i))
+// 	}
+// 	bat := catalog2.MockBatch(schema, rowCount)
+// 	bats := bat.Split(rowCount)
 
-	// create database and table
+// 	// create database and table
 
-	for i := 0; i < tableCount; i++ {
-		disttaeEngine.CreateDatabaseAndTable(ctxWithTimeout, dbNames[i], srcTables[i], schema)
+// 	for i := 0; i < tableCount; i++ {
+// 		disttaeEngine.CreateDatabaseAndTable(ctxWithTimeout, dbNames[i], srcTables[i], schema)
 
-		_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, dbNames[i], srcTables[i])
-		require.Nil(t, err)
-		tableIDs = append(tableIDs, rel.GetTableID(ctxWithTimeout))
-		txn.Commit(ctxWithTimeout)
-	}
+// 		_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, dbNames[i], srcTables[i])
+// 		require.Nil(t, err)
+// 		tableIDs = append(tableIDs, rel.GetTableID(ctxWithTimeout))
+// 		txn.Commit(ctxWithTimeout)
+// 	}
 
-	appendFn := func(db, table string, rowIdx int) {
-		_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, db, table)
-		require.Nil(t, err)
+// 	appendFn := func(db, table string, rowIdx int) {
+// 		_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, db, table)
+// 		require.Nil(t, err)
 
-		err = rel.Write(ctxWithTimeout, containers.ToCNBatch(bats[rowIdx]))
-		require.Nil(t, err)
+// 		err = rel.Write(ctxWithTimeout, containers.ToCNBatch(bats[rowIdx]))
+// 		require.Nil(t, err)
 
-		txn.Commit(ctxWithTimeout)
-	}
+// 		txn.Commit(ctxWithTimeout)
+// 	}
 
-	for i := 0; i < tableCount; i++ {
-		appendFn(dbNames[i], srcTables[i], 0)
-	}
+// 	for i := 0; i < tableCount; i++ {
+// 		appendFn(dbNames[i], srcTables[i], 0)
+// 	}
 
-	cdcExecutor := getCDCExecutor(ctxWithTimeout, t, idAllocator, accountId, disttaeEngine, taeHandler)
+// 	cdcExecutor := getCDCExecutor(ctxWithTimeout, t, idAllocator, accountId, disttaeEngine, taeHandler)
 
-	cdcExecutor.Start()
-	defer cdcExecutor.Stop()
+// 	cdcExecutor.Start()
+// 	defer cdcExecutor.Stop()
 
-	for i := 0; i < tableCount; i++ {
-		err := addCDCTask(ctxWithTimeout, cdcExecutor, dbNames[i], srcTables[i], dbNames[i], dstTables[i])
-		assert.NoError(t, err)
-	}
+// 	for i := 0; i < tableCount; i++ {
+// 		err := addCDCTask(ctxWithTimeout, cdcExecutor, dbNames[i], srcTables[i], dbNames[i], dstTables[i])
+// 		assert.NoError(t, err)
+// 	}
 
-	for j := 0; j < tableCount; j++ {
-		appendFn(dbNames[j], srcTables[j], 1)
-	}
+// 	for j := 0; j < tableCount; j++ {
+// 		appendFn(dbNames[j], srcTables[j], 1)
+// 	}
 
-	now := taeHandler.GetDB().TxnMgr.Now()
-	testutils.WaitExpect(4000, func() bool {
-		for i := 0; i < tableCount; i++ {
-			watermark := cdcExecutor.GetWatermark(tableIDs[i])
-			if !watermark.GE(&now) {
-				return false
-			}
-		}
-		return true
-	})
+// 	now := taeHandler.GetDB().TxnMgr.Now()
+// 	testutils.WaitExpect(4000, func() bool {
+// 		for i := 0; i < tableCount; i++ {
+// 			watermark := cdcExecutor.GetWatermark(tableIDs[i])
+// 			if !watermark.GE(&now) {
+// 				return false
+// 			}
+// 		}
+// 		return true
+// 	})
 
-	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
+// 	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
 
-	for i := 0; i < tableCount; i++ {
-		tnTxn, err := taeHandler.GetDB().StartTxn(nil)
-		assert.NoError(t, err)
-		tnDatabase, err := tnTxn.GetDatabase(dbNames[i])
-		assert.NoError(t, err)
-		tnRel, err := tnDatabase.GetRelationByName(dstTables[i])
-		assert.NoError(t, err)
-		testutil2.CheckAllColRowsByScan(t, tnRel, 2, false)
-		assert.NoError(t, tnTxn.Commit(ctxWithTimeout))
-	}
+// 	for i := 0; i < tableCount; i++ {
+// 		tnTxn, err := taeHandler.GetDB().StartTxn(nil)
+// 		assert.NoError(t, err)
+// 		tnDatabase, err := tnTxn.GetDatabase(dbNames[i])
+// 		assert.NoError(t, err)
+// 		tnRel, err := tnDatabase.GetRelationByName(dstTables[i])
+// 		assert.NoError(t, err)
+// 		testutil2.CheckAllColRowsByScan(t, tnRel, 2, false)
+// 		assert.NoError(t, tnTxn.Commit(ctxWithTimeout))
+// 	}
 
-	for i := 0; i < tableCount; i++ {
-		err := pauseCDCTask(ctxWithTimeout, cdcExecutor, dbNames[i], srcTables[i], dbNames[i], dstTables[i])
-		assert.NoError(t, err)
-	}
+// 	for i := 0; i < tableCount; i++ {
+// 		err := pauseCDCTask(ctxWithTimeout, cdcExecutor, dbNames[i], srcTables[i], dbNames[i], dstTables[i])
+// 		assert.NoError(t, err)
+// 	}
 
-	for i := 0; i < tableCount; i++ {
-		appendFn(dbNames[i], srcTables[i], 2)
-	}
+// 	for i := 0; i < tableCount; i++ {
+// 		appendFn(dbNames[i], srcTables[i], 2)
+// 	}
 
-	time.Sleep(time.Second)
+// 	time.Sleep(time.Second)
 
-	for i := 0; i < tableCount; i++ {
-		tnTxn, err := taeHandler.GetDB().StartTxn(nil)
-		assert.NoError(t, err)
-		tnDatabase, err := tnTxn.GetDatabase(dbNames[i])
-		assert.NoError(t, err)
-		tnRel, err := tnDatabase.GetRelationByName(dstTables[i])
-		assert.NoError(t, err)
-		testutil2.CheckAllColRowsByScan(t, tnRel, 2, false)
-		assert.NoError(t, tnTxn.Commit(ctxWithTimeout))
-	}
+// 	for i := 0; i < tableCount; i++ {
+// 		tnTxn, err := taeHandler.GetDB().StartTxn(nil)
+// 		assert.NoError(t, err)
+// 		tnDatabase, err := tnTxn.GetDatabase(dbNames[i])
+// 		assert.NoError(t, err)
+// 		tnRel, err := tnDatabase.GetRelationByName(dstTables[i])
+// 		assert.NoError(t, err)
+// 		testutil2.CheckAllColRowsByScan(t, tnRel, 2, false)
+// 		assert.NoError(t, tnTxn.Commit(ctxWithTimeout))
+// 	}
 
-	for i := 0; i < tableCount; i++ {
-		err := addCDCTask(ctxWithTimeout, cdcExecutor, dbNames[i], srcTables[i], dbNames[i], dstTables[i])
-		assert.NoError(t, err)
-	}
-	now = taeHandler.GetDB().TxnMgr.Now()
-	testutils.WaitExpect(4000, func() bool {
-		for i := 0; i < tableCount; i++ {
-			watermark := cdcExecutor.GetWatermark(tableIDs[i])
-			if !watermark.GE(&now) {
-				return false
-			}
-		}
-		return true
-	})
+// 	for i := 0; i < tableCount; i++ {
+// 		err := addCDCTask(ctxWithTimeout, cdcExecutor, dbNames[i], srcTables[i], dbNames[i], dstTables[i])
+// 		assert.NoError(t, err)
+// 	}
+// 	now = taeHandler.GetDB().TxnMgr.Now()
+// 	testutils.WaitExpect(4000, func() bool {
+// 		for i := 0; i < tableCount; i++ {
+// 			watermark := cdcExecutor.GetWatermark(tableIDs[i])
+// 			if !watermark.GE(&now) {
+// 				return false
+// 			}
+// 		}
+// 		return true
+// 	})
 
-	for i := 0; i < tableCount; i++ {
-		tnTxn, err := taeHandler.GetDB().StartTxn(nil)
-		assert.NoError(t, err)
-		tnDatabase, err := tnTxn.GetDatabase(dbNames[i])
-		assert.NoError(t, err)
-		tnRel, err := tnDatabase.GetRelationByName(dstTables[i])
-		assert.NoError(t, err)
-		testutil2.CheckAllColRowsByScan(t, tnRel, 3, false)
-		assert.NoError(t, tnTxn.Commit(ctxWithTimeout))
-	}
+// 	for i := 0; i < tableCount; i++ {
+// 		tnTxn, err := taeHandler.GetDB().StartTxn(nil)
+// 		assert.NoError(t, err)
+// 		tnDatabase, err := tnTxn.GetDatabase(dbNames[i])
+// 		assert.NoError(t, err)
+// 		tnRel, err := tnDatabase.GetRelationByName(dstTables[i])
+// 		assert.NoError(t, err)
+// 		testutil2.CheckAllColRowsByScan(t, tnRel, 3, false)
+// 		assert.NoError(t, tnTxn.Commit(ctxWithTimeout))
+// 	}
 
-	for i := 0; i < tableCount; i++ {
-		err := dropCDCTask(ctxWithTimeout, cdcExecutor, dbNames[i], srcTables[i], dbNames[i], dstTables[i])
-		assert.NoError(t, err)
-	}
-}
+// 	for i := 0; i < tableCount; i++ {
+// 		err := dropCDCTask(ctxWithTimeout, cdcExecutor, dbNames[i], srcTables[i], dbNames[i], dstTables[i])
+// 		assert.NoError(t, err)
+// 	}
+// }

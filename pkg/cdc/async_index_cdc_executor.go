@@ -24,20 +24,20 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
-	"github.com/matrixorigin/matrixone/pkg/defines"
+	// "github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/api"
-	"github.com/matrixorigin/matrixone/pkg/pb/plan"
-	"github.com/matrixorigin/matrixone/pkg/pb/task"
+	// "github.com/matrixorigin/matrixone/pkg/pb/plan"
+	// "github.com/matrixorigin/matrixone/pkg/pb/task"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
-	ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
+	// ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/cmd_util"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
 	"github.com/tidwall/btree"
-	"go.uber.org/zap"
+	// "go.uber.org/zap"
 )
 
 type relationFactory func(context.Context) (engine.Relation, client.TxnOperator, error)
@@ -51,40 +51,40 @@ type deleteFn func(ctx context.Context, tableID uint64, accountID uint32, indexI
 type TxnFactory func() (client.TxnOperator, error)
 
 type CDCTaskExecutor2 struct {
-	tables               *btree.BTreeG[*TableInfo_2]
-	tableMu              sync.RWMutex
-	getInsertWatermarkFn func(
-		ctx context.Context,
-		tableID uint64,
-		accountID int32,
-		indexID int32,
-	) error
-	getFlushWatermarkFn func(
-		ctx context.Context,
-		tableID uint64,
-		watermark types.TS,
-		accountID int32,
-		indexID int32,
-		errorCode int,
-		info string,
-		errorMsg string,
-	) error
-	replayFn replayFn
-	deleteFn deleteFn
-	packer   *types.Packer
-	mp       *mpool.MPool
-	spec     *task.CreateCdcDetails
+	tables  *btree.BTreeG[*TableInfo_2]
+	tableMu sync.RWMutex
+	// getInsertWatermarkFn func(
+	// 	ctx context.Context,
+	// 	tableID uint64,
+	// 	accountID int32,
+	// 	indexID int32,
+	// ) error
+	// getFlushWatermarkFn func(
+	// 	ctx context.Context,
+	// 	tableID uint64,
+	// 	watermark types.TS,
+	// 	accountID int32,
+	// 	indexID int32,
+	// 	errorCode int,
+	// 	info string,
+	// 	errorMsg string,
+	// ) error
+	// replayFn replayFn
+	// deleteFn deleteFn
+	packer *types.Packer
+	mp     *mpool.MPool
+	// spec     *task.CreateCdcDetails
 
-	watermarkUpdater   WatermarkUpdater
-	logger             *zap.Logger //todo: replace logutil.Infof
-	sqlExecutorFactory func() ie.InternalExecutor
+	// watermarkUpdater   WatermarkUpdater
+	// logger             *zap.Logger //todo: replace logutil.Infof
+	// sqlExecutorFactory func() ie.InternalExecutor
 	// attachToTask       func(context.Context, uint64, taskservice.ActiveRoutine) error
 	cnUUID string
 	// ts                 taskservice.TaskService
 	// fs                 fileservice.FileService
-	txnFactory    func() (client.TxnOperator, error)
-	sinkerFactory func(dbName, tableName string, tableDef []engine.TableDef) (Sinker, error)
-	txnEngine     engine.Engine
+	txnFactory func() (client.TxnOperator, error)
+	// sinkerFactory func(dbName, tableName string, tableDef []engine.TableDef) (Sinker, error)
+	txnEngine engine.Engine
 
 	rpcHandleFn func(
 		ctx context.Context,
@@ -100,66 +100,76 @@ type CDCTaskExecutor2 struct {
 	wg     sync.WaitGroup
 }
 
+func GetTxnFactory(
+	ctx context.Context,
+	cnEngine engine.Engine,
+	cnTxnClient client.TxnClient,
+) func() (client.TxnOperator, error) {
+	return func() (client.TxnOperator, error) {
+		return GetTxnOp(ctx, cnEngine, cnTxnClient, "debug cdc")
+	}
+}
+
 func NewCDCTaskExecutor2(
 	ctx context.Context,
-	accountID uint64,
-	spec *task.CreateCdcDetails,
-	sqlExecutorFactory func() ie.InternalExecutor,
-	sinkerFactory func(dbName, tableName string, tableDef []engine.TableDef) (Sinker, error),
-	txnFactory TxnFactory,
+	// accountID uint64,
+	// spec *task.CreateCdcDetails,
+	// sqlExecutorFactory func() ie.InternalExecutor,
+	// sinkerFactory func(dbName, tableName string, tableDef []engine.TableDef) (Sinker, error),
 	txnEngine engine.Engine,
+	cnTxnClient client.TxnClient,
 	cdUUID string,
-	rpcHandleFn func(
-		ctx context.Context,
-		meta txn.TxnMeta,
-		req *cmd_util.GetChangedTableListReq,
-		resp *cmd_util.GetChangedTableListResp,
-	) (func(), error),
-	getInsertWatermarkFn func(
-		ctx context.Context,
-		tableID uint64,
-		accountID int32,
-		indexID int32,
-	) error,
-	getFlushWatermarkFn func(
-		ctx context.Context,
-		tableID uint64,
-		watermark types.TS,
-		accountID int32,
-		indexID int32,
-		errorCode int,
-		info string,
-		errorMsg string,
-	) error,
-	replayFn replayFn,
-	deleteFn deleteFn,
+	// rpcHandleFn func(
+	// 	ctx context.Context,
+	// 	meta txn.TxnMeta,
+	// 	req *cmd_util.GetChangedTableListReq,
+	// 	resp *cmd_util.GetChangedTableListResp,
+	// ) (func(), error),
+	// getInsertWatermarkFn func(
+	// 	ctx context.Context,
+	// 	tableID uint64,
+	// 	accountID int32,
+	// 	indexID int32,
+	// ) error,
+	// getFlushWatermarkFn func(
+	// 	ctx context.Context,
+	// 	tableID uint64,
+	// 	watermark types.TS,
+	// 	accountID int32,
+	// 	indexID int32,
+	// 	errorCode int,
+	// 	info string,
+	// 	errorMsg string,
+	// ) error,
+	// replayFn replayFn,
+	// deleteFn deleteFn,
 	mp *mpool.MPool,
 ) *CDCTaskExecutor2 {
 	ctx, cancel := context.WithCancel(ctx)
 	worker := NewWorker()
-	ctx = context.WithValue(ctx, defines.TenantIDKey{}, uint32(accountID))
+	// ctx = context.WithValue(ctx, defines.TenantIDKey{}, uint32(accountID))
 	//TODO: subscribe mo_catalog.mo_async_index_log
 	return &CDCTaskExecutor2{
-		ctx:                  ctx,
-		cancel:               cancel,
-		packer:               types.NewPacker(),
-		tables:               btree.NewBTreeGOptions(tableInfoLess, btree.Options{NoLocks: true}),
-		spec:                 spec,
-		sqlExecutorFactory:   sqlExecutorFactory,
-		cnUUID:               cdUUID,
-		txnFactory:           txnFactory,
-		sinkerFactory:        sinkerFactory,
-		txnEngine:            txnEngine,
-		worker:               worker,
-		wg:                   sync.WaitGroup{},
-		rpcHandleFn:          rpcHandleFn,
-		watermarkUpdater:     newWatermarkUpdater(), //TODO
-		tableMu:              sync.RWMutex{},
-		getInsertWatermarkFn: getInsertWatermarkFn,
-		getFlushWatermarkFn:  getFlushWatermarkFn,
-		replayFn:             replayFn,
-		deleteFn:             deleteFn,
-		mp:                   mp,
+		ctx:    ctx,
+		cancel: cancel,
+		packer: types.NewPacker(),
+		tables: btree.NewBTreeGOptions(tableInfoLess, btree.Options{NoLocks: true}),
+		// spec:                 spec,
+		// sqlExecutorFactory:   sqlExecutorFactory,
+		cnUUID:     cdUUID,
+		txnFactory: GetTxnFactory(ctx, txnEngine, cnTxnClient),
+		// sinkerFactory:        sinkerFactory,
+		txnEngine: txnEngine,
+		worker:    worker,
+		wg:        sync.WaitGroup{},
+		// rpcHandleFn:          rpcHandleFn,
+		// watermarkUpdater:     newWatermarkUpdater(), //TODO
+		tableMu: sync.RWMutex{},
+		// getInsertWatermarkFn: getInsertWatermarkFn,
+		// getFlushWatermarkFn:  getFlushWatermarkFn,
+		// replayFn:             replayFn,
+		// deleteFn:             deleteFn,
+		mp: mp,
 	}
 }
 
@@ -232,7 +242,8 @@ func (exec *CDCTaskExecutor2) run() {
 			candidateTables := exec.getCandidateTables()
 			tables, fromTSs, toTS, err := exec.getDirtyTables(exec.ctx, candidateTables, exec.cnUUID, exec.txnEngine)
 			if err != nil {
-				logutil.Errorf("cdc task %s get dirty tables failed, err: %v", exec.spec.TaskName, err)
+				// logutil.Errorf("cdc task %s get dirty tables failed, err: %v", exec.spec.TaskName, err)
+				logutil.Errorf("cdc task get dirty tables failed, err: %v", err)
 				continue
 			}
 			for i, table := range candidateTables {

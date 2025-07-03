@@ -48,6 +48,10 @@ type TableInfo_2 struct {
 	mu        sync.RWMutex
 }
 
+func tableInfoLess(a, b *TableInfo_2) bool {
+	return a.tableID < b.tableID
+}
+
 func NewTableInfo_2(
 	exec *CDCTaskExecutor2,
 	accountID uint32,
