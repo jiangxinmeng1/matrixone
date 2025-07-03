@@ -27,6 +27,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/incrservice"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/partitionservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/pb/lock"
@@ -450,6 +451,9 @@ func (s *Scope) AlterTableInplace(c *Compile) error {
 
 		// 3. lock foreign key's table
 		for _, action := range qry.Actions {
+			if action == nil {
+				continue
+			}
 			switch act := action.Action.(type) {
 			case *plan.AlterTable_Action_Drop:
 				alterTableDrop := act.Drop
@@ -525,6 +529,9 @@ func (s *Scope) AlterTableInplace(c *Compile) error {
 	cols := tableDef.Cols
 	// drop foreign key
 	for _, action := range qry.Actions {
+		if action == nil {
+			continue
+		}
 		switch act := action.Action.(type) {
 		case *plan.AlterTable_Action_AlterVarcharLength:
 			alterKinds = append(alterKinds, api.AlterKind_ReplaceDef)
@@ -552,16 +559,14 @@ func (s *Scope) AlterTableInplace(c *Compile) error {
 			} else if alterTableDrop.Typ == plan.AlterTableDrop_INDEX {
 				alterKinds = addAlterKind(alterKinds, api.AlterKind_UpdateConstraint)
 				var notDroppedIndex []*plan.IndexDef
-				for _, indexdef := range tableDef.Indexes {
+				var newIndexes []uint64
+				for idx, indexdef := range tableDef.Indexes {
 					if indexdef.IndexName == constraintName {
 						dropIndexMap[indexdef.IndexName] = true
 
 						//1. drop index table
 						if indexdef.TableExist {
-							if _, err = dbSource.Relation(c.proc.Ctx, indexdef.IndexTableName, nil); err != nil {
-								return err
-							}
-							if err = dbSource.Delete(c.proc.Ctx, indexdef.IndexTableName); err != nil {
+							if err := c.runSql("drop table `" + indexdef.IndexTableName + "`"); err != nil {
 								return err
 							}
 						}
@@ -573,10 +578,12 @@ func (s *Scope) AlterTableInplace(c *Compile) error {
 						}
 					} else {
 						notDroppedIndex = append(notDroppedIndex, indexdef)
+						newIndexes = append(newIndexes, extra.IndexTables[idx])
 					}
 				}
 				// Avoid modifying slice directly during iteration
 				tableDef.Indexes = notDroppedIndex
+				extra.IndexTables = newIndexes
 			} else if alterTableDrop.Typ == plan.AlterTableDrop_COLUMN {
 				alterKinds = append(alterKinds, api.AlterKind_DropColumn)
 				var idx int
@@ -746,9 +753,8 @@ func (s *Scope) AlterTableInplace(c *Compile) error {
 						if err != nil {
 							return err
 						}
-
 					case catalog.MoIndexHnswAlgo.ToString():
-						// PASS: keep option unchange for incremental update
+						// PASS
 					default:
 						return moerr.NewInternalError(c.proc.Ctx, "invalid index algo type for alter reindex")
 					}
@@ -2048,6 +2054,21 @@ func (s *Scope) handleVectorIvfFlatIndex(
 		return err
 	}
 
+	async, err := catalog.IsIndexAsync(indexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata].IndexAlgoParams)
+	if err != nil {
+		return err
+	}
+
+	// HNSWCDC CREATE PITR AND CDC TASK HERE
+	if async {
+		logutil.Infof("Ivfflat index Async is true")
+		sinker_type := getSinkerTypeFromAlgo(catalog.MoIndexIvfFlatAlgo.ToString())
+		err = CreateIndexCdcTask(c, originalTableDef, qryDatabase, originalTableDef.Name,
+			indexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata].IndexTableName, sinker_type)
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 
 }
@@ -2102,12 +2123,20 @@ func (s *Scope) DropIndex(c *Compile) error {
 
 	}
 
-	//3. delete index object from mo_catalog.mo_indexes
+	//3. HNSWCDC delete cdc table task for vector, fulltext index
+	tableDef := r.GetTableDef(c.proc.Ctx)
+	err = DropIndexCdcTask(c, tableDef, qry.Database, qry.Table, qry.IndexName)
+	if err != nil {
+		return err
+	}
+
+	//4. delete index object from mo_catalog.mo_indexes
 	deleteSql := fmt.Sprintf(deleteMoIndexesWithTableIdAndIndexNameFormat, r.GetTableID(c.proc.Ctx), qry.IndexName)
 	err = c.runSql(deleteSql)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -2366,6 +2395,15 @@ func (s *Scope) TruncateTable(c *Compile) error {
 		}
 	}
 
+	// TODO: HNSWCDC drop CDC task with old table Id before truncate index table
+	if !isTemp {
+		tabledef := rel.GetTableDef(c.proc.Ctx)
+		e := DropAllIndexCdcTasks(c, tabledef, dbName, tblName)
+		if e != nil {
+			return e
+		}
+	}
+
 	if isTemp {
 		// memoryengine truncate always return 0, so for temporary table, just use origin tableId as newId
 		_, err = dbSource.Truncate(c.proc.Ctx, engine.GetTempTableName(dbName, tblName))
@@ -2489,6 +2527,15 @@ func (s *Scope) TruncateTable(c *Compile) error {
 		return err
 	}
 
+	// TODO: HNSWCDC create CDC task with new table Id
+	if !isTemp {
+		tabledef := rel.GetTableDef(c.proc.Ctx)
+		e := CreateAllIndexCdcTasks(c, tabledef, dbName, tblName)
+		if e != nil {
+			return e
+		}
+	}
+
 	c.addAffectedRows(uint64(affectedRows))
 	return nil
 }
@@ -2599,7 +2646,7 @@ func (s *Scope) DropTable(c *Compile) error {
 			err = e
 		}
 		// before dropping table, lock it.
-		if e := lockTable(c.proc.Ctx, c.e, c.proc, rel, dbName, false); e != nil {
+		if e := lockTable(c.proc.Ctx, c.e, c.proc, rel, dbName, true); e != nil {
 			if !moerr.IsMoErrCode(e, moerr.ErrTxnNeedRetry) &&
 				!moerr.IsMoErrCode(err, moerr.ErrTxnNeedRetryWithDefChanged) {
 				return e
@@ -2655,6 +2702,12 @@ func (s *Scope) DropTable(c *Compile) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	// HNSWCDC delete cdc task of the vector and fulltext index here
+	err = DropAllIndexCdcTasks(c, rel.GetTableDef(c.proc.Ctx), qry.Database, qry.Table)
+	if err != nil {
+		return err
 	}
 
 	// delete all index objects record of the table in mo_catalog.mo_indexes

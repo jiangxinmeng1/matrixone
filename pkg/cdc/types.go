@@ -52,9 +52,10 @@ const (
 )
 
 const (
-	CDCSinkType_MySQL   = "mysql"
-	CDCSinkType_MO      = "matrixone"
-	CDCSinkType_Console = "console"
+	CDCSinkType_MySQL     = "mysql"
+	CDCSinkType_MO        = "matrixone"
+	CDCSinkType_Console   = "console"
+	CDCSinkType_IndexSync = "indexsync"
 )
 
 const (
@@ -75,12 +76,14 @@ const (
 	CDCRequestOptions_MaxSqlLength         = "MaxSqlLength"
 	CDCRequestOptions_NoFull               = "NoFull"
 	CDCRequestOptions_ConfigFile           = "ConfigFile"
+	CDCRequestOptions_Frequency            = "Frequency"
 )
 
 const (
 	CDCTaskExtraOptions_MaxSqlLength         = CDCRequestOptions_MaxSqlLength
 	CDCTaskExtraOptions_SendSqlTimeout       = CDCRequestOptions_SendSqlTimeout
 	CDCTaskExtraOptions_InitSnapshotSplitTxn = CDCRequestOptions_InitSnapshotSplitTxn
+	CDCTaskExtraOptions_Frequency            = CDCRequestOptions_Frequency
 )
 
 var CDCRequestOptions = []string{
@@ -93,12 +96,14 @@ var CDCRequestOptions = []string{
 	CDCRequestOptions_InitSnapshotSplitTxn,
 	CDCRequestOptions_ConfigFile,
 	CDCRequestOptions_NoFull,
+	CDCRequestOptions_Frequency,
 }
 
 var CDCTaskExtraOptions = []string{
 	CDCTaskExtraOptions_MaxSqlLength,
 	CDCTaskExtraOptions_SendSqlTimeout,
 	CDCTaskExtraOptions_InitSnapshotSplitTxn,
+	CDCTaskExtraOptions_Frequency,
 }
 
 var (
@@ -118,6 +123,13 @@ func NewTaskId() TaskId {
 type Reader interface {
 	Run(ctx context.Context, ar *ActiveRoutine)
 	Close()
+}
+
+type TableReader interface {
+	Run(ctx context.Context, ar *ActiveRoutine)
+	Close()
+	Info() *DbTableInfo
+	GetWg() *sync.WaitGroup
 }
 
 // Sinker manages and drains the sql parts
@@ -143,17 +155,6 @@ type Sink interface {
 	SendCommit(ctx context.Context) error
 	SendRollback(ctx context.Context) error
 	Close()
-}
-
-type IWatermarkUpdater interface {
-	Run(ctx context.Context, ar *ActiveRoutine)
-	InsertIntoDb(dbTableInfo *DbTableInfo, watermark types.TS) error
-	GetFromMem(dbName, tblName string) types.TS
-	GetFromDb(dbName, tblName string) (watermark types.TS, err error)
-	UpdateMem(dbName, tblName string, watermark types.TS)
-	DeleteFromMem(dbName, tblName string)
-	DeleteFromDb(dbName, tblName string) error
-	SaveErrMsg(dbName, tblName string, errMsg string) error
 }
 
 type ActiveRoutine struct {
@@ -249,16 +250,19 @@ type DbTableInfo struct {
 
 	SinkDbName  string
 	SinkTblName string
+
+	IdChanged bool
 }
 
 func (info DbTableInfo) String() string {
-	return fmt.Sprintf("%v(%v).%v(%v) -> %v.%v",
+	return fmt.Sprintf("%v(%v).%v(%v) -> %v.%v, %v",
 		info.SourceDbName,
 		info.SourceDbId,
 		info.SourceTblName,
 		info.SourceTblId,
 		info.SinkDbName,
 		info.SinkTblName,
+		info.IdChanged,
 	)
 }
 
@@ -271,7 +275,18 @@ func (info DbTableInfo) Clone() *DbTableInfo {
 		SourceCreateSql: info.SourceCreateSql,
 		SinkDbName:      info.SinkDbName,
 		SinkTblName:     info.SinkTblName,
+		IdChanged:       info.IdChanged,
 	}
+}
+
+func (info DbTableInfo) OnlyDiffinTblId(t *DbTableInfo) bool {
+	if info.SourceDbId != t.SourceDbId ||
+		info.SourceDbName != t.SourceDbName ||
+		info.SourceTblName != t.SourceTblName ||
+		info.SourceCreateSql != t.SourceCreateSql {
+		return false
+	}
+	return info.SourceTblId != t.SourceTblId
 }
 
 // AtomicBatch holds batches from [Tail_wip,...,Tail_done] or [Tail_done].
