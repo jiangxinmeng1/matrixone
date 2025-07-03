@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cdc
+package idxcdc
 
 import (
 	"context"
 	"encoding/json"
 
+	"github.com/matrixorigin/matrixone/pkg/cdc"
 	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
@@ -63,7 +64,7 @@ func RegisterJob(
 		return false, err
 	}
 
-	sql := CDCSQLBuilder.AsyncIndexLogInsertSQL(
+	sql := cdc.CDCSQLBuilder.AsyncIndexLogInsertSQL(
 		tenantId,
 		tableDef.TblId,
 		sinkerinfo_json.IndexName,
@@ -91,7 +92,7 @@ func UnregisterJob(
 	}
 	var rel engine.Relation
 	tableDef := rel.GetTableDef(ctx)
-	sql := CDCSQLBuilder.AsyncIndexLogUpdateDropAtSQL(
+	sql := cdc.CDCSQLBuilder.AsyncIndexLogUpdateDropAtSQL(
 		tenantId,
 		tableDef.TblId,
 		consumerInfo.IndexName,

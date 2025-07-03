@@ -12,19 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cdc
+package idxcdc
 
 import (
-	"context"
 	"sync/atomic"
 
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 )
-
-type Consumer interface{
-	Consume(context.Context, DataRetriever) error
-  }
 
 type SinkerState int8
 
@@ -33,26 +28,6 @@ const (
 	SinkerState_Running
 	SinkerState_Finished
 )
-
-type ConsumerInfo struct {
-	SinkerType int8
-	TableName  string
-	DBName     string 
-	IndexName  string 
-}
-
-const (
-	ConsumerType_UT int8 = iota
-)
-
-func NewConsumer(
-	cnUUID string,
-	tableDef *plan.TableDef,
-	sinkerConfig *ConsumerInfo,
-) (Consumer, error) {
-	panic("todo")
-}
-
 type SinkerEntry struct {
 	tableInfo  *TableInfo_2
 	indexName  string
@@ -79,7 +54,7 @@ func NewSinkerEntry(
 		tableInfo:  tableInfo,
 		indexName:  sinkerConfig.IndexName,
 		consumer:     consumer,
-		consumerType: sinkerConfig.SinkerType,
+		consumerType: sinkerConfig.ConsumerType,
 		watermark:  watermark,
 		err:        err,
 	}

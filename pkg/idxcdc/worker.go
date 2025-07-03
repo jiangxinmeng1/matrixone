@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cdc
+package idxcdc
 
 import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/sm"

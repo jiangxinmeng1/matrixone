@@ -12,21 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cdc
+package idxcdc
 
 import (
+	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/util/executor"
 )
 
-type DataRetriever interface {
-	//SNAPSHOT = 0, TAIL = 1
-	//TAIL can use INSERT, SNAPSHOT need REPLACE INTO
-	//in SNAPSHOT, deleteBatch is nil
-	  Next() (insertBatch *AtomicBatch, deleteBatch *AtomicBatch, noMoreData bool, err error)
-	  UpdateWatermark(executor.TxnExecutor,executor.StatementOption)error
-	  GetDataType() int8
-  }
 type CDCData struct {
 	insertBatch *AtomicBatch
 	deleteBatch *AtomicBatch
@@ -78,7 +71,7 @@ func (r *DataRetrieverImpl) UpdateWatermark(exec executor.TxnExecutor, opts exec
 	if r.typ == CDCDataType_Snapshot {
 		return nil
 	}
-	updateWatermarkSQL := CDCSQLBuilder.AsyncIndexLogUpdateResultSQL(
+	updateWatermarkSQL := cdc.CDCSQLBuilder.AsyncIndexLogUpdateResultSQL(
 		r.tableInfo.accountID,
 		r.tableInfo.tableID,
 		r.indexName,

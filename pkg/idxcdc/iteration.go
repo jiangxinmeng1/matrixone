@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cdc
+package idxcdc
 
 import (
 	"context"
 	"fmt"
 	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 )
@@ -80,7 +81,7 @@ func (iter *Iteration) insertAsyncIndexIterations()error{
 		errorStr= fmt.Sprintf("%s%s, ",errorStr,err.Error())
 	}
 
-	sql := CDCSQLBuilder.AsyncIndexIterationsInsertSQL(
+	sql := cdc.CDCSQLBuilder.AsyncIndexIterationsInsertSQL(
 		iter.table.accountID,
 		iter.table.tableID,
 		indexNames,
