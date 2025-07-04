@@ -173,6 +173,17 @@ func NewCDCTaskExecutor2(
 	}
 }
 
+type RpcHandleFn func(
+	ctx context.Context,
+	meta txn.TxnMeta,
+	req *cmd_util.GetChangedTableListReq,
+	resp *cmd_util.GetChangedTableListResp,
+) (func(), error)
+
+func (exec *CDCTaskExecutor2) SetRpcHandleFn(fn RpcHandleFn	) {
+	exec.rpcHandleFn = fn
+}
+
 // scan candidates
 func (exec *CDCTaskExecutor2) getAllTables() []*TableInfo_2 {
 	exec.tableMu.RLock()
