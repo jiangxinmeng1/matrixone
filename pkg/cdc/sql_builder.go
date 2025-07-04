@@ -227,7 +227,7 @@ const (
 				consumer_config VARCHAR(255) NULL,//9
 			);
 		*/
-	CDCInsertMOAsyncIndexLogSqlTemplate = `INSERT INTO mo_catalog.mo_async_index_log(` +
+	CDCInsertMOAsyncIndexLogSqlTemplate = `INSERT INTO mo_catalog.mo_async_index_log (` +
 		`account_id,` +
 		`table_id,` +
 		`index_name,` +
@@ -236,15 +236,17 @@ const (
 		`error_msg,` +
 		`info,` +
 		`consumer_config,` +
+		`drop_at` +
 		`) VALUES (` +
 		`%d,` + // account_id
 		`%d,` + // table_id
-		`%s,` + // index_name
-		`%s,` + // last_sync_txn_ts
+		`'%s',` + // index_name
+		`'%s',` + // last_sync_txn_ts
 		`%d,` + // err_code
-		`%s,` + // error_msg
-		`%s,` + // info
-		`%s,` + // consumer_config
+		`'%s',` + // error_msg
+		`'%s',` + // info
+		`'%s',` + // consumer_config
+		`null` + // drop_at
 		`)`
 	CDCUpdateMOAsyncIndexLogSqlTemplate = `UPDATE mo_catalog.mo_async_index_log SET ` +
 		`err_code = %d,` +
@@ -288,15 +290,44 @@ const (
 		`) VALUES (` +
 		`%d,` + // account_id
 		`%d,` + // table_id
-		`%s,` + // index_names
-		`%s,` + // from_ts
-		`%s,` + // to_ts
-		`%s,` + // error_json
-		`%s,` + // start_at
-		`%s` + // end_at
+		`'%s',` + // index_names
+		`'%s',` + // from_ts
+		`'%s',` + // to_ts
+		`'%s',` + // error_json
+		`'%s',` + // start_at
+		`'%s'` + // end_at
 		`)`
 	CDCDeleteMOAsyncIndexIterationsTemplate = `DELETE FROM mo_catalog.mo_async_index_iterations WHERE ` +
 		`end_at < %s`
+	/*  CREATE TABLE `mo_tables` (
+			`rel_id` bigint unsigned DEFAULT NULL,
+			`relname` varchar(5000) DEFAULT NULL,
+			`reldatabase` varchar(5000) DEFAULT NULL,
+			`reldatabase_id` bigint unsigned DEFAULT NULL,
+			`relpersistence` varchar(5000) DEFAULT NULL,
+			`relkind` varchar(5000) DEFAULT NULL,
+			`rel_comment` varchar(5000) DEFAULT NULL,
+			`rel_createsql` text DEFAULT NULL,
+			`created_time` timestamp NULL DEFAULT NULL,
+			`creator` int unsigned DEFAULT NULL,
+			`owner` int unsigned DEFAULT NULL,
+			`account_id` int unsigned DEFAULT NULL,
+			`partitioned` tinyint DEFAULT NULL,
+			`partition_info` blob DEFAULT NULL,
+			`viewdef` varchar(5000) DEFAULT NULL,
+			`constraint` varchar(5000) DEFAULT NULL,
+			`rel_version` int unsigned DEFAULT NULL,
+			`catalog_version` int unsigned DEFAULT NULL,
+			PRIMARY KEY (`account_id`,`reldatabase`,`relname`)
+		  )
+	*/
+	CDCGetTableIDTemplate = "SELECT " +
+		"rel_id " +
+		"FROM `mo_catalog`.`mo_tables` " +
+		"WHERE " +
+		" account_id = %d " +
+		" AND reldatabase = '%s' " +
+		" AND relname = '%s' "
 )
 
 const (
@@ -329,7 +360,9 @@ const (
 	CDCInsertMOAsyncIndexIterationsTemplate_Idx = 24
 	CDCDeleteMOAsyncIndexIterationsTemplate_Idx = 25
 
-	CDCSqlTemplateCount = 26
+	CDCGetTableIDTemplate_Idx = 26
+
+	CDCSqlTemplateCount = 27
 )
 
 var CDCSQLTemplates = [CDCSqlTemplateCount]struct {
@@ -465,6 +498,12 @@ var CDCSQLTemplates = [CDCSqlTemplateCount]struct {
 	},
 	CDCOnDuplicateUpdateWatermarkErrMsgTemplate_Idx: {
 		SQL: CDCOnDuplicateUpdateWatermarkErrMsgTemplate,
+	},
+	CDCGetTableIDTemplate_Idx: {
+		SQL: CDCGetTableIDTemplate,
+		OutputAttrs: []string{
+			"rel_id",
+		},
 	},
 }
 
@@ -909,5 +948,18 @@ func (b cdcSQLBuilder) CollectTableInfoSQL(accountIDs string, dbNames string, ta
 		}(),
 		catalog.SystemOrdinaryRel,
 		AddSingleQuotesJoin(catalog.SystemDatabases),
+	)
+}
+
+func (b cdcSQLBuilder) GetTableIDSQL(
+	accountID uint32,
+	dbName string,
+	tableName string,
+) string {
+	return fmt.Sprintf(
+		CDCSQLTemplates[CDCGetTableIDTemplate_Idx].SQL,
+		accountID,
+		dbName,
+		tableName,
 	)
 }

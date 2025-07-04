@@ -17,9 +17,11 @@ package idxcdc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/matrixorigin/matrixone/pkg/cdc"
 	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/util/executor"
@@ -56,17 +58,35 @@ func RegisterJob(
 	sinkerinfo_json *ConsumerInfo,
 ) (ok bool, err error) {
 	tenantId, err := defines.GetAccountId(ctx)
-	//todo get relation
-	var rel engine.Relation
-	tableDef := rel.GetTableDef(ctx)
 	consumerInfoJson, err := json.Marshal(sinkerinfo_json)
 	if err != nil {
 		return false, err
 	}
 
+	tableIDSql := cdc.CDCSQLBuilder.GetTableIDSQL(
+		tenantId,
+		sinkerinfo_json.DbName,
+		sinkerinfo_json.TableName,
+	)
+	result, err := ExecWithResult(ctx, tableIDSql, cnUUID, txn)
+	if err != nil {
+		return false, err
+	}
+	defer result.Close()
+	var tableID uint64
+	result.ReadRows(func(rows int, cols []*vector.Vector) bool {
+		if rows != 1 {
+			panic(fmt.Sprintf("invalid rows %d", rows))
+		}
+		for i := 0; i < rows; i++ {
+			tableID = vector.MustFixedColWithTypeCheck[uint64](cols[0])[i]
+		}
+		return true
+	})
+
 	sql := cdc.CDCSQLBuilder.AsyncIndexLogInsertSQL(
 		tenantId,
-		tableDef.TblId,
+		tableID,
 		sinkerinfo_json.IndexName,
 		"",
 		string(consumerInfoJson),

@@ -1425,7 +1425,15 @@ func TestCDCExecutor(t *testing.T) {
 	for i := 0; i < tableCount; i++ {
 		txn,err:=disttaeEngine.NewTxnOperator(ctx,disttaeEngine.Engine.LatestLogtailAppliedTime())
 		require.NoError(t, err)
-		ok,err:=idxcdc.RegisterJob(ctx,"",txn,"pitr",&idxcdc.ConsumerInfo{})
+		ok,err:=idxcdc.RegisterJob(
+			ctx,"",txn,"pitr",
+			&idxcdc.ConsumerInfo{
+				ConsumerType: int8(idxcdc.ConsumerType_IndexSync),
+				DbName:       dbNames[i],
+				TableName:    srcTables[i],
+				IndexName:    "index1",
+			},
+		)
 		assert.True(t, ok)
 		assert.NoError(t, err)
 		assert.NoError(t, txn.Commit(ctxWithTimeout))
