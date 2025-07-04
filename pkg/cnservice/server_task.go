@@ -20,11 +20,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/frontend"
+	"github.com/matrixorigin/matrixone/pkg/idxcdc"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/pb/api"
@@ -390,7 +390,7 @@ func (s *service) registerExecutorsLocked() {
 		),
 	)
 
-	cdcTask := cdc.NewCDCTaskExecutor2(
+	cdcTask := idxcdc.NewCDCTaskExecutor2(
 		context.Background(),
 		s.storeEngine,
 		s._txnClient,

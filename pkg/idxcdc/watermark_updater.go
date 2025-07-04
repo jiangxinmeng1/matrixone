@@ -50,8 +50,8 @@ func ExecWithResult(
 // return true if create, return false if task already exists, return error when error
 func RegisterJob(
 	ctx context.Context,
-	txn client.TxnOperator,
 	cnUUID string,
+	txn client.TxnOperator,
 	pitr_name string,
 	sinkerinfo_json *ConsumerInfo,
 ) (ok bool, err error) {
@@ -82,8 +82,8 @@ func RegisterJob(
 // return true if delete success, return false if no task found, return error when delete failed.
 func UnregisterJob(
 	ctx context.Context,
-	txn client.TxnOperator,
 	cnUUID string,
+	txn client.TxnOperator,
 	consumerInfo *ConsumerInfo,
 ) (bool, error) {
 	tenantId, err := defines.GetAccountId(ctx)
