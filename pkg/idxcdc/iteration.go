@@ -21,6 +21,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 )
 
@@ -68,6 +69,10 @@ func (iter *Iteration) Run() {
 		iter.table.exec.mp,
 	)
 	iter.endAt=time.Now()
+	err=iter.insertAsyncIndexIterations()
+	if err!=nil{
+		logutil.Errorf("insert async index iterations failed, err: %v", err)
+	}
 }
 
 func (iter *Iteration) insertAsyncIndexIterations()error{

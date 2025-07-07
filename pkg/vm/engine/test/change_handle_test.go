@@ -1346,7 +1346,6 @@ func TestChangesHandle7(t *testing.T) {
 	}
 }
 
-
 func TestCDCExecutor(t *testing.T) {
 	catalog.SetupDefines("")
 
@@ -1373,6 +1372,8 @@ func TestCDCExecutor(t *testing.T) {
 	require.NoError(t, err)
 	err = mock_mo_async_index_iterations(disttaeEngine, ctxWithTimeout)
 	require.NoError(t, err)
+
+	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
 
 	schema := catalog2.MockSchemaAll(10, 1)
 	tableCount := 1
@@ -1416,17 +1417,21 @@ func TestCDCExecutor(t *testing.T) {
 		appendFn(dbNames[i], srcTables[i], 0)
 	}
 
-	cdcExecutor:=idxcdc.NewCDCTaskExecutor2(ctxWithTimeout, disttaeEngine.Engine, disttaeEngine.GetTxnClient(), "",common.DebugAllocator)
+	txnFactory := func() (client.TxnOperator, error) {
+		return disttaeEngine.NewTxnOperator(ctxWithTimeout, disttaeEngine.Engine.LatestLogtailAppliedTime())
+	}
+	cdcExecutor, err := idxcdc.NewCDCTaskExecutor2(ctxWithTimeout, disttaeEngine.Engine, disttaeEngine.GetTxnClient(), "", txnFactory, common.DebugAllocator)
+	require.NoError(t, err)
 	cdcExecutor.SetRpcHandleFn(taeHandler.GetRPCHandle().HandleGetChangedTableList)
 
 	cdcExecutor.Start()
 	defer cdcExecutor.Stop()
 
 	for i := 0; i < tableCount; i++ {
-		txn,err:=disttaeEngine.NewTxnOperator(ctx,disttaeEngine.Engine.LatestLogtailAppliedTime())
+		txn, err := disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Engine.LatestLogtailAppliedTime())
 		require.NoError(t, err)
-		ok,err:=idxcdc.RegisterJob(
-			ctx,"",txn,"pitr",
+		ok, err := idxcdc.RegisterJob(
+			ctx, "", txn, "pitr",
 			&idxcdc.ConsumerInfo{
 				ConsumerType: int8(idxcdc.ConsumerType_IndexSync),
 				DbName:       dbNames[i],
@@ -1443,7 +1448,7 @@ func TestCDCExecutor(t *testing.T) {
 		appendFn(dbNames[j], srcTables[j], 1)
 	}
 
-	time.Sleep(time.Second)
+	time.Sleep(time.Second*10)
 
 	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
 

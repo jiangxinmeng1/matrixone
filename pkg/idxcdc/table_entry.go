@@ -57,10 +57,12 @@ func NewTableInfo_2(
 	accountID uint32,
 	dbID, tableID uint64,
 	dbName, tableName string,
+	tableDef *plan.TableDef,
 ) *TableInfo_2 {
 	return &TableInfo_2{
 		exec:      exec,
 		accountID: accountID,
+		tableDef:  tableDef,
 		sinkers:   make([]*SinkerEntry, 0),
 		dbID:      dbID,
 		tableID:   tableID,

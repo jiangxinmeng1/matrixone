@@ -267,7 +267,6 @@ const (
 	CDCSelectMOAsyncIndexLogSqlTemplate = `SELECT * from mo_catalog.mo_async_index_log`
 	/*
 		CREATE TABLE mo_async_index_iterations (
-			id INT AUTO_INCREMENT PRIMARY KEY,
 			account_id INT UNSIGNED NOT NULL,
 			table_id BIGINT UNSIGNED NOT NULL,
 			index_names VARCHAR(255),--multiple indexes
@@ -322,7 +321,8 @@ const (
 		  )
 	*/
 	CDCGetTableIDTemplate = "SELECT " +
-		"rel_id " +
+		"rel_id, " +
+		"reldatabase_id " +
 		"FROM `mo_catalog`.`mo_tables` " +
 		"WHERE " +
 		" account_id = %d " +
@@ -503,6 +503,7 @@ var CDCSQLTemplates = [CDCSqlTemplateCount]struct {
 		SQL: CDCGetTableIDTemplate,
 		OutputAttrs: []string{
 			"rel_id",
+			"reldatabase_id",
 		},
 	},
 }

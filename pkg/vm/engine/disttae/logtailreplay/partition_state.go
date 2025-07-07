@@ -41,7 +41,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 )
 
-type RowsInsertHook func(ctx context.Context, input *api.Batch)
+type RowsInsertHook func(ctx context.Context, input *api.Batch, tableID uint64)
 
 var rowsInsertHooks []RowsInsertHook
 
@@ -375,7 +375,7 @@ func (p *PartitionState) HandleLogtailEntry(
 			}
 			p.HandleRowsInsert(ctx, entry.Bat, primarySeqnum, packer, pool)
 			for _, hook := range rowsInsertHooks {
-				hook(ctx, entry.Bat)
+				hook(ctx, entry.Bat, p.tid)
 			}
 		}
 

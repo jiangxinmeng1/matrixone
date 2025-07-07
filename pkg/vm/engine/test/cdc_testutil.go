@@ -39,7 +39,6 @@ import (
 	// ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
 )
 
-
 type idAllocator interface {
 	Alloc() uint64
 }
@@ -377,6 +376,7 @@ func getDeleteFn(
 		return err
 	}
 }
+
 // func getCDCExecutor(
 // 	ctx context.Context,
 // 	t *testing.T,
@@ -450,17 +450,19 @@ func getDeleteFn(
 
 /*
 CREATE TABLE mo_async_index_log (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    account_id INT NOT NULL,
-    table_id INT NOT NULL,
-    db_id VARCHAR NOT NULL,
-    index_name VARCHAR NOT NULL,
-    last_sync_txn_ts VARCHAR(32)  NOT NULL,
-    err_code INT NOT NULL,
-    error_msg VARCHAR(255) NOT NULL,
-    info VARCHAR(255) NOT NULL,
-    drop_at VARCHAR(32) NULL,
-    consumer_config VARCHAR(32) NULL,
+
+	id INT AUTO_INCREMENT PRIMARY KEY,
+	account_id INT NOT NULL,
+	table_id INT NOT NULL,
+	db_id VARCHAR NOT NULL,
+	index_name VARCHAR NOT NULL,
+	last_sync_txn_ts VARCHAR(32)  NOT NULL,
+	err_code INT NOT NULL,
+	error_msg VARCHAR(255) NOT NULL,
+	info VARCHAR(255) NOT NULL,
+	drop_at VARCHAR(32) NULL,
+	consumer_config VARCHAR(32) NULL,
+
 );
 */
 func mock_mo_async_index_log(
@@ -537,15 +539,17 @@ func mock_mo_async_index_log(
 
 /*
 CREATE TABLE mo_async_index_iterations (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    account_id INT UNSIGNED NOT NULL,
-    table_id BIGINT UNSIGNED NOT NULL,
-    index_names VARCHAR(255),--multiple indexes
-    from_ts VARCHAR(32) NOT NULL,
-    to_ts VARCHAR(32) NOT NULL,
-    error_json VARCHAR(255) NOT NULL,--Multiple errors are stored. Different consumers may have different errors.
-    start_at DATETIME NULL,
-    end_at DATETIME NULL,
+
+	id INT AUTO_INCREMENT PRIMARY KEY,
+	account_id INT UNSIGNED NOT NULL,
+	table_id BIGINT UNSIGNED NOT NULL,
+	index_names VARCHAR(255),--multiple indexes
+	from_ts VARCHAR(32) NOT NULL,
+	to_ts VARCHAR(32) NOT NULL,
+	error_json VARCHAR(255) NOT NULL,--Multiple errors are stored. Different consumers may have different errors.
+	start_at DATETIME NULL,
+	end_at DATETIME NULL,
+
 );
 */
 func mock_mo_async_index_iterations(

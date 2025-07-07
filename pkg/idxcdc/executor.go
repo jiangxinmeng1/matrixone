@@ -17,27 +17,35 @@ package idxcdc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+
 	"sync"
 	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
-	// "github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/defines"
+
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/api"
-	// "github.com/matrixorigin/matrixone/pkg/pb/plan"
-	// "github.com/matrixorigin/matrixone/pkg/pb/task"
+
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
-	// ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
+
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/cmd_util"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae/logtailreplay"
 	"github.com/tidwall/btree"
-	// "go.uber.org/zap"
+)
+
+const (
+	MOAsyncIndexLogTableName = "mo_async_index_log"
 )
 
 type relationFactory func(context.Context) (engine.Relation, client.TxnOperator, error)
@@ -84,7 +92,8 @@ type CDCTaskExecutor2 struct {
 	// fs                 fileservice.FileService
 	txnFactory func() (client.TxnOperator, error)
 	// sinkerFactory func(dbName, tableName string, tableDef []engine.TableDef) (Sinker, error)
-	txnEngine engine.Engine
+	txnEngine            engine.Engine
+	asyncIndexLogTableID uint64
 
 	rpcHandleFn func(
 		ctx context.Context,
@@ -143,13 +152,14 @@ func NewCDCTaskExecutor2(
 	// ) error,
 	// replayFn replayFn,
 	// deleteFn deleteFn,
+	txnFactory func() (client.TxnOperator, error),
 	mp *mpool.MPool,
-) *CDCTaskExecutor2 {
+) (*CDCTaskExecutor2, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	worker := NewWorker()
 	// ctx = context.WithValue(ctx, defines.TenantIDKey{}, uint32(accountID))
 	//TODO: subscribe mo_catalog.mo_async_index_log
-	return &CDCTaskExecutor2{
+	exec := &CDCTaskExecutor2{
 		ctx:    ctx,
 		cancel: cancel,
 		packer: types.NewPacker(),
@@ -157,7 +167,7 @@ func NewCDCTaskExecutor2(
 		// spec:                 spec,
 		// sqlExecutorFactory:   sqlExecutorFactory,
 		cnUUID:     cdUUID,
-		txnFactory: GetTxnFactory(ctx, txnEngine, cnTxnClient),
+		txnFactory: txnFactory,
 		// sinkerFactory:        sinkerFactory,
 		txnEngine: txnEngine,
 		worker:    worker,
@@ -171,6 +181,59 @@ func NewCDCTaskExecutor2(
 		// deleteFn:             deleteFn,
 		mp: mp,
 	}
+	err := exec.setAsyncIndexLogTableID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = exec.subscribeMOAsyncIndexLog(ctx)
+	if err != nil {
+		return nil, err
+	}
+	logtailreplay.RegisterRowsInsertHook(exec.onAsyncIndexLogInsert)
+	return exec, nil
+}
+func (exec *CDCTaskExecutor2) setAsyncIndexLogTableID(ctx context.Context) (err error) {
+	tenantId, err := defines.GetAccountId(ctx)
+	txn, err := exec.txnFactory()
+	if err != nil {
+		return err
+	}
+	defer txn.Commit(ctx)
+
+	tableIDSql := cdc.CDCSQLBuilder.GetTableIDSQL(
+		tenantId,
+		catalog.MO_CATALOG,
+		MOAsyncIndexLogTableName,
+	)
+	result, err := ExecWithResult(ctx, tableIDSql, exec.cnUUID, txn)
+	if err != nil {
+		return err
+	}
+	defer result.Close()
+	result.ReadRows(func(rows int, cols []*vector.Vector) bool {
+		if rows != 1 {
+			panic(fmt.Sprintf("invalid rows %d", rows))
+		}
+		for i := 0; i < rows; i++ {
+			exec.asyncIndexLogTableID = vector.MustFixedColWithTypeCheck[uint64](cols[0])[i]
+		}
+		return true
+	})
+	return nil
+}
+func (exec *CDCTaskExecutor2) subscribeMOAsyncIndexLog(ctx context.Context) (err error) {
+	sql := cdc.CDCSQLBuilder.AsyncIndexLogSelectSQL()
+	txn, err := exec.txnFactory()
+	if err != nil {
+		return err
+	}
+	defer txn.Commit(ctx)
+	result, err := ExecWithResult(ctx, sql, exec.cnUUID, txn)
+	if err != nil {
+		return err
+	}
+	defer result.Close()
+	return nil
 }
 
 type RpcHandleFn func(
@@ -180,7 +243,7 @@ type RpcHandleFn func(
 	resp *cmd_util.GetChangedTableListResp,
 ) (func(), error)
 
-func (exec *CDCTaskExecutor2) SetRpcHandleFn(fn RpcHandleFn	) {
+func (exec *CDCTaskExecutor2) SetRpcHandleFn(fn RpcHandleFn) {
 	exec.rpcHandleFn = fn
 }
 
@@ -280,35 +343,39 @@ func (exec *CDCTaskExecutor2) GetWatermark(srcTableID uint64, indexName string) 
 	return table.GetWatermark(indexName)
 }
 
-func (exec *CDCTaskExecutor2) onAsyncIndexLogInsert(ctx context.Context, input *api.Batch) {
-	accountIDVector, err := vector.ProtoVectorToVector(input.Vecs[1])
+func (exec *CDCTaskExecutor2) onAsyncIndexLogInsert(ctx context.Context, input *api.Batch, tableID uint64) {
+	if tableID != exec.asyncIndexLogTableID {
+		return
+	}
+	// first 2 columns are rowID and commitTS
+	accountIDVector, err := vector.ProtoVectorToVector(input.Vecs[2])
 	if err != nil {
 		panic(err)
 	}
 	accountIDs := vector.MustFixedColWithTypeCheck[uint32](accountIDVector)
-	tableIDVector, err := vector.ProtoVectorToVector(input.Vecs[2])
+	tableIDVector, err := vector.ProtoVectorToVector(input.Vecs[3])
 	if err != nil {
 		panic(err)
 	}
 	tableIDs := vector.MustFixedColWithTypeCheck[uint64](tableIDVector)
-	indexNameVector, err := vector.ProtoVectorToVector(input.Vecs[3])
+	indexNameVector, err := vector.ProtoVectorToVector(input.Vecs[4])
 	if err != nil {
 		panic(err)
 	}
-	watermarkVector, err := vector.ProtoVectorToVector(input.Vecs[4])
+	watermarkVector, err := vector.ProtoVectorToVector(input.Vecs[5])
 	if err != nil {
 		panic(err)
 	}
-	errorCodeVector, err := vector.ProtoVectorToVector(input.Vecs[5])
+	errorCodeVector, err := vector.ProtoVectorToVector(input.Vecs[6])
 	if err != nil {
 		panic(err)
 	}
 	errorCodes := vector.MustFixedColWithTypeCheck[int32](errorCodeVector)
-	consumerInfoVector, err := vector.ProtoVectorToVector(input.Vecs[9])
+	consumerInfoVector, err := vector.ProtoVectorToVector(input.Vecs[10])
 	if err != nil {
 		panic(err)
 	}
-	dropAtVector, err := vector.ProtoVectorToVector(input.Vecs[8])
+	dropAtVector, err := vector.ProtoVectorToVector(input.Vecs[9])
 	if err != nil {
 		panic(err)
 	}
@@ -349,13 +416,14 @@ func (exec *CDCTaskExecutor2) addIndex(
 	var table *TableInfo_2
 	table, ok := exec.getTable(tableDef.TblId)
 	if !ok {
-		table := NewTableInfo_2(
+		table = NewTableInfo_2(
 			exec,
 			accountID,
 			tableDef.DbId,
 			tableDef.TblId,
 			tableDef.DbName,
 			tableDef.Name,
+			tableDef,
 		)
 		exec.setTable(table)
 	}
