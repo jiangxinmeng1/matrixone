@@ -91,7 +91,11 @@ func CollectChanges_2(
 	for i, consumer := range consumers {
 		insertDataChs[i] = make(chan *CDCData, 1)
 		ackChs[i] = make(chan struct{}, 1)
-		txns[i] = iter.txnFN()
+		txns[i], err = iter.table.exec.txnFactory()
+		if err != nil {
+			errs[i] = err
+			return
+		}
 		dataRetrievers[i] = NewDataRetriever(consumer, iter, txns[i], insertDataChs[i], ackChs[i], typ)
 	}
 
