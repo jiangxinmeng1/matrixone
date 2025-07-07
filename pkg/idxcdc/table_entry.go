@@ -44,7 +44,7 @@ type TableInfo_2 struct {
 	state     TableState
 	inited    atomic.Bool
 	sinkers   []*SinkerEntry
-	watermark types.TS
+	watermark types.TS//max watermark
 	mu        sync.RWMutex
 }
 
@@ -149,6 +149,12 @@ func (t *TableInfo_2) GetMinWaterMark() types.TS {
 		}
 	}
 	return minWatermark
+}
+
+func (t *TableInfo_2) GetMaxWaterMark() types.TS {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.watermark
 }
 
 func (t *TableInfo_2) GetSyncTask(ctx context.Context, toTS types.TS) *Iteration {

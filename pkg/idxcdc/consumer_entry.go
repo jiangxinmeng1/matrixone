@@ -44,7 +44,7 @@ func NewSinkerEntry(
 	tableInfo *TableInfo_2,
 	sinkerConfig *ConsumerInfo,
 	watermark types.TS,
-	err error,
+	iterationErr error,
 ) (*SinkerEntry, error) {
 	consumer, err := NewConsumer(cnUUID, tableDef, sinkerConfig)
 	if err != nil {
@@ -56,16 +56,29 @@ func NewSinkerEntry(
 		consumer:     consumer,
 		consumerType: sinkerConfig.ConsumerType,
 		watermark:  watermark,
-		err:        err,
+		err:        iterationErr,
 	}
 	sinkerEntry.init()
 	return sinkerEntry, nil
 }
 
 func (sinkerEntry *SinkerEntry) init() {
-	/*
-		1. sink snapshot
-	*/
+	if sinkerEntry.watermark.IsEmpty() {
+		maxWatermark:=sinkerEntry.tableInfo.GetMaxWaterMark()
+		if maxWatermark.IsEmpty(){
+			timeStamp:=sinkerEntry.tableInfo.exec.txnEngine.LatestLogtailAppliedTime()
+			maxWatermark=types.TimestampToTS(timeStamp)
+		}
+		iter:=&Iteration{
+			table:   sinkerEntry.tableInfo,
+			sinkers: []*SinkerEntry{sinkerEntry},
+			to:      maxWatermark,
+			from:    types.TS{},
+		}
+		sinkerEntry.tableInfo.exec.worker.Submit(iter)
+	}else {
+		sinkerEntry.inited.Store(true)
+	}
 }
 
 // TODO
