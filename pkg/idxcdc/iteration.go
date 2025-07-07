@@ -56,6 +56,9 @@ func (iter *Iteration) Run() {
 		}
 		return
 	}
+	if iter.from.IsEmpty(){
+		iter.to = types.TimestampToTS(txn.SnapshotTS())
+	}
 	defer txn.Commit(iter.ctx)
 	iter.err = CollectChanges_2(
 		iter.ctx,

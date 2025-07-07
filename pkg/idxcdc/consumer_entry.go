@@ -64,15 +64,11 @@ func NewSinkerEntry(
 
 func (sinkerEntry *SinkerEntry) init() {
 	if sinkerEntry.watermark.IsEmpty() {
-		maxWatermark:=sinkerEntry.tableInfo.GetMaxWaterMark()
-		if maxWatermark.IsEmpty(){
-			timeStamp:=sinkerEntry.tableInfo.exec.txnEngine.LatestLogtailAppliedTime()
-			maxWatermark=types.TimestampToTS(timeStamp)
-		}
+		// in the 1st iteration, toTS is determined by txn.SnapshotTS()
 		iter:=&Iteration{
 			table:   sinkerEntry.tableInfo,
 			sinkers: []*SinkerEntry{sinkerEntry},
-			to:      maxWatermark,
+			to:      types.TS{},
 			from:    types.TS{},
 		}
 		sinkerEntry.tableInfo.exec.worker.Submit(iter)

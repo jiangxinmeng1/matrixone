@@ -44,7 +44,6 @@ type TableInfo_2 struct {
 	state     TableState
 	inited    atomic.Bool
 	sinkers   []*SinkerEntry
-	watermark types.TS//max watermark
 	mu        sync.RWMutex
 }
 
@@ -136,7 +135,7 @@ func (t *TableInfo_2) IsInitedAndFinished() bool {
 func (t *TableInfo_2) GetMinWaterMark() types.TS {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	minWatermark := t.watermark
+	minWatermark := types.TS{}
 	for _, sinker := range t.sinkers {
 		if !sinker.inited.Load() {
 			continue
@@ -154,34 +153,45 @@ func (t *TableInfo_2) GetMinWaterMark() types.TS {
 func (t *TableInfo_2) GetMaxWaterMark() types.TS {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.watermark
+	maxWatermark := types.TS{}
+	for _, sinker := range t.sinkers {
+		if sinker.watermark.GT(&maxWatermark) {
+			maxWatermark = sinker.watermark
+		}
+	}
+	return maxWatermark
+}
+
+func (t *TableInfo_2) GetMaxWaterMarkLocked() types.TS {
+	maxWatermark := types.TS{}
+	for _, sinker := range t.sinkers {
+		if sinker.watermark.GT(&maxWatermark) {
+			maxWatermark = sinker.watermark
+		}
+	}
+	return maxWatermark
 }
 
 func (t *TableInfo_2) GetSyncTask(ctx context.Context, toTS types.TS) *Iteration {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	dirtySinker := t.getNewSinkersLocked()
+	maxTS:=t.GetMaxWaterMarkLocked()
 	if dirtySinker != nil {
-		if dirtySinker.watermark.GE(&t.watermark) {
-			panic("logic error")
-		}
 		t.state = TableState_Running
 		return &Iteration{
 			table:   t,
 			sinkers: []*SinkerEntry{dirtySinker},
-			to:      t.watermark,
+			to:      maxTS,
 			from:    dirtySinker.watermark,
 		}
-	}
-	if t.watermark.GE(&toTS) {
-		panic("logic error")
 	}
 	t.state = TableState_Running
 	return &Iteration{
 		table:   t,
 		sinkers: t.sinkers,
 		to:      toTS,
-		from:    t.watermark,
+		from:    maxTS,
 	}
 }
 
@@ -193,7 +203,6 @@ func toErrorCode(err error) int {
 func (t *TableInfo_2) UpdateWatermark(from, to types.TS) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	maxWatermark := types.TS{}
 	for _, sinker := range t.sinkers {
 		if sinker.watermark.GE(&to) {
 			panic("logic error")
@@ -201,11 +210,7 @@ func (t *TableInfo_2) UpdateWatermark(from, to types.TS) {
 		if sinker.watermark.GE(&from) {
 			sinker.watermark = to
 		}
-		if sinker.watermark.GT(&maxWatermark) {
-			maxWatermark = sinker.watermark
-		}
 	}
-	t.watermark = maxWatermark
 }
 
 func (t *TableInfo_2) OnIterationFinished(iter *Iteration) {
@@ -215,16 +220,14 @@ func (t *TableInfo_2) OnIterationFinished(iter *Iteration) {
 	if len(iter.sinkers) == 1 && !iter.sinkers[0].inited.Load() {
 		iter.sinkers[0].inited.Store(true)
 		t.inited.Store(true)
-		if t.watermark.LT(&iter.to) {
-			t.watermark = iter.to
-		}
 		return
 	}
 	if t.state != TableState_Running {
 		panic("logic error")
 	}
 	// dirty sinkers
-	if t.watermark.EQ(&iter.to) {
+	maxTS:=t.GetMaxWaterMarkLocked()
+	if maxTS.EQ(&iter.to) {
 		if len(iter.sinkers) != 1 {
 			panic("logic error")
 		}
@@ -238,11 +241,10 @@ func (t *TableInfo_2) OnIterationFinished(iter *Iteration) {
 		return
 	}
 	// all sinkers
-	if t.watermark.LT(&iter.to) {
+	if !maxTS.EQ(&iter.from) {
 		panic("logic error")
 	}
 	t.state = TableState_Finished
-	t.watermark = iter.to
 	for i, sinker := range iter.sinkers {
 		if iter.err[i] != nil {
 			sinker.err = iter.err[i]
@@ -253,11 +255,12 @@ func (t *TableInfo_2) OnIterationFinished(iter *Iteration) {
 }
 
 func (t *TableInfo_2) getNewSinkersLocked() *SinkerEntry {
+	maxTS:=t.GetMaxWaterMarkLocked()
 	for _, sinker := range t.sinkers {
 		if !sinker.inited.Load() {
 			continue
 		}
-		if sinker.watermark.LE(&t.watermark) {
+		if sinker.watermark.LE(&maxTS) {
 			return sinker
 		}
 	}
