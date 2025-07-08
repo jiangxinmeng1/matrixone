@@ -48,6 +48,7 @@ func CollectChanges_2(
 	//step3: pull data
 	var insertData, deleteData *batch.Batch
 	var insertAtmBatch, deleteAtmBatch *AtomicBatch
+	var preinsertAtmBatch, predeleteAtmBatch *AtomicBatch
 
 	tableDef := rel.CopyTableDef(ctx)
 	insTSColIdx := len(tableDef.Cols) - 1
@@ -153,12 +154,20 @@ func CollectChanges_2(
 			for i := range consumers {
 				<-ackChs[i]
 			}
+			if preinsertAtmBatch != nil {
+				preinsertAtmBatch.Close()
+				preinsertAtmBatch = nil
+			}
+			if predeleteAtmBatch != nil {
+				predeleteAtmBatch.Close()
+				predeleteAtmBatch = nil
+			}
 			if insertAtmBatch != nil {
-				insertAtmBatch.Close()
+				preinsertAtmBatch = insertAtmBatch
 				insertAtmBatch = nil
 			}
 			if deleteAtmBatch != nil {
-				deleteAtmBatch.Close()
+				predeleteAtmBatch = deleteAtmBatch
 				deleteAtmBatch = nil
 			}
 
