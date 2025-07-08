@@ -299,26 +299,26 @@ const (
 	CDCDeleteMOAsyncIndexIterationsTemplate = `DELETE FROM mo_catalog.mo_async_index_iterations WHERE ` +
 		`end_at < %s`
 	/*  CREATE TABLE `mo_tables` (
-			`rel_id` bigint unsigned DEFAULT NULL,
-			`relname` varchar(5000) DEFAULT NULL,
-			`reldatabase` varchar(5000) DEFAULT NULL,
-			`reldatabase_id` bigint unsigned DEFAULT NULL,
-			`relpersistence` varchar(5000) DEFAULT NULL,
-			`relkind` varchar(5000) DEFAULT NULL,
-			`rel_comment` varchar(5000) DEFAULT NULL,
-			`rel_createsql` text DEFAULT NULL,
-			`created_time` timestamp NULL DEFAULT NULL,
-			`creator` int unsigned DEFAULT NULL,
-			`owner` int unsigned DEFAULT NULL,
-			`account_id` int unsigned DEFAULT NULL,
-			`partitioned` tinyint DEFAULT NULL,
-			`partition_info` blob DEFAULT NULL,
-			`viewdef` varchar(5000) DEFAULT NULL,
-			`constraint` varchar(5000) DEFAULT NULL,
-			`rel_version` int unsigned DEFAULT NULL,
-			`catalog_version` int unsigned DEFAULT NULL,
-			PRIMARY KEY (`account_id`,`reldatabase`,`relname`)
-		  )
+		`rel_id` bigint unsigned DEFAULT NULL,
+		`relname` varchar(5000) DEFAULT NULL,
+		`reldatabase` varchar(5000) DEFAULT NULL,
+		`reldatabase_id` bigint unsigned DEFAULT NULL,
+		`relpersistence` varchar(5000) DEFAULT NULL,
+		`relkind` varchar(5000) DEFAULT NULL,
+		`rel_comment` varchar(5000) DEFAULT NULL,
+		`rel_createsql` text DEFAULT NULL,
+		`created_time` timestamp NULL DEFAULT NULL,
+		`creator` int unsigned DEFAULT NULL,
+		`owner` int unsigned DEFAULT NULL,
+		`account_id` int unsigned DEFAULT NULL,
+		`partitioned` tinyint DEFAULT NULL,
+		`partition_info` blob DEFAULT NULL,
+		`viewdef` varchar(5000) DEFAULT NULL,
+		`constraint` varchar(5000) DEFAULT NULL,
+		`rel_version` int unsigned DEFAULT NULL,
+		`catalog_version` int unsigned DEFAULT NULL,
+		PRIMARY KEY (`account_id`,`reldatabase`,`relname`)
+	  )
 	*/
 	CDCGetTableIDTemplate = "SELECT " +
 		"rel_id, " +

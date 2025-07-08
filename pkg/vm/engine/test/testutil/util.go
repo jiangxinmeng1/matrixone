@@ -206,8 +206,8 @@ func EngineDefAddIndex(defs []engine.TableDef, idxColName string) []engine.Table
 			IndexAlgoParams:    `{"m":"16","ef_construction":"200","ef_search":"100","op_type":"vector_l2_ops"}`,
 		},
 	}
-	for _,def:=range defs {
-		if con,ok:=def.(*engine.ConstraintDef);ok {
+	for _, def := range defs {
+		if con, ok := def.(*engine.ConstraintDef); ok {
 			con.Cts = append(con.Cts, &engine.IndexDef{
 				Indexes: indexes,
 			})

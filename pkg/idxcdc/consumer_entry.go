@@ -28,14 +28,15 @@ const (
 	SinkerState_Running
 	SinkerState_Finished
 )
+
 type SinkerEntry struct {
-	tableInfo  *TableInfo_2
-	indexName  string
-	inited     atomic.Bool
+	tableInfo    *TableInfo_2
+	indexName    string
+	inited       atomic.Bool
 	consumer     Consumer
 	consumerType int8
-	watermark  types.TS
-	err        error
+	watermark    types.TS
+	err          error
 }
 
 func NewSinkerEntry(
@@ -51,12 +52,12 @@ func NewSinkerEntry(
 		return nil, err
 	}
 	sinkerEntry := &SinkerEntry{
-		tableInfo:  tableInfo,
-		indexName:  sinkerConfig.IndexName,
+		tableInfo:    tableInfo,
+		indexName:    sinkerConfig.IndexName,
 		consumer:     consumer,
 		consumerType: sinkerConfig.ConsumerType,
-		watermark:  watermark,
-		err:        iterationErr,
+		watermark:    watermark,
+		err:          iterationErr,
 	}
 	sinkerEntry.init()
 	return sinkerEntry, nil
@@ -65,14 +66,14 @@ func NewSinkerEntry(
 func (sinkerEntry *SinkerEntry) init() {
 	if sinkerEntry.watermark.IsEmpty() {
 		// in the 1st iteration, toTS is determined by txn.SnapshotTS()
-		iter:=&Iteration{
+		iter := &Iteration{
 			table:   sinkerEntry.tableInfo,
 			sinkers: []*SinkerEntry{sinkerEntry},
 			to:      types.TS{},
 			from:    types.TS{},
 		}
 		sinkerEntry.tableInfo.exec.worker.Submit(iter)
-	}else {
+	} else {
 		sinkerEntry.inited.Store(true)
 	}
 }

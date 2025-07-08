@@ -286,7 +286,7 @@ var (
 				consumer_config VARCHAR(255) NULL
 			)`
 
-	MoCatalogMoCdcAsyncIndexIterationsDDL =`CREATE TABLE mo_async_index_iterations (
+	MoCatalogMoCdcAsyncIndexIterationsDDL = `CREATE TABLE mo_async_index_iterations (
 			id INT AUTO_INCREMENT PRIMARY KEY,
 			account_id INT UNSIGNED NOT NULL,
 			table_id BIGINT UNSIGNED NOT NULL,

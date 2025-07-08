@@ -2926,7 +2926,7 @@ func getChangedTableList(
 
 	if handleFn != nil {
 		resp = &cmd_util.GetChangedTableListResp{}
-		payload(0,"",proc)
+		payload(0, "", proc)
 		handleFn(ctx, txn.TxnMeta{}, req, resp)
 	} else {
 

@@ -21,7 +21,7 @@ import (
 // func ExecuteSql(
 // 	ctx context.Context,
 // 	txn client.TxnOperator,
-// 	cnServiceID string, 
+// 	cnServiceID string,
 // 	sql string,
 // 	) (executor.Result, error){
 // 	v, ok := moruntime.ServiceRuntime(cnServiceID).GetGlobalVariables(moruntime.InternalSQLExecutor)
@@ -74,7 +74,6 @@ func (w *worker) onItem(items ...any) {
 func (w *worker) Stop() {
 	w.queue.Stop()
 }
-
 
 // type CNSinker struct {
 // 	ctx         context.Context

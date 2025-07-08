@@ -307,7 +307,7 @@ func (exec *CDCTaskExecutor2) Stop() {
 
 func (exec *CDCTaskExecutor2) run() {
 	defer exec.wg.Done()
-	trigger := time.NewTicker(time.Millisecond * 100)// todo
+	trigger := time.NewTicker(time.Millisecond * 100) // todo
 	for {
 		select {
 		case <-exec.ctx.Done():
