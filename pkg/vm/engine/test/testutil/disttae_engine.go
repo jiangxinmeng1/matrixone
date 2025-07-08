@@ -73,6 +73,7 @@ type TestDisttaeEngine struct {
 	writeWorkspaceThreshold  uint64
 	quota                    uint64
 	insertEntryMaxCount      int
+	newTxnMu                 sync.Mutex
 
 	rootDir string
 }
@@ -226,6 +227,8 @@ func (de *TestDisttaeEngine) NewTxnOperator(
 	commitTS timestamp.Timestamp,
 	opts ...client.TxnOption,
 ) (client.TxnOperator, error) {
+	de.newTxnMu.Lock()
+	defer de.newTxnMu.Unlock()
 	op, err := de.txnClient.New(ctx, commitTS, opts...)
 	if err != nil {
 		return nil, err

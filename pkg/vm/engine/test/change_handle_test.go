@@ -1435,7 +1435,6 @@ func TestCDCExecutor(t *testing.T) {
 
 	txn.Commit(ctxWithTimeout)
 
-	time.Sleep(time.Second * 10)
 	now := taeHandler.GetDB().TxnMgr.Now()
 	testutils.WaitExpect(
 		4000,

@@ -114,6 +114,7 @@ func CreateEngines(
 	rpcAgent = NewMockLogtailAgent()
 
 	rootDir := GetDefaultTestPath("engine_test", t)
+	os.RemoveAll(rootDir)
 
 	s3Op, err := getS3SharedFileServiceOption(ctx, rootDir)
 	require.NoError(t, err)
