@@ -196,7 +196,6 @@ func (c *IndexConsumer) Consume(ctx context.Context, r DataRetriever) error {
 
 	// read data
 	for !noMoreData {
-
 		insertBatch, deleteBatch, noMoreData, err = r.Next()
 		if err != nil {
 			errch <- err

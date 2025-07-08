@@ -540,9 +540,9 @@ func mock_mo_async_index_log(
 /*
 CREATE TABLE mo_async_index_iterations (
 
-	id INT AUTO_INCREMENT PRIMARY KEY,
+	id INT AUTO_INCREMENT PRIMARY KEY,// ignore id in ut, or preinsert will panic
 	account_id INT UNSIGNED NOT NULL,
-	table_id BIGINT UNSIGNED NOT NULL,
+	table_id BIGINT UNSIGNED NOT NULL,// use table_id as primary key instead
 	index_names VARCHAR(255),--multiple indexes
 	from_ts VARCHAR(32) NOT NULL,
 	to_ts VARCHAR(32) NOT NULL,
@@ -565,24 +565,23 @@ func mock_mo_async_index_iterations(
 				IsRowId:       false,
 				Name:          name,
 				ID:            uint64(idx),
-				Primary:       name == "id",
+				Primary:       name == "table_id",
 				IsHidden:      false,
 				Seqnum:        uint16(idx),
 				ClusterBy:     false,
-				AutoIncrement: name == "id",
+				AutoIncrement: false,
 			},
 		})
 	}
 
-	addDefFn("id", types.T_int32.ToType(), 0)
-	addDefFn("account_id", types.T_uint32.ToType(), 1)
-	addDefFn("table_id", types.T_uint64.ToType(), 2)
-	addDefFn("index_names", types.T_varchar.ToType(), 3)
-	addDefFn("from_ts", types.T_varchar.ToType(), 4)
-	addDefFn("to_ts", types.T_varchar.ToType(), 5)
-	addDefFn("error_json", types.T_varchar.ToType(), 6)
-	addDefFn("start_at", types.T_datetime.ToType(), 7)
-	addDefFn("end_at", types.T_datetime.ToType(), 8)
+	addDefFn("account_id", types.T_uint32.ToType(), 0)
+	addDefFn("table_id", types.T_uint64.ToType(), 1)
+	addDefFn("index_names", types.T_varchar.ToType(), 2)
+	addDefFn("from_ts", types.T_varchar.ToType(), 3)
+	addDefFn("to_ts", types.T_varchar.ToType(), 4)
+	addDefFn("error_json", types.T_varchar.ToType(), 5)
+	addDefFn("start_at", types.T_datetime.ToType(), 6)
+	addDefFn("end_at", types.T_datetime.ToType(), 7)
 
 	defs = append(defs,
 		&engine.ConstraintDef{

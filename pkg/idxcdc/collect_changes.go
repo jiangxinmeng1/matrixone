@@ -127,8 +127,6 @@ func CollectChanges_2(
 						insertBatch: insertAtmBatch,
 						deleteBatch: nil,
 					}
-					insertAtmBatch.Close()
-					insertAtmBatch = nil
 				case engine.ChangesHandle_Tail_wip:
 					panic("logic error")
 				case engine.ChangesHandle_Tail_done:
@@ -144,11 +142,21 @@ func CollectChanges_2(
 
 					addTailEndMetrics(insertAtmBatch)
 					addTailEndMetrics(deleteAtmBatch)
-					insertAtmBatch.Close()
-					deleteAtmBatch.Close()
-					insertAtmBatch = nil
-					deleteAtmBatch = nil
 				}
+			}
+			for i := range consumers {
+				insertDataChs[i] <- data
+			}
+			for i := range consumers {
+				<-ackChs[i]
+			}
+			if insertData != nil {
+				insertAtmBatch.Close()
+				insertAtmBatch = nil
+			}
+			if deleteData != nil {
+				deleteAtmBatch.Close()
+				deleteAtmBatch = nil
 			}
 
 			if data.noMoreData {

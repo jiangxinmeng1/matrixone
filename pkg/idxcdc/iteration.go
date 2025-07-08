@@ -93,7 +93,11 @@ func (iter *Iteration) insertAsyncIndexIterations(ctx context.Context) error {
 
 	errorStr := ""
 	for _, err := range iter.err {
-		errorStr = fmt.Sprintf("%s%s, ", errorStr, err.Error())
+		if err != nil {
+			errorStr = fmt.Sprintf("%s%s, ", errorStr, err.Error())
+		} else {
+			errorStr = fmt.Sprintf("%s%s, ", errorStr, " ")
+		}
 	}
 
 	sql := cdc.CDCSQLBuilder.AsyncIndexIterationsInsertSQL(

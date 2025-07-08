@@ -1375,27 +1375,53 @@ func TestCDCExecutor(t *testing.T) {
 
 	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
 
-	schema := catalog2.MockSchemaAll(10, 1)
+	schema := catalog2.MockSchemaAll(20, 3)
 	tableCount := 1
 	rowCount := 10
 
 	tableIDs := make([]uint64, 0, tableCount)
 	dbNames := make([]string, 0, tableCount)
 	srcTables := make([]string, 0, tableCount)
-	dstTables := make([]string, 0, tableCount)
 
 	for i := 0; i < tableCount; i++ {
 		dbNames = append(dbNames, fmt.Sprintf("db%d", i))
 		srcTables = append(srcTables, fmt.Sprintf("src_table%d", i))
-		dstTables = append(dstTables, fmt.Sprintf("dst_table%d", i))
 	}
 	bat := catalog2.MockBatch(schema, rowCount)
 	bats := bat.Split(rowCount)
 
+	createTableFn := func(ctx context.Context, databaseName, tableName string, schema *catalog2.Schema) {
+
+		de := disttaeEngine
+		txn, err := de.NewTxnOperator(ctx, de.Now())
+		assert.NoError(t, err)
+
+		err = de.Engine.Create(ctx, databaseName, txn)
+		assert.NoError(t, err)
+
+		database, err := de.Engine.Database(ctx, databaseName, txn)
+		assert.NoError(t, err)
+
+		engineTblDef, err := testutil.EngineTableDefBySchema(schema)
+		assert.NoError(t, err)
+
+		indexColName := schema.ColDefs[18].Name
+		engineTblDef = testutil.EngineDefAddIndex(engineTblDef, indexColName)
+
+		err = database.Create(ctx, tableName, engineTblDef)
+		assert.NoError(t, err)
+
+		_, err = database.Relation(ctx, tableName, nil)
+		assert.NoError(t, err)
+
+		err = txn.Commit(ctx)
+		assert.NoError(t, err)
+	}
+
 	// create database and table
 
 	for i := 0; i < tableCount; i++ {
-		disttaeEngine.CreateDatabaseAndTable(ctxWithTimeout, dbNames[i], srcTables[i], schema)
+		createTableFn(ctxWithTimeout, dbNames[i], srcTables[i], schema)
 
 		_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, dbNames[i], srcTables[i])
 		require.Nil(t, err)
@@ -1436,7 +1462,7 @@ func TestCDCExecutor(t *testing.T) {
 				ConsumerType: int8(idxcdc.ConsumerType_IndexSync),
 				DbName:       dbNames[i],
 				TableName:    srcTables[i],
-				IndexName:    "index1",
+				IndexName:    "hnsw_idx",
 			},
 		)
 		assert.True(t, ok)
@@ -1448,7 +1474,7 @@ func TestCDCExecutor(t *testing.T) {
 		appendFn(dbNames[j], srcTables[j], 1)
 	}
 
-	time.Sleep(time.Second*10)
+	time.Sleep(time.Second * 10)
 
 	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
 
