@@ -4713,8 +4713,6 @@ func (c *Compile) runSqlWithResultAndOptions(
 		WithLowerCaseTableNames(&lower).
 		WithStatementOption(options)
 
-	opts.StatementOption()
-
 	if qry, ok := c.pn.Plan.(*plan.Plan_Ddl); ok {
 		if qry.Ddl.DdlType == plan.DataDefinition_DROP_DATABASE {
 			opts = opts.WithStatementOption(executor.StatementOption{}.WithIgnoreForeignKey())

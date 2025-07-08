@@ -14,20 +14,10 @@
 package idxcdc
 
 import (
-	// "context"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
-	// "github.com/matrixorigin/matrixone/pkg/txn/client"
 )
-
-// func RegisterJob(ctx context.Context, cnUUID string, txn client.TxnOperator, pitr_name string, info *ConsumerInfo) (bool, error) {
-// 	return true, nil
-// }
-
-// func UnregisterJob(ctx context.Context, cnUUID string, txn client.TxnOperator, info *ConsumerInfo) (bool, error) {
-// 	return true, nil
-// }
 
 func NewConsumer(cnUUID string,
 	tableDef *plan.TableDef,
