@@ -25,7 +25,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/util/executor"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 )
 
 func ExecWithResult(
@@ -110,11 +109,29 @@ func UnregisterJob(
 	if err != nil {
 		return false, err
 	}
-	var rel engine.Relation
-	tableDef := rel.GetTableDef(ctx)
+	tableIDSql := cdc.CDCSQLBuilder.GetTableIDSQL(
+		tenantId,
+		consumerInfo.DbName,
+		consumerInfo.TableName,
+	)
+	result, err := ExecWithResult(ctx, tableIDSql, cnUUID, txn)
+	if err != nil {
+		return false, err
+	}
+	defer result.Close()
+	var tableID uint64
+	result.ReadRows(func(rows int, cols []*vector.Vector) bool {
+		if rows != 1 {
+			panic(fmt.Sprintf("invalid rows %d", rows))
+		}
+		for i := 0; i < rows; i++ {
+			tableID = vector.MustFixedColWithTypeCheck[uint64](cols[0])[i]
+		}
+		return true
+	})
 	sql := cdc.CDCSQLBuilder.AsyncIndexLogUpdateDropAtSQL(
 		tenantId,
-		tableDef.TblId,
+		tableID,
 		consumerInfo.IndexName,
 	)
 	_, err = ExecWithResult(ctx, sql, cnUUID, txn)

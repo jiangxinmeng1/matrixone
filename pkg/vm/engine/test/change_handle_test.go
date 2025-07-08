@@ -16,9 +16,6 @@ package test
 
 import (
 	"context"
-	"fmt"
-
-	// "fmt"
 	"testing"
 	"time"
 
@@ -45,7 +42,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/jobs"
 
-	// "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils/config"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/test/testutil"
 )
@@ -1372,77 +1369,27 @@ func TestCDCExecutor(t *testing.T) {
 	require.NoError(t, err)
 	err = mock_mo_async_index_iterations(disttaeEngine, ctxWithTimeout)
 	require.NoError(t, err)
-
+	err = mock_mo_indexes(disttaeEngine, ctxWithTimeout)
+	require.NoError(t, err)
 	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
-
-	schema := catalog2.MockSchemaAll(20, 3)
-	tableCount := 1
-	rowCount := 10
-
-	tableIDs := make([]uint64, 0, tableCount)
-	dbNames := make([]string, 0, tableCount)
-	srcTables := make([]string, 0, tableCount)
-
-	for i := 0; i < tableCount; i++ {
-		dbNames = append(dbNames, fmt.Sprintf("db%d", i))
-		srcTables = append(srcTables, fmt.Sprintf("src_table%d", i))
-	}
-	bat := catalog2.MockBatch(schema, rowCount)
-	bats := bat.Split(rowCount)
-
-	createTableFn := func(ctx context.Context, databaseName, tableName string, schema *catalog2.Schema) {
-
-		de := disttaeEngine
-		txn, err := de.NewTxnOperator(ctx, de.Now())
-		assert.NoError(t, err)
-
-		err = de.Engine.Create(ctx, databaseName, txn)
-		assert.NoError(t, err)
-
-		database, err := de.Engine.Database(ctx, databaseName, txn)
-		assert.NoError(t, err)
-
-		engineTblDef, err := testutil.EngineTableDefBySchema(schema)
-		assert.NoError(t, err)
-
-		indexColName := schema.ColDefs[18].Name
-		engineTblDef = testutil.EngineDefAddIndex(engineTblDef, indexColName)
-
-		err = database.Create(ctx, tableName, engineTblDef)
-		assert.NoError(t, err)
-
-		_, err = database.Relation(ctx, tableName, nil)
-		assert.NoError(t, err)
-
-		err = txn.Commit(ctx)
-		assert.NoError(t, err)
-	}
 
 	// create database and table
 
-	for i := 0; i < tableCount; i++ {
-		createTableFn(ctxWithTimeout, dbNames[i], srcTables[i], schema)
+	bat := CreateDBAndTableForHNSWAndGetAppendData(t, disttaeEngine, ctxWithTimeout, "srcdb", "src_table", 10)
+	bats := bat.Split(10)
 
-		_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, dbNames[i], srcTables[i])
-		require.Nil(t, err)
-		tableIDs = append(tableIDs, rel.GetTableID(ctxWithTimeout))
-		txn.Commit(ctxWithTimeout)
-	}
+	// append 1 row
+	_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, "srcdb", "src_table")
+	require.Nil(t, err)
 
-	appendFn := func(db, table string, rowIdx int) {
-		_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, db, table)
-		require.Nil(t, err)
+	tableID := rel.GetTableID(ctxWithTimeout)
 
-		err = rel.Write(ctxWithTimeout, containers.ToCNBatch(bats[rowIdx]))
-		require.Nil(t, err)
+	err = rel.Write(ctxWithTimeout, containers.ToCNBatch(bats[0]))
+	require.Nil(t, err)
 
-		txn.Commit(ctxWithTimeout)
-	}
+	txn.Commit(ctxWithTimeout)
 
-	for i := 0; i < tableCount; i++ {
-		appendFn(dbNames[i], srcTables[i], 0)
-	}
-
+	// init cdc executor
 	txnFactory := func() (client.TxnOperator, error) {
 		return disttaeEngine.NewTxnOperator(ctxWithTimeout, disttaeEngine.Engine.LatestLogtailAppliedTime())
 	}
@@ -1453,29 +1400,77 @@ func TestCDCExecutor(t *testing.T) {
 	cdcExecutor.Start()
 	defer cdcExecutor.Stop()
 
-	for i := 0; i < tableCount; i++ {
-		txn, err := disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Engine.LatestLogtailAppliedTime())
-		require.NoError(t, err)
-		ok, err := idxcdc.RegisterJob(
-			ctx, "", txn, "pitr",
-			&idxcdc.ConsumerInfo{
-				ConsumerType: int8(idxcdc.ConsumerType_IndexSync),
-				DbName:       dbNames[i],
-				TableName:    srcTables[i],
-				IndexName:    "hnsw_idx",
-			},
-		)
-		assert.True(t, ok)
-		assert.NoError(t, err)
-		assert.NoError(t, txn.Commit(ctxWithTimeout))
-	}
+	// register cdc job
+	txn, err = disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Engine.LatestLogtailAppliedTime())
+	require.NoError(t, err)
+	ok, err := idxcdc.RegisterJob(
+		ctx, "", txn, "pitr",
+		&idxcdc.ConsumerInfo{
+			ConsumerType: int8(idxcdc.ConsumerType_IndexSync),
+			DbName:       "srcdb",
+			TableName:    "src_table",
+			IndexName:    "hnsw_idx",
+		},
+	)
+	assert.True(t, ok)
+	assert.NoError(t, err)
+	assert.NoError(t, txn.Commit(ctxWithTimeout))
 
-	for j := 0; j < tableCount; j++ {
-		appendFn(dbNames[j], srcTables[j], 1)
-	}
+	testutils.WaitExpect(
+		4000,
+		func() bool {
+			_, ok := cdcExecutor.GetWatermark(tableID, "hnsw_idx")
+			return ok
+		},
+	)
+	_, ok = cdcExecutor.GetWatermark(tableID, "hnsw_idx")
+	assert.True(t, ok)
+
+	// append 1 row
+	_, rel, txn, err = disttaeEngine.GetTable(ctxWithTimeout, "srcdb", "src_table")
+	require.Nil(t, err)
+
+	err = rel.Write(ctxWithTimeout, containers.ToCNBatch(bats[1]))
+	require.Nil(t, err)
+
+	txn.Commit(ctxWithTimeout)
 
 	time.Sleep(time.Second * 10)
+	now := taeHandler.GetDB().TxnMgr.Now()
+	testutils.WaitExpect(
+		4000,
+		func() bool {
+			ts, _ := cdcExecutor.GetWatermark(tableID, "hnsw_idx")
+			return ts.GE(&now)
+		},
+	)
+	ts, _ := cdcExecutor.GetWatermark(tableID, "hnsw_idx")
+	assert.True(t, ts.GE(&now))
+	t.Logf("watermark greater than %v", now.ToString())
 
+	// unregister cdc job
+	txn, err = disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Engine.LatestLogtailAppliedTime())
+	require.NoError(t, err)
+	ok, err = idxcdc.UnregisterJob(ctx, "", txn,
+		&idxcdc.ConsumerInfo{
+			ConsumerType: int8(idxcdc.ConsumerType_IndexSync),
+			DbName:       "srcdb",
+			TableName:    "src_table",
+			IndexName:    "hnsw_idx",
+		})
+	assert.True(t, ok)
+	assert.NoError(t, err)
+	assert.NoError(t, txn.Commit(ctxWithTimeout))
+
+	testutils.WaitExpect(
+		4000,
+		func() bool {
+			_, ok := cdcExecutor.GetWatermark(tableID, "hnsw_idx")
+			return !ok
+		},
+	)
+	_, ok = cdcExecutor.GetWatermark(tableID, "hnsw_idx")
+	assert.False(t, ok)
 	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
 
 }

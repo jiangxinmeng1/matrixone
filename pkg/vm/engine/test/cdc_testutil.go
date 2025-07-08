@@ -23,20 +23,28 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
+
 	// "github.com/matrixorigin/matrixone/pkg/defines"
 	// "github.com/matrixorigin/matrixone/pkg/frontend"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+
 	// "github.com/matrixorigin/matrixone/pkg/pb/task"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
+
 	// "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/test/testutil"
 	"github.com/stretchr/testify/assert"
+
 	// ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
+	catalog2 "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 )
 
 type idAllocator interface {
@@ -619,6 +627,77 @@ func mock_mo_async_index_iterations(
 	}
 	return
 }
+
+/*
+CREATE TABLE `mo_indexes` (
+
+	`id` bigint unsigned NOT NULL,
+	`table_id` bigint unsigned NOT NULL,
+	`database_id` bigint unsigned NOT NULL,
+	`name` varchar(64) NOT NULL,
+	`type` varchar(11) NOT NULL,
+	`algo` varchar(11) DEFAULT NULL,
+	`algo_table_type` varchar(11) DEFAULT NULL,
+	`algo_params` varchar(2048) DEFAULT NULL,
+	`is_visible` tinyint NOT NULL,
+	`hidden` tinyint NOT NULL,
+	`comment` varchar(2048) NOT NULL,
+	`column_name` varchar(256) NOT NULL,
+	`ordinal_position` int unsigned NOT NULL,
+	`options` text DEFAULT NULL,
+	`index_table_name` varchar(5000) DEFAULT NULL,
+	PRIMARY KEY (`id`,`column_name`)
+
+)
+*/
+func mock_mo_indexes(
+	de *testutil.TestDisttaeEngine,
+	ctx context.Context,
+) (err error) {
+	sql := "CREATE TABLE `mo_catalog`.`mo_indexes` ( " +
+		"`id` bigint unsigned NOT NULL," +
+		"`table_id` bigint unsigned NOT NULL," +
+		"`database_id` bigint unsigned NOT NULL," +
+		"`name` varchar(64) NOT NULL," +
+		"`type` varchar(11) NOT NULL," +
+		"`algo` varchar(11) DEFAULT NULL," +
+		"`algo_table_type` varchar(11) DEFAULT NULL," +
+		"`algo_params` varchar(2048) DEFAULT NULL," +
+		"`is_visible` tinyint NOT NULL," +
+		"`hidden` tinyint NOT NULL," +
+		"`comment` varchar(2048) NOT NULL," +
+		"`column_name` varchar(256) NOT NULL," +
+		"`ordinal_position` int unsigned NOT NULL," +
+		"`options` text DEFAULT NULL," +
+		"`index_table_name` varchar(5000) DEFAULT NULL," +
+		"PRIMARY KEY (`id`,`column_name`)" +
+		")"
+
+	v, ok := moruntime.ServiceRuntime("").GetGlobalVariables(moruntime.InternalSQLExecutor)
+	if !ok {
+		panic("missing lock service")
+	}
+
+	exec := v.(executor.SQLExecutor)
+	txn, err := de.NewTxnOperator(ctx, de.Now())
+	if err != nil {
+		return err
+	}
+	opts := executor.Options{}.
+		// All runSql and runSqlWithResult is a part of input sql, can not incr statement.
+		// All these sub-sql's need to be rolled back and retried en masse when they conflict in pessimistic mode
+		WithDisableIncrStatement().
+		WithTxn(txn)
+
+	_, err = exec.Exec(ctx, sql, opts)
+	if err != nil {
+		return err
+	}
+	if err = txn.Commit(ctx); err != nil {
+		return err
+	}
+	return err
+}
 func getCDCPitrTablesString(
 	srcDB, srcTable string,
 	dstDB, dstTable string,
@@ -701,3 +780,41 @@ func getCDCPitrTablesString(
 // 	)
 // 	return err
 // }
+
+func CreateDBAndTableForHNSWAndGetAppendData(
+	t *testing.T,
+	de *testutil.TestDisttaeEngine,
+	ctx context.Context,
+	databaseName string,
+	tableName string,
+	rowCount int,
+) *containers.Batch {
+	// int64 is column 3, array_float32 is column 18
+	schema := catalog2.MockSchemaAll(20, 3)
+	txn, err := de.NewTxnOperator(ctx, de.Now())
+	assert.NoError(t, err)
+
+	err = de.Engine.Create(ctx, databaseName, txn)
+	assert.NoError(t, err)
+
+	database, err := de.Engine.Database(ctx, databaseName, txn)
+	assert.NoError(t, err)
+
+	engineTblDef, err := testutil.EngineTableDefBySchema(schema)
+	assert.NoError(t, err)
+
+	// add index
+	indexColName := schema.ColDefs[18].Name
+	engineTblDef = testutil.EngineDefAddIndex(engineTblDef, indexColName)
+
+	err = database.Create(ctx, tableName, engineTblDef)
+	assert.NoError(t, err)
+
+	_, err = database.Relation(ctx, tableName, nil)
+	assert.NoError(t, err)
+
+	err = txn.Commit(ctx)
+	assert.NoError(t, err)
+
+	return catalog2.MockBatch(schema, rowCount)
+}

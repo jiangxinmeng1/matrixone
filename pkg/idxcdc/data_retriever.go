@@ -50,12 +50,12 @@ func NewDataRetriever(
 	dataType int8,
 ) *DataRetrieverImpl {
 	return &DataRetrieverImpl{
-		SinkerEntry: consumer,
-		Iteration: iteration,
-		txn: txn,
+		SinkerEntry:  consumer,
+		Iteration:    iteration,
+		txn:          txn,
 		insertDataCh: insertDataCh,
-		ackChan: ackChan,
-		typ: dataType,
+		ackChan:      ackChan,
+		typ:          dataType,
 	}
 }
 

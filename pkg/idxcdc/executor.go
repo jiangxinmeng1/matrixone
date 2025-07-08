@@ -307,7 +307,7 @@ func (exec *CDCTaskExecutor2) Stop() {
 
 func (exec *CDCTaskExecutor2) run() {
 	defer exec.wg.Done()
-	trigger := time.NewTicker(time.Second * 10)
+	trigger := time.NewTicker(time.Millisecond * 100)// todo
 	for {
 		select {
 		case <-exec.ctx.Done():
@@ -335,12 +335,13 @@ func (exec *CDCTaskExecutor2) run() {
 }
 
 // For UT
-func (exec *CDCTaskExecutor2) GetWatermark(srcTableID uint64, indexName string) (types.TS, error) {
+func (exec *CDCTaskExecutor2) GetWatermark(srcTableID uint64, indexName string) (watermark types.TS, ok bool) {
 	table, ok := exec.getTable(srcTableID)
 	if !ok {
-		return types.TS{}, moerr.NewInternalError(context.Background(), "table not found")
+		return
 	}
-	return table.GetWatermark(indexName)
+	watermark, ok = table.GetWatermark(indexName)
+	return
 }
 
 func (exec *CDCTaskExecutor2) onAsyncIndexLogInsert(ctx context.Context, input *api.Batch, tableID uint64) {
@@ -386,7 +387,7 @@ func (exec *CDCTaskExecutor2) onAsyncIndexLogInsert(ctx context.Context, input *
 			consumerInfoStr := consumerInfoVector.GetStringAt(i)
 			go exec.addIndex(ctx, accountIDs[i], tid, watermarkStr, int(errorCodes[i]), consumerInfoStr)
 		}
-		if dropAtVector.IsNull(uint64(i)) {
+		if !dropAtVector.IsNull(uint64(i)) {
 			indexName := indexNameVector.GetStringAt(i)
 			go exec.deleteIndex(ctx, accountIDs[i], tid, indexName)
 		}

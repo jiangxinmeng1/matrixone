@@ -105,9 +105,6 @@ func CollectChanges_2(
 			if err != nil {
 				return
 			}
-			if typ != int8(currentHint) {
-				panic("logic error")
-			}
 
 			var data *CDCData
 			// both nil denote no more data (end of this tail)
@@ -120,6 +117,9 @@ func CollectChanges_2(
 			} else {
 				switch currentHint {
 				case engine.ChangesHandle_Snapshot:
+					if typ != CDCDataType_Snapshot {
+						panic("logic error")
+					}
 					insertAtmBatch = allocateAtomicBatchIfNeed(insertAtmBatch)
 					insertAtmBatch.Append(packer, insertData, insTSColIdx, insCompositedPkColIdx)
 					data = &CDCData{
@@ -130,6 +130,9 @@ func CollectChanges_2(
 				case engine.ChangesHandle_Tail_wip:
 					panic("logic error")
 				case engine.ChangesHandle_Tail_done:
+					if typ != CDCDataType_Tail {
+						panic("logic error")
+					}
 					insertAtmBatch = allocateAtomicBatchIfNeed(insertAtmBatch)
 					deleteAtmBatch = allocateAtomicBatchIfNeed(deleteAtmBatch)
 					insertAtmBatch.Append(packer, insertData, insTSColIdx, insCompositedPkColIdx)
@@ -137,7 +140,7 @@ func CollectChanges_2(
 					data = &CDCData{
 						noMoreData:  false,
 						insertBatch: insertAtmBatch,
-						deleteBatch: nil,
+						deleteBatch: deleteAtmBatch,
 					}
 
 					addTailEndMetrics(insertAtmBatch)
@@ -150,11 +153,11 @@ func CollectChanges_2(
 			for i := range consumers {
 				<-ackChs[i]
 			}
-			if insertData != nil {
+			if insertAtmBatch != nil {
 				insertAtmBatch.Close()
 				insertAtmBatch = nil
 			}
-			if deleteData != nil {
+			if deleteAtmBatch != nil {
 				deleteAtmBatch.Close()
 				deleteAtmBatch = nil
 			}

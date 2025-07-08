@@ -17,10 +17,10 @@ package idxcdc
 import (
 	"context"
 	"sync"
-	"sync/atomic"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 )
 
@@ -42,7 +42,6 @@ type TableInfo_2 struct {
 	tableName string
 	dbName    string
 	state     TableState
-	inited    atomic.Bool
 	sinkers   []*SinkerEntry
 	mu        sync.RWMutex
 }
@@ -91,15 +90,16 @@ func (t *TableInfo_2) AddSinker(
 	return true, nil
 }
 
-func (t *TableInfo_2) GetWatermark(indexName string) (types.TS, error) {
+// for UT
+func (t *TableInfo_2) GetWatermark(indexName string) (watermark types.TS, ok bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	for _, sinker := range t.sinkers {
 		if sinker.indexName == indexName {
-			return sinker.watermark, nil
+			return sinker.watermark, true
 		}
 	}
-	return types.TS{}, moerr.NewInternalError(context.Background(), "sinker not found")
+	return types.TS{}, false
 }
 func (t *TableInfo_2) DeleteSinker(
 	ctx context.Context,
@@ -110,21 +110,18 @@ func (t *TableInfo_2) DeleteSinker(
 	for i, sinker := range t.sinkers {
 		if sinker.indexName == indexName {
 			t.sinkers = append(t.sinkers[:i], t.sinkers[i+1:]...)
+			return len(t.sinkers) == 0, nil
 		}
-		return len(t.sinkers) == 0, nil
 	}
 	return false, moerr.NewInternalError(ctx, "sinker not found")
 }
 
 func (t *TableInfo_2) IsInitedAndFinished() bool {
-	if !t.inited.Load() {
-		return false
-	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	hasActiveSinker := false
 	for _, sinker := range t.sinkers {
-		if !sinker.PermanentError() {
+		if !sinker.PermanentError() && sinker.inited.Load() {
 			hasActiveSinker = true
 			break
 		}
@@ -135,7 +132,7 @@ func (t *TableInfo_2) IsInitedAndFinished() bool {
 func (t *TableInfo_2) GetMinWaterMark() types.TS {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	minWatermark := types.TS{}
+	minWatermark := types.MaxTs()
 	for _, sinker := range t.sinkers {
 		if !sinker.inited.Load() {
 			continue
@@ -176,7 +173,7 @@ func (t *TableInfo_2) GetSyncTask(ctx context.Context, toTS types.TS) *Iteration
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	dirtySinker := t.getNewSinkersLocked()
-	maxTS:=t.GetMaxWaterMarkLocked()
+	maxTS := t.GetMaxWaterMarkLocked()
 	if dirtySinker != nil {
 		t.state = TableState_Running
 		return &Iteration{
@@ -219,20 +216,27 @@ func (t *TableInfo_2) OnIterationFinished(iter *Iteration) {
 	// init sinker
 	if len(iter.sinkers) == 1 && !iter.sinkers[0].inited.Load() {
 		iter.sinkers[0].inited.Store(true)
-		t.inited.Store(true)
+		sinker := iter.sinkers[0]
+		if iter.err[0] != nil {
+			logutil.Infof("lalala sinker %v, error %v", sinker.indexName, iter.err[0])
+			sinker.err = iter.err[0]
+		} else {
+			sinker.watermark = iter.to
+		}
 		return
 	}
 	if t.state != TableState_Running {
 		panic("logic error")
 	}
 	// dirty sinkers
-	maxTS:=t.GetMaxWaterMarkLocked()
+	maxTS := t.GetMaxWaterMarkLocked()
 	if maxTS.EQ(&iter.to) {
 		if len(iter.sinkers) != 1 {
 			panic("logic error")
 		}
 		sinker := iter.sinkers[0]
 		if iter.err[0] != nil {
+			logutil.Infof("lalala sinker %v, error %v", sinker.indexName, iter.err[0])
 			sinker.err = iter.err[0]
 		} else {
 			sinker.watermark = iter.to
@@ -247,6 +251,7 @@ func (t *TableInfo_2) OnIterationFinished(iter *Iteration) {
 	t.state = TableState_Finished
 	for i, sinker := range iter.sinkers {
 		if iter.err[i] != nil {
+			logutil.Infof("lalala sinker %v, error %v", sinker.indexName, iter.err[i])
 			sinker.err = iter.err[i]
 		} else {
 			sinker.watermark = iter.to
@@ -255,12 +260,12 @@ func (t *TableInfo_2) OnIterationFinished(iter *Iteration) {
 }
 
 func (t *TableInfo_2) getNewSinkersLocked() *SinkerEntry {
-	maxTS:=t.GetMaxWaterMarkLocked()
+	maxTS := t.GetMaxWaterMarkLocked()
 	for _, sinker := range t.sinkers {
 		if !sinker.inited.Load() {
 			continue
 		}
-		if sinker.watermark.LE(&maxTS) {
+		if sinker.watermark.LT(&maxTS) {
 			return sinker
 		}
 	}

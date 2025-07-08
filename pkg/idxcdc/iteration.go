@@ -67,6 +67,7 @@ func (iter *Iteration) Run() {
 	if iter.from.IsEmpty() {
 		iter.to = types.TimestampToTS(txn.SnapshotTS())
 	}
+	logutil.Infof("lalala iteration %v->%v", iter.from.ToString(), iter.to.ToString())
 	iter.err = CollectChanges_2(
 		ctx,
 		iter,
@@ -83,6 +84,7 @@ func (iter *Iteration) Run() {
 	if err != nil {
 		logutil.Errorf("insert async index iterations failed, err: %v", err)
 	}
+	iter.table.OnIterationFinished(iter)
 }
 
 func (iter *Iteration) insertAsyncIndexIterations(ctx context.Context) error {

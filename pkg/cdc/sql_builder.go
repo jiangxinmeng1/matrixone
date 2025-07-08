@@ -875,7 +875,7 @@ func (b cdcSQLBuilder) AsyncIndexLogUpdateDropAtSQL(
 	indexName string,
 ) string {
 	return fmt.Sprintf(
-		CDCSQLTemplates[CDCUpdateMOAsyncIndexLogSqlTemplate_Idx].SQL,
+		CDCSQLTemplates[CDCUpdateMOAsyncIndexLogDropAtSqlTemplate_Idx].SQL,
 		accountID,
 		tableID,
 		indexName,
