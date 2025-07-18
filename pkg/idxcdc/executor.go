@@ -423,6 +423,33 @@ func (exec *CDCTaskExecutor) GetWatermark(srcTableID uint64, indexName string) (
 }
 
 func (exec *CDCTaskExecutor) onAsyncIndexLogInsert(ctx context.Context, input *api.Batch, tableID uint64) {
+	if tableID == 2 {
+		tableNameVector, err := vector.ProtoVectorToVector(input.Vecs[3])
+		if err != nil {
+			panic(err)
+		}
+		tableName := tableNameVector.GetStringAt(0)
+		logutil.Info("Async-Index-CDC-Task create table", zap.String("tableName", tableName))
+		if tableName == "t" {
+			go func() {
+				txn, err := exec.txnFactory()
+				if err != nil {
+					panic(err)
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				ctx = context.WithValue(ctx, defines.TenantIDKey{}, catalog.System_Account)
+				ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Minute*5)
+				defer cancel()
+				RegisterJob(ctxWithTimeout, exec.cnUUID, txn, "", &ConsumerInfo{
+					ConsumerType: int8(ConsumerType_CNConsumer),
+					DbName:       "t",
+					TableName:    "t",
+					IndexName:    "t",
+				})
+			}()
+		}
+	}
 	if tableID != exec.asyncIndexLogTableID {
 		return
 	}
