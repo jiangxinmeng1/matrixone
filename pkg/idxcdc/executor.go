@@ -426,12 +426,19 @@ func (exec *CDCTaskExecutor) onAsyncIndexLogInsert(ctx context.Context, input *a
 				ctx = context.WithValue(ctx, defines.TenantIDKey{}, catalog.System_Account)
 				ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Minute*5)
 				defer cancel()
-				RegisterJob(ctxWithTimeout, exec.cnUUID, txn, "", &ConsumerInfo{
+				_, err = RegisterJob(ctxWithTimeout, exec.cnUUID, txn, "", &ConsumerInfo{
 					ConsumerType: int8(ConsumerType_CNConsumer),
 					DbName:       "t",
 					TableName:    "t",
 					IndexName:    "t",
 				})
+				if err != nil {
+					panic(err)
+				}
+				err = txn.Commit(ctx)
+				if err != nil {
+					panic(err)
+				}
 			}()
 		}
 	}
