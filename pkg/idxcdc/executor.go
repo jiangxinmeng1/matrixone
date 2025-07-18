@@ -137,7 +137,7 @@ func AsyncIndexCdcTaskExecutorFactory(
 			return nil
 		}
 		exec.initStateLocked()
-		exec.run()
+		exec.run(ctx)
 		return nil
 	}
 }
@@ -312,7 +312,7 @@ func (exec *CDCTaskExecutor) Start() {
 		return
 	}
 	exec.initStateLocked()
-	go exec.run()
+	go exec.run(context.Background())
 }
 
 func (exec *CDCTaskExecutor) initStateLocked() {
@@ -347,16 +347,23 @@ func (exec *CDCTaskExecutor) Stop() {
 	exec.worker = nil
 }
 
-func (exec *CDCTaskExecutor) run() {
+func (exec *CDCTaskExecutor) run(ctx context.Context) {
 	logutil.Info(
 		"Async-Index-CDC-Task Run",
 	)
+	defer func() {
+		logutil.Info(
+			"Async-Index-CDC-Task Run Done",
+		)
+	}()
 	defer exec.wg.Done()
 	syncTaskTrigger := time.NewTicker(exec.option.SyncTaskInterval)
 	flushWatermarkTrigger := time.NewTicker(exec.option.FlushWatermarkInterval)
 	gcTrigger := time.NewTicker(exec.option.GCTTL)
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-exec.ctx.Done():
 			return
 		case <-syncTaskTrigger.C:
