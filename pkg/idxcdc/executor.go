@@ -271,10 +271,10 @@ func (exec *CDCTaskExecutor) getAllTables() []*TableInfo_2 {
 }
 
 // get watermark, register new table, delete
-func (exec *CDCTaskExecutor) getTable(tableID uint64) (*TableInfo_2, bool) {
+func (exec *CDCTaskExecutor) getTable(accountID uint32, tableID uint64) (*TableInfo_2, bool) {
 	exec.tableMu.RLock()
 	defer exec.tableMu.RUnlock()
-	return exec.tables.Get(&TableInfo_2{tableID: tableID})
+	return exec.tables.Get(&TableInfo_2{accountID: accountID, tableID: tableID})
 }
 
 func (exec *CDCTaskExecutor) setTable(table *TableInfo_2) {
@@ -413,8 +413,8 @@ func (exec *CDCTaskExecutor) run(ctx context.Context) {
 }
 
 // For UT
-func (exec *CDCTaskExecutor) GetWatermark(srcTableID uint64, indexName string) (watermark types.TS, ok bool) {
-	table, ok := exec.getTable(srcTableID)
+func (exec *CDCTaskExecutor) GetWatermark(accountID uint32, srcTableID uint64, indexName string) (watermark types.TS, ok bool) {
+	table, ok := exec.getTable(accountID, srcTableID)
 	if !ok {
 		return
 	}
@@ -534,9 +534,9 @@ func (exec *CDCTaskExecutor) replay(ctx context.Context) {
 		accountIDs := vector.MustFixedColNoTypeCheck[uint32](cols[0])
 		tableIDs := vector.MustFixedColNoTypeCheck[uint64](cols[1])
 		watermarkVector := cols[3]
-		errorCodes := vector.MustFixedColNoTypeCheck[int32](cols[4])
-		consumerInfoVector := cols[8]
-		dropAtVector := cols[7]
+		errorCodes := vector.MustFixedColNoTypeCheck[int32](cols[5])
+		consumerInfoVector := cols[9]
+		dropAtVector := cols[8]
 		for i := 0; i < rows; i++ {
 			if !dropAtVector.IsNull(uint64(i)) {
 				continue
@@ -600,7 +600,7 @@ func (exec *CDCTaskExecutor) addIndex(
 	watermark := types.StringToTS(watermarkStr)
 	tableDef := rel.GetTableDef(ctx)
 	var table *TableInfo_2
-	table, ok := exec.getTable(tableDef.TblId)
+	table, ok := exec.getTable(accountID, tableDef.TblId)
 	if !ok {
 		table = NewTableInfo_2(
 			exec,
@@ -643,7 +643,7 @@ func (exec *CDCTaskExecutor) deleteIndex(
 			zap.Error(err),
 		)
 	}()
-	table, ok := exec.getTable(tableID)
+	table, ok := exec.getTable(accountID, tableID)
 	if !ok {
 		return moerr.NewInternalErrorNoCtx("table not found")
 	}
