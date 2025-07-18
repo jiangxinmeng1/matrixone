@@ -423,6 +423,8 @@ func (exec *CDCTaskExecutor) onAsyncIndexLogInsert(ctx context.Context, input *a
 				}
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
+				ctx, cancel = context.WithTimeout(ctx, time.Minute*5)
+				defer cancel()
 				ctx = context.WithValue(ctx, defines.TenantIDKey{}, catalog.System_Account)
 				ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Minute*5)
 				defer cancel()
