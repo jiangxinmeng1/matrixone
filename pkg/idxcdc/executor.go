@@ -59,7 +59,7 @@ const (
 	DefaultSyncTaskInterval       = time.Millisecond * 100
 	DefaultFlushWatermarkInterval = time.Hour
 
-	DefaultRetryTimes = 5
+	DefaultRetryTimes    = 5
 	DefaultRetryDuration = time.Second
 )
 
@@ -419,35 +419,54 @@ func (exec *CDCTaskExecutor) onAsyncIndexLogInsert(ctx context.Context, input *a
 		if err != nil {
 			panic(err)
 		}
-		tableName := tableNameVector.GetStringAt(0)
-		logutil.Info("Async-Index-CDC-Task create table", zap.String("tableName", tableName))
-		if tableName == "t" {
-			go func() {
-				txn, err := exec.txnFactory()
-				if err != nil {
-					panic(err)
-				}
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
-				ctx, cancel = context.WithTimeout(ctx, time.Minute*5)
-				defer cancel()
-				ctx = context.WithValue(ctx, defines.TenantIDKey{}, catalog.System_Account)
-				ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Minute*5)
-				defer cancel()
-				_, err = RegisterJob(ctxWithTimeout, exec.cnUUID, txn, "", &ConsumerInfo{
-					ConsumerType: int8(ConsumerType_CNConsumer),
-					DbName:       "t",
-					TableName:    "t",
-					IndexName:    "t",
-				})
-				if err != nil {
-					panic(err)
-				}
-				err = txn.Commit(ctx)
-				if err != nil {
-					panic(err)
-				}
-			}()
+		dbNameVector, err := vector.ProtoVectorToVector(input.Vecs[4])
+		if err != nil {
+			panic(err)
+		}
+		for i := 0; i < dbNameVector.Length(); i++ {
+
+			dbName := dbNameVector.GetStringAt(i)
+			tableName := tableNameVector.GetStringAt(i)
+			logutil.Info("Async-Index-CDC-Task create table", zap.String("tableName", tableName))
+			if dbName == "tpcc" {
+				go func() {
+					err := retry(
+						func() error {
+							txn, err := exec.txnFactory()
+							if err != nil {
+								panic(err)
+							}
+							ctx, cancel := context.WithCancel(context.Background())
+							defer cancel()
+							ctx, cancel = context.WithTimeout(ctx, time.Minute*5)
+							defer cancel()
+							ctx = context.WithValue(ctx, defines.TenantIDKey{}, catalog.System_Account)
+							ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Minute*5)
+							defer cancel()
+							_, err = RegisterJob(ctxWithTimeout, exec.cnUUID, txn, "", &ConsumerInfo{
+								ConsumerType: int8(ConsumerType_CNConsumer),
+								DbName:       dbName,
+								TableName:    tableName,
+								IndexName:    "t",
+							})
+							if err != nil {
+								txn.Rollback(ctx)
+								return err
+							}
+							err = txn.Commit(ctx)
+							if err != nil {
+								return err
+							}
+							return nil
+						},
+						exec.option.RetryTimes,
+					)
+					if err != nil {
+						panic(err)
+					}
+				}()
+
+			}
 		}
 	}
 	if tableID != exec.asyncIndexLogTableID {
@@ -841,7 +860,7 @@ func (exec *CDCTaskExecutor) String() string {
 	return str
 }
 
-func  retry(fn func() error, retryTimes int) (err error) {
+func retry(fn func() error, retryTimes int) (err error) {
 	for i := 0; i < retryTimes; i++ {
 		err = fn()
 		if err == nil {
