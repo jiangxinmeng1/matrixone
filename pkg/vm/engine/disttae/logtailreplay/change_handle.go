@@ -623,7 +623,7 @@ func (p *baseHandle) QuickNext(ctx context.Context, bat **batch.Batch, mp *mpool
 			return
 		}
 	}
-	if (*bat).RowCount() > p.changesHandle.coarseMaxRow {
+	if (*bat) != nil && (*bat).RowCount() > p.changesHandle.coarseMaxRow {
 		return
 	}
 	if p.inMemoryHandle != nil {
@@ -637,7 +637,7 @@ func (p *baseHandle) QuickNext(ctx context.Context, bat **batch.Batch, mp *mpool
 			return
 		}
 	}
-	if (*bat).RowCount() > p.changesHandle.coarseMaxRow {
+	if (*bat) != nil && (*bat).RowCount() > p.changesHandle.coarseMaxRow {
 		return
 	}
 	err = p.cnObjectHandle.QuickNext(ctx, bat, mp)
