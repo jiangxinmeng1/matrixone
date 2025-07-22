@@ -16,6 +16,7 @@ package v3_0_0
 
 import (
 	"fmt"
+
 	"github.com/matrixorigin/matrixone/pkg/bootstrap/versions"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/frontend"
@@ -57,7 +58,7 @@ var upg_mo_intra_system_change_propagation_log_new = versions.UpgradeEntry{
 	Schema:    catalog.MO_CATALOG,
 	TableName: catalog.MO_INTRA_SYSTEM_CHANGE_PROPAGATION_LOG,
 	UpgType:   versions.CREATE_NEW_TABLE,
-	UpgSql:    frontend.MoCatalogMoCdcAsyncIndexLogDDL,
+	UpgSql:    frontend.MoCatalogMoISCPLogDDL,
 	CheckFunc: func(txn executor.TxnExecutor, accountId uint32) (bool, error) {
 		return versions.CheckTableDefinition(txn, accountId, catalog.MO_CATALOG, catalog.MO_INTRA_SYSTEM_CHANGE_PROPAGATION_LOG)
 	},

@@ -228,7 +228,7 @@ func (exec *ISCPTaskExecutor) setAsyncIndexLogTableID(ctx context.Context) (err 
 	return nil
 }
 func (exec *ISCPTaskExecutor) subscribeMOAsyncIndexLog(ctx context.Context) (err error) {
-	sql := cdc.CDCSQLBuilder.AsyncIndexLogSelectSQL()
+	sql := cdc.CDCSQLBuilder.IntraSystemChangePropagationLogSelectSQL()
 	txn, err := exec.txnFactory()
 	if err != nil {
 		return err
@@ -545,7 +545,7 @@ func (exec *ISCPTaskExecutor) replay(ctx context.Context) {
 			zap.Error(err),
 		)
 	}()
-	sql := cdc.CDCSQLBuilder.AsyncIndexLogSelectSQL()
+	sql := cdc.CDCSQLBuilder.IntraSystemChangePropagationLogSelectSQL()
 	txn, err := exec.txnFactory()
 	if err != nil {
 		return
@@ -836,7 +836,7 @@ func (exec *ISCPTaskExecutor) GC(cleanupThreshold time.Duration) (err error) {
 	defer cancel()
 	defer txn.Commit(ctx)
 	gcTime := time.Now().Add(-cleanupThreshold)
-	asyncIndexLogGCSql := cdc.CDCSQLBuilder.AsyncIndexLogGCSQL(gcTime)
+	asyncIndexLogGCSql := cdc.CDCSQLBuilder.IntraSystemChangePropagationLogGCSQL(gcTime)
 	if _, err = ExecWithResult(ctx, asyncIndexLogGCSql, exec.cnUUID, txn); err != nil {
 		return err
 	}
