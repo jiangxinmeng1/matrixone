@@ -213,23 +213,11 @@ const (
 		"%s" +
 		" AND relkind = '%s' " +
 		" AND reldatabase NOT IN (%s)"
-		/*
-			CREATE TABLE mo_async_index_log (
-				account_id INT UNSIGNED NOT NULL,//0
-				table_id BIGINT UNSIGNED NOT NULL,//1
-				index_name VARCHAR NOT NULL,//2
-				last_sync_txn_ts VARCHAR(32)  NOT NULL,//3
-				err_code INT NOT NULL,//4
-				error_msg VARCHAR(255) NOT NULL,//5
-				info VARCHAR(255) NOT NULL,//6
-				drop_at DATETIME NULL,//7
-				consumer_config VARCHAR(255) NULL,//8
-			);
-		*/
-	CDCInsertMOAsyncIndexLogSqlTemplate = `REPLACE INTO mo_catalog.mo_async_index_log (` +
+	CDCInsertMOAsyncIndexLogSqlTemplate = `REPLACE INTO mo_catalog.mo_intra_system_change_propagation_log (` +
 		`account_id,` +
 		`table_id,` +
-		`index_name,` +
+		`job_name,` +
+		`job_type,` +
 		`column_names,` +
 		`last_sync_txn_ts,` +
 		`err_code,` +
@@ -240,7 +228,8 @@ const (
 		`) VALUES (` +
 		`%d,` + // account_id
 		`%d,` + // table_id
-		`'%s',` + // index_name
+		`'%s',` + // job_name
+		`%d,` + // job_type
 		`'%s',` + // column_names
 		`'%s',` + // last_sync_txn_ts
 		`%d,` + // err_code
@@ -249,82 +238,27 @@ const (
 		`'%s',` + // consumer_config
 		`null` + // drop_at
 		`)`
-	CDCUpdateMOAsyncIndexLogSqlTemplate = `UPDATE mo_catalog.mo_async_index_log SET ` +
+	CDCUpdateMOAsyncIndexLogSqlTemplate = `UPDATE mo_catalog.mo_intra_system_change_propagation_log SET ` +
 		`err_code = %d,` +
 		`error_msg = '%s',` +
 		`last_sync_txn_ts = '%s'` +
 		`WHERE` +
 		` account_id = %d ` +
 		`AND table_id = %d ` +
-		`AND index_name = '%s'`
-	CDCUpdateMOAsyncIndexLogDropAtSqlTemplate = `UPDATE mo_catalog.mo_async_index_log SET ` +
+		`AND job_name = '%s'`
+	CDCUpdateMOAsyncIndexLogDropAtSqlTemplate = `UPDATE mo_catalog.mo_intra_system_change_propagation_log SET ` +
 		`drop_at = now()` +
 		`WHERE` +
 		` account_id = %d ` +
 		`AND table_id = %d ` +
-		`AND index_name = '%s'`
-	CDCDeleteMOAsyncIndexLogSqlTemplate = `DELETE FROM mo_catalog.mo_async_index_log WHERE ` +
+		`AND job_name = '%s'`
+	CDCDeleteMOAsyncIndexLogSqlTemplate = `DELETE FROM mo_catalog.mo_intra_system_change_propagation_log WHERE ` +
 		`drop_at < '%s'`
-	CDCSelectMOAsyncIndexLogSqlTemplate        = `SELECT * from mo_catalog.mo_async_index_log`
-	CDCSelectMOAsyncIndexLogByTableSqlTemplate = `SELECT drop_at from mo_catalog.mo_async_index_log WHERE ` +
+	CDCSelectMOAsyncIndexLogSqlTemplate        = `SELECT * from mo_catalog.mo_intra_system_change_propagation_log`
+	CDCSelectMOAsyncIndexLogByTableSqlTemplate = `SELECT drop_at from mo_catalog.mo_intra_system_change_propagation_log WHERE ` +
 		`account_id = %d ` +
 		`AND table_id = %d ` +
-		`AND index_name = '%s'`
-	/*
-		CREATE TABLE mo_async_index_iterations (
-			account_id INT UNSIGNED NOT NULL,
-			table_id BIGINT UNSIGNED NOT NULL,
-			index_names VARCHAR(255),--multiple indexes
-			from_ts VARCHAR(32) NOT NULL,
-			to_ts VARCHAR(32) NOT NULL,
-			error_json VARCHAR(255) NOT NULL,--Multiple errors are stored. Different consumers may have different errors.
-			start_at DATETIME NULL,
-			end_at DATETIME NULL,
-		);
-	*/
-	CDCInsertMOAsyncIndexIterationsTemplate = `INSERT INTO mo_catalog.mo_async_index_iterations(` +
-		`account_id,` +
-		`table_id,` +
-		`index_names,` +
-		`from_ts,` +
-		`to_ts,` +
-		`error_json,` +
-		`start_at,` +
-		`end_at` +
-		`) VALUES (` +
-		`%d,` + // account_id
-		`%d,` + // table_id
-		`'%s',` + // index_names
-		`'%s',` + // from_ts
-		`'%s',` + // to_ts
-		`'%s',` + // error_json
-		`'%s',` + // start_at
-		`'%s'` + // end_at
-		`)`
-	CDCDeleteMOAsyncIndexIterationsTemplate = `DELETE FROM mo_catalog.mo_async_index_iterations WHERE ` +
-		`end_at < '%s'`
-	/*  CREATE TABLE `mo_tables` (
-		`rel_id` bigint unsigned DEFAULT NULL,
-		`relname` varchar(5000) DEFAULT NULL,
-		`reldatabase` varchar(5000) DEFAULT NULL,
-		`reldatabase_id` bigint unsigned DEFAULT NULL,
-		`relpersistence` varchar(5000) DEFAULT NULL,
-		`relkind` varchar(5000) DEFAULT NULL,
-		`rel_comment` varchar(5000) DEFAULT NULL,
-		`rel_createsql` text DEFAULT NULL,
-		`created_time` timestamp NULL DEFAULT NULL,
-		`creator` int unsigned DEFAULT NULL,
-		`owner` int unsigned DEFAULT NULL,
-		`account_id` int unsigned DEFAULT NULL,
-		`partitioned` tinyint DEFAULT NULL,
-		`partition_info` blob DEFAULT NULL,
-		`viewdef` varchar(5000) DEFAULT NULL,
-		`constraint` varchar(5000) DEFAULT NULL,
-		`rel_version` int unsigned DEFAULT NULL,
-		`catalog_version` int unsigned DEFAULT NULL,
-		PRIMARY KEY (`account_id`,`reldatabase`,`relname`)
-	  )
-	*/
+		`AND job_name = '%s'`
 	CDCGetTableIDTemplate = "SELECT " +
 		"rel_id, " +
 		"reldatabase_id " +
@@ -363,12 +297,9 @@ const (
 	CDCSelectMOAsyncIndexLogSqlTemplate_Idx        = 23
 	CDCSelectMOAsyncIndexLogByTableSqlTemplate_Idx = 24
 
-	CDCInsertMOAsyncIndexIterationsTemplate_Idx = 25
-	CDCDeleteMOAsyncIndexIterationsTemplate_Idx = 26
+	CDCGetTableIDTemplate_Idx = 25
 
-	CDCGetTableIDTemplate_Idx = 27
-
-	CDCSqlTemplateCount = 28
+	CDCSqlTemplateCount = 26
 )
 
 var CDCSQLTemplates = [CDCSqlTemplateCount]struct {
@@ -477,11 +408,12 @@ var CDCSQLTemplates = [CDCSqlTemplateCount]struct {
 	CDCSelectMOAsyncIndexLogSqlTemplate_Idx: {
 		SQL: CDCSelectMOAsyncIndexLogSqlTemplate,
 		OutputAttrs: []string{
-			"id",
 			"account_id",
 			"table_id",
 			"db_id",
-			"index_name",
+			"job_name",
+			"job_type",
+			"column_names",
 			"last_sync_txn_ts",
 			"err_code",
 			"error_msg",
@@ -495,12 +427,6 @@ var CDCSQLTemplates = [CDCSqlTemplateCount]struct {
 		OutputAttrs: []string{
 			"drop_at",
 		},
-	},
-	CDCInsertMOAsyncIndexIterationsTemplate_Idx: {
-		SQL: CDCInsertMOAsyncIndexIterationsTemplate,
-	},
-	CDCDeleteMOAsyncIndexIterationsTemplate_Idx: {
-		SQL: CDCDeleteMOAsyncIndexIterationsTemplate,
 	},
 	CDCGetWatermarkWhereSqlTemplate_Idx: {
 		SQL: CDCGetWatermarkWhereSqlTemplate,
@@ -845,7 +771,8 @@ func (b cdcSQLBuilder) OnDuplicateUpdateWatermarkErrMsgSQL(
 func (b cdcSQLBuilder) AsyncIndexLogInsertSQL(
 	accountID uint32,
 	tableID uint64,
-	indexName string,
+	jobName string,
+	jobType int,
 	columnNames string,
 	info string,
 	consumerConfig string,
@@ -854,7 +781,8 @@ func (b cdcSQLBuilder) AsyncIndexLogInsertSQL(
 		CDCSQLTemplates[CDCInsertMOAsyncIndexLogSqlTemplate_Idx].SQL,
 		accountID,
 		tableID,
-		indexName,
+		jobName,
+		jobType,
 		columnNames,
 		types.TS{}.ToString(),
 		0,
@@ -904,9 +832,7 @@ func (b cdcSQLBuilder) AsyncIndexLogGCSQL(t time.Time) string {
 }
 
 func (b cdcSQLBuilder) AsyncIndexLogSelectSQL() string {
-	return fmt.Sprintf(
-		CDCSQLTemplates[CDCSelectMOAsyncIndexLogSqlTemplate_Idx].SQL,
-	)
+	return CDCSQLTemplates[CDCSelectMOAsyncIndexLogSqlTemplate_Idx].SQL
 }
 
 func (b cdcSQLBuilder) AsyncIndexLogSelectByTableSQL(
@@ -919,39 +845,6 @@ func (b cdcSQLBuilder) AsyncIndexLogSelectByTableSQL(
 		accountID,
 		tableID,
 		indexName,
-	)
-}
-
-// ------------------------------------------------------------------------------------------------
-// Async Index Iterations SQL
-// ------------------------------------------------------------------------------------------------
-
-func (b cdcSQLBuilder) AsyncIndexIterationsInsertSQL(
-	accountID uint32,
-	tableID uint64,
-	indexNames string,
-	fromTs types.TS,
-	toTs types.TS,
-	errorJson string,
-	startAt time.Time,
-	endAt time.Time,
-) string {
-	return fmt.Sprintf(
-		CDCSQLTemplates[CDCInsertMOAsyncIndexIterationsTemplate_Idx].SQL,
-		accountID,
-		tableID,
-		indexNames,
-		fromTs.ToString(),
-		toTs.ToString(),
-		errorJson,
-		startAt.Format(time.DateTime),
-		endAt.Format(time.DateTime),
-	)
-}
-func (b cdcSQLBuilder) AsyncIndexIterationsGCSQL(t time.Time) string {
-	return fmt.Sprintf(
-		CDCSQLTemplates[CDCDeleteMOAsyncIndexIterationsTemplate_Idx].SQL,
-		t.Format(time.DateTime),
 	)
 }
 

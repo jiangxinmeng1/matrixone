@@ -785,9 +785,10 @@ func (p *ChangeHandler) decideMode() {
 		p.quick = true
 		return
 	}
-	if p.dataHandle.IsSmall() && p.tombstoneHandle.IsSmall() {
-		p.quick = true
-	}
+	// todo:
+	// if p.dataHandle.IsSmall() && p.tombstoneHandle.IsSmall() {
+	// 	p.quick = true
+	// }
 }
 func (p *ChangeHandler) decideNextHandle() int {
 	tombstoneTS := p.tombstoneHandle.NextTS()

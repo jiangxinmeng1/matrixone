@@ -909,30 +909,29 @@ var (
 		"mo_task":            0,
 	}
 	sysWantedTables = map[string]int8{
-		"mo_user":                         0,
-		"mo_account":                      0,
-		"mo_role":                         0,
-		"mo_user_grant":                   0,
-		"mo_role_grant":                   0,
-		"mo_role_privs":                   0,
-		"mo_user_defined_function":        0,
-		"mo_stored_procedure":             0,
-		"mo_mysql_compatibility_mode":     0,
-		"mo_stages":                       0,
-		catalog.MOAutoIncrTable:           0,
-		"mo_sessions":                     0,
-		"mo_configurations":               0,
-		"mo_locks":                        0,
-		"mo_variables":                    0,
-		"mo_transactions":                 0,
-		"mo_cache":                        0,
-		"mo_snapshots":                    0,
-		"mo_cdc_task":                     0,
-		"mo_cdc_watermark":                0,
-		catalog.MO_TABLE_STATS:            0,
-		catalog.MO_MERGE_SETTINGS:         0,
-		catalog.MO_ASYNC_INDEX_LOG:        0,
-		catalog.MO_ASYNC_INDEX_ITERATIONS: 0,
+		"mo_user":                     0,
+		"mo_account":                  0,
+		"mo_role":                     0,
+		"mo_user_grant":               0,
+		"mo_role_grant":               0,
+		"mo_role_privs":               0,
+		"mo_user_defined_function":    0,
+		"mo_stored_procedure":         0,
+		"mo_mysql_compatibility_mode": 0,
+		"mo_stages":                   0,
+		catalog.MOAutoIncrTable:       0,
+		"mo_sessions":                 0,
+		"mo_configurations":           0,
+		"mo_locks":                    0,
+		"mo_variables":                0,
+		"mo_transactions":             0,
+		"mo_cache":                    0,
+		"mo_snapshots":                0,
+		"mo_cdc_task":                 0,
+		"mo_cdc_watermark":            0,
+		catalog.MO_TABLE_STATS:        0,
+		catalog.MO_MERGE_SETTINGS:     0,
+		catalog.MO_INTRA_SYSTEM_CHANGE_PROPAGATION_LOG: 0,
 	}
 	sysAccountTables = map[string]struct{}{
 		catalog.MOVersionTable:       {},
@@ -942,42 +941,41 @@ var (
 	}
 	//predefined tables of the database mo_catalog in every account
 	predefinedTables = map[string]int8{
-		"mo_database":                     0,
-		"mo_tables":                       0,
-		"mo_columns":                      0,
-		"mo_account":                      0,
-		"mo_user":                         0,
-		"mo_role":                         0,
-		"mo_user_grant":                   0,
-		"mo_role_grant":                   0,
-		"mo_role_privs":                   0,
-		"mo_user_defined_function":        0,
-		"mo_stored_procedure":             0,
-		"mo_mysql_compatibility_mode":     0,
-		catalog.MOAutoIncrTable:           0,
-		"mo_indexes":                      0,
-		"mo_table_partitions":             0,
-		"mo_pubs":                         0,
-		"mo_stages":                       0,
-		"mo_sessions":                     0,
-		"mo_configurations":               0,
-		"mo_locks":                        0,
-		"mo_variables":                    0,
-		"mo_transactions":                 0,
-		"mo_cache":                        0,
-		"mo_foreign_keys":                 0,
-		"mo_snapshots":                    0,
-		"mo_subs":                         0,
-		"mo_shards":                       0,
-		"mo_shards_metadata":              0,
-		catalog.MO_RETENTION:              0,
-		"mo_cdc_task":                     0,
-		"mo_cdc_watermark":                0,
-		catalog.MO_TABLE_STATS:            0,
-		catalog.MO_ACCOUNT_LOCK:           0,
-		catalog.MO_MERGE_SETTINGS:         0,
-		catalog.MO_ASYNC_INDEX_LOG:        0,
-		catalog.MO_ASYNC_INDEX_ITERATIONS: 0,
+		"mo_database":                 0,
+		"mo_tables":                   0,
+		"mo_columns":                  0,
+		"mo_account":                  0,
+		"mo_user":                     0,
+		"mo_role":                     0,
+		"mo_user_grant":               0,
+		"mo_role_grant":               0,
+		"mo_role_privs":               0,
+		"mo_user_defined_function":    0,
+		"mo_stored_procedure":         0,
+		"mo_mysql_compatibility_mode": 0,
+		catalog.MOAutoIncrTable:       0,
+		"mo_indexes":                  0,
+		"mo_table_partitions":         0,
+		"mo_pubs":                     0,
+		"mo_stages":                   0,
+		"mo_sessions":                 0,
+		"mo_configurations":           0,
+		"mo_locks":                    0,
+		"mo_variables":                0,
+		"mo_transactions":             0,
+		"mo_cache":                    0,
+		"mo_foreign_keys":             0,
+		"mo_snapshots":                0,
+		"mo_subs":                     0,
+		"mo_shards":                   0,
+		"mo_shards_metadata":          0,
+		catalog.MO_RETENTION:          0,
+		"mo_cdc_task":                 0,
+		"mo_cdc_watermark":            0,
+		catalog.MO_TABLE_STATS:        0,
+		catalog.MO_ACCOUNT_LOCK:       0,
+		catalog.MO_MERGE_SETTINGS:     0,
+		catalog.MO_INTRA_SYSTEM_CHANGE_PROPAGATION_LOG: 0,
 	}
 	createDbInformationSchemaSql = "create database information_schema;"
 	createAutoTableSql           = MoCatalogMoAutoIncrTableDDL
@@ -1020,7 +1018,6 @@ var (
 		MoCatalogMergeSettingsDDL,
 		MoCatalogMergeSettingsInitData,
 		MoCatalogMoCdcAsyncIndexLogDDL,
-		MoCatalogMoCdcAsyncIndexIterationsDDL,
 	}
 
 	//drop tables for the tenant
@@ -1043,8 +1040,8 @@ var (
 	}
 	dropMoMysqlCompatibilityModeSql = `drop table if exists mo_catalog.mo_mysql_compatibility_mode;`
 	dropAutoIcrColSql               = fmt.Sprintf("drop table if exists mo_catalog.`%s`;", catalog.MOAutoIncrTable)
-	dropMoIndexes                   = fmt.Sprintf(`drop table if exists %s.%s;`, catalog.MO_CATALOG, catalog.MO_INDEXES)
-	dropMoTablePartitions           = fmt.Sprintf(`drop table if exists %s.%s;`, catalog.MO_CATALOG, catalog.MO_TABLE_PARTITIONS)
+	dropMoIndexes                   = fmt.Sprintf("drop table if exists `%s`.`%s`;", catalog.MO_CATALOG, catalog.MO_INDEXES)
+	dropMoTablePartitions           = fmt.Sprintf("drop table if exists `%s`.`%s`;", catalog.MO_CATALOG, catalog.MO_TABLE_PARTITIONS)
 	dropMoForeignKeys               = `drop table if exists mo_catalog.mo_foreign_keys;`
 	dropMoRetention                 = `drop table if exists mo_catalog.mo_retention;`
 
@@ -1463,16 +1460,16 @@ const (
 	deleteRoleFromMoRolePrivsFormat = `delete from mo_catalog.mo_role_privs where role_id = %d;`
 
 	// grant ownership on database
-	grantOwnershipOnDatabaseFormat = `grant ownership on database %s to %s;`
+	grantOwnershipOnDatabaseFormat = "grant ownership on database `%s` to `%s`;"
 
 	// grant ownership on table
-	grantOwnershipOnTableFormat = `grant ownership on table %s.%s to %s;`
+	grantOwnershipOnTableFormat = "grant ownership on table `%s`.`%s` to `%s`;"
 
 	// revoke ownership on database owner
-	revokeOwnershipFromDatabaseFormat = `revoke ownership on database %s from %s;`
+	revokeOwnershipFromDatabaseFormat = "revoke ownership on database `%s` from `%s`;"
 
 	// revoke ownership on table owner
-	revokeOwnershipFromTableFormat = `revoke ownership on table %s.%s from %s;`
+	revokeOwnershipFromTableFormat = "revoke ownership on table `%s`.`%s` from `%s`;"
 
 	// get the owner of the database
 	getOwnerOfDatabaseFormat = `select owner from mo_catalog.mo_database where datname = '%s';`
@@ -3945,11 +3942,20 @@ func doDropAccount(ctx context.Context, bh BackgroundExec, ses *Session, da *dro
 			}
 		}
 
+		ts := time.Now().UTC().UnixNano()
+		if ses != nil && ses.proc != nil && ses.proc.GetTxnOperator() != nil {
+			ts = ses.proc.GetTxnOperator().SnapshotTS().ToStdTime().UTC().UnixNano()
+		}
+
 		// update pitr
-		rtnErr = updatePitrObjectId(ctx, bh, da.Name, uint64(accountId))
-		if rtnErr != nil {
+		if rtnErr = updatePitrObjectId(
+			ctx, bh, da.Name,
+			uint64(accountId),
+			ts,
+		); rtnErr != nil {
 			return rtnErr
 		}
+
 		return rtnErr
 	}
 
@@ -5668,6 +5674,14 @@ func determinePrivilegeSetOfStatement(stmt tree.Statement) *privilege {
 		objType = objectTypeNone
 		kind = privilegeKindSpecial
 		special = specialTagAdmin
+	case *tree.CloneTable:
+		objType = objectTypeTable
+		typs = append(typs, PrivilegeTypeInsert, PrivilegeTypeTableAll, PrivilegeTypeTableOwnership)
+		writeDatabaseAndTableDirectly = true
+	case *tree.CloneDatabase:
+		objType = objectTypeDatabase
+		typs = append(typs, PrivilegeTypeCreateDatabase, PrivilegeTypeAccountAll)
+		writeDatabaseAndTableDirectly = true
 	default:
 		panic(fmt.Sprintf("does not have the privilege definition of the statement %s", stmt))
 	}
@@ -7706,10 +7720,7 @@ func createTablesInMoCatalogOfGeneralTenant2(bh BackgroundExec, ca *createAccoun
 		if strings.HasPrefix(sql, fmt.Sprintf("create table mo_catalog.%s", catalog.MO_ACCOUNT_LOCK)) {
 			return true
 		}
-		if strings.HasPrefix(sql, fmt.Sprintf("create table mo_catalog.%s", catalog.MO_ASYNC_INDEX_LOG)) {
-			return true
-		}
-		if strings.HasPrefix(sql, fmt.Sprintf("create table mo_catalog.%s", catalog.MO_ASYNC_INDEX_ITERATIONS)) {
+		if strings.HasPrefix(sql, fmt.Sprintf("CREATE TABLE mo_catalog.%s", catalog.MO_INTRA_SYSTEM_CHANGE_PROPAGATION_LOG)) {
 			return true
 		}
 		return false

@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package v2_3_0
+package v3_0_0
 
 import (
+	"fmt"
 	"github.com/matrixorigin/matrixone/pkg/bootstrap/versions"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/frontend"
@@ -22,26 +23,42 @@ import (
 )
 
 var clusterUpgEntries = []versions.UpgradeEntry{
-	upg_mo_async_index_log_new,
-	upg_mo_async_index_iterations_new,
+	upg_mo_pitr,
+	upg_mo_intra_system_change_propagation_log_new,
 }
 
-var upg_mo_async_index_log_new = versions.UpgradeEntry{
+var upg_mo_pitr = versions.UpgradeEntry{
 	Schema:    catalog.MO_CATALOG,
-	TableName: catalog.MO_ASYNC_INDEX_LOG,
-	UpgType:   versions.CREATE_NEW_TABLE,
-	UpgSql:    frontend.MoCatalogMoCdcAsyncIndexLogDDL,
+	TableName: catalog.MO_PITR,
+	UpgType:   versions.MODIFY_COLUMN,
+	UpgSql: fmt.Sprintf(
+		"ALTER TABLE "+
+			"		%s.%s "+
+			"	MODIFY COLUMN create_time bigint not null,"+
+			"	MODIFY COLUMN modified_time bigint not null,"+
+			"	MODIFY COLUMN pitr_status_changed_time bigint not null",
+		catalog.MO_CATALOG, catalog.MO_PITR,
+	),
+
 	CheckFunc: func(txn executor.TxnExecutor, accountId uint32) (bool, error) {
-		return versions.CheckTableDefinition(txn, accountId, catalog.MO_CATALOG, catalog.MO_ASYNC_INDEX_LOG)
+		colInfo, err := versions.CheckTableColumn(txn, accountId, catalog.MO_CATALOG, catalog.MO_PITR, "create_time")
+		if err != nil {
+			return false, err
+		}
+
+		if colInfo.ColType != "TIMESTAMP" {
+			return true, nil
+		}
+		return false, nil
 	},
 }
 
-var upg_mo_async_index_iterations_new = versions.UpgradeEntry{
+var upg_mo_intra_system_change_propagation_log_new = versions.UpgradeEntry{
 	Schema:    catalog.MO_CATALOG,
-	TableName: catalog.MO_ASYNC_INDEX_ITERATIONS,
+	TableName: catalog.MO_INTRA_SYSTEM_CHANGE_PROPAGATION_LOG,
 	UpgType:   versions.CREATE_NEW_TABLE,
-	UpgSql:    frontend.MoCatalogMoCdcAsyncIndexIterationsDDL,
+	UpgSql:    frontend.MoCatalogMoCdcAsyncIndexLogDDL,
 	CheckFunc: func(txn executor.TxnExecutor, accountId uint32) (bool, error) {
-		return versions.CheckTableDefinition(txn, accountId, catalog.MO_CATALOG, catalog.MO_ASYNC_INDEX_ITERATIONS)
+		return versions.CheckTableDefinition(txn, accountId, catalog.MO_CATALOG, catalog.MO_INTRA_SYSTEM_CHANGE_PROPAGATION_LOG)
 	},
 }

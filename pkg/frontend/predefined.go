@@ -142,8 +142,8 @@ var (
 			pitr_id uuid unique key,
 			pitr_name varchar(5000),
 			create_account bigint unsigned,
-			create_time timestamp,
-			modified_time timestamp,
+			create_time bigint not null,
+			modified_time bigint not null,
 			level varchar(10),
 			account_id bigint unsigned,
 			account_name varchar(300),
@@ -153,7 +153,7 @@ var (
 			pitr_length tinyint unsigned,
 			pitr_unit varchar(10),
 			pitr_status tinyint unsigned default 1 comment '1: active, 0: inactive',
-			pitr_status_changed_time timestamp default UTC_TIMESTAMP,
+			pitr_status_changed_time bigint not null,
 			primary key(pitr_name, create_account)
 			)`, catalog.MO_CATALOG, catalog.MO_PITR)
 
@@ -273,30 +273,20 @@ var (
     			primary key(account_id,task_id,db_name,table_name)
 			)`
 
-	MoCatalogMoCdcAsyncIndexLogDDL = `CREATE TABLE mo_async_index_log (
+	MoCatalogMoCdcAsyncIndexLogDDL = `CREATE TABLE mo_catalog.mo_intra_system_change_propagation_log (
 				account_id INT UNSIGNED NOT NULL,
 				table_id BIGINT UNSIGNED NOT NULL,
-				index_name VARCHAR NOT NULL,
+				job_name VARCHAR NOT NULL,
+				job_type INT NOT NULL,
 				column_names VARCHAR NOT NULL,
 				last_sync_txn_ts VARCHAR(32)  NOT NULL,
 				err_code INT NOT NULL,
 				error_msg VARCHAR(255) NOT NULL,
-				info VARCHAR(255) NOT NULL,
+				info VARCHAR NOT NULL,
 				drop_at DATETIME NULL,
-				consumer_config VARCHAR(255) NULL
+				consumer_config VARCHAR(255) NULL,
+				primary key(account_id, table_id, job_name)
 			)`
-
-	MoCatalogMoCdcAsyncIndexIterationsDDL = `CREATE TABLE mo_async_index_iterations (
-			id INT AUTO_INCREMENT PRIMARY KEY,
-			account_id INT UNSIGNED NOT NULL,
-			table_id BIGINT UNSIGNED NOT NULL,
-			index_names VARCHAR(255),
-			from_ts VARCHAR(32) NOT NULL,
-			to_ts VARCHAR(32) NOT NULL,
-			error_json VARCHAR(255) NOT NULL,
-			start_at DATETIME NULL,
-			end_at DATETIME NULL
-		)`
 
 	MoCatalogMoSessionsDDL       = `CREATE VIEW mo_catalog.mo_sessions AS SELECT node_id, conn_id, session_id, account, user, host, db, session_start, command, info, txn_id, statement_id, statement_type, query_type, sql_source_type, query_start, client_host, role, proxy_host FROM mo_sessions() AS mo_sessions_tmp`
 	MoCatalogMoConfigurationsDDL = `CREATE VIEW mo_catalog.mo_configurations AS SELECT node_type, node_id, name, current_value, default_value, internal FROM mo_configurations() AS mo_configurations_tmp`
