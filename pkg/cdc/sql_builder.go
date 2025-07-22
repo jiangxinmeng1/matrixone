@@ -213,7 +213,7 @@ const (
 		"%s" +
 		" AND relkind = '%s' " +
 		" AND reldatabase NOT IN (%s)"
-	CDCInsertMOAsyncIndexLogSqlTemplate = `REPLACE INTO mo_catalog.mo_async_index_log (` +
+	CDCInsertMOAsyncIndexLogSqlTemplate = `REPLACE INTO mo_catalog.mo_intra_system_change_propagation_log (` +
 		`account_id,` +
 		`table_id,` +
 		`job_name,` +
@@ -238,7 +238,7 @@ const (
 		`'%s',` + // consumer_config
 		`null` + // drop_at
 		`)`
-	CDCUpdateMOAsyncIndexLogSqlTemplate = `UPDATE mo_catalog.mo_async_index_log SET ` +
+	CDCUpdateMOAsyncIndexLogSqlTemplate = `UPDATE mo_catalog.mo_intra_system_change_propagation_log SET ` +
 		`err_code = %d,` +
 		`error_msg = '%s',` +
 		`last_sync_txn_ts = '%s'` +
@@ -246,16 +246,16 @@ const (
 		` account_id = %d ` +
 		`AND table_id = %d ` +
 		`AND job_name = '%s'`
-	CDCUpdateMOAsyncIndexLogDropAtSqlTemplate = `UPDATE mo_catalog.mo_async_index_log SET ` +
+	CDCUpdateMOAsyncIndexLogDropAtSqlTemplate = `UPDATE mo_catalog.mo_intra_system_change_propagation_log SET ` +
 		`drop_at = now()` +
 		`WHERE` +
 		` account_id = %d ` +
 		`AND table_id = %d ` +
 		`AND job_name = '%s'`
-	CDCDeleteMOAsyncIndexLogSqlTemplate = `DELETE FROM mo_catalog.mo_async_index_log WHERE ` +
+	CDCDeleteMOAsyncIndexLogSqlTemplate = `DELETE FROM mo_catalog.mo_intra_system_change_propagation_log WHERE ` +
 		`drop_at < '%s'`
-	CDCSelectMOAsyncIndexLogSqlTemplate        = `SELECT * from mo_catalog.mo_async_index_log`
-	CDCSelectMOAsyncIndexLogByTableSqlTemplate = `SELECT drop_at from mo_catalog.mo_async_index_log WHERE ` +
+	CDCSelectMOAsyncIndexLogSqlTemplate        = `SELECT * from mo_catalog.mo_intra_system_change_propagation_log`
+	CDCSelectMOAsyncIndexLogByTableSqlTemplate = `SELECT drop_at from mo_catalog.mo_intra_system_change_propagation_log WHERE ` +
 		`account_id = %d ` +
 		`AND table_id = %d ` +
 		`AND job_name = '%s'`
