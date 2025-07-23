@@ -17,12 +17,10 @@ package iscp
 import (
 	"bytes"
 	"context"
-	"encoding/json"
-
-	"sync"
-	"time"
 
 	"go.uber.org/zap"
+	"sync"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/cdc"
@@ -205,7 +203,7 @@ func NewISCPTaskExecutor(
 	if err != nil {
 		return nil, err
 	}
-	logtailreplay.RegisterRowsInsertHook(exec.onAsyncIndexLogInsert)
+	logtailreplay.RegisterRowsInsertHook(exec.onISCPLogInsert)
 	return exec, nil
 }
 
@@ -358,8 +356,10 @@ func (exec *ISCPTaskExecutor) run(ctx context.Context) {
 		case <-exec.ctx.Done():
 			return
 		case <-syncTaskTrigger.C:
-			candidateTables := exec.getCandidateTables()
-			tables, fromTSs, toTS, err := exec.getDirtyTables(exec.ctx, candidateTables, exec.cnUUID, exec.txnEngine)
+			// get candidate iterations and tables
+			iterations, candidateTables, fromTSs := exec.getCandidateTables()
+			// check if there are any dirty tables
+			tables, toTS, err := exec.getDirtyTables(exec.ctx, candidateTables, fromTSs, exec.cnUUID, exec.txnEngine)
 			if msg, injected := objectio.ISCPExecutorInjected(); injected && msg == "getDirtyTables" {
 				err = moerr.NewInternalErrorNoCtx(msg)
 			}
@@ -370,17 +370,19 @@ func (exec *ISCPTaskExecutor) run(ctx context.Context) {
 				)
 				continue
 			}
-			for i, table := range candidateTables {
-				_, ok := tables[table.tableID]
+			// run iterations with dirty table
+			// update watermark for clean tables
+			for _, iter := range iterations {
+				maxTS := types.MaxTs()
+				if iter.to.EQ(&maxTS) {
+					iter.to = toTS
+				}
+				_, ok := tables[iter.table.tableID]
 				if ok {
-					iteration := table.GetSyncTask(exec.ctx, toTS)
-					if iteration == nil {
-						continue
-					}
-					exec.worker.Submit(iteration)
+					iter.Init()
+					exec.worker.Submit(iter)
 				} else {
-					from := types.TimestampToTS(fromTSs[i])
-					table.UpdateWatermark(from, toTS)
+					iter.table.UpdateWatermark(iter)
 				}
 			}
 		case <-flushWatermarkTrigger.C:
@@ -413,7 +415,7 @@ func (exec *ISCPTaskExecutor) GetWatermark(accountID uint32, srcTableID uint64, 
 	return
 }
 
-func (exec *ISCPTaskExecutor) onAsyncIndexLogInsert(ctx context.Context, input *api.Batch, tableID uint64) {
+func (exec *ISCPTaskExecutor) onISCPLogInsert(ctx context.Context, input *api.Batch, tableID uint64) {
 	if tableID == 2 {
 		tableNameVector, err := vector.ProtoVectorToVector(input.Vecs[3])
 		if err != nil {
@@ -504,14 +506,19 @@ func (exec *ISCPTaskExecutor) onAsyncIndexLogInsert(ctx context.Context, input *
 	if err != nil {
 		panic(err)
 	}
+	jobConfigVector, err := vector.ProtoVectorToVector(input.Vecs[5])
+	if err != nil {
+		panic(err)
+	}
 	for i, tid := range tableIDs {
 		watermarkStr := watermarkVector.GetStringAt(i)
 		watermark := types.StringToTS(watermarkStr)
 		if watermark.IsEmpty() && errorCodes[i] == 0 && dropAtVector.IsNull(uint64(i)) {
 			consumerInfoStr := consumerInfoVector.GetStringAt(i)
+			jobConfigStr := jobConfigVector.GetStringAt(i)
 			go retry(
 				func() error {
-					return exec.addIndex(accountIDs[i], tid, watermarkStr, int(errorCodes[i]), consumerInfoStr)
+					return exec.addIndex(accountIDs[i], tid, watermarkStr, int(errorCodes[i]), consumerInfoStr, jobConfigStr)
 				},
 				exec.option.RetryTimes,
 			)
@@ -566,6 +573,7 @@ func (exec *ISCPTaskExecutor) replay(ctx context.Context) {
 		errorCodes := vector.MustFixedColNoTypeCheck[int32](cols[6])
 		consumerInfoVector := cols[10]
 		dropAtVector := cols[9]
+		jobConfigVector := cols[3]
 		for i := 0; i < rows; i++ {
 			if !dropAtVector.IsNull(uint64(i)) {
 				continue
@@ -573,6 +581,7 @@ func (exec *ISCPTaskExecutor) replay(ctx context.Context) {
 			indexCount++
 			watermarkStr := watermarkVector.GetStringAt(i)
 			consumerInfoStr := consumerInfoVector.GetStringAt(i)
+			jobConfigStr := jobConfigVector.GetStringAt(i)
 			retry(
 				func() error {
 					return exec.addIndex(
@@ -581,6 +590,7 @@ func (exec *ISCPTaskExecutor) replay(ctx context.Context) {
 						watermarkStr,
 						int(errorCodes[i]),
 						consumerInfoStr,
+						jobConfigStr,
 					)
 				},
 				exec.option.RetryTimes,
@@ -596,6 +606,7 @@ func (exec *ISCPTaskExecutor) addIndex(
 	watermarkStr string,
 	errorCode int,
 	consumerInfoStr string,
+	jobConfigStr string,
 ) (err error) {
 	var indexName string
 	defer func() {
@@ -619,7 +630,7 @@ func (exec *ISCPTaskExecutor) addIndex(
 	defer cancel()
 	ctx = context.WithValue(ctx, defines.TenantIDKey{}, accountID)
 	consumerInfo := &ConsumerInfo{}
-	err = json.Unmarshal([]byte(consumerInfoStr), consumerInfo)
+	consumerInfo, err = UnmarshalConsumerConfig([]byte(consumerInfoStr))
 	if msg, injected := objectio.ISCPExecutorInjected(); injected && msg == "addIndex" {
 		err = moerr.NewInternalErrorNoCtx(msg)
 	}
@@ -628,6 +639,10 @@ func (exec *ISCPTaskExecutor) addIndex(
 	}
 	indexName = consumerInfo.IndexName
 	rel, err := exec.getTableByID(ctx, tableID)
+	if err != nil {
+		return
+	}
+	jobConfig, err := UnmarshalJobConfig([]byte(jobConfigStr))
 	if err != nil {
 		return
 	}
@@ -650,7 +665,7 @@ func (exec *ISCPTaskExecutor) addIndex(
 	if errorCode != 0 {
 		panic("logic error") // TODO: convert error
 	}
-	ok, err = table.AddSinker(consumerInfo, watermark, nil)
+	ok, err = table.AddSinker(consumerInfo, jobConfig, watermark, nil)
 	if !ok {
 		return moerr.NewInternalErrorNoCtx("sinker already exists")
 	}
@@ -720,36 +735,41 @@ func (exec *ISCPTaskExecutor) getTableByID(ctx context.Context, tableID uint64) 
 	}
 	return
 }
-func (exec *ISCPTaskExecutor) getCandidateTables() []*TableEntry {
-	ret := make([]*TableEntry, 0)
+func (exec *ISCPTaskExecutor) getCandidateTables() ([]*Iteration, []*TableEntry, []types.TS) {
+	tables := make([]*TableEntry, 0)
+	fromTSs := make([]types.TS, 0)
+	iterations := make([]*Iteration, 0)
 	items := exec.getAllTables()
 	for _, t := range items {
 		if t.IsEmpty() {
 			continue
 		}
-		if !t.IsInitedAndFinished() {
-			continue
+		iters, fromTS := t.getCandidate()
+		if len(iters) > 0 {
+			iterations = append(iterations, iters...)
+			tables = append(tables, t)
+			fromTSs = append(fromTSs, fromTS)
 		}
-		ret = append(ret, t)
 	}
-	return ret
+	return iterations, tables, fromTSs
 }
 func (exec *ISCPTaskExecutor) getDirtyTables(
 	ctx context.Context,
 	candidateTables []*TableEntry,
+	fromTSs []types.TS,
 	service string,
 	eng engine.Engine,
-) (tables map[uint64]struct{}, fromTS []timestamp.Timestamp, toTS types.TS, err error) {
+) (tables map[uint64]struct{}, toTS types.TS, err error) {
 
 	accs := make([]uint64, 0, len(candidateTables))
 	dbs := make([]uint64, 0, len(candidateTables))
 	tbls := make([]uint64, 0, len(candidateTables))
-	fromTS = make([]timestamp.Timestamp, 0, len(candidateTables))
-	for _, t := range candidateTables {
+	fromTimestamps := make([]timestamp.Timestamp, 0, len(candidateTables))
+	for i, t := range candidateTables {
 		accs = append(accs, uint64(t.accountID))
 		dbs = append(dbs, t.dbID)
 		tbls = append(tbls, t.tableID)
-		fromTS = append(fromTS, t.GetMinWaterMark().ToTimestamp())
+		fromTimestamps = append(fromTimestamps, fromTSs[i].ToTimestamp())
 	}
 	// tmpTS := types.TimestampToTS(exec.txnEngine.LatestLogtailAppliedTime())
 	tables = make(map[uint64]struct{})
@@ -760,7 +780,7 @@ func (exec *ISCPTaskExecutor) getDirtyTables(
 		accs,
 		dbs,
 		tbls,
-		fromTS,
+		fromTimestamps,
 		&toTS,
 		cmd_util.CheckChanged,
 		func(
@@ -789,7 +809,7 @@ func (exec *ISCPTaskExecutor) FlushWatermarkForAllTables() error {
 	insertSqlWriter := &bytes.Buffer{}
 	deleteSqlWriter.WriteString("DELETE FROM mo_catalog.mo_intra_system_change_propagation_log WHERE")
 	insertSqlWriter.WriteString("INSERT INTO mo_catalog.mo_intra_system_change_propagation_log " +
-		"(account_id,table_id,index_name,last_sync_txn_ts,err_code,error_msg,info,consumer_config,drop_at) VALUES")
+		"(account_id,table_id,column_names,job_name,job_config,last_sync_txn_ts,err_code,error_msg,info,consumer_config,drop_at) VALUES")
 	for i, table := range tables {
 		err := table.fillInAsyncIndexLogUpdateSQL(i == 0, insertSqlWriter, deleteSqlWriter)
 		if err != nil {

@@ -22,7 +22,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/google/uuid"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
@@ -49,6 +48,15 @@ type DataRetriever interface {
 	GetDataType() int8
 }
 
+type JobState int8
+
+const (
+	JobState_Invalid JobState = iota
+	JobState_Init
+	JobState_Running
+	JobState_Finished
+)
+
 // Intra-System Change Propagation Job Entry
 type JobEntry struct {
 	tableInfo    *TableEntry
@@ -59,6 +67,8 @@ type JobEntry struct {
 	watermark    types.TS
 	err          error
 	consumerInfo *ConsumerInfo
+	jobConfig    JobConfig
+	state        JobState
 }
 
 // Intra-System Change Propagation Table Entry
@@ -70,7 +80,6 @@ type TableEntry struct {
 	tableID   uint64
 	tableName string
 	dbName    string
-	state     TableState
 	sinkers   []*JobEntry
 	mu        sync.RWMutex
 }
@@ -82,14 +91,21 @@ type ConsumerInfo struct {
 	IndexName    string
 }
 
-type Consumer interface {
-	Consume(context.Context, DataRetriever) error
+type JobConfig interface {
+	Marshal() ([]byte, error)
+	Unmarshal([]byte) error
+	GetType() uint16
+	Check(
+		otherConsumers []*JobEntry,
+		consumer *JobEntry,
+		now types.TS,
+	) (
+		ok bool, from, to types.TS, shareIteration bool,
+	)
 }
 
-type TaskId = uuid.UUID
-
-func NewTaskId() TaskId {
-	return uuid.Must(uuid.NewV7())
+type Consumer interface {
+	Consume(context.Context, DataRetriever) error
 }
 
 type OutputType int8

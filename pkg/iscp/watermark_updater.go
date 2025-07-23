@@ -16,7 +16,6 @@ package iscp
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -103,7 +102,7 @@ func registerJob(
 	if tenantId, err = defines.GetAccountId(ctx); err != nil {
 		return false, err
 	}
-	consumerInfoJson, err := json.Marshal(sinkerinfo_json)
+	consumerInfoJson, err := sinkerinfo_json.Marshal()
 	if err != nil {
 		return false, err
 	}
@@ -132,12 +131,17 @@ func registerJob(
 	if exist && !dropped {
 		return false, nil
 	}
+	jobConfig := NewJobConfig(IOET_JobConfig_Default)
+	jobConfigStr, err := jobConfig.Marshal()
+	if err != nil {
+		return false, err
+	}
 	ok = true
 	sql := cdc.CDCSQLBuilder.IntraSystemChangePropagationLogInsertSQL(
 		tenantId,
 		tableID,
 		sinkerinfo_json.IndexName,
-		int(sinkerinfo_json.ConsumerType),
+		string(jobConfigStr),
 		"",
 		"",
 		string(consumerInfoJson),

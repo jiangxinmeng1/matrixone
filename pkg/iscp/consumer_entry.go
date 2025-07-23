@@ -16,19 +16,10 @@ package iscp
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
-)
-
-type SinkerState int8
-
-const (
-	SinkerState_Invalid SinkerState = iota
-	SinkerState_Running
-	SinkerState_Finished
 )
 
 const (
@@ -40,6 +31,7 @@ func NewJobEntry(
 	tableDef *plan.TableDef,
 	tableInfo *TableEntry,
 	sinkerConfig *ConsumerInfo,
+	jobConfig JobConfig,
 	watermark types.TS,
 	iterationErr error,
 ) (*JobEntry, error) {
@@ -47,36 +39,81 @@ func NewJobEntry(
 	if err != nil {
 		return nil, err
 	}
-	sinkerEntry := &JobEntry{
+	jobEntry := &JobEntry{
 		tableInfo:    tableInfo,
 		indexName:    sinkerConfig.IndexName,
 		consumer:     consumer,
 		consumerType: sinkerConfig.ConsumerType,
+		jobConfig:    jobConfig,
 		watermark:    watermark,
 		err:          iterationErr,
 		consumerInfo: sinkerConfig,
+		state:        JobState_Finished,
 	}
-	sinkerEntry.init()
-	return sinkerEntry, nil
+	jobEntry.init()
+	return jobEntry, nil
 }
 
-func (sinkerEntry *JobEntry) init() {
-	if sinkerEntry.watermark.IsEmpty() {
+func (jobEntry *JobEntry) init() {
+	if jobEntry.watermark.IsEmpty() {
 		// in the 1st iteration, toTS is determined by txn.SnapshotTS()
 		iter := &Iteration{
-			table:   sinkerEntry.tableInfo,
-			sinkers: []*JobEntry{sinkerEntry},
+			table:   jobEntry.tableInfo,
+			sinkers: []*JobEntry{jobEntry},
 			to:      types.TS{},
 			from:    types.TS{},
 		}
-		sinkerEntry.tableInfo.exec.worker.Submit(iter)
+		jobEntry.tableInfo.exec.worker.Submit(iter)
 	} else {
-		sinkerEntry.inited.Store(true)
+		jobEntry.inited.Store(true)
 	}
 }
 
-func (sinkerEntry *JobEntry) getConsumerInfoStr() string {
-	consumerInfoStr, err := json.Marshal(sinkerEntry.consumerInfo)
+func (jobEntry *JobEntry) IsInitedAndFinished() bool {
+	return jobEntry.inited.Load() && !jobEntry.PermanentError() && jobEntry.state == JobState_Finished
+}
+
+func (jobEntry *JobEntry) OnIterationFinished(iter *Iteration, offset int) {
+	if !jobEntry.inited.Load() {
+		if iter.err[offset] != nil {
+			jobEntry.err = iter.err[offset]
+			jobEntry.tableInfo.exec.worker.Submit(
+				&Iteration{
+					table:   jobEntry.tableInfo,
+					sinkers: []*JobEntry{jobEntry},
+					to:      types.TS{},
+					from:    types.TS{},
+				},
+			)
+		} else {
+			jobEntry.watermark = iter.to
+			jobEntry.inited.Store(true)
+		}
+		return
+	}
+	if jobEntry.state != JobState_Running {
+		panic("logic error")
+	}
+	if iter.err[offset] != nil {
+		jobEntry.err = iter.err[offset]
+	} else {
+		jobEntry.watermark = iter.to
+	}
+	jobEntry.state = JobState_Finished
+}
+
+func (jobEntry *JobEntry) UpdateWatermark(from, to types.TS) {
+	if from.GE(&to) {
+		return
+	}
+	if !jobEntry.watermark.EQ(&from) {
+		panic("logic error")
+	}
+	jobEntry.watermark = to
+}
+
+func (jobEntry *JobEntry) getConsumerInfoStr() string {
+	consumerInfoStr, err := jobEntry.consumerInfo.Marshal()
 	if err != nil {
 		panic(err)
 	}
@@ -84,41 +121,61 @@ func (sinkerEntry *JobEntry) getConsumerInfoStr() string {
 }
 
 // TODO
-func (sinkerEntry *JobEntry) PermanentError() bool {
-	return toErrorCode(sinkerEntry.err) > PermanentErrorThreshold
+func (jobEntry *JobEntry) PermanentError() bool {
+	return toErrorCode(jobEntry.err) > PermanentErrorThreshold
 }
 
-func (sinkerEntry *JobEntry) StringLocked() string {
+func (jobEntry *JobEntry) StringLocked() string {
 	initStr := ""
-	if !sinkerEntry.inited.Load() {
+	if !jobEntry.inited.Load() {
 		initStr = "-N"
 	}
-	return fmt.Sprintf("Index[%s%s]%d,%s,%v", sinkerEntry.indexName, initStr, sinkerEntry.consumerType, sinkerEntry.watermark.ToString(), sinkerEntry.err)
+	stateStr := "I"
+	if jobEntry.state == JobState_Running {
+		stateStr = "R"
+	}
+	if jobEntry.state == JobState_Finished {
+		stateStr = "F"
+	}
+	return fmt.Sprintf(
+		"Index[%s%s]%d,%s,%v[%v]",
+		jobEntry.indexName,
+		initStr,
+		jobEntry.consumerType,
+		jobEntry.watermark.ToString(),
+		jobEntry.err,
+		stateStr,
+	)
 }
 
-func (sinkerEntry *JobEntry) fillInAsyncIndexLogInsertSQL(firstSinker bool, w *bytes.Buffer) error {
+func (jobEntry *JobEntry) fillInAsyncIndexLogInsertSQL(firstSinker bool, w *bytes.Buffer) error {
 	if !firstSinker {
 		w.WriteString(",")
 	}
-	_, err := w.WriteString(fmt.Sprintf(" (%d, %d, '%s', '%s', 0, '', '', '%s', NULL)",
-		sinkerEntry.tableInfo.accountID,
-		sinkerEntry.tableInfo.tableID,
-		sinkerEntry.indexName,
-		sinkerEntry.watermark.ToString(),
-		sinkerEntry.getConsumerInfoStr(),
+	jobConfigStr, err := jobEntry.jobConfig.Marshal()
+	if err != nil {
+		return err
+	}
+	_, err = w.WriteString(fmt.Sprintf(" (%d, %d,'', '%s','%s', '%s',  0, '', '', '%s', NULL)",
+		jobEntry.tableInfo.accountID,
+		jobEntry.tableInfo.tableID,
+		jobEntry.indexName,
+		string(jobConfigStr),
+		jobEntry.watermark.ToString(),
+		jobEntry.getConsumerInfoStr(),
 	))
 	return err
 }
 
-func (sinkerEntry *JobEntry) fillInAsyncIndexLogDeleteSQL(firstSinker bool, w *bytes.Buffer) error {
+func (jobEntry *JobEntry) fillInAsyncIndexLogDeleteSQL(firstSinker bool, w *bytes.Buffer) error {
 	if !firstSinker {
 		w.WriteString(" OR")
 	}
 	_, err := w.WriteString(
-		fmt.Sprintf(" (account_id = %d AND table_id = %d AND index_name = '%s' and drop_at is null)",
-			sinkerEntry.tableInfo.accountID,
-			sinkerEntry.tableInfo.tableID,
-			sinkerEntry.indexName,
+		fmt.Sprintf(" (account_id = %d AND table_id = %d AND job_name = '%s' and drop_at is null)",
+			jobEntry.tableInfo.accountID,
+			jobEntry.tableInfo.tableID,
+			jobEntry.indexName,
 		))
 	return err
 }
