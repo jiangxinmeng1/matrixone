@@ -54,6 +54,8 @@ const (
 	FJ_CronJobsOpen = "fj/cronjobs/open"
 	FJ_CDCRecordTxn = "fj/cdc/recordtxn"
 
+	FJ_CDCStart = "fj/cdc/start"
+
 	FJ_CDCHandleSlow             = "fj/cdc/handleslow"
 	FJ_CDCHandleErr              = "fj/cdc/handleerr"
 	FJ_CDCScanTableErr           = "fj/cdc/scantableerr"
@@ -339,6 +341,11 @@ func WaitInjected(key string) {
 	fault.TriggerFault(key)
 }
 
+func CDCStartInjected() (string, bool) {
+	_, sarg, injected := fault.TriggerFault(FJ_CDCStart)
+	return sarg, injected
+}
+
 func NotifyInjected(key string) {
 	fault.TriggerFault(key)
 }
@@ -430,6 +437,24 @@ func InjectCommitWait(msg string) (rmFault func() (bool, error), err error) {
 	}
 	rmFault = func() (ok bool, err error) {
 		return fault.RemoveFaultPoint(context.Background(), FJ_CommitWait)
+	}
+	return
+}
+
+func InjectCDCStart(msg string) (rmFault func() (bool, error), err error) {
+	if err = fault.AddFaultPoint(
+		context.Background(),
+		FJ_CDCStart,
+		":::",
+		"echo",
+		0,
+		msg,
+		false,
+	); err != nil {
+		return
+	}
+	rmFault = func() (ok bool, err error) {
+		return fault.RemoveFaultPoint(context.Background(), FJ_CDCStart)
 	}
 	return
 }

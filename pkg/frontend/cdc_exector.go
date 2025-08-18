@@ -17,11 +17,13 @@ package frontend
 import (
 	"context"
 	"encoding/json"
-	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/cdc"
@@ -268,6 +270,9 @@ func (exec *CDCTaskExecutor) Resume() error {
 		_ = exec.startFunc(context.Background())
 	}()
 	return nil
+}
+func (exec *CDCTaskExecutor) SetAR() {
+	exec.activeRoutine = cdc.NewCdcActiveRoutine()
 }
 
 // Restart cdc task from init watermark
@@ -524,33 +529,40 @@ func (exec *CDCTaskExecutor) addExecPipelineForTable(
 		return moerr.NewInternalErrorNoCtx("CDC_AddExecPipelineForTable_ERR")
 	}
 
-	// step 1. init watermarkUpdater
-	// get watermark from db
-	watermark := exec.startTs
-	if exec.noFull {
-		watermark = types.TimestampToTS(txnOp.SnapshotTS())
-	}
-	watermarkKey := cdc.WatermarkKey{
-		AccountId: uint64(exec.spec.Accounts[0].GetId()),
-		TaskId:    exec.spec.TaskId,
-		DBName:    info.SourceDbName,
-		TableName: info.SourceTblName,
-	}
-	if watermark, err = exec.watermarkUpdater.GetOrAddCommitted(
-		ctx,
-		&watermarkKey,
-		&watermark,
-	); err != nil {
-		return err
+	skipWatermark := false
+	if _, injected := objectio.CDCStartInjected(); injected {
+		skipWatermark = true
 	}
 
-	// clear err msg
-	if err = exec.watermarkUpdater.UpdateWatermarkErrMsg(
-		ctx,
-		&watermarkKey,
-		"",
-	); err != nil {
-		return
+	if !skipWatermark {
+		// step 1. init watermarkUpdater
+		// get watermark from db
+		watermark := exec.startTs
+		if exec.noFull {
+			watermark = types.TimestampToTS(txnOp.SnapshotTS())
+		}
+		watermarkKey := cdc.WatermarkKey{
+			AccountId: uint64(exec.spec.Accounts[0].GetId()),
+			TaskId:    exec.spec.TaskId,
+			DBName:    info.SourceDbName,
+			TableName: info.SourceTblName,
+		}
+		if watermark, err = exec.watermarkUpdater.GetOrAddCommitted(
+			ctx,
+			&watermarkKey,
+			&watermark,
+		); err != nil {
+			return err
+		}
+
+		// clear err msg
+		if err = exec.watermarkUpdater.UpdateWatermarkErrMsg(
+			ctx,
+			&watermarkKey,
+			"",
+		); err != nil {
+			return
+		}
 	}
 
 	tableDef, err := cdc.GetTableDef(ctx, txnOp, exec.cnEngine, info.SourceTblId)
@@ -578,30 +590,65 @@ func (exec *CDCTaskExecutor) addExecPipelineForTable(
 	go sinker.Run(ctx, exec.activeRoutine)
 
 	// step 3. new reader
-	reader := cdc.NewTableReader(
-		exec.cnTxnClient,
-		exec.cnEngine,
-		exec.mp,
-		exec.packerPool,
-		uint64(exec.spec.Accounts[0].GetId()),
-		exec.spec.TaskId,
-		info,
-		sinker,
-		exec.watermarkUpdater,
-		tableDef,
-		exec.additionalConfig[cdc.CDCTaskExtraOptions_InitSnapshotSplitTxn].(bool),
-		exec.runningReaders,
-		exec.startTs,
-		exec.endTs,
-		exec.noFull,
-		exec.additionalConfig[cdc.CDCTaskExtraOptions_Frequency].(string),
-	)
+	var reader cdc.Reader
+	if _, injected := objectio.CDCStartInjected(); injected {
+		reader = cdc.NewMockReader(
+			info,
+			exec.cnEngine,
+			exec.cnTxnClient,
+			exec.runningReaders,
+		)
+	} else {
+		reader = cdc.NewTableReader(
+			exec.cnTxnClient,
+			exec.cnEngine,
+			exec.mp,
+			exec.packerPool,
+			uint64(exec.spec.Accounts[0].GetId()),
+			exec.spec.TaskId,
+			info,
+			sinker,
+			exec.watermarkUpdater,
+			tableDef,
+			exec.additionalConfig[cdc.CDCTaskExtraOptions_InitSnapshotSplitTxn].(bool),
+			exec.runningReaders,
+			exec.startTs,
+			exec.endTs,
+			exec.noFull,
+			exec.additionalConfig[cdc.CDCTaskExtraOptions_Frequency].(string),
+		)
+	}
 	go reader.Run(ctx, exec.activeRoutine)
 
 	return
 }
 
+func (exec *CDCTaskExecutor) retrieveCDCTaskWithFaultInjection(msg string) (err error) {
+	strs := strings.Split(msg, "|")
+
+	//update sink type after deserialize
+	exec.sinkUri.SinkTyp = cdc.CDCSinkType_Console
+
+	// tables
+	jsonTables := strs[0]
+
+	if err = cdc.JsonDecode(jsonTables, &exec.tables); err != nil {
+		return err
+	}
+
+	exec.additionalConfig = make(map[string]interface{})
+	exec.additionalConfig[cdc.CDCTaskExtraOptions_Frequency] = ""
+	exec.additionalConfig[cdc.CDCTaskExtraOptions_InitSnapshotSplitTxn] = true
+	exec.additionalConfig[cdc.CDCTaskExtraOptions_MaxSqlLength] = float64(4109304)
+	exec.additionalConfig[cdc.CDCTaskExtraOptions_SendSqlTimeout] = "10m"
+
+	return nil
+}
+
 func (exec *CDCTaskExecutor) retrieveCdcTask(ctx context.Context) error {
+	if msg, injected := objectio.CDCStartInjected(); injected {
+		return exec.retrieveCDCTaskWithFaultInjection(msg)
+	}
 	ctx = defines.AttachAccountId(ctx, catalog.System_Account)
 
 	accId := exec.spec.Accounts[0].GetId()

@@ -218,6 +218,9 @@ func NewTestDisttaeEngine(
 	//err = de.prevSubscribeSysTables(ctx, rpcAgent)
 	return de, err
 }
+func (de *TestDisttaeEngine) GetTxnClient() client.TxnClient {
+	return de.txnClient
+}
 
 func (de *TestDisttaeEngine) NewTxnOperator(
 	ctx context.Context,
