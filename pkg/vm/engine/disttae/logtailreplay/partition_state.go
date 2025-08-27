@@ -145,7 +145,7 @@ func (p *PartitionState) handleDataObjectEntry(ctx context.Context, objEntry obj
 		p.lastFlushTimestamp = commitTS
 	}
 
-	if objEntry.Size() == 0 || (objEntry.GetAppendable() && objEntry.DeleteTime.IsEmpty()) {
+	if objEntry.Size() == 0 {
 		// CN doesn't consume the create event of appendable object
 		return
 	}
