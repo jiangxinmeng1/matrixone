@@ -422,7 +422,7 @@ func (s *mysqlSinker) Run(ctx context.Context, ar *ActiveRoutine) {
 				s.SetError(err)
 			}
 		} else {
-			sql := string(sqlBuffer)
+			sql := string(sqlBuffer[5:])
 			sqlFile.WriteString(sql + "\n")
 			if err := s.mysql.Send(ctx, ar, sqlBuffer, true); err != nil {
 				logutil.Errorf("cdc mysqlSinker(%v) send sql failed, err: %v, sql: %s", s.dbTblInfo, err, sqlBuffer[sqlBufReserved:])
