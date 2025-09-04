@@ -19,6 +19,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -36,8 +37,11 @@ import (
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/mysql"
 )
+
 var sqlFile *os.File
+
 func init() {
+	var err error
 	sqlFile, err = os.Create("sql.txt")
 	if err != nil {
 		panic(err)
