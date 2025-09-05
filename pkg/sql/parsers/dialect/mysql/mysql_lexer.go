@@ -138,7 +138,7 @@ func (l *Lexer) GetParamIndex() int {
 
 func (l *Lexer) Lex(lval *yySymType) int {
 	typ, str := l.scanner.Scan()
-	l.scanner.LastToken = str
+	l.scanner.LastToken = string([]byte(str))
 
 	switch typ {
 	case INTEGRAL:
@@ -147,7 +147,7 @@ func (l *Lexer) Lex(lval *yySymType) int {
 		return l.toFloat(lval, str)
 	}
 
-	lval.str = str
+	lval.str = string([]byte(str))
 	return typ
 }
 

@@ -603,7 +603,6 @@ func (ses *Session) ReserveConnAndClose() {
 }
 
 func (ses *Session) Close() {
-	logutil.Infof("lalala close session")
 	ses.mu.Lock()
 	defer ses.mu.Unlock()
 	ses.feSessionImpl.Close()
@@ -654,6 +653,7 @@ func (ses *Session) Close() {
 	}
 
 	if ses.buf != nil {
+		logutil.Infof("lalala close session")
 		ses.buf.Free()
 		ses.buf = nil
 	}
