@@ -513,6 +513,7 @@ func NewSession(
 	proto MysqlRrWr,
 	mp *mpool.MPool,
 ) *Session {
+	logutil.Infof("lalala new session")
 	//if the sharedTxnHandler exists,we use its txnCtx and txnOperator in this session.
 	//Currently, we only use the sharedTxnHandler in the background session.
 	var txnOp TxnOperator
