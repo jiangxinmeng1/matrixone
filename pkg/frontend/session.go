@@ -589,6 +589,7 @@ func NewSession(
 	// ses.proc.SetResolveVariableFunc(ses.txnCompileCtx.ResolveVariable)
 
 	runtime.SetFinalizer(ses, func(ss *Session) {
+		logutil.Infof("lalala close session")
 		ss.Close()
 	})
 	return ses
@@ -653,7 +654,6 @@ func (ses *Session) Close() {
 	}
 
 	if ses.buf != nil {
-		logutil.Infof("lalala close session")
 		ses.buf.Free()
 		ses.buf = nil
 	}
