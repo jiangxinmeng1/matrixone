@@ -731,9 +731,7 @@ func NewChangesHandler(
 	mp *mpool.MPool,
 	fs fileservice.FileService,
 ) (changeHandle *ChangeHandler, err error) {
-	if state.start.GT(&start) {
-		return nil, moerr.NewErrStaleReadNoCtx(state.start.ToString(), start.ToString())
-	}
+	return nil, moerr.NewErrStaleReadNoCtx(state.start.ToString(), start.ToString())
 	changeHandle = &ChangeHandler{
 		coarseMaxRow:  int(maxRow),
 		start:         start,
