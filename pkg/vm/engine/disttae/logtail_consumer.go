@@ -73,7 +73,7 @@ const (
 	unsubscribeTimer = 1 * time.Hour
 
 	// gc blocks and BlockIndexByTSEntry in partition state
-	gcPartitionStateTimer = 1 * time.Hour
+	gcPartitionStateTimer = 20 * time.Minute
 
 	// log tail consumer related constants.
 	// if buffer is almost full (percent > consumerWarningPercent, we will send a message to log.
@@ -102,7 +102,7 @@ const (
 
 var (
 	unsubscribeProcessTicker = 20 * time.Minute
-	gcPartitionStateTicker   = 20 * time.Minute
+	gcPartitionStateTicker   = 5 * time.Minute
 
 	defaultGetLogTailAddrTimeoutDuration = time.Minute * 10
 	defaultServerTimeout                 = time.Minute * 10
@@ -1048,7 +1048,7 @@ func (c *PushClient) doGCPartitionState(ctx context.Context, e *Engine) {
 		parts[ids] = part
 	}
 	e.Unlock()
-	ts := types.BuildTS(time.Now().UTC().UnixNano()-gcPartitionStateTimer.Nanoseconds()*5, 0)
+	ts := types.BuildTS(time.Now().UTC().UnixNano()-gcPartitionStateTimer.Nanoseconds(), 0)
 	for ids, part := range parts {
 		part.Truncate(ctx, ids, ts)
 	}

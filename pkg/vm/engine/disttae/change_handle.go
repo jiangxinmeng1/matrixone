@@ -167,7 +167,9 @@ func (h *PartitionChangesHandle) getNextChangeHandle(ctx context.Context) (end b
 		return
 	}
 
-	response, err := RequestSnapshotRead(ctx, h.tbl, &nextFrom)
+	ctxWithDeadline, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	response, err := RequestSnapshotRead(ctxWithDeadline, h.tbl, &nextFrom)
 	if err != nil {
 		return
 	}
