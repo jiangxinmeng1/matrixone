@@ -122,6 +122,37 @@ func ExecuteIteration(
 		}
 		statuses[i].StartAt = startAt
 	}
+
+	if iterCtx.fromTS.IsEmpty() && jobSpecs[0].ConsumerInfo.InheritedJob.SrcIndexTable != "" {
+		if len(jobSpecs) > 1 {
+			errMsg := fmt.Sprintf(
+				"inherited job not supported for multiple %v->%v %v",
+				iterCtx.fromTS.ToString(), iterCtx.toTS.ToString(), iterCtx.jobNames,
+			)
+			FlushPermanentErrorMessage(
+				ctx,
+				cnUUID,
+				cnEngine,
+				cnTxnClient,
+				iterCtx.accountID,
+				iterCtx.tableID,
+				iterCtx.jobNames,
+				iterCtx.jobIDs,
+				iterCtx.lsn,
+				statuses,
+				iterCtx.fromTS,
+				errMsg,
+			)
+			return
+		}
+		var prevWatermark types.TS
+		prevWatermark, err = initFromInheritedJob(ctx, cnUUID, txnOp, &jobSpecs[0].ConsumerInfo.InheritedJob)
+		if err != nil {
+			return
+		}
+		iterCtx.fromTS = prevWatermark.Next()
+	}
+
 	changes, err := CollectChanges(ctx, rel, iterCtx.fromTS, iterCtx.toTS, mp)
 	if changes != nil {
 		defer changes.Close()
@@ -576,4 +607,50 @@ func NewIterationContext(accountID uint32, tableID uint64, jobNames []string, jo
 		fromTS:    fromTS,
 		toTS:      toTS,
 	}
+}
+
+func initFromInheritedJob(
+	ctx context.Context,
+	cnUUID string,
+	txn client.TxnOperator,
+	inheritedJob *InheritedJob,
+) (prevWatermark types.TS, err error) {
+	defer func() {
+		logutil.Info(
+			"ISCP-Task init from inherited job",
+			zap.Uint32("accountID", inheritedJob.AccountID),
+			zap.Uint64("tableID", inheritedJob.TableID),
+			zap.String("jobName", inheritedJob.JobName),
+			zap.String("prevWatermark", prevWatermark.ToString()),
+			zap.String("srcIndexTable", inheritedJob.SrcIndexTable),
+			zap.String("dstIndexTable", inheritedJob.DstIndexTable),
+			zap.Error(err),
+		)
+	}()
+	exist, dropped, watermarkStr, _, err := queryIndexLog(
+		ctx,
+		cnUUID,
+		txn,
+		inheritedJob.AccountID,
+		inheritedJob.TableID,
+		inheritedJob.JobName,
+	)
+	if err != nil {
+		return
+	}
+	if !exist || dropped {
+		return types.TS{}, moerr.NewInternalErrorNoCtx("inherited job not found")
+	}
+	prevWatermark = types.StringToTS(watermarkStr)
+	cloneTableSql := fmt.Sprintf(
+		"insert into %s select * from %s",
+		inheritedJob.DstIndexTable,
+		inheritedJob.SrcIndexTable,
+	)
+	result, err := ExecWithResult(ctx, cloneTableSql, cnUUID, txn)
+	if err != nil {
+		return
+	}
+	result.Close()
+	return
 }

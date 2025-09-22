@@ -246,7 +246,7 @@ func registerJob(
 		DBName:    jobID.DBName,
 		TableName: jobID.TableName,
 	}
-	exist, dropped, prevID, err := queryIndexLog(
+	exist, dropped, _, prevID, err := queryIndexLog(
 		ctxWithSysAccount,
 		cnUUID,
 		txn,
@@ -475,7 +475,7 @@ func updateJobSpec(
 	if err != nil {
 		return
 	}
-	exist, dropped, internalJobID, err := queryIndexLog(
+	exist, dropped, _, internalJobID, err := queryIndexLog(
 		ctx,
 		cnUUID,
 		txn,
@@ -546,7 +546,7 @@ func unregisterJob(
 	if err != nil {
 		return
 	}
-	exist, dropped, internalJobID, err := queryIndexLog(
+	exist, dropped, _, internalJobID, err := queryIndexLog(
 		ctxWithSysAccount,
 		cnUUID,
 		txn,
@@ -620,8 +620,8 @@ func queryIndexLog(
 	tenantId uint32,
 	tableID uint64,
 	jobName string,
-) (exist, dropped bool, prevID uint64, err error) {
-	selectSql := cdc.CDCSQLBuilder.ISCPLogSelectByTableSQL(
+) (exist, dropped bool, watermarkStr string, prevID uint64, err error) {
+	selectSql := ISCPLogSelectByTableSQL(
 		tenantId,
 		tableID,
 		jobName,
@@ -631,20 +631,21 @@ func queryIndexLog(
 		return
 	}
 	defer result.Close()
+	maxJobID := uint64(0)
 	result.ReadRows(func(rows int, cols []*vector.Vector) bool {
 		if rows != 0 {
 			exist = true
 		}
 		dropped = true
-		ids := vector.MustFixedColWithTypeCheck[uint64](cols[1])
+		ids := vector.MustFixedColWithTypeCheck[uint64](cols[2])
 		for i := 0; i < rows; i++ {
-			if cols[0].IsNull(0) {
-				dropped = false
+			if ids[i] > maxJobID {
+				maxJobID = ids[i]
 				prevID = ids[i]
-				return false
-			}
-			if ids[i] > prevID {
-				prevID = ids[i]
+				watermarkStr = cols[1].GetStringAt(i)
+				if cols[0].IsNull(uint64(i)) {
+					dropped = false
+				}
 			}
 		}
 		return true

@@ -210,6 +210,16 @@ type ConsumerInfo struct {
 	DBName       string
 	Columns      []string
 	SrcTable     TableInfo
+	InheritedJob InheritedJob
+}
+
+type InheritedJob struct {
+	AccountID uint32
+	TableID   uint64
+	JobName   string
+
+	SrcIndexTable string
+	DstIndexTable string
 }
 
 type TableInfo struct {
