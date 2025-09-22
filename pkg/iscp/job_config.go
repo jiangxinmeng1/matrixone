@@ -80,11 +80,11 @@ func checkDefaultJobConfig(
 	}
 	// lag behind any other default job
 	if consumer.watermark.LT(&maxTS) {
-		return true, consumer.watermark, maxTS, true
+		return true, consumer.watermark.Next(), maxTS, true
 	} else {
 		// no lagging jobs on the same table
 		if minTS.EQ(&maxTS) {
-			return true, maxTS, now, true
+			return true, maxTS.Next(), now, true
 		}
 		return false, types.TS{}, types.TS{}, false
 	}
@@ -99,7 +99,7 @@ func checkAlwaysUpdateJobConfig(
 ) (
 	ok bool, from, to types.TS, shareIteration bool,
 ) {
-	return true, consumer.watermark, now, false
+	return true, consumer.watermark.Next(), now, false
 }
 
 // TimedJobConfig is a job configuration that only updates when the time difference
@@ -146,12 +146,12 @@ func checkTimedJobConfig(
 			return true, consumer.watermark, maxTS, true
 		} else {
 			if minTS.EQ(&maxTS) {
-				return true, maxTS, now, true
+				return true, maxTS.Next(), now, true
 			}
 			return false, types.TS{}, types.TS{}, false
 		}
 	}
 
 	// Individual iteration for each job
-	return true, consumer.watermark, now, false
+	return true, consumer.watermark.Next(), now, false
 }
