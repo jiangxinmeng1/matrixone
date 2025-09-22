@@ -234,6 +234,7 @@ func registerJob(
 	if jobSpec.TriggerSpec.JobType == 0 {
 		jobSpec.TriggerSpec.JobType = TriggerType_Default
 	}
+	jobSpec.ConsumerInfo.InheritedJob.AccountID = tenantId
 	var dbID uint64
 	tableID, dbID, err = getTableID(
 		ctxWithSysAccount,

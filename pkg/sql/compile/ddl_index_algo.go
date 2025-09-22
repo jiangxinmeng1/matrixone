@@ -130,6 +130,8 @@ func (s *Scope) handleFullTextIndexTable(
 	mainTableID uint64,
 	mainExtra *api.SchemaExtra,
 	dbSource engine.Database,
+	prevTableID uint64,
+	prevIndexDef *plan.IndexDef,
 	indexDef *plan.IndexDef,
 	qryDatabase string,
 	originalTableDef *plan.TableDef,
@@ -175,7 +177,7 @@ func (s *Scope) handleFullTextIndexTable(
 		logutil.Infof("fulltext index Async is true")
 		sinker_type := getSinkerTypeFromAlgo(catalog.MOIndexFullTextAlgo.ToString())
 		err = CreateIndexCdcTask(c, qryDatabase, originalTableDef.Name,
-			indexDef.IndexName, sinker_type)
+			indexDef.IndexName, sinker_type, prevIndexDef, prevTableID)
 		if err != nil {
 			return err
 		}
@@ -541,6 +543,8 @@ func (s *Scope) handleVectorHnswIndex(
 	mainTableID uint64,
 	mainExtra *api.SchemaExtra,
 	dbSource engine.Database,
+	prevTableID uint64,
+	prevIndexDef *plan.IndexDef,
 	indexDefs map[string]*plan.IndexDef,
 	qryDatabase string,
 	originalTableDef *plan.TableDef,
@@ -604,7 +608,7 @@ func (s *Scope) handleVectorHnswIndex(
 
 	// TODO: HNSWCDC 4. register CDC update
 	sinker_type := getSinkerTypeFromAlgo(catalog.MoIndexHnswAlgo.ToString())
-	err = CreateIndexCdcTask(c, qryDatabase, originalTableDef.Name, indexDefs[catalog.Hnsw_TblType_Metadata].IndexName, sinker_type)
+	err = CreateIndexCdcTask(c, qryDatabase, originalTableDef.Name, indexDefs[catalog.Hnsw_TblType_Metadata].IndexName, sinker_type, prevIndexDef,prevTableID)
 	if err != nil {
 		return err
 	}

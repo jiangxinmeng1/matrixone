@@ -265,7 +265,14 @@ func (s *Scope) AlterTableCopy(c *Compile) error {
 				multiTableIndexes[indexDef.IndexName].IndexDefs[ty] = indexDef
 			}
 			if catalog.IsFullTextIndexAlgo(indexDef.IndexAlgo) {
-				err = s.handleFullTextIndexTable(c, id, extra, dbSource, indexDef, qry.Database, newTableDef, nil)
+				var prevIndexDef *plan.IndexDef
+				for _, indexDef := range newTableDef.Indexes {
+					if indexDef.IndexName == indexDef.IndexName {
+						prevIndexDef = indexDef
+						break
+					}
+				}
+				err = s.handleFullTextIndexTable(c, id, extra, dbSource, oldId, prevIndexDef, indexDef, qry.Database, newTableDef, nil)
 				if err != nil {
 					c.proc.Error(c.proc.Ctx, "invoke reindex for the new table for alter table",
 						zap.String("origin tableName", qry.GetTableDef().Name),
@@ -277,15 +284,22 @@ func (s *Scope) AlterTableCopy(c *Compile) error {
 			}
 		}
 		for _, multiTableIndex := range multiTableIndexes {
+			var prevIndexDef *plan.IndexDef
+			for _, indexDef := range newTableDef.Indexes {
+				if indexDef.IndexName == indexDef.IndexName {
+					prevIndexDef = indexDef
+					break
+				}
+			}
 			switch multiTableIndex.IndexAlgo {
 			case catalog.MoIndexIvfFlatAlgo.ToString():
 				err = s.handleVectorIvfFlatIndex(
-					c, id, extra, dbSource, multiTableIndex.IndexDefs,
+					c, id, extra, dbSource, oldId, prevIndexDef, multiTableIndex.IndexDefs,
 					qry.Database, newTableDef, nil,
 				)
 			case catalog.MoIndexHnswAlgo.ToString():
 				err = s.handleVectorHnswIndex(
-					c, id, extra, dbSource, multiTableIndex.IndexDefs,
+					c, id, extra, dbSource, oldId, prevIndexDef, multiTableIndex.IndexDefs,
 					qry.Database, newTableDef, nil,
 				)
 			}
@@ -614,7 +628,28 @@ func cowUnaffectedIndexes(
 		if slices.Index(affectedCols, idxTbl.IndexName) != -1 {
 			continue
 		}
-
+		//skip async index
+		if catalog.IsFullTextIndexAlgo(idxTbl.IndexAlgo) {
+			async, err := catalog.IsIndexAsync(idxTbl.IndexAlgoParams)
+			if err != nil {
+				return err
+			}
+			if async {
+				continue
+			}
+		}
+		if catalog.IsIvfIndexAlgo(idxTbl.IndexAlgo) {
+			async, err := catalog.IsIndexAsync(idxTbl.IndexAlgoParams)
+			if err != nil {
+				return err
+			}
+			if async {
+				continue
+			}
+		}
+		if catalog.IsHnswIndexAlgo(idxTbl.IndexAlgo) {
+			continue
+		}
 		oriIdxColNameToTblName[idxTbl.IndexName] = idxTbl.IndexTableName
 	}
 
