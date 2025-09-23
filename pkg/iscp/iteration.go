@@ -630,7 +630,7 @@ func initFromInheritedJob(
 			zap.Error(err),
 		)
 	}()
-	exist, dropped, watermarkStr, _, err := queryIndexLog(
+	exist, _, watermarkStr, _, err := queryIndexLog(
 		ctx,
 		cnUUID,
 		txn,
@@ -641,7 +641,7 @@ func initFromInheritedJob(
 	if err != nil {
 		return
 	}
-	if !exist || dropped {
+	if !exist  {
 		return types.TS{}, moerr.NewInternalErrorNoCtx("inherited job not found")
 	}
 	prevWatermark = types.StringToTS(watermarkStr)
