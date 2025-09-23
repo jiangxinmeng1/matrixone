@@ -131,7 +131,6 @@ func (s *Scope) handleFullTextIndexTable(
 	mainExtra *api.SchemaExtra,
 	dbSource engine.Database,
 	prevTableID uint64,
-	prevIndexDef *plan.IndexDef,
 	indexDef *plan.IndexDef,
 	qryDatabase string,
 	originalTableDef *plan.TableDef,
@@ -161,23 +160,25 @@ func (s *Scope) handleFullTextIndexTable(
 		return err
 	}
 
-	for _, insertSQL := range insertSQLs {
-		err = c.runSql(insertSQL)
-		if err != nil {
-			return err
-		}
-	}
-
 	async, err := catalog.IsIndexAsync(indexDef.IndexAlgoParams)
 	if err != nil {
 		return err
+	}
+	if prevTableID == 0 || !async {
+		for _, insertSQL := range insertSQLs {
+			err = c.runSql(insertSQL)
+			if err != nil {
+				return err
+			}
+		}
+		insertSQLs = nil
 	}
 	// TODO: HNSWCDC create PITR and CDC TASK here
 	if async {
 		logutil.Infof("fulltext index Async is true")
 		sinker_type := getSinkerTypeFromAlgo(catalog.MOIndexFullTextAlgo.ToString())
 		err = CreateIndexCdcTask(c, qryDatabase, originalTableDef.Name,
-			indexDef.IndexName, sinker_type, prevIndexDef, prevTableID)
+			indexDef.IndexName, sinker_type, insertSQLs, prevTableID)
 		if err != nil {
 			return err
 		}
@@ -208,7 +209,7 @@ func (s *Scope) handleIndexColCount(c *Compile, indexDef *plan.IndexDef, qryData
 	return totalCnt, nil
 }
 
-func (s *Scope) handleIvfIndexMetaTable(c *Compile, indexDef *plan.IndexDef, qryDatabase string) error {
+func (s *Scope) handleIvfIndexMetaTable(c *Compile, indexDef *plan.IndexDef, qryDatabase string) string {
 
 	/*
 		The meta table will contain version number for now. In the future, it can contain `index progress` etc.
@@ -232,16 +233,11 @@ func (s *Scope) handleIvfIndexMetaTable(c *Compile, indexDef *plan.IndexDef, qry
 		catalog.SystemSI_IVFFLAT_TblCol_Metadata_val,
 	)
 
-	err := c.runSql(insertSQL)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return insertSQL
 }
 
 func (s *Scope) handleIvfIndexCentroidsTable(c *Compile, indexDef *plan.IndexDef,
-	qryDatabase string, originalTableDef *plan.TableDef, totalCnt int64, metadataTableName string) error {
+	qryDatabase string, originalTableDef *plan.TableDef, totalCnt int64, metadataTableName string) ([]string, error) {
 
 	var cfg vectorindex.IndexTableConfig
 	src_alias := "src"
@@ -258,16 +254,16 @@ func (s *Scope) handleIvfIndexCentroidsTable(c *Compile, indexDef *plan.IndexDef
 	// 1.a algo params
 	listsval, err := sonic.Get([]byte(indexDef.IndexAlgoParams), catalog.IndexAlgoParamLists)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	centroidParamsListsStr, err := listsval.StrictString()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	centroidParamsLists, err := strconv.Atoi(centroidParamsListsStr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// 1.b init centroids table with default centroid, if centroids are not enough.
@@ -288,28 +284,25 @@ func (s *Scope) handleIvfIndexCentroidsTable(c *Compile, indexDef *plan.IndexDef
 			metadataTableName,
 			catalog.SystemSI_IVFFLAT_TblCol_Metadata_key,
 		)
-		err := c.runSql(initSQL)
-		if err != nil {
-			return err
-		}
-		return nil
+
+		return []string{initSQL}, nil
 	}
 
 	val, err := c.proc.GetResolveVariableFunc()("ivf_threads_build", true, false)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cfg.ThreadsBuild = val.(int64)
 
 	val, err = c.proc.GetResolveVariableFunc()("kmeans_train_percent", true, false)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cfg.KmeansTrainPercent = val.(int64)
 
 	val, err = c.proc.GetResolveVariableFunc()("kmeans_max_iteration", true, false)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cfg.KmeansMaxIteration = val.(int64)
 
@@ -317,7 +310,7 @@ func (s *Scope) handleIvfIndexCentroidsTable(c *Compile, indexDef *plan.IndexDef
 
 	cfgbytes, err := json.Marshal(cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	part := src_alias + "." + indexDef.Parts[0]
@@ -329,36 +322,25 @@ func (s *Scope) handleIvfIndexCentroidsTable(c *Compile, indexDef *plan.IndexDef
 		string(cfgbytes),
 		part)
 
-	err = s.logTimestamp(c, qryDatabase, metadataTableName, "clustering_start")
-	if err != nil {
-		return err
-	}
+	logStartSql := s.logTimestamp(c, qryDatabase, metadataTableName, "clustering_start")
 
-	err = c.runSql(sql)
-	if err != nil {
-		return err
-	}
+	logEndSql := s.logTimestamp(c, qryDatabase, metadataTableName, "clustering_end")
 
-	err = s.logTimestamp(c, qryDatabase, metadataTableName, "clustering_end")
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return []string{logStartSql, sql, logEndSql}, nil
 }
 
 func (s *Scope) handleIvfIndexEntriesTable(c *Compile, indexDef *plan.IndexDef, qryDatabase string, originalTableDef *plan.TableDef,
 	metadataTableName string,
-	centroidsTableName string) error {
+	centroidsTableName string) ([]string, error) {
 
 	// 1.a algo params
 	val, err := sonic.Get([]byte(indexDef.IndexAlgoParams), catalog.IndexAlgoParamOpType)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	optype, err := val.StrictString()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// 1. Original table's pkey name and value
@@ -424,26 +406,15 @@ func (s *Scope) handleIvfIndexEntriesTable(c *Compile, indexDef *plan.IndexDef, 
 		indexColumnName,
 	)
 
-	err = s.logTimestamp(c, qryDatabase, metadataTableName, "mapping_start")
-	if err != nil {
-		return err
-	}
+	logStartSql := s.logTimestamp(c, qryDatabase, metadataTableName, "mapping_start")
 
-	err = c.runSql(centroidsCrossL2JoinTbl)
-	if err != nil {
-		return err
-	}
+	logEndSql := s.logTimestamp(c, qryDatabase, metadataTableName, "mapping_end")
 
-	err = s.logTimestamp(c, qryDatabase, metadataTableName, "mapping_end")
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return []string{logStartSql, centroidsCrossL2JoinTbl, logEndSql}, nil
 }
 
-func (s *Scope) logTimestamp(c *Compile, qryDatabase, metadataTableName, metrics string) error {
-	return c.runSql(fmt.Sprintf("INSERT INTO `%s`.`%s` (%s, %s) "+
+func (s *Scope) logTimestamp(c *Compile, qryDatabase, metadataTableName, metrics string) string {
+	return fmt.Sprintf("INSERT INTO `%s`.`%s` (%s, %s) "+
 		" VALUES ('%s', NOW()) "+
 		" ON DUPLICATE KEY UPDATE %s = NOW();",
 		qryDatabase,
@@ -454,7 +425,7 @@ func (s *Scope) logTimestamp(c *Compile, qryDatabase, metadataTableName, metrics
 		metrics,
 
 		catalog.SystemSI_IVFFLAT_TblCol_Metadata_val,
-	))
+	)
 }
 
 func (s *Scope) isExperimentalEnabled(c *Compile, flag string) (bool, error) {
@@ -489,7 +460,7 @@ func (s *Scope) handleIvfIndexDeleteOldEntries(c *Compile,
 	metadataTableName string,
 	centroidsTableName string,
 	entriesTableName string,
-	qryDatabase string) error {
+	qryDatabase string) []string {
 
 	pruneCentroidsTbl := fmt.Sprintf("DELETE FROM `%s`.`%s` WHERE `%s` < "+
 		"(SELECT CAST(`%s` AS BIGINT) FROM `%s`.`%s` WHERE `%s` = 'version');",
@@ -515,27 +486,11 @@ func (s *Scope) handleIvfIndexDeleteOldEntries(c *Compile,
 		catalog.SystemSI_IVFFLAT_TblCol_Metadata_key,
 	)
 
-	err := s.logTimestamp(c, qryDatabase, metadataTableName, "pruning_start")
-	if err != nil {
-		return err
-	}
+	logStartSql := s.logTimestamp(c, qryDatabase, metadataTableName, "pruning_start")
 
-	err = c.runSql(pruneCentroidsTbl)
-	if err != nil {
-		return err
-	}
+	logEndSql := s.logTimestamp(c, qryDatabase, metadataTableName, "pruning_end")
 
-	err = c.runSql(pruneEntriesTbl)
-	if err != nil {
-		return err
-	}
-
-	err = s.logTimestamp(c, qryDatabase, metadataTableName, "pruning_end")
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return []string{logStartSql, pruneCentroidsTbl, pruneEntriesTbl, logEndSql}
 }
 
 func (s *Scope) handleVectorHnswIndex(
@@ -544,7 +499,6 @@ func (s *Scope) handleVectorHnswIndex(
 	mainExtra *api.SchemaExtra,
 	dbSource engine.Database,
 	prevTableID uint64,
-	prevIndexDef *plan.IndexDef,
 	indexDefs map[string]*plan.IndexDef,
 	qryDatabase string,
 	originalTableDef *plan.TableDef,
@@ -599,16 +553,19 @@ func (s *Scope) handleVectorHnswIndex(
 		return err
 	}
 
-	for _, sql := range sqls {
-		err = c.runSql(sql)
-		if err != nil {
-			return err
+	if prevTableID == 0 {
+		for _, sql := range sqls {
+			err = c.runSql(sql)
+			if err != nil {
+				return err
+			}
 		}
+		sqls = nil
 	}
 
 	// TODO: HNSWCDC 4. register CDC update
 	sinker_type := getSinkerTypeFromAlgo(catalog.MoIndexHnswAlgo.ToString())
-	err = CreateIndexCdcTask(c, qryDatabase, originalTableDef.Name, indexDefs[catalog.Hnsw_TblType_Metadata].IndexName, sinker_type, prevIndexDef,prevTableID)
+	err = CreateIndexCdcTask(c, qryDatabase, originalTableDef.Name, indexDefs[catalog.Hnsw_TblType_Metadata].IndexName, sinker_type, sqls, prevTableID)
 	if err != nil {
 		return err
 	}

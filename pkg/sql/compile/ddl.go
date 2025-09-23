@@ -635,7 +635,7 @@ func (s *Scope) AlterTableInplace(c *Compile) error {
 					err = s.handleMasterIndexTable(c, tblId, extra, dbSource, indexDef, qry.Database, oTableDef, indexInfo)
 				} else if !indexDef.Unique && catalog.IsFullTextIndexAlgo(indexDef.IndexAlgo) {
 					// 3. FullText index
-					err = s.handleFullTextIndexTable(c, tblId, extra, dbSource, 0, nil, indexDef, qry.Database, oTableDef, indexInfo)
+					err = s.handleFullTextIndexTable(c, tblId, extra, dbSource, 0, indexDef, qry.Database, oTableDef, indexInfo)
 				} else if !indexDef.Unique &&
 					(catalog.IsIvfIndexAlgo(indexDef.IndexAlgo) || catalog.IsHnswIndexAlgo(indexDef.IndexAlgo)) {
 					// 4. IVF and HNSW indexDefs are aggregated and handled later
@@ -655,9 +655,9 @@ func (s *Scope) AlterTableInplace(c *Compile) error {
 			for _, multiTableIndex := range multiTableIndexes {
 				switch multiTableIndex.IndexAlgo { // no need for catalog.ToLower() here
 				case catalog.MoIndexIvfFlatAlgo.ToString():
-					err = s.handleVectorIvfFlatIndex(c, tblId, extra, dbSource, 0, nil, multiTableIndex.IndexDefs, qry.Database, oTableDef, indexInfo)
+					err = s.handleVectorIvfFlatIndex(c, tblId, extra, dbSource, 0, multiTableIndex.IndexDefs, qry.Database, oTableDef, indexInfo)
 				case catalog.MoIndexHnswAlgo.ToString():
-					err = s.handleVectorHnswIndex(c, tblId, extra, dbSource, 0, nil, multiTableIndex.IndexDefs, qry.Database, oTableDef, indexInfo)
+					err = s.handleVectorHnswIndex(c, tblId, extra, dbSource, 0, multiTableIndex.IndexDefs, qry.Database, oTableDef, indexInfo)
 				}
 
 				if err != nil {
@@ -762,10 +762,10 @@ func (s *Scope) AlterTableInplace(c *Compile) error {
 			for _, multiTableIndex := range multiTableIndexes {
 				switch multiTableIndex.IndexAlgo {
 				case catalog.MoIndexIvfFlatAlgo.ToString():
-					err = s.handleVectorIvfFlatIndex(c, tblId, extra, dbSource, 0, nil, multiTableIndex.IndexDefs, qry.Database, oTableDef, nil)
+					err = s.handleVectorIvfFlatIndex(c, tblId, extra, dbSource, 0, multiTableIndex.IndexDefs, qry.Database, oTableDef, nil)
 				case catalog.MoIndexHnswAlgo.ToString():
 					// TODO: we should call refresh Hnsw Index function instead of CreateHnswIndex function
-					err = s.handleVectorHnswIndex(c, tblId, extra, dbSource, 0, nil, multiTableIndex.IndexDefs, qry.Database, oTableDef, nil)
+					err = s.handleVectorHnswIndex(c, tblId, extra, dbSource, 0, multiTableIndex.IndexDefs, qry.Database, oTableDef, nil)
 				}
 
 				if err != nil {
@@ -1915,7 +1915,7 @@ func (s *Scope) doCreateIndex(
 			multiTableIndexes[indexDef.IndexName].IndexDefs[catalog.ToLower(indexDef.IndexAlgoTableType)] = indexDef
 		} else if !indexDef.Unique && catalog.IsFullTextIndexAlgo(indexAlgo) {
 			// 5. FullText index
-			err = s.handleFullTextIndexTable(c, tableId, extra, dbSource, 0, nil, indexDef, qry.Database, originalTableDef, indexInfo)
+			err = s.handleFullTextIndexTable(c, tableId, extra, dbSource, 0, indexDef, qry.Database, originalTableDef, indexInfo)
 		}
 		if err != nil {
 			return err
@@ -1925,9 +1925,9 @@ func (s *Scope) doCreateIndex(
 	for _, multiTableIndex := range multiTableIndexes {
 		switch multiTableIndex.IndexAlgo {
 		case catalog.MoIndexIvfFlatAlgo.ToString():
-			err = s.handleVectorIvfFlatIndex(c, tableId, extra, dbSource, 0, nil, multiTableIndex.IndexDefs, qry.Database, originalTableDef, indexInfo)
+			err = s.handleVectorIvfFlatIndex(c, tableId, extra, dbSource, 0, multiTableIndex.IndexDefs, qry.Database, originalTableDef, indexInfo)
 		case catalog.MoIndexHnswAlgo.ToString():
-			err = s.handleVectorHnswIndex(c, tableId, extra, dbSource, 0, nil, multiTableIndex.IndexDefs, qry.Database, originalTableDef, indexInfo)
+			err = s.handleVectorHnswIndex(c, tableId, extra, dbSource, 0, multiTableIndex.IndexDefs, qry.Database, originalTableDef, indexInfo)
 		}
 
 		if err != nil {
@@ -2041,7 +2041,6 @@ func (s *Scope) handleVectorIvfFlatIndex(
 	mainExtra *api.SchemaExtra,
 	dbSource engine.Database,
 	prevTableID uint64,
-	prevIndexDef *plan.IndexDef,
 	indexDefs map[string]*plan.IndexDef,
 	qryDatabase string,
 	originalTableDef *plan.TableDef,
@@ -2079,37 +2078,36 @@ func (s *Scope) handleVectorIvfFlatIndex(
 		return err
 	}
 
+	insertSQLs := make([]string, 0)
 	// 4.a populate meta table
-	err = s.handleIvfIndexMetaTable(c, indexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata], qryDatabase)
-	if err != nil {
-		return err
-	}
+	metaSql := s.handleIvfIndexMetaTable(c, indexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata], qryDatabase)
+	insertSQLs = append(insertSQLs, metaSql)
 
 	// 4.b populate centroids table
-	err = s.handleIvfIndexCentroidsTable(c, indexDefs[catalog.SystemSI_IVFFLAT_TblType_Centroids], qryDatabase, originalTableDef,
+	centroidsSql, err := s.handleIvfIndexCentroidsTable(c, indexDefs[catalog.SystemSI_IVFFLAT_TblType_Centroids], qryDatabase, originalTableDef,
 		totalCnt,
 		indexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata].IndexTableName)
 	if err != nil {
 		return err
 	}
+	insertSQLs = append(insertSQLs, centroidsSql...)
 
 	// 4.c populate entries table
-	err = s.handleIvfIndexEntriesTable(c, indexDefs[catalog.SystemSI_IVFFLAT_TblType_Entries], qryDatabase, originalTableDef,
+	entriesSql, err := s.handleIvfIndexEntriesTable(c, indexDefs[catalog.SystemSI_IVFFLAT_TblType_Entries], qryDatabase, originalTableDef,
 		indexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata].IndexTableName,
 		indexDefs[catalog.SystemSI_IVFFLAT_TblType_Centroids].IndexTableName)
 	if err != nil {
 		return err
 	}
+	insertSQLs = append(insertSQLs, entriesSql...)
 
 	// 4.d delete older entries in index table.
-	err = s.handleIvfIndexDeleteOldEntries(c,
+	pruneEntriesSql := s.handleIvfIndexDeleteOldEntries(c,
 		indexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata].IndexTableName,
 		indexDefs[catalog.SystemSI_IVFFLAT_TblType_Centroids].IndexTableName,
 		indexDefs[catalog.SystemSI_IVFFLAT_TblType_Entries].IndexTableName,
 		qryDatabase)
-	if err != nil {
-		return err
-	}
+	insertSQLs = append(insertSQLs, pruneEntriesSql...)
 
 	async, err := catalog.IsIndexAsync(indexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata].IndexAlgoParams)
 	if err != nil {
@@ -2118,12 +2116,28 @@ func (s *Scope) handleVectorIvfFlatIndex(
 
 	// HNSWCDC CREATE PITR AND CDC TASK HERE
 	if async {
+		if prevTableID == 0 {
+			for _, sql := range insertSQLs {
+				err = c.runSql(sql)
+				if err != nil {
+					return err
+				}
+			}
+			insertSQLs = nil
+		}
 		logutil.Infof("Ivfflat index Async is true")
 		sinker_type := getSinkerTypeFromAlgo(catalog.MoIndexIvfFlatAlgo.ToString())
 		err = CreateIndexCdcTask(c, qryDatabase, originalTableDef.Name,
-			indexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata].IndexName, sinker_type, prevIndexDef, prevTableID)
+			indexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata].IndexName, sinker_type, insertSQLs, prevTableID)
 		if err != nil {
 			return err
+		}
+	} else {
+		for _, sql := range insertSQLs {
+			err = c.runSql(sql)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil

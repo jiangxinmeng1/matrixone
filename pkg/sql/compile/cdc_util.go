@@ -92,7 +92,7 @@ func checkValidIndexCdc(tableDef *plan.TableDef, indexname string) (bool, error)
 }
 
 // NOTE: CreateIndexCdcTask will create CDC task without any checking.  Original TableDef may be empty
-func CreateIndexCdcTask(c *Compile, dbname string, tablename string, indexname string, sinker_type int8, prevIndexDef *plan.IndexDef, prevTableID uint64) error {
+func CreateIndexCdcTask(c *Compile, dbname string, tablename string, indexname string, sinker_type int8, insertSqls []string, prevTableID uint64) error {
 	var err error
 
 	spec := &iscp.JobSpec{
@@ -101,12 +101,11 @@ func CreateIndexCdcTask(c *Compile, dbname string, tablename string, indexname s
 			TableName: tablename,
 			IndexName: indexname},
 	}
-	if prevIndexDef != nil {
+	if prevTableID != 0 {
 		spec.ConsumerInfo.InheritedJob = iscp.InheritedJob{
-			TableID:       prevTableID,
-			JobName:       genCdcTaskJobID(prevIndexDef.IndexName),
-			SrcIndexTable: prevIndexDef.IndexTableName,
-			DstIndexTable: indexname,
+			TableID:    prevTableID,
+			JobName:    genCdcTaskJobID(indexname),
+			InsertSqls: insertSqls,
 		}
 	}
 	job := &iscp.JobID{DBName: dbname, TableName: tablename, JobName: genCdcTaskJobID(indexname)}

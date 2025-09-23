@@ -220,8 +220,7 @@ type InheritedJob struct {
 	TableID   uint64
 	JobName   string
 
-	SrcIndexTable string
-	DstIndexTable string
+	InsertSqls []string
 }
 
 type TableInfo struct {
