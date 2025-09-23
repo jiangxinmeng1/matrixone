@@ -145,7 +145,7 @@ func ExecuteIteration(
 			return
 		}
 		var prevWatermark types.TS
-		prevWatermark, err = initFromInheritedJob(ctx, cnUUID, txnOp, &jobSpecs[0].ConsumerInfo.InheritedJob)
+		prevWatermark, err = initFromInheritedJob(ctx, cnUUID, txnOp, dbName, &jobSpecs[0].ConsumerInfo.InheritedJob)
 		if err != nil {
 			return
 		}
@@ -616,6 +616,7 @@ func initFromInheritedJob(
 	ctx context.Context,
 	cnUUID string,
 	txn client.TxnOperator,
+	dbName string,
 	inheritedJob *InheritedJob,
 ) (prevWatermark types.TS, err error) {
 	defer func() {
@@ -641,13 +642,15 @@ func initFromInheritedJob(
 	if err != nil {
 		return
 	}
-	if !exist  {
+	if !exist {
 		return types.TS{}, moerr.NewInternalErrorNoCtx("inherited job not found")
 	}
 	prevWatermark = types.StringToTS(watermarkStr)
 	cloneTableSql := fmt.Sprintf(
-		"insert into %s select * from %s",
+		"insert into `%s`.`%s` select * from `%s`.`%s`",
+		dbName,
 		inheritedJob.DstIndexTable,
+		dbName,
 		inheritedJob.SrcIndexTable,
 	)
 	result, err := ExecWithResult(ctx, cloneTableSql, cnUUID, txn)
