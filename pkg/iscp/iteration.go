@@ -122,7 +122,7 @@ func ExecuteIteration(
 		}
 		statuses[i].StartAt = startAt
 	}
-	if iterCtx.fromTS.IsEmpty() && jobSpecs[0].ConsumerInfo.InheritedJob.SrcIndexTable != "" {
+	if iterCtx.fromTS.IsEmpty() && jobSpecs[0].ConsumerInfo.InheritedJob.InsertSqls != nil {
 		if len(jobSpecs) > 1 {
 			errMsg := fmt.Sprintf(
 				"inherited job not supported for multiple %v->%v %v",
@@ -145,7 +145,15 @@ func ExecuteIteration(
 			return
 		}
 		var prevWatermark types.TS
-		prevWatermark, err = initFromInheritedJob(ctx, cnUUID, txnOp, dbName, &jobSpecs[0].ConsumerInfo.InheritedJob)
+		prevWatermark, err = initFromInheritedJob(
+			ctx,
+			cnUUID,
+			cnEngine,
+			cnTxnClient,
+			txnOp,
+			dbName,
+			&jobSpecs[0].ConsumerInfo.InheritedJob,
+		)
 		if err != nil {
 			return
 		}
@@ -615,6 +623,8 @@ func NewIterationContext(accountID uint32, tableID uint64, jobNames []string, jo
 func initFromInheritedJob(
 	ctx context.Context,
 	cnUUID string,
+	cnEngine engine.Engine,
+	cnTxnClient client.TxnClient,
 	txn client.TxnOperator,
 	dbName string,
 	inheritedJob *InheritedJob,
@@ -626,8 +636,6 @@ func initFromInheritedJob(
 			zap.Uint64("tableID", inheritedJob.TableID),
 			zap.String("jobName", inheritedJob.JobName),
 			zap.String("prevWatermark", prevWatermark.ToString()),
-			zap.String("srcIndexTable", inheritedJob.SrcIndexTable),
-			zap.String("dstIndexTable", inheritedJob.DstIndexTable),
 			zap.Error(err),
 		)
 	}()
@@ -646,17 +654,11 @@ func initFromInheritedJob(
 		return types.TS{}, moerr.NewInternalErrorNoCtx("inherited job not found")
 	}
 	prevWatermark = types.StringToTS(watermarkStr)
-	cloneTableSql := fmt.Sprintf(
-		"insert into `%s`.`%s` select * from `%s`.`%s`",
-		dbName,
-		inheritedJob.DstIndexTable,
-		dbName,
-		inheritedJob.SrcIndexTable,
-	)
-	result, err := ExecWithResult(ctx, cloneTableSql, cnUUID, txn)
-	if err != nil {
-		return
+	for _, sql := range inheritedJob.InsertSqls {
+		err = ExecWithResultAutoCommit(ctx, cnEngine, cnTxnClient, sql, cnUUID, txn)
+		if err != nil {
+			return
+		}
 	}
-	result.Close()
 	return
 }

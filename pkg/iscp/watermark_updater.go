@@ -17,6 +17,7 @@ package iscp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/util/executor"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"go.uber.org/zap"
 )
 
@@ -72,6 +74,48 @@ func ExecWithResult(
 	return exec.Exec(ctx, sql, opts)
 }
 
+func ExecWithResultAutoCommit(
+	ctx context.Context,
+	cnEngine engine.Engine,
+	cnTxnClient client.TxnClient,
+	sql string,
+	cnUUID string,
+	txn client.TxnOperator,
+) (error) {
+	
+	ctx = context.WithValue(ctx, defines.TenantIDKey{}, catalog.System_Account)
+	ctx, cancel := context.WithTimeout(ctx, time.Minute*5)
+	defer cancel()
+	txnWriter, err := getTxn(ctx, cnEngine, cnTxnClient, "iscp iteration")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, txnWriter.Rollback(ctx))
+		} else {
+			err = txnWriter.Commit(ctx)
+		}
+	}()
+	v, ok := moruntime.ServiceRuntime(cnUUID).GetGlobalVariables(moruntime.InternalSQLExecutor)
+	if !ok {
+		panic("missing lock service")
+	}
+
+	exec := v.(executor.SQLExecutor)
+	opts := executor.Options{}.
+		// All runSql and runSqlWithResult is a part of input sql, can not incr statement.
+		// All these sub-sql's need to be rolled back and retried en masse when they conflict in pessimistic mode
+		WithDisableIncrStatement().
+		WithTxn(txn)
+
+	result, err := exec.Exec(ctx, sql, opts)
+	if err != nil {
+		return err
+	}
+	result.Close()
+	return nil
+}
 // RegisterJob create jobs. return true if create, return false if task already exists, return error when error
 // JobID.DBName: required, the name of the database.
 // JobID.TableName: required, the name of the table.
@@ -199,7 +243,7 @@ func registerJob(
 	ctxWithSysAccount := context.WithValue(ctx, defines.TenantIDKey{}, catalog.System_Account)
 	ctxWithSysAccount, cancel := context.WithTimeout(ctxWithSysAccount, time.Minute*5)
 	startTs := types.TS{}
-	if startFromNow && jobSpec.ConsumerInfo.InheritedJob.SrcIndexTable == "" {
+	if startFromNow && jobSpec.ConsumerInfo.InheritedJob.InsertSqls == nil {
 		startTs = types.TimestampToTS(txn.SnapshotTS())
 	}
 	defer cancel()
