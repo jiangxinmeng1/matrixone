@@ -353,7 +353,7 @@ import (
 %token <str> PREPARE DEALLOCATE RESET
 %token <str> EXTENSION
 %token <str> RETENTION PERIOD
-%token <str> CLONE MO BRANCH LOG REVERT REBASE DIFF
+%token <str> CLONE BRANCH LOG REVERT REBASE DIFF
 %token <str> CONFLICT CONFLICT_FAIL CONFLICT_SKIP CONFLICT_ACCEPT
 
 // Sequence
@@ -3666,7 +3666,7 @@ algorithm_type:
 |   INPLACE
 |   COPY
 |   CLONE
-|   MO
+|   DATA
 |   BRANCH
 
 able_type:
@@ -7950,7 +7950,7 @@ replace_opt:
 
 
 branch_stmt:
-    MO BRANCH CREATE TABLE table_name FROM table_name to_account_opt
+    DATA BRANCH CREATE TABLE table_name FROM table_name to_account_opt
     {
     	t := tree.NewDataBranchCreateTable()
     	t.CreateTable.Table = *$5
@@ -7960,7 +7960,7 @@ branch_stmt:
         t.ToAccountOpt = $8
         $$ = t
     }
-|   MO BRANCH CREATE DATABASE db_name FROM db_name table_snapshot_opt to_account_opt
+|   DATA BRANCH CREATE DATABASE db_name FROM db_name table_snapshot_opt to_account_opt
     {
     	t := tree.NewDataBranchCreateDatabase()
         t.DstDatabase = tree.Identifier($4)
@@ -7969,31 +7969,32 @@ branch_stmt:
         t.ToAccountOpt = $9
         $$ = t
     }
-|   MO BRANCH DELETE TABLE table_name
+|   DATA BRANCH DELETE TABLE table_name
     {
     	t := tree.NewDataBranchDeleteTable()
     	t.TableName = *$5
     	$$ = t
     }
-|   MO BRANCH DELETE DATABASE db_name
+|   DATA BRANCH DELETE DATABASE db_name
     {
 	t := tree.NewDataBranchDeleteDatabase()
 	t.DatabaseName = tree.Identifier($5)
 	$$ = t
     }
-|   SNAPSHOT DIFF table_name AGAINST table_name
+|   DATA BRANCH DIFF table_name AGAINST table_name diff_as_opt
     {
-    	t := tree.NewSnapshotDiff()
-    	t.TargetTable = *$3
-    	t.BaseTable = *$5
+    	t := tree.NewDataBranchDiff()
+    	t.TargetTable = *$4
+    	t.BaseTable = *$6
+    	t.DiffAsOpts = $7
     	$$ = t
     }
-|   SNAPSHOT MERGE table_name INTO table_name conflict_opt
+|   DATA BRANCH MERGE table_name INTO table_name conflict_opt
     {
-    	t := tree.NewSnapshotMerge()
-    	t.SrcTable = *$3
-    	t.DstTable = *$5
-    	t.ConflictOpt = $6
+    	t := tree.NewDataBranchMerge()
+    	t.SrcTable = *$4
+    	t.DstTable = *$6
+    	t.ConflictOpt = $7
     	$$ = t
     }
 
