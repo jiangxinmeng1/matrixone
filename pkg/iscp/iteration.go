@@ -194,6 +194,14 @@ func ExecuteIteration(
 		defer dataRetrievers[i].Close()
 	}
 
+	ok, err := checkLeaseWithRetry(ctx, cnUUID, cnEngine, cnTxnClient)
+	if err != nil {
+		return
+	}
+	if !ok {
+		err = moerr.NewInternalErrorNoCtx("check lease failed")
+		return
+	}
 	err = FlushJobStatusOnIterationState(
 		ctx,
 		cnUUID,
@@ -228,6 +236,12 @@ func ExecuteIteration(
 			insertData, deleteData, currentHint, err := changes.Next(ctxWithCancel, mp)
 			if msg, injected := objectio.ISCPExecutorInjected(); injected && msg == "changesNext" {
 				err = moerr.NewInternalErrorNoCtx(msg)
+			}
+			if err != nil {
+				ok, err = checkLeaseWithRetry(ctx, cnUUID, cnEngine, cnTxnClient)
+				if err == nil && !ok {
+					err = moerr.NewInternalErrorNoCtx("check lease failed")
+				}
 			}
 			if err != nil {
 				jobNames := ""
@@ -433,6 +447,12 @@ func FlushStatus(
 	if err != nil {
 		return
 	}
+	var expectPrevLSN uint64
+	if state == ISCPJobState_Running {
+		expectPrevLSN = jobStatus.LSN-1
+	} else {
+		expectPrevLSN = jobStatus.LSN
+	}
 	sql := cdc.CDCSQLBuilder.ISCPLogUpdateResultSQL(
 		tenantId,
 		tableID,
@@ -441,6 +461,7 @@ func FlushStatus(
 		watermark,
 		statusJson,
 		state,
+		expectPrevLSN,
 	)
 	result, err := ExecWithResult(ctx, sql, cnUUID, txn)
 	if err != nil {

@@ -152,6 +152,7 @@ func (r *DataRetrieverImpl) UpdateWatermark(exec executor.TxnExecutor, opts exec
 		r.status.To,
 		statusJson,
 		ISCPJobState_Completed,
+		r.lsn,
 	)
 	_, err = exec.Exec(updateWatermarkSQL, opts)
 	return err

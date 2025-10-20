@@ -16,6 +16,7 @@ package iscp
 
 import (
 	"context"
+	"fmt"
 
 	"sync"
 	"time"
@@ -286,6 +287,72 @@ func (exec *ISCPTaskExecutor) Stop() {
 	exec.worker = nil
 }
 
+func checkLeaseWithRetry(
+	ctx context.Context,
+	cnUUID string,
+	txnEngine engine.Engine,
+	cnTxnClient client.TxnClient,
+) (ok bool, err error) {
+	defer func() {
+		if err != nil || !ok {
+			logutil.Errorf(
+				"ISCP-Task check lease failed",
+				zap.Error(err),
+				zap.Bool("ok", ok),
+				zap.String("cnUUID", cnUUID),
+			)
+		}
+	}()
+	err = retry(
+		func() error {
+			ok, err = checkLease(ctx, cnUUID, txnEngine, cnTxnClient)
+			return err
+		},
+		DefaultRetryTimes,
+	)
+	return
+}
+
+func checkLease(
+	ctx context.Context,
+	cnUUID string,
+	txnEngine engine.Engine,
+	cnTxnClient client.TxnClient,
+) (ok bool, err error) {
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Minute*5)
+	defer cancel()
+	txn, err := getTxn(ctxWithTimeout, txnEngine, cnTxnClient, "iscp check lease")
+	if err != nil {
+		return
+	}
+	defer txn.Commit(ctxWithTimeout)
+
+	sql := `select task_runner from mo_task.sys_daemon_task where task_type = "ISCP"`
+	result, err := ExecWithResult(ctxWithTimeout, sql, cnUUID, txn)
+	if err != nil {
+		return
+	}
+	defer result.Close()
+	result.ReadRows(func(rows int, cols []*vector.Vector) bool {
+		if rows != 1 {
+			err = moerr.NewInternalErrorNoCtx(fmt.Sprintf("unexpected rows count: %d", rows))
+			return false
+		}
+		runner := cols[0].GetStringAt(0)
+		if runner == cnUUID {
+			ok = true
+		} else {
+			logutil.Errorf(
+				"ISCP-Task check lease failed, runner: %s, expected: %s",
+				runner,
+				cnUUID,
+			)
+		}
+		return false
+	})
+	return
+}
+
 func (exec *ISCPTaskExecutor) run(ctx context.Context) {
 	logutil.Info(
 		"ISCP-Task Run",
@@ -369,8 +436,11 @@ func (exec *ISCPTaskExecutor) run(ctx context.Context) {
 						job.currentLSN++
 						job.state = ISCPJobState_Pending
 					}
-					err := exec.worker.Submit(iter)
-					if err != nil {
+					ok, err = checkLeaseWithRetry(exec.ctx, exec.cnUUID, exec.txnEngine, exec.cnTxnClient)
+					if !ok {
+						return
+					}
+					onErrorFn := func() {
 						for i, jobName := range iter.jobNames {
 							job := table.jobs[JobKey{
 								JobName: jobName,
@@ -383,6 +453,14 @@ func (exec *ISCPTaskExecutor) run(ctx context.Context) {
 							"ISCP-Task submit iteration failed",
 							zap.Error(err),
 						)
+
+					}
+					if err != nil {
+						onErrorFn()
+					}
+					err := exec.worker.Submit(iter)
+					if err != nil {
+						onErrorFn()
 					}
 				} else {
 					if !ok2 {

@@ -151,6 +151,7 @@ func (jobEntry *JobEntry) tryFlushWatermark(
 		jobEntry.watermark,
 		statusJson,
 		ISCPJobState_Completed,
+		jobEntry.currentLSN,
 	)
 	result, err := ExecWithResult(
 		ctx,
