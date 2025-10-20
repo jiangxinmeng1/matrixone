@@ -287,6 +287,12 @@ func (exec *ISCPTaskExecutor) Stop() {
 	exec.worker = nil
 }
 
+func (exec *ISCPTaskExecutor) IsRunning() bool {
+	exec.runningMu.Lock()
+	defer exec.runningMu.Unlock()
+	return exec.running
+}
+
 var CheckLeaseWithRetry = func(
 	ctx context.Context,
 	cnUUID string,
