@@ -287,7 +287,7 @@ func (exec *ISCPTaskExecutor) Stop() {
 	exec.worker = nil
 }
 
-func checkLeaseWithRetry(
+var CheckLeaseWithRetry = func(
 	ctx context.Context,
 	cnUUID string,
 	txnEngine engine.Engine,
@@ -436,9 +436,10 @@ func (exec *ISCPTaskExecutor) run(ctx context.Context) {
 						job.currentLSN++
 						job.state = ISCPJobState_Pending
 					}
-					ok, err = checkLeaseWithRetry(exec.ctx, exec.cnUUID, exec.txnEngine, exec.cnTxnClient)
+					ok, err = CheckLeaseWithRetry(exec.ctx, exec.cnUUID, exec.txnEngine, exec.cnTxnClient)
 					if !ok {
-						return
+						go exec.Stop()
+						break
 					}
 					onErrorFn := func() {
 						for i, jobName := range iter.jobNames {

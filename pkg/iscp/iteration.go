@@ -194,7 +194,7 @@ func ExecuteIteration(
 		defer dataRetrievers[i].Close()
 	}
 
-	ok, err := checkLeaseWithRetry(ctx, cnUUID, cnEngine, cnTxnClient)
+	ok, err := CheckLeaseWithRetry(ctx, cnUUID, cnEngine, cnTxnClient)
 	if err != nil {
 		return
 	}
@@ -238,7 +238,7 @@ func ExecuteIteration(
 				err = moerr.NewInternalErrorNoCtx(msg)
 			}
 			if err != nil {
-				ok, err = checkLeaseWithRetry(ctx, cnUUID, cnEngine, cnTxnClient)
+				ok, err = CheckLeaseWithRetry(ctx, cnUUID, cnEngine, cnTxnClient)
 				if err == nil && !ok {
 					err = moerr.NewInternalErrorNoCtx("check lease failed")
 				}

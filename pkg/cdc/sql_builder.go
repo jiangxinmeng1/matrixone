@@ -255,7 +255,7 @@ const (
 		`AND table_id = %d ` +
 		`AND job_name = '%s'` +
 		`AND job_id = %d ` +
-		`AND  JSON_EXTRACT(job_status, '$.LSN') = %d`
+		`AND  JSON_EXTRACT(job_status, '$.LSN') = '%d'`
 	CDCUpdateMOISCPLogJobSpecSqlTemplate = `UPDATE mo_catalog.mo_iscp_log SET ` +
 		`job_spec = '%s'` +
 		`WHERE` +

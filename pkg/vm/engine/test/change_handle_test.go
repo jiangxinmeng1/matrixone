@@ -1639,6 +1639,19 @@ func TestISCPExecutor1(t *testing.T) {
 	txn.Commit(ctxWithTimeout)
 
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -1791,6 +1804,19 @@ func TestISCPExecutor2(t *testing.T) {
 	txn.Commit(ctxWithTimeout)
 
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	opts := GetTestISCPExecutorOption()
 	opts.GCTTL = time.Hour
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
@@ -1973,6 +1999,19 @@ func TestISCPExecutor3(t *testing.T) {
 	txn.Commit(ctxWithTimeout)
 
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -2184,6 +2223,19 @@ func TestISCPExecutor4(t *testing.T) {
 	txn.Commit(ctxWithTimeout)
 
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -2376,6 +2428,19 @@ func TestISCPExecutor5(t *testing.T) {
 	}
 
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -2512,6 +2577,19 @@ func TestISCPExecutor6(t *testing.T) {
 	txn.Commit(ctxAccountID2)
 
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -2614,6 +2692,19 @@ func TestISCPExecutor7(t *testing.T) {
 	txn.Commit(ctxWithTimeout)
 
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -2718,6 +2809,19 @@ func TestISCPExecutor8(t *testing.T) {
 	txn.Commit(ctxWithTimeout)
 
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -2827,7 +2931,20 @@ func TestUpdateJobSpec(t *testing.T) {
 
 	txn.Commit(ctxWithTimeout)
 
-	// init cdc executor
+	// init cdc 
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -3006,6 +3123,19 @@ func TestFlushWatermark(t *testing.T) {
 	txn.Commit(ctxWithTimeout)
 
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -3112,6 +3242,19 @@ func TestGCInMemoryJob(t *testing.T) {
 	txn.Commit(ctxWithTimeout)
 
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -3224,6 +3367,19 @@ func TestIteration(t *testing.T) {
 	require.NoError(t, err)
 	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
 
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -3363,6 +3519,19 @@ func TestDropJobsByDBName(t *testing.T) {
 
 	txn.Commit(ctxWithTimeout)
 
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -3487,6 +3656,19 @@ func TestInvalidTimestamp(t *testing.T) {
 	require.NoError(t, err)
 	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -3692,6 +3874,18 @@ func TestCancelIteration2(t *testing.T) {
 
 	cancelCh := make(chan struct{})
 
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	stub := gostub.Stub(
 		&iscp.GetJobSpecs,
 		func(
@@ -3835,6 +4029,19 @@ func TestStartFromNow(t *testing.T) {
 
 	txn.Commit(ctxWithTimeout)
 
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
+
 	// init cdc executor
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
@@ -3943,6 +4150,19 @@ func TestApplyISCPLog(t *testing.T) {
 
 	txn.Commit(ctxWithTimeout)
 
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	// init cdc executor
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
@@ -4080,6 +4300,19 @@ func TestISCPReplay(t *testing.T) {
 
 	txn.Commit(ctxWithTimeout)
 
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	// init cdc executor
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
@@ -4181,6 +4414,20 @@ func TestRenameSrcTable(t *testing.T) {
 		RetryTimes:             1,
 	}
 	opts.GCTTL = time.Hour
+	
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -4302,6 +4549,19 @@ func TestISCPExecutorStartError(t *testing.T) {
 	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
 
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
@@ -4370,6 +4630,19 @@ func TestStaleRead(t *testing.T) {
 	require.NoError(t, err)
 	t.Log(taeHandler.GetDB().Catalog.SimplePPString(3))
 	// init cdc executor
+
+	checkLeaseStub := gostub.Stub(
+		&iscp.CheckLeaseWithRetry,
+		func(
+			context.Context,
+			string,
+			engine.Engine,
+			client.TxnClient,
+		) (bool, error) {
+			return true, nil
+		},
+	)
+	defer checkLeaseStub.Reset()
 	cdcExecutor, err := iscp.NewISCPTaskExecutor(
 		ctxWithTimeout,
 		disttaeEngine.Engine,
