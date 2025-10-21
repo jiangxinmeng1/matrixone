@@ -17,7 +17,10 @@ package disttae
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"time"
+
+	"sync"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
@@ -35,7 +38,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/readutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/checkpoint"
 	"go.uber.org/zap"
-	"sync"
 )
 
 const DefaultLoadParallism = 20
@@ -92,6 +94,7 @@ func NewPartitionChangesHandle(
 	skipDeletes bool,
 	mp *mpool.MPool,
 ) (*PartitionChangesHandle, error) {
+	logutil.Infof("lalala change handle stack %v->%v %s", from.ToString(), to.ToString(), debug.Stack())
 	if to.IsEmpty() || from.GT(&to) {
 		return nil, moerr.NewInternalErrorNoCtx("invalid timestamp")
 	}

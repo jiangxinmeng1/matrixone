@@ -53,6 +53,7 @@ func ExecuteIteration(
 	iterCtx *IterationContext,
 	mp *mpool.MPool,
 ) (err error) {
+	logutil.Infof("lalala iteration %v->%v", iterCtx.fromTS.ToString(), iterCtx.toTS.ToString())
 	time.Sleep(time.Minute * 5)
 	packer := types.NewPacker()
 	defer packer.Close()
