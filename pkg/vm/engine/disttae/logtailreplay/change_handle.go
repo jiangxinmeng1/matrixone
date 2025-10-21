@@ -1131,6 +1131,11 @@ func (p *ChangeHandler) Next(ctx context.Context, mp *mpool.MPool) (data, tombst
 		}
 	}
 	defer func() {
+		if data == nil && tombstone == nil {
+			logutil.Infof("lalala ChangeHandle %v->%v, data length %d", p.start.ToString(), p.end.ToString(), p.dataLength)
+		}
+	}()
+	defer func() {
 		if data != nil && data.RowCount() == 0 {
 			data.Clean(p.mp)
 			data = nil
