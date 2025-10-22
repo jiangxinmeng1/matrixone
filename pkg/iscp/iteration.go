@@ -398,6 +398,7 @@ func ExecuteIteration(
 	cancel()
 	changeHandelWg.Wait()
 	for i, status := range statuses {
+		logutil.Infof("lalala status %d, error code %d", i, status.ErrorCode)
 		if status.ErrorCode != 0 || typ == ISCPDataType_Snapshot {
 			state := ISCPJobState_Completed
 			if status.PermanentlyFailed() {
