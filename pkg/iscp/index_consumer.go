@@ -375,6 +375,7 @@ func (c *IndexConsumer) Consume(ctx context.Context, r DataRetriever) error {
 	for !noMoreData {
 		data := r.Next()
 		noMoreData = c.processISCPData(ctx, data, datatype, errch)
+		logutil.Infof("lalala data.noMoreData %v, noMoreData %v", data.noMoreData, noMoreData)
 	}
 
 	wg.Wait()
