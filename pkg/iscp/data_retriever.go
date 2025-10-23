@@ -24,6 +24,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 )
 
@@ -101,6 +102,7 @@ type DataRetrieverImpl struct {
 	err          error
 
 	mu sync.Mutex
+	close bool
 }
 
 func NewDataRetriever(
@@ -134,6 +136,9 @@ func (r *DataRetrieverImpl) Next() *ISCPData {
 	case <-r.ctx.Done():
 		return nil
 	case data = <-r.insertDataCh:
+		if r.close {
+			logutil.Infof("lalala DataRetrieverImpl Next close")
+		}
 	}
 	return data
 }
@@ -217,5 +222,6 @@ func (r *DataRetrieverImpl) SetError(err error) {
 }
 
 func (r *DataRetrieverImpl) Close() {
+	r.close = true
 	close(r.insertDataCh)
 }

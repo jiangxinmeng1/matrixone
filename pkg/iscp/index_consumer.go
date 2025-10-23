@@ -301,6 +301,7 @@ func (c *IndexConsumer) processISCPData(ctx context.Context, data *ISCPData, dat
 	if data == nil {
 		err := c.flushCdc()
 		if err != nil {
+			logutil.Infof("lalala flushCdc when data is nil err %v", err)
 			errch <- err
 		}
 		close(c.sqlBufSendCh)
@@ -314,6 +315,7 @@ func (c *IndexConsumer) processISCPData(ctx context.Context, data *ISCPData, dat
 	noMoreData := data.noMoreData
 	err := data.err
 	if err != nil {
+		logutil.Infof("lalala data.err %v", err)
 		errch <- err
 		return true
 	}
@@ -321,6 +323,7 @@ func (c *IndexConsumer) processISCPData(ctx context.Context, data *ISCPData, dat
 	if noMoreData {
 		err := c.flushCdc()
 		if err != nil {
+			logutil.Infof("lalala flushCdc err %v", err)
 			errch <- err
 		}
 		close(c.sqlBufSendCh)
@@ -336,6 +339,7 @@ func (c *IndexConsumer) processISCPData(ctx context.Context, data *ISCPData, dat
 			// error out
 			errch <- err
 			noMoreData = true
+			logutil.Infof("lalala sinkSnapshot err %v", err)
 		}
 
 	} else {
@@ -345,6 +349,7 @@ func (c *IndexConsumer) processISCPData(ctx context.Context, data *ISCPData, dat
 			// error out
 			errch <- err
 			noMoreData = true
+			logutil.Infof("lalala sinkTail err %v", err)
 		}
 	}
 
@@ -375,13 +380,20 @@ func (c *IndexConsumer) Consume(ctx context.Context, r DataRetriever) error {
 	for !noMoreData {
 		data := r.Next()
 		noMoreData = c.processISCPData(ctx, data, datatype, errch)
-		logutil.Infof("lalala data.noMoreData %v, noMoreData %v", data.noMoreData, noMoreData)
+		dataNoMoreData := "nil"
+		if data != nil {
+			dataNoMoreData = fmt.Sprintf("%v", data.noMoreData)
+		}
+		logutil.Infof("lalala data.noMoreData %v, noMoreData %v", dataNoMoreData, noMoreData)
 	}
 
 	wg.Wait()
+	logutil.Infof("lalala errch len %v", len(errch))
 
 	if len(errch) > 0 {
-		return <-errch
+		err := <-errch
+		logutil.Infof("lalala err %v", err)
+		return err
 	}
 
 	return nil
