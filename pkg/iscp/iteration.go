@@ -54,11 +54,11 @@ func ExecuteIteration(
 	mp *mpool.MPool,
 ) (err error) {
 	logutil.Infof("lalala iteration %v->%v", iterCtx.fromTS.ToString(), iterCtx.toTS.ToString())
-	time.Sleep(time.Minute * 5)
 	packer := types.NewPacker()
 	defer packer.Close()
 
 	ctx = context.WithValue(ctx, defines.TenantIDKey{}, catalog.System_Account)
+	originalCtx := ctx
 	ctx, cancel := context.WithTimeout(ctx, time.Hour)
 	defer cancel()
 
@@ -255,7 +255,7 @@ func ExecuteIteration(
 			continue
 		}
 		dataRetrievers[i] = NewDataRetriever(
-			ctx,
+			originalCtx,
 			iterCtx.accountID,
 			iterCtx.tableID,
 			iterCtx.jobNames[i],
