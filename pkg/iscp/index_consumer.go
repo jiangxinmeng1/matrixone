@@ -379,11 +379,11 @@ func (c *IndexConsumer) Consume(ctx context.Context, r DataRetriever) error {
 	// read data
 	for !noMoreData {
 		data := r.Next()
-		noMoreData = c.processISCPData(ctx, data, datatype, errch)
 		dataNoMoreData := "nil"
 		if data != nil {
 			dataNoMoreData = fmt.Sprintf("%v", data.noMoreData)
 		}
+		noMoreData = c.processISCPData(ctx, data, datatype, errch)
 		logutil.Infof("lalala data.noMoreData %v, noMoreData %v", dataNoMoreData, noMoreData)
 	}
 
