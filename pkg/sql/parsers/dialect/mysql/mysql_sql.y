@@ -8009,6 +8009,12 @@ diff_output_opt:
             As: *$3,
         }
     }
+    | OUTPUT SQL STRING
+    {
+        $$ = &tree.DiffOutputOpt {
+            FilePath: $3,
+        }
+    }
     | OUTPUT LIMIT INTEGRAL
     {
     	x := $3.(int64)
