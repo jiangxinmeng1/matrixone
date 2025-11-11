@@ -8009,10 +8009,10 @@ diff_output_opt:
             As: *$3,
         }
     }
-    | OUTPUT SQL STRING
+    | OUTPUT FILE STRING
     {
         $$ = &tree.DiffOutputOpt {
-            FilePath: $3,
+            DirPath: $3,
         }
     }
     | OUTPUT LIMIT INTEGRAL
