@@ -32,7 +32,7 @@
 - 同步配置：sync_interval、full_sync_completed
 - 时间戳：created_at、updated_at、started_at
 - 错误: error message，retry count, first error ts
-- 执行的worker的配置：cn uuid
+- 执行的worker的配置：cn uuid，task status(pending, running, complete, error/cancel)，job lsn
 
 ## 3. S3目录结构
 
@@ -98,19 +98,36 @@ s3://{bucket}/{prefix}/{account_id}/{db_id}/{table_id}/
 
 **执行位置**：CN的TaskService
 
-**核心功能**：
-1. 状态检查：检查系统表中task的state和cn_uuid，确保未被其他CN执行
-2. 读取ObjectList：
-   - 从TN的catalog读取表的ObjectEntry列表
-   - 首次同步：读取所有可见object
-   - 增量同步：只读取CreateTS > watermark的aobj和cnobj
-3. 复制Object：将object文件从源S3复制到目标S3的表目录
-4. 生成元数据：
-   - 序列化ObjectEntry列表到`object_list.meta`
-   - 生成`manifest.json`，包含watermark、object数量等
-5. 更新系统表：
-   - 更新`mo_s3_sync_tasks`的watermark、updated_at
-   - 首次完成后设置`full_sync_completed=true`
+**执行步骤**：
+
+**Step 1: 状态检查并加锁**
+- 输入：job_lsn、table info（Job传入）
+- 操作：从`mo_s3_sync_tasks`读取cn_uuid、task_status、job_lsn
+- 检查：cn_uuid == 当前CN && task_status == 'pending' && job_lsn == 传入的lsn
+- 更新：设置task_status = 'running'
+- 输出：current_watermark
+
+**Step 2: 从Partition State读取ObjectList**
+- 输入：table_info、current_watermark
+- 操作：从TN的Partition State读取ObjectEntry列表（类似changes handle）
+  - 首次同步：读取所有可见object
+  - 增量同步：只读取CreateTS > current_watermark的aobj和cnobj
+- 计算：new_watermark = max(objects.CreateTS)
+- 输出：ObjectEntry列表、new_watermark
+
+**Step 3: 复制Object并生成元数据**（打包在一个函数中）
+- 输入：ObjectEntry列表、S3配置、FileService
+- 操作：
+  - 复制每个object文件从源S3到目标S3的表目录
+  - 序列化ObjectEntry列表到`object_list.meta`
+  - 生成`manifest.json`（包含new_watermark、object数量、时间戳）
+- 输出：成功复制的object数量
+
+**Step 4: 更新系统表**
+- 输入：new_watermark
+- 操作：再次检查cn_uuid、task_status、job_lsn是否仍然一致
+- 更新：watermark = new_watermark、updated_at = now()、task_status = 'complete'、首次完成设置full_sync_completed = true
+- 输出：更新成功/失败
 
 ---
 
