@@ -33,7 +33,7 @@
 - **Watermark追踪**：使用时间戳跟踪同步进度
 - **分层存储**：保留最近时间段的增量数据 + 历史快照
 - **上游GC管理**：由上游控制数据保留策略，自动清理过期数据
-- **下游灵活消费**：下游可控制开始时间，每次同步到最新数据
+- **灵活消费模式**：下游支持定时同步或自动跟随最新数据
 
 ---
 
@@ -46,16 +46,13 @@
 ┌──────────────┐                           ┌──────────────┐
 │   CN Node    │                           │   CN Node    │
 │ ┌──────────┐ │                           │ ┌──────────┐ │
-│ │Upstream  │ │                           │ │Downstream│ │
-│ │Executor  │ │                           │ │Executor  │ │
+│ │  S3Sync  │ │                           │ │  S3Sync  │ │
+│ │ Executor │ │                           │ │ Executor │ │
 │ └────┬─────┘ │                           │ └────┬─────┘ │
 │      │       │                           │      │       │
-│      │ 提交Job                           │      │ 提交Job
-│      ↓       │                           │      ↓       │
-│ ┌──────────┐ │                           │ ┌──────────┐ │
-│ │Upstream  │ │                           │ │Downstream│ │
-│ │SyncJob   │ │                           │ │ConsumeJob│ │
-│ └────┬─────┘ │                           │ └────┬─────┘ │
+│      ├──→ UpstreamSyncJob                │      ├──→ DownstreamConsumeJob
+│      └──→ SnapshotGCJob                  │      │       │
+│                                           │      │       │
 └──────┼───────┘                           └──────┼───────┘
        │                                          │
        │ 读取Partition State                     │ 应用到Catalog
@@ -85,13 +82,17 @@
 
 ### 2.2 核心组件
 
-**上游组件**：
-- **UpstreamSyncExecutor**：CN启动时创建，负责任务管理和调度
-- **UpstreamSyncJob**：TaskService执行的任务，负责读取ObjectList、复制到S3、GC清理
+**统一的Executor**：
+- **S3SyncExecutor**：CN启动时创建，用同一个Executor处理本集群作为上游或下游的job
+- 启动时从系统表加载所有任务（上游和下游）
+- 为每个任务提交相应的Job到TaskService
 
-**下游组件**：
-- **DownstreamSyncExecutor**：CN启动时创建，负责任务管理和调度
-- **DownstreamConsumeJob**：TaskService执行的任务，负责从S3消费数据、应用到Catalog
+**上游Job**：
+- **UpstreamSyncJob**：读取增量数据并复制到S3
+- **SnapshotGCJob**：生成快照并清理过期增量数据
+
+**下游Job**：
+- **DownstreamConsumeJob**：从S3消费数据并应用到Catalog
 
 ---
 
@@ -121,7 +122,7 @@ CREATE UPSTREAM S3 SYNC <task_name>
 - `SOURCE DATABASE/TABLE`：源数据库和表名
 - `S3 CONFIG`：S3配置信息
 - `SYNC_INTERVAL`：同步间隔（秒），默认60秒
-- `RETENTION_DAYS`：增量数据保留天数，默认7天，超过此时间的增量目录会被GC清理
+- `RETENTION_DAYS`：增量数据保留天数，默认7天
 
 **示例**：
 
@@ -157,12 +158,15 @@ CREATE DOWNSTREAM S3 SYNC <task_name>
     ACCESS_KEY '<access_key>',
     SECRET_KEY '<secret_key>'
   )
+  [SYNC_MODE <mode>]
   [SYNC_INTERVAL <seconds>];
 ```
 
 **参数说明**：
+- `SYNC_MODE`：同步模式
+  - `'auto'`（默认）：自动跟随最新数据，持续同步
+  - `'manual'`：定时同步到当前时间戳，不自动跟随
 - `SYNC_INTERVAL`：检查间隔（秒），默认60秒
-- **注意**：下游任务始终从头开始同步（从快照开始），每次消费到最新的数据
 
 **示例**：
 
@@ -170,7 +174,7 @@ CREATE DOWNSTREAM S3 SYNC <task_name>
 -- 先创建目标表（与上游表结构相同）
 CREATE TABLE tpcc_replica.orders LIKE tpcc.orders;
 
--- 创建消费任务（从头开始）
+-- 自动模式：持续跟随最新数据
 CREATE DOWNSTREAM S3 SYNC sync_orders
   TARGET DATABASE tpcc_replica TABLE orders
   S3 CONFIG (
@@ -181,7 +185,14 @@ CREATE DOWNSTREAM S3 SYNC sync_orders
     ACCESS_KEY 'AKIAIOSFODNN7EXAMPLE',
     SECRET_KEY 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
   )
-  SYNC_INTERVAL 60;
+  SYNC_MODE 'auto';
+  SYNC_INTERVAL 3600;  -- 每小时同步一次
+
+-- 手动模式：定时同步到当前时间戳
+CREATE DOWNSTREAM S3 SYNC sync_orders_manual
+  TARGET DATABASE tpcc_replica TABLE orders
+  S3 CONFIG (...)
+  SYNC_MODE 'manual'
 ```
 
 ---
@@ -203,8 +214,6 @@ SHOW S3 SYNC TASK <task_name>;
 ```sql
 DROP S3 SYNC TASK <task_name>;
 ```
-
-**说明**：删除任务只会删除系统表记录，不会删除S3数据。S3数据由上游的GC机制自动清理。
 
 ---
 
@@ -231,31 +240,23 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
     table_name           VARCHAR(128) NOT NULL,
     table_id             BIGINT NOT NULL,
     
-    -- S3配置
-    s3_endpoint          VARCHAR(256) NOT NULL,
-    s3_region            VARCHAR(64),
-    s3_bucket            VARCHAR(128) NOT NULL,
-    s3_dir               VARCHAR(256) NOT NULL,
-    s3_access_key        VARCHAR(256),                   -- 加密存储
-    s3_secret_key        VARCHAR(512),                   -- 加密存储
+    -- S3配置（JSON格式）
+    s3_config            JSON NOT NULL,                  -- {endpoint, region, bucket, dir, access_key, secret_key}
     
     -- 同步状态
     watermark            TIMESTAMP(6) NOT NULL DEFAULT '1970-01-01 00:00:00',
     snapshot_watermark   TIMESTAMP(6),                   -- 快照的watermark（上游）
     sync_interval        INT DEFAULT 60,                 -- 同步间隔（秒）
     
-    -- 上游特有
-    retention_days       INT DEFAULT 7,                  -- 增量数据保留天数（上游）
+    sync_config            JSON NOT NULL,                 -- RETENTION_DAYS, sync_mode, sync_interval
     
     -- 任务控制
     state                VARCHAR(16) NOT NULL DEFAULT 'running',  -- 'running', 'stopped'
     cn_uuid              VARCHAR(64),                    -- 执行任务的CN标识
     job_lsn              BIGINT DEFAULT 0,               -- Job序列号
     
-    -- 错误追踪
-    error_message        TEXT,
-    retry_count          INT DEFAULT 0,
-    first_error_ts       TIMESTAMP,
+    -- 错误信息
+    error_message        VARCHAR(1024),                  -- 最后错误信息
     
     -- 时间戳
     created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -264,7 +265,8 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
     -- 约束
     UNIQUE KEY uk_task_name (task_name, cluster_role),
     INDEX idx_state (state),
-    INDEX idx_cn_uuid (cn_uuid)
+    INDEX idx_cn_uuid (cn_uuid),
+    INDEX idx_role (cluster_role)
 );
 ```
 
@@ -299,277 +301,173 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 ### 5.2 文件说明
 
 **快照目录（0-{snapshot_ts}）**：
-- 包含从表创建到snapshot_ts时间点的所有数据
+- 包含从表创建到snapshot_ts时间点的所有可见数据
 - 所有object按CreateTS排序
-- 只保留一个快照，新快照生成后删除旧快照
-- 用于下游从头开始消费
+- 只保留一个快照
 
 **增量目录（{start_ts}-{end_ts}）**：
 - 包含该时间段内的aobj和cnobj
 - 按CreateTS排序
 - 保留最近`retention_days`天的数据
-- 超过保留期的目录会被上游GC删除
 
 **object_list.meta**：
 - 序列化的ObjectEntry列表
-- 已按CreateTS排序，下游可直接使用
-- 包含：ObjectStats、CreateTS、DeleteTS、object_type、is_appendable
+- 包含：ObjectStats
 
 **manifest.json**：
 - 标记批次写入完成
-- 内容：
-  - start_ts / end_ts：时间范围
-  - object_count：对象数量
-  - is_snapshot：是否为快照
-  - state：'complete'
-  - created_at：生成时间
-
-### 5.3 GC清理规则（上游负责）
-
-**增量数据清理**：
-- 扫描所有增量目录，检查end_ts
-- 如果`now() - end_ts > retention_days`，删除整个目录
-- 保证至少保留最近一个增量目录
-
-**快照更新**：
-- 当最旧的增量目录即将被GC时，生成新快照
-- 新快照包含：旧快照 + 所有待删除的增量数据
-- 范围：`0-{最旧增量的end_ts}`
-- 新快照生成后，删除旧快照和待删除的增量目录
+- 内容：start_ts、end_ts、object_count、is_snapshot、state、created_at
 
 ---
 
 ## 6. 上游处理流程
 
-### 6.1 Executor启动和调度
+### 6.1 Executor启动
 
-1. CN启动时创建UpstreamSyncExecutor（单例）
-2. 从`mo_s3_sync_tasks`加载所有`cluster_role='upstream'`且`state='running'`的任务
-3. 为每个任务启动定时器（间隔由`sync_interval`配置）
-4. 定时向TaskService提交UpstreamSyncJob
-5. 每次重启后把pending，running的job置成complete。job是幂等的，新的job覆盖上次做到一半的。
+1. CN启动时创建S3SyncExecutor（单例，上下游共用）
+2. 从`mo_s3_sync_tasks`加载所有任务
+3. 重启时将所有`state='pending'`或`'running'`的任务置为`'complete'`（Job是幂等的）
+4. 提交UpstreamSyncJob和SnapshotGCJob
 
-### 6.2 UpstreamSyncJob执行流程
+### 6.2 UpstreamSyncJob
 
-**阶段1：状态检查并加锁**
-- 检查系统表状态（cn_uuid、state、job_lsn）
+**Object选择策略**：
+- 从TN的Partition State读取ObjectEntry列表
+- 只选择CreateTS > watermark的aobj和cnobj
+
+**复制到S3**：
+- 创建增量目录：`{current_watermark}-{new_watermark}/`
+- 复制object文件到目录
+- 写入排序后的object_list.meta
+- 最后生成manifest.json标记完成
+
+**状态管理和并发控制**：
+- 执行前检查cn_uuid、job_lsn、state是否一致
+- 完成后更新watermark、updated_at，将state更新为'complete'
 - 清理S3中上次未完成的同步目录
 
-**阶段2：读取增量数据**
-- 从TN的Partition State读取ObjectEntry列表
-- 只读取CreateTS > watermark的aobj和cnobj
-- 按CreateTS对ObjectEntry排序
-- 计算new_watermark = max(objects.CreateTS)
+### 6.3 SnapshotGCJob
 
-**阶段3：复制到S3**
-- 创建增量目录：`{current_watermark}-{new_watermark}/`
-- 复制object文件（保持排序）
-- 写入排序后的object_list.meta
-- 生成manifest.json（标记完成）
+**快照生成**：
+- 触发条件：最旧的增量目录超过retention_days
+- Object选择策略：读取快照时间戳（snapshot_ts）时所有可见的object
+  - 从TN的Partition State读取，基于snapshot_ts判断可见性
+  - 包含所有CreateTS <= snapshot_ts且未被删除的object
+- 生成过程类似增量同步：
+  - 创建快照目录：`0-{new_snapshot_ts}`
+  - 按CreateTS排序object
+  - 复制object文件
+  - 写入object_list.meta
+  - 生成manifest.json
 
-**阶段4：GC清理**
-- 扫描S3增量目录，检查是否超过retention_days
-- 如有待删除的增量目录：
-  - 生成新快照（0-{待删除增量的最大end_ts}）
-  - 合并：旧快照 + 待删除的增量目录
-  - 删除旧快照和待删除的增量目录
+**GC清理**：
+- 删除旧快照（如果存在）
+- 删除超过retention_days的增量目录
 - 更新系统表的snapshot_watermark
-
-**阶段5：更新状态**
-- 再次检查系统表状态（防并发冲突）
-- 更新watermark、updated_at
-
-### 6.3 快照生成逻辑
-
-**触发条件**：
-- 最旧的增量目录超过retention_days
-
-**生成过程**：
-1. 读取当前快照（如果存在）的object_list.meta
-2. 读取所有待删除增量目录的object_list.meta
-3. 合并并按CreateTS排序
-4. 过滤已删除的object（DeleteTS不为空且已过期）
-5. 创建新快照目录`0-{new_snapshot_ts}`
-6. 复制所有object文件
-7. 写入合并排序后的object_list.meta
-8. 生成manifest.json
 
 **原子性保证**：
 - 先生成新快照
 - 新快照完成后才删除旧数据
-- 确保下游始终能读取到完整数据
 
 ---
 
 ## 7. 下游处理流程
 
-### 7.1 Executor启动和调度
+### 7.2 DownstreamConsumeJob
 
-1. CN启动时创建DownstreamSyncExecutor（单例）
-2. 从`mo_s3_sync_tasks`加载所有`cluster_role='downstream'`且`state='running'`的任务
-3. 为每个任务启动定时器
-4. 定时向TaskService提交DownstreamConsumeJob
+**watermark落后检测**：
+- 读取系统表的watermark和S3快照的snapshot_ts
+- 如果watermark < snapshot_ts：
+  - 下游数据已过期，无法继续增量同步
+  - 清理本地表的所有object
+  - 重置watermark为0
+  - 从快照重新开始应用
 
-### 7.2 DownstreamConsumeJob执行流程
+**确定消费范围**：
+- 扫描S3目录，列出所有批次目录
+- 如果watermark=0，从快照开始消费
+- 否则，找到所有start_ts >= watermark的增量目录
+- 根据sync_mode决定消费策略：
+  - `auto`模式：消费所有可用批次（到最新）
+  - `manual`模式：消费到当前时间戳为止
 
-**阶段1：状态检查并加锁**
-- 检查系统表状态（cn_uuid、state、job_lsn）
-- 读取当前watermark和start_timestamp
-
-**阶段2：确定消费范围**
-- 扫描S3目录，列出所有批次目录（包括快照和增量）
-- 如果是首次消费（watermark=0）：
-  - 从快照开始：`0-{snapshot_ts}`
-  - 然后消费所有增量目录
-- 否则，找到所有start_ts > watermark的增量目录
-- **关键**：每次消费到最新的数据（包括所有可用的增量目录）
-
-**阶段3：顺序消费批次**
-- 按时间顺序遍历需要消费的批次目录
+**应用数据**：
+- 按时间顺序遍历批次目录
 - 对每个批次：
-  - 检查manifest.json是否存在（等待上游写完）
-  - 读取object_list.meta（已排序）
+  - 检查manifest.json是否存在
+  - 读取object_list.meta
   - 开启新事务
-  - 遍历ObjectEntry：
-    - 检查object是否已存在（幂等性）
-    - 如不存在，下载object文件，创建CN类型ObjectEntry
+  - 遍历ObjectEntry，检查幂等性，下载并创建CN类型ObjectEntry
   - 提交事务
-  - 更新watermark为该批次的end_ts
 
-**阶段4：更新状态**
-- 再次检查系统表状态
-- 更新watermark为最新消费的end_ts
-
-### 7.3 消费策略
-
-**从头开始**：
-- 下游任务始终从快照开始消费
-- 首次消费会应用快照 + 所有增量数据
-
-**始终同步到最新**：
-- 每次Job执行时，消费所有可用的批次
-- 不会停在中间某个时间点
-- 确保下游数据尽可能接近上游
-
-**断点续传**：
-- watermark记录已消费的最新时间点
-- 重启后从watermark继续消费
+**状态管理和并发控制**：
+- 执行前检查cn_uuid、job_lsn、state是否一致
+- 每个批次成功后更新watermark
+- 完成后将state更新为'complete'
 
 ---
 
 ## 8. 关键设计要点
 
-### 8.1 分层存储设计
+### 8.1 防止重复执行
 
-**问题**：如何平衡存储成本和数据可用性？
+**问题**：多个CN可能同时运行Executor，或Job重复提交
 
 **解决方案**：
-- **快照**：保留完整历史，供新下游从头开始消费
-- **增量**：保留最近N天的增量数据，供增量同步
-- **自动合并**：定期将过期增量合并到快照，避免增量目录过多
+- 系统表记录cn_uuid，标识任务归属的CN
+- Executor提交Job前检查cn_uuid是否匹配
+- Job执行时检查cn_uuid、job_lsn、state：
+  - cn_uuid必须匹配当前CN
+  - job_lsn必须与传入的一致
+  - state必须为'pending'
+- 更新系统表时再次验证上述字段（乐观锁）
+- 重启时将pending/running的任务置为complete，新Job会覆盖
 
-**优势**：
-- 下游可从任意时间点开始消费
-- 存储成本可控（只保留N天增量）
-- 快照更新是增量的，不需要每次全量重建
+### 8.2 分层存储设计
 
-### 8.2 上游负责GC
+**快照**：保留完整历史，供下游从头开始或过期后重建
+
+**增量**：保留最近N天，供增量同步
+
+**自动合并**：定期生成新快照并清理过期增量
+
+### 8.3 上游负责GC
 
 **设计理念**：数据生命周期由数据源控制
 
-**实现**：
-- 上游配置retention_days
-- 上游Job中执行GC清理
-- 上游决定何时生成快照
+**实现**：独立的SnapshotGCJob执行GC和快照生成
 
-**优势**：
-- 下游无需关心数据清理
-- 统一的数据保留策略
-- 避免下游误删导致其他下游消费失败
+### 8.4 Object内部排序
 
-### 8.3 Object内部排序
+上游在生成object_list.meta时按CreateTS排序，下游直接使用
 
-**问题**：下游如何高效应用数据？
+### 8.5 快照生成策略
 
-**解决方案**：
-- 上游在生成object_list.meta时按CreateTS排序
-- 下游直接按顺序读取，无需再次排序
-- 快照合并时也保持排序
+快照生成过程类似增量同步，只是object选择策略不同：
+- 增量：选择CreateTS > watermark的aobj/cnobj
+- 快照：选择snapshot_ts时可见的所有object
 
-**优势**：
-- 下游处理逻辑简化
-- 保证数据应用的顺序性
-- 提高下游消费效率
+### 8.6 下游消费模式
 
-### 8.4 每次同步到最新
+**auto模式**：每次消费到最新，确保数据延迟最小
 
-**设计**：下游不维护中间状态，每次跳到最新
+**manual模式**：定时同步到当前时间戳，适合按需同步场景
 
-**实现**：
-- 每次Job扫描所有watermark之后的批次
-- 顺序消费直到最新
-- 更新watermark为最新的end_ts
+### 8.7 下游过期重建
 
-**优势**：
-- 简化状态管理
-- 下游数据延迟最小
-- 避免积压多个批次
+当watermark落后于快照时，自动清理并从快照重建，保证数据一致性
 
-### 8.5 时间范围命名
+### 8.8 统一的Executor
 
-**格式**：`{start_ts}-{end_ts}`
+上下游使用同一个S3SyncExecutor，简化架构，根据cluster_role区分任务类型
 
-**优势**：
-- 自描述：目录名即表示时间范围
-- 可追溯：便于排查问题
-- 易排序：字典序即时间序
-- 便于GC：根据end_ts判断是否过期
+### 8.9 幂等性保证
 
-### 8.6 manifest.json作为完成标记
+Job可安全重试，下游应用前检查object是否已存在
 
-**问题**：上游写入多个文件，下游如何知道何时可以消费？
+### 8.10 事务性应用
 
-**解决方案**：
-- 上游最后写入manifest.json
-- 下游检测到manifest.json才开始消费
-- 避免读取不完整的数据
-
-### 8.7 幂等性保证
-
-**场景**：Job可能因故障重试
-
-**解决方案**：
-- 下游应用前检查object是否已存在
-- 存在则跳过，不存在则创建
-- 支持Job安全重试
-
-### 8.8 事务性应用
-
-**要求**：批次内的对象要么全部应用，要么全部不应用
-
-**实现**：
-- 下游在一个事务中应用一个批次的所有ObjectEntry
-- 事务成功才更新watermark
-- 事务失败回滚，下次重试
-
-### 8.9 防止重复执行
-
-**问题**：多个CN可能同时运行Executor
-
-**解决方案**：
-- 系统表记录cn_uuid
-- Executor和Job都检查cn_uuid
-- 使用job_lsn序列号
-- 更新系统表时验证状态（乐观锁）
-
-### 8.10 简化的任务管理
-
-**设计**：只有running和stopped两种状态
-
-**理由**：
-- 无需暂停恢复（下游可随时停止和重启）
-- 无需复杂的错误状态（失败会自动重试）
-- 简化状态机和运维操作
+下游在一个事务中应用一个批次的所有ObjectEntry
 
 ---
 
