@@ -38,19 +38,23 @@
 
 ```
 s3://{bucket}/{prefix}/{account_id}/{db_id}/{table_id}/
-├── manifest.json                    # 元数据清单（记录所有object和watermark）
-├── object_list.meta                 # ObjectEntry列表序列化文件
-├── {object_uuid_1}                  # TAE Object文件
-├── {object_uuid_2}                  # TAE Object文件
-├── ...
+├── {watermark_start}-{watermark_end}/
+│   ├── object_list.meta             # ObjectEntry列表序列化文件
+│   ├── {object_uuid_1}              # TAE Object文件
+│   ├── {object_uuid_2}              # TAE Object文件
+│   ├── ...
+│   └── manifest.json                # 完成标记（上游写完后生成）
+├── {watermark_start}-{watermark_end}/
+│   └── ...
 └── consumer_status.json             # 下游消费状态反馈
 ```
 
 **说明**：
 - 每个表一个独立目录，路径为 `{account_id}/{db_id}/{table_id}`
-- `manifest.json`：记录当前watermark、object列表、版本号等元信息
+- 每次同步创建一个以watermark范围命名的子目录：`{上次watermark}-{本次watermark}`
 - `object_list.meta`：序列化的ObjectEntry列表，包含CreateTS、DeleteTS、ObjectStats等
 - `{object_uuid}`：TAE的实际数据块文件
+- `manifest.json`：上游写完所有文件后最后生成，标记本次同步完成，下游检测到此文件才开始消费
 - `consumer_status.json`：下游写入的消费状态，上游定期读取
 
 ---
@@ -101,9 +105,10 @@ s3://{bucket}/{prefix}/{account_id}/{db_id}/{table_id}/
 **执行步骤**：
 
 **Step 1: 状态检查并加锁**
-- 输入：job_lsn、table info（Job传入）
-- 操作：从`mo_s3_sync_tasks`读取cn_uuid、task_status、job_lsn
+- 输入：job_lsn、table_info（Job传入）
+- 操作：从`mo_s3_sync_tasks`读取cn_uuid、task_status、job_lsn、current_watermark
 - 检查：cn_uuid == 当前CN && task_status == 'pending' && job_lsn == 传入的lsn
+- 清理：删除S3中所有以`{current_watermark}-*`开头的目录（清理上次未完成的同步）
 - 更新：设置task_status = 'running'
 - 输出：current_watermark
 
@@ -116,11 +121,12 @@ s3://{bucket}/{prefix}/{account_id}/{db_id}/{table_id}/
 - 输出：ObjectEntry列表、new_watermark
 
 **Step 3: 复制Object并生成元数据**（打包在一个函数中）
-- 输入：ObjectEntry列表、S3配置、FileService
+- 输入：ObjectEntry列表、current_watermark、new_watermark、S3配置、FileService
 - 操作：
-  - 复制每个object文件从源S3到目标S3的表目录
+  - 创建目标目录：`{current_watermark}-{new_watermark}/`
+  - 复制每个object文件从源S3到目标目录
   - 序列化ObjectEntry列表到`object_list.meta`
-  - 生成`manifest.json`（包含new_watermark、object数量、时间戳）
+  - 生成`manifest.json`（标记写入完成，包含watermark、object数量、状态='complete'）
 - 输出：成功复制的object数量
 
 **Step 4: 更新系统表**
@@ -149,20 +155,49 @@ s3://{bucket}/{prefix}/{account_id}/{db_id}/{table_id}/
 
 **执行位置**：CN的TaskService
 
-**核心功能**：
-1. 状态检查：检查task的state和cn_uuid
-2. 读取元数据：从S3读取`manifest.json`和`object_list.meta`
-3. 检查watermark：如果S3的watermark <= 本地watermark，跳过本次执行
-4. 下载Object：批量下载新的object文件到本地FileService
-5. 应用到Catalog：
-   - 开启新事务
-   - 根据object_list.meta反序列化ObjectEntry
-   - 创建ObjectEntry并关联到目标表
-   - 提交事务
-6. 更新系统表：更新watermark、updated_at
-7. 写入反馈：
-   - 成功：写入`consumer_status.json` {state: "ok", watermark: xxx, updated_at: xxx}
-   - 失败：写入{state: "error", error_message: xxx, watermark: xxx}
+**执行步骤**：
+
+**Step 1: 状态检查并加锁**
+- 输入：job_lsn、table_info（Job传入）
+- 操作：从`mo_s3_sync_tasks`读取cn_uuid、task_status、job_lsn、current_watermark
+- 检查：cn_uuid == 当前CN && task_status == 'pending' && job_lsn == 传入的lsn
+- 更新：设置task_status = 'running'
+- 输出：current_watermark
+
+**Step 2: 检查S3是否有新数据**
+- 输入：current_watermark、S3配置
+- 操作：扫描S3目录，查找以`{current_watermark}-*`开头的子目录
+- 检查：子目录中是否存在`manifest.json`（标记上游写完）
+- watermark验证：解析目录名，如果watermark_start != current_watermark，报错写入`consumer_status.json`并退出
+- 输出：watermark_end、同步目录路径
+
+**Step 3: 应用到Catalog（事务性）**
+- 输入：table_info、同步目录路径、S3配置、FileService
+- 操作：
+  - 开启新事务
+  - 从catalog用table_info获取TableEntry
+  - 遍历每个ObjectEntry：
+    - 从S3读取`object_list.meta`并反序列化ObjectEntry列表
+    - 检查object是否已存在（通过object_name）
+    - 如果存在且一致：跳过
+    - 如果存在但不一致：回滚事务，报错到consumer_status，退出
+    - 如果不存在：创建CN类型的ObjectEntry（保持object_name一致）
+    - 下载s3 object
+  - 提交事务
+- 输出：应用的object数量
+
+**Step 4: 写入反馈**
+- 输入：watermark_end、应用结果
+- 操作：写入`consumer_status.json`
+  - 成功：{state: "ok", watermark: watermark_end, updated_at: now()}
+  - 失败：{state: "error", error_message: xxx, watermark: current_watermark}
+- 输出：反馈写入成功
+
+**Step 5: 更新系统表**
+- 输入：watermark_end
+- 操作：再次检查cn_uuid、task_status、job_lsn是否仍然一致
+- 更新：watermark = watermark_end、updated_at = now()、task_status = 'complete'
+- 输出：更新成功/失败
 
 ---
 
