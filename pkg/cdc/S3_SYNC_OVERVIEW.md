@@ -279,26 +279,45 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
 ```
 s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 │
-├── 0-{snapshot_ts}/                            # 历史快照（只保留1个）
-│   ├── object_list.meta                        # 排序后的ObjectEntry列表
-│   ├── {object_uuid_1}                         # TAE Object文件
-│   ├── {object_uuid_2}
-│   ├── ...
-│   └── manifest.json                           # 完成标记
+├── data/                                       # 数据对象
+│   ├── 0-{snapshot_ts}/                        # 历史快照（只保留1个）
+│   │   ├── object_list.meta                    # 排序后的ObjectEntry列表
+│   │   ├── {object_uuid_1}                     # TAE Object文件
+│   │   ├── {object_uuid_2}
+│   │   ├── ...
+│   │   └── manifest.json                       # 完成标记
+│   │
+│   ├── {start_ts}-{end_ts}/                    # 增量数据（最近N天）
+│   │   ├── object_list.meta                    # 排序后的增量ObjectEntry
+│   │   ├── {object_uuid}...
+│   │   └── manifest.json
+│   │
+│   ├── {start_ts}-{end_ts}/                    # 更早的增量
+│   │   └── ...
+│   │
+│   └── {start_ts}-{end_ts}/                    # 最新的增量
+│       └── ...
 │
-├── {start_ts}-{end_ts}/                        # 增量数据（最近N天）
-│   ├── object_list.meta                        # 排序后的增量ObjectEntry
-│   ├── {object_uuid}...
-│   └── manifest.json
-│
-├── {start_ts}-{end_ts}/                        # 更早的增量
-│   └── ...
-│
-└── {start_ts}-{end_ts}/                        # 最新的增量
-    └── ...
+└── tombstone/                                  # 墓碑对象
+    ├── 0-{snapshot_ts}/                        # 历史快照
+    │   ├── object_list.meta
+    │   ├── {object_uuid}...
+    │   └── manifest.json
+    │
+    ├── {start_ts}-{end_ts}/                    # 增量数据
+    │   └── ...
+    │
+    └── {start_ts}-{end_ts}/
+        └── ...
 ```
 
-### 5.2 文件说明
+### 5.2 目录结构说明
+
+**data/ 和 tombstone/**：
+- 按object类型分离存储
+- data：存储普通数据对象
+- tombstone：存储墓碑对象（用于标记删除）
+- 两个目录下的结构完全相同
 
 **快照目录（0-{snapshot_ts}）**：
 - 包含从表创建到snapshot_ts时间点的所有可见数据
