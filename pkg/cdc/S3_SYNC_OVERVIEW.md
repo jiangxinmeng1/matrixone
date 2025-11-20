@@ -334,7 +334,7 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 
 **object_list.meta**：
 - 序列化的ObjectEntry列表
-- 包含：ObjectStats
+- 包含：ObjectStats、is_deleted（标记该object是否已被删除）
 
 **manifest.json**：
 - 标记批次写入完成
@@ -360,10 +360,10 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 
 **Object选择策略**：
 - 从TN的Partition State读取ObjectEntry列表
-- 只选择CreateTS > watermark的aobj和cnobj
+- 选择某个已经刷盘的aobj的create at作为watermark
+  - 选取所有create ts落在这个区间里的obj
 - 每次以某个aobj的CreateTS作为结束时间戳（new_watermark）
 - aobj是首尾相接的（前一个aobj的CreateTS等于后一个aobj的起始位置）
-- 只选择aobj和cnobj就能保证所有数据完整
 - 每次tombstone的watermark大于等于data的watermark
 
 **复制到S3**：
@@ -509,6 +509,31 @@ Job可安全重试，下游应用前检查object是否已存在
 ### 8.10 事务性应用
 
 下游在一个事务中应用一个批次的所有ObjectEntry
+
+### 8.11 下游Object不参与Merge
+
+**设计理念**：下游只负责复制数据，不参与数据整理
+
+**实现**：
+- 下游创建的ObjectEntry标记为CN类型
+- 下游的object不参与merge操作
+- 上游的删除和新增已经体现了上游的merge结果
+- 下游直接应用上游merge后的object即可
+
+**优势**：
+- 简化下游逻辑，只做数据复制
+- 避免下游重复执行merge，节省资源
+- 保证下游数据与上游一致
+
+### 8.12 下游消费延迟的影响
+
+**关键特性**：因为没有内存数据，checkpoint不需要等待object的flush
+
+**优势**：
+- 下游消费慢不会影响checkpoint
+- 不会阻塞系统的正常运行
+- 下游可以按自己的节奏消费数据
+- 适合批量或定时同步场景
 
 ---
 
