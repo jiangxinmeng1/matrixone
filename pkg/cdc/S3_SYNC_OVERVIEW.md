@@ -334,6 +334,9 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 **Object选择策略**：
 - 从TN的Partition State读取ObjectEntry列表
 - 只选择CreateTS > watermark的aobj和cnobj
+- 每次以某个aobj的CreateTS作为结束时间戳（new_watermark）
+- aobj是首尾相接的（前一个aobj的CreateTS等于后一个aobj的起始位置）
+- 只选择aobj和cnobj就能保证所有数据完整：
 
 **复制到S3**：
 - 创建增量目录：`{current_watermark}-{new_watermark}/`
