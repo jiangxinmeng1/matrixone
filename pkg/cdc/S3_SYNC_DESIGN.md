@@ -37,7 +37,7 @@
 ## 3. S3目录结构
 
 ```
-s3://{bucket}/{prefix}/{account_id}/{db_id}/{table_id}/
+s3://{dir}/{account_id}/{db_id}/{table_id}/
 ├── {watermark_start}-{watermark_end}/
 │   ├── object_list.meta             # ObjectEntry列表序列化文件
 │   ├── {object_uuid_1}              # TAE Object文件
@@ -68,15 +68,13 @@ s3://{bucket}/{prefix}/{account_id}/{db_id}/{table_id}/
 **核心功能**：
 1. 任务管理：启动时从`mo_s3_sync_tasks`加载所有`cluster_role='upstream'`的任务
 2. 状态检查：执行前检查task的cn_uuid是否与当前CN一致，防止重复执行
-3. 任务调度：根据系统表信息，定期（如每5秒）向TaskService提交Job
-4. Job类型：
-   - **UpstreamSyncJob**：同步数据到S3
-   - **FeedbackMonitorJob**：监控下游消费状态
+3. 任务调度：根据系统表信息，定期（如每5秒）向TaskService提交UpstreamSyncJob
 
 **传递给Job的信息**：
 - task_id、table_id、db_name、table_name
 - S3配置（endpoint、bucket、key_prefix等）
 - current_watermark、full_sync_completed
+- watermark_lag_threshold（下游延迟阈值）
 
 ---
 
@@ -87,9 +85,7 @@ s3://{bucket}/{prefix}/{account_id}/{db_id}/{table_id}/
 **核心功能**：
 1. 任务管理：启动时从`mo_s3_sync_tasks`加载所有`cluster_role='downstream'`的任务
 2. 状态检查：执行前检查task的cn_uuid是否与当前CN一致
-3. 任务调度：根据系统表信息，定期向TaskService提交Job
-4. Job类型：
-   - **DownstreamConsumeJob**：从S3消费数据并写入反馈
+3. 任务调度：根据系统表信息，定期向TaskService提交DownstreamConsumeJob
 
 **传递给Job的信息**：
 - task_id、table_id、db_name、table_name
@@ -103,6 +99,15 @@ s3://{bucket}/{prefix}/{account_id}/{db_id}/{table_id}/
 **执行位置**：CN的TaskService
 
 **执行步骤**：
+
+**Step 0: 检查下游反馈状态**
+- 输入：S3配置、watermark_lag_threshold
+- 操作：从S3读取`consumer_status.json`
+- 检查：
+  - 如果error_message存在且不为空：更新系统表state='paused'，记录错误，退出Job
+  - 计算watermark延迟：lag = current_watermark - downstream_watermark
+  - 如果lag > watermark_lag_threshold：更新系统表记录延迟告警
+- 输出：下游状态正常，继续执行
 
 **Step 1: 状态检查并加锁**
 - 输入：job_lsn、table_info（Job传入）
@@ -137,21 +142,7 @@ s3://{bucket}/{prefix}/{account_id}/{db_id}/{table_id}/
 
 ---
 
-### 4.4 FeedbackMonitorJob（反馈监控任务）
-
-**执行位置**：CN的TaskService
-
-**核心功能**：
-1. 状态检查：检查task的state和cn_uuid
-2. 读取反馈：从S3读取`consumer_status.json`
-3. 解析状态：解析下游的消费状态（ok/error）和error_message
-4. 错误处理：
-   - 如果状态为error，更新系统表state='paused'，记录error信息
-   - 如果状态恢复为ok，自动将state改回'running'
-
----
-
-### 4.5 DownstreamConsumeJob（下游消费任务）
+### 4.4 DownstreamConsumeJob（下游消费任务）
 
 **执行位置**：CN的TaskService
 
@@ -176,40 +167,32 @@ s3://{bucket}/{prefix}/{account_id}/{db_id}/{table_id}/
 - 操作：
   - 开启新事务
   - 从catalog用table_info获取TableEntry
+  - 从S3读取`object_list.meta`并反序列化ObjectEntry列表
   - 遍历每个ObjectEntry：
-    - 从S3读取`object_list.meta`并反序列化ObjectEntry列表
     - 检查object是否已存在（通过object_name）
     - 如果存在且一致：跳过
     - 如果存在但不一致：回滚事务，报错到consumer_status，退出
-    - 如果不存在：创建CN类型的ObjectEntry（保持object_name一致）
-    - 下载s3 object
+    - 如果不存在：下载s3 object，创建CN类型的ObjectEntry（保持object_name一致）
   - 提交事务
 - 输出：应用的object数量
 
-**Step 4: 写入反馈**
+**Step 4: GC清理S3文件**
+- 输入：同步目录路径
+- 操作：删除S3中`{current_watermark}-{watermark_end}/`整个目录及其所有文件
+- 输出：清理成功
+
+**Step 5: 写入反馈**
 - 输入：watermark_end、应用结果
 - 操作：写入`consumer_status.json`
   - 成功：{state: "ok", watermark: watermark_end, updated_at: now()}
   - 失败：{state: "error", error_message: xxx, watermark: current_watermark}
 - 输出：反馈写入成功
 
-**Step 5: 更新系统表**
+**Step 6: 更新系统表**
 - 输入：watermark_end
 - 操作：再次检查cn_uuid、task_status、job_lsn是否仍然一致
 - 更新：watermark = watermark_end、updated_at = now()、task_status = 'complete'
 - 输出：更新成功/失败
-
----
-
-### 4.6 S3GCManager（S3垃圾回收管理器）
-
-**部署位置**：下游CN节点，作为独立的后台协程
-
-**核心功能**：
-1. 定期扫描：每小时检查S3中超过保留期（如24小时）的object文件
-2. 安全验证：检查文件是否已被消费（watermark已超过该object的CreateTS）
-3. 批量删除：删除过期的object文件和旧的object_list.meta
-4. 保留文件：始终保留最新的manifest.json和object_list.meta
 
 ---
 
