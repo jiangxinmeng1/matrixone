@@ -1,6 +1,5 @@
 # MatrixOne 基于S3的跨集群数据同步 - 概要设计
 
-**版本**: 2.0  
 **创建日期**: 2025-11-19  
 **文档类型**: 概要设计文档
 
@@ -291,6 +290,7 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
     db_name              VARCHAR(128) NOT NULL,
     table_id             BIGINT NOT NULL,
     table_name           VARCHAR(128) NOT NULL,
+    lsn                  BIGINT NOT NULL,
     
     -- 同步状态 - data对象
     data_watermark       TIMESTAMP(6) NOT NULL DEFAULT '1970-01-01 00:00:00',
@@ -417,9 +417,9 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 - 分别写入到data/和tombstone/目录
 
 **Object选择策略**：
-- 从TN的Partition State读取ObjectEntry列表
+- 从CN的Partition State读取ObjectEntry列表
 - 选择某个已经刷盘的aobj的create at作为watermark
-  - 选取所有create ts落在这个区间里的obj
+  - 选取所有create ts/delete ts落在这个区间里的obj
 - 每次以某个aobj的CreateTS作为结束时间戳（new_watermark）
 - aobj是首尾相接的（前一个aobj的CreateTS等于后一个aobj的起始位置）
 - 每次tombstone的watermark大于等于data的watermark
@@ -528,13 +528,28 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 - 增量：选择CreateTS > watermark的aobj/cnobj
 - 快照：选择snapshot_ts时可见的所有object
 
-### 8.3 幂等性保证
+### 8.3 Watermark选择策略
+
+**关键设计**：选择某个已刷盘aobj的最大commit ts之前的某个时间戳作为watermark
+
+**保证**：
+- 该时间戳之前的所有数据都已经刷盘
+- 不需要考虑内存中的数据
+- 避免数据不完整或丢失
+
+**data和tombstone的watermark关系**：
+- tombstone的watermark必须等于data的watermark
+- 保证data和tombstone的同步进度一致
+
+**tombstone的aobj剪裁**：
+- 如果tombstone的aobj的CreateTS跨越了watermark边界
+- 需要对该aobj进行剪裁（只保留watermark之前的部分）
+- 下次同步会用完整的object覆盖这个被剪裁的aobj
+- 保证最终数据完整性
+
+### 8.4 幂等性保证
 
 Job可安全重试，下游应用前检查object是否已存在
-
-### 8.4 事务性应用
-
-下游在一个事务中应用一个批次的所有ObjectEntry
 
 ### 8.5 下游Object不参与Merge
 
@@ -560,30 +575,6 @@ Job可安全重试，下游应用前检查object是否已存在
 - 不会阻塞系统的正常运行
 - 下游可以按自己的节奏消费数据
 - 适合批量或定时同步场景
-
-### 8.7 多级别同步支持
-
-**三个级别**：
-- **account级别**：同步整个账号下的所有表，适合全局备份
-- **database级别**：同步指定数据库下的所有表，适合按库同步
-- **table级别**：同步指定表，适合精细控制
-
-**实现机制**：
-- 配置存储在`mo_s3_sync_configs`表，一个配置对应一个同步级别
-- 实际任务存储在`mo_s3_sync_tasks`表，每行对应一张具体的表
-- TaskScanner根据配置扫描并生成/更新表级任务
-
-### 8.8 表Truncate处理
-
-**问题**：表truncate后table_id会变化，但表名不变
-
-**解决方案**：
-- TaskScanner定期检查表的table_id
-- 发现table_id变化时：
-  - 更新`mo_s3_sync_tasks`中的table_id
-  - 重置watermark为0
-  - 从头开始同步该表
-- 保证同名表truncate后能正确同步
 
 ---
 
