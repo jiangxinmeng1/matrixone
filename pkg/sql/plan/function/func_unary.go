@@ -964,19 +964,124 @@ func Collation(_ []*vector.Vector, result vector.FunctionResultWrapper, proc *pr
 	})
 }
 
-func Coercibility(_ []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
-	// According to MySQL documentation, coercibility values are:
-	// 0 - Explicit collation
-	// 1 - No collation
-	// 2 - Implicit collation  
-	// 3 - System constant
-	// 4 - Coercible (default for string literals and column values)
-	// 5 - Ignorable
+func Coercibility(ivecs []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	// MySQL COERCIBILITY function returns the collation coercibility value:
+	// 0 - Explicit collation (e.g., expr COLLATE collation_name)
+	// 1 - No collation (VARBINARY, BINARY types)
+	// 2 - Implicit collation (column values)
+	// 3 - System constant (e.g., USER(), VERSION())
+	// 4 - Coercible (string literals)
+	// 5 - Ignorable (NULL)
 	// 6 - Numeric
-	// For simplicity, we return 4 (coercible) for all string types
-	return opNoneParamToFixed[int64](result, proc, length, func() int64 {
-		return 4
-	})
+	//
+	// Current implementation limitations:
+	// - VARBINARY/BINARY types: correctly return 1 ✅
+	// - NULL values: correctly return 5 ✅
+	// - Numeric types: correctly return 6 ✅
+	// - String literals: correctly return 4 ✅
+	// - Explicit COLLATE (should be 0): returns 4 (needs planner support) ⚠️
+	// - System functions (should be 3): returns 4 (needs planner support) ⚠️
+	// - Column values (should be 2): returns 4 (needs planner support) ⚠️
+	//
+	// To fully support values 0, 2, and 3, coercibility needs to be tracked
+	// through the query planning phase and passed to the execution phase.
+
+	if len(ivecs) == 0 || ivecs[0] == nil {
+		// No parameter, return ignorable
+		return opNoneParamToFixed[int64](result, proc, length, func() int64 {
+			return 5
+		})
+	}
+
+	vec := ivecs[0]
+	typ := vec.GetType()
+	rs := vector.MustFunctionResult[int64](result)
+
+	// Check if vector is constant NULL
+	if vec.IsConstNull() {
+		for i := 0; i < length; i++ {
+			if err := rs.Append(5, true); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Handle different types
+	if typ.IsNumeric() {
+		// Numeric types: return 6
+		nulls := vec.GetNulls()
+		for i := 0; i < length; i++ {
+			isNull := nulls != nil && nulls.Contains(uint64(i))
+			if isNull {
+				if err := rs.Append(5, true); err != nil {
+					return err
+				}
+			} else {
+				if err := rs.Append(6, false); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	// Binary types (VARBINARY, BINARY): return 1 (no collation)
+	if typ.Oid == types.T_varbinary || typ.Oid == types.T_binary {
+		nulls := vec.GetNulls()
+		for i := 0; i < length; i++ {
+			isNull := nulls != nil && nulls.Contains(uint64(i))
+			if isNull {
+				if err := rs.Append(5, true); err != nil {
+					return err
+				}
+			} else {
+				if err := rs.Append(1, false); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	// String types: return 4 (coercible)
+	// Note: We cannot distinguish at execution time:
+	// - Explicit COLLATE (should be 0) vs regular strings (4)
+	// - System functions (should be 3) vs regular strings (4)
+	// - Column values (should be 2) vs literals (4)
+	// So we return 4 for all string types, which is correct for literals
+	if typ.IsString() {
+		source := vector.GenerateFunctionStrParameter(vec)
+		for i := uint64(0); i < uint64(length); i++ {
+			_, null := source.GetStrValue(i)
+			if null {
+				if err := rs.Append(5, true); err != nil {
+					return err
+				}
+			} else {
+				if err := rs.Append(4, false); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	// For other types (date, time, etc.), treat as coercible
+	nulls := vec.GetNulls()
+	for i := 0; i < length; i++ {
+		isNull := nulls != nil && nulls.Contains(uint64(i))
+		if isNull {
+			if err := rs.Append(5, true); err != nil {
+				return err
+			}
+		} else {
+			if err := rs.Append(4, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func ConnectionID(_ []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {

@@ -415,6 +415,8 @@ func (b *baseBinder) baseBindColRef(astExpr *tree.UnresolvedName, depth int32, i
 				},
 			}
 		}
+		// Column references have coercibility 2 (implicit collation)
+		setCoercibility(expr, 2)
 		if err != nil {
 			errutil.ReportError(b.GetContext(), err)
 		}
@@ -1869,7 +1871,7 @@ func BindFuncExprImplByPlanExpr(ctx context.Context, name string, args []*Expr) 
 	// return new expr
 	Typ := makePlan2Type(&returnType)
 	Typ.NotNullable = function.DeduceNotNullable(funcID, args)
-	return &Expr{
+	expr := &Expr{
 		Expr: &plan.Expr_F{
 			F: &plan.Function{
 				Func: getFunctionObjRef(funcID, name),
@@ -1877,7 +1879,14 @@ func BindFuncExprImplByPlanExpr(ctx context.Context, name string, args []*Expr) 
 			},
 		},
 		Typ: Typ,
-	}, nil
+	}
+
+	// Set coercibility for system functions (coercibility 3)
+	if isSystemFunction(name) {
+		setCoercibility(expr, 3)
+	}
+
+	return expr, nil
 }
 
 func (b *baseBinder) bindNumVal(astExpr *tree.NumVal, typ Type) (*Expr, error) {

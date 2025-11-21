@@ -3032,3 +3032,34 @@ func onlyHasHiddenPrimaryKey(tableDef *TableDef) bool {
 	pk := tableDef.GetPkey()
 	return pk != nil && pk.GetPkeyColName() == catalog.FakePrimaryKeyColName
 }
+
+// setCoercibility sets the coercibility value for an expression
+// MySQL COERCIBILITY values:
+// 0 - Explicit collation (e.g., expr COLLATE collation_name)
+// 1 - No collation (VARBINARY, BINARY types)
+// 2 - Implicit collation (column values)
+// 3 - System constant (e.g., USER(), VERSION())
+// 4 - Coercible (string literals, default)
+// 5 - Ignorable (NULL)
+// 6 - Numeric
+func setCoercibility(expr *Expr, value int32) {
+	if expr != nil {
+		expr.Coercibility = value
+	}
+}
+
+// isSystemFunction checks if a function name is a system function that should have coercibility 3
+func isSystemFunction(funcName string) bool {
+	systemFunctions := map[string]bool{
+		"user":              true,
+		"system_user":       true,
+		"session_user":      true,
+		"current_user":      true,
+		"version":           true,
+		"database":          true,
+		"schema":            true,
+		"current_user_id":   true,
+		"current_user_name": true,
+	}
+	return systemFunctions[strings.ToLower(funcName)]
+}

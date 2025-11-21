@@ -5541,12 +5541,17 @@ var supportedOthersBuiltIns = []FuncNew{
 		functionId: COERCIBILITY,
 		class:      plan.Function_STRICT,
 		layout:     STANDARD_FUNCTION,
-		checkFn:    fixedTypeMatch,
+		checkFn: func(overloads []overload, inputs []types.Type) checkResult {
+			// COERCIBILITY accepts any single argument
+			if len(inputs) == 1 {
+				return newCheckResultWithSuccess(0)
+			}
+			return newCheckResultWithFailure(failedFunctionParametersWrong)
+		},
 
 		Overloads: []overload{
 			{
 				overloadId:      0,
-				args:            []types.T{types.T_varchar},
 				volatile:        true,
 				realTimeRelated: true,
 				retType: func(parameters []types.Type) types.Type {

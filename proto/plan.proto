@@ -231,6 +231,7 @@ message Expr {
 	int32 aux_id = 16;
 	double ndv = 17;
 	double selectivity = 18;
+	int32 coercibility = 19; // MySQL COERCIBILITY value: 0=explicit collation, 1=no collation, 2=implicit collation, 3=system constant, 4=coercible, 5=ignorable, 6=numeric
 }
 
 message FoldVal {

@@ -200,6 +200,9 @@ func NewExpressionExecutor(proc *process.Process, planExpr *plan.Expr) (Expressi
 			return nil, err
 		}
 
+		// Store plan.Expr for accessing metadata like coercibility
+		executor.planExpr = planExpr
+
 		for i := range executor.parameterExecutor {
 			subExecutor, paramErr := NewExpressionExecutor(proc, t.F.Args[i])
 			if paramErr != nil {
@@ -240,6 +243,8 @@ type FunctionExpressionExecutor struct {
 	// parameters related
 	parameterResults  []*vector.Vector
 	parameterExecutor []ExpressionExecutor
+	// store plan.Expr for accessing metadata like coercibility
+	planExpr *plan.Expr
 }
 
 type ColumnExpressionExecutor struct {
@@ -626,6 +631,41 @@ func (expr *FunctionExpressionExecutor) Eval(proc *process.Process, batches []*b
 				expr.selectList.AllNull = false
 			} else {
 				expr.selectList.AnyNull = true
+			}
+		}
+	}
+
+	// Special handling for COERCIBILITY function: use coercibility from plan.Expr if available
+	if expr.fid == function.COERCIBILITY && expr.planExpr != nil {
+		// Get coercibility from the first argument's plan.Expr
+		if funcExpr, ok := expr.planExpr.Expr.(*plan.Expr_F); ok && len(funcExpr.F.Args) > 0 {
+			argExpr := funcExpr.F.Args[0]
+			// If the argument has a coercibility value set in planner, use it directly
+			coercibilityVal := argExpr.GetCoercibility()
+			if coercibilityVal > 0 {
+				// Use the coercibility value from planner
+				rowCount := batches[0].RowCount()
+				if err = expr.resultVector.PreExtendAndReset(rowCount); err != nil {
+					return nil, err
+				}
+				rs := vector.MustFunctionResult[int64](expr.resultVector)
+				argVec := expr.parameterResults[0]
+				nulls := argVec.GetNulls()
+				for i := 0; i < rowCount; i++ {
+					// Check if the argument is NULL
+					isNull := argVec.IsConstNull() || (nulls != nil && nulls.Contains(uint64(i)))
+					if isNull {
+						if err = rs.Append(5, true); err != nil { // NULL has coercibility 5
+							return nil, err
+						}
+					} else {
+						// Use the coercibility value from planner
+						if err = rs.Append(int64(coercibilityVal), false); err != nil {
+							return nil, err
+						}
+					}
+				}
+				return expr.resultVector.GetResultVector(), nil
 			}
 		}
 	}
