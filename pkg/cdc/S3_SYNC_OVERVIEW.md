@@ -72,10 +72,16 @@
 
 ### 2.2 核心组件
 
-**统一的Executor**：
+**Executor**：
 - **S3SyncExecutor**：CN启动时创建，用同一个Executor处理本集群作为上游或下游的job
 - 启动时从系统表加载所有任务（上游和下游）
-- 为每个任务提交相应的Job到TaskService
+- 为每个表任务提交相应的Job到TaskService
+
+**TaskScanner**：
+- **S3SyncTaskScanner**：定期扫描组件
+- 根据`mo_s3_sync_configs`中的配置扫描数据库和表
+- 发现新表或表ID变化时，在`mo_s3_sync_tasks`中创建或更新记录
+- 处理表truncate后的table_id变化
 
 **上游Job**：
 - **UpstreamSyncJob**：读取增量数据并复制到S3
@@ -94,7 +100,9 @@
 
 ```sql
 CREATE UPSTREAM S3 SYNC <task_name>
-  SOURCE DATABASE <db_name> TABLE <table_name>
+  [ACCOUNT <account_name>]
+  [DATABASE <db_name>]
+  [TABLE <table_name>]
   S3 CONFIG (
     ENDPOINT '<s3_endpoint>',
     REGION '<s3_region>',
@@ -108,8 +116,11 @@ CREATE UPSTREAM S3 SYNC <task_name>
 ```
 
 **参数说明**：
-- `task_name`：任务名称，集群内唯一
-- `SOURCE DATABASE/TABLE`：源数据库和表名
+- `task_name`：配置名称，集群内唯一
+- 同步级别（三选一，不指定则为account级别）：
+  - `ACCOUNT`：同步整个账号下的所有表
+  - `DATABASE`：同步指定数据库下的所有表
+  - `TABLE`：同步指定表
 - `S3 CONFIG`：S3配置信息
 - `SYNC_INTERVAL`：同步间隔（秒），默认60秒
 - `RETENTION_DAYS`：增量数据保留天数，默认7天
@@ -117,16 +128,26 @@ CREATE UPSTREAM S3 SYNC <task_name>
 **示例**：
 
 ```sql
-CREATE UPSTREAM S3 SYNC sync_orders
-  SOURCE DATABASE tpcc TABLE orders
+-- Account级别：同步整个账号
+CREATE UPSTREAM S3 SYNC sync_account
   S3 CONFIG (
     ENDPOINT 'https://s3.us-west-2.amazonaws.com',
     REGION 'us-west-2',
     BUCKET 'mo-cross-sync',
-    DIR 'cluster-a/sync_orders',
+    DIR 'cluster-a/account',
     ACCESS_KEY 'AKIAIOSFODNN7EXAMPLE',
     SECRET_KEY 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
-  )
+  );
+
+-- Database级别：同步整个数据库
+CREATE UPSTREAM S3 SYNC sync_tpcc
+  DATABASE tpcc
+  S3 CONFIG (...);
+
+-- Table级别：同步单张表
+CREATE UPSTREAM S3 SYNC sync_orders
+  DATABASE tpcc TABLE orders
+  S3 CONFIG (...)
   SYNC_INTERVAL 60
   RETENTION_DAYS 7;
 ```
@@ -139,7 +160,9 @@ CREATE UPSTREAM S3 SYNC sync_orders
 
 ```sql
 CREATE DOWNSTREAM S3 SYNC <task_name>
-  TARGET DATABASE <db_name> TABLE <table_name>
+  [ACCOUNT <account_name>]
+  [DATABASE <db_name>]
+  [TABLE <table_name>]
   S3 CONFIG (
     ENDPOINT '<s3_endpoint>',
     REGION '<s3_region>',
@@ -153,6 +176,7 @@ CREATE DOWNSTREAM S3 SYNC <task_name>
 ```
 
 **参数说明**：
+- 同步级别：与上游对应，可以是account/database/table级别
 - `SYNC_MODE`：同步模式
   - `'auto'`（默认）：自动跟随最新数据，持续同步
   - `'manual'`：定时同步到当前时间戳，不自动跟随
@@ -161,28 +185,23 @@ CREATE DOWNSTREAM S3 SYNC <task_name>
 **示例**：
 
 ```sql
--- 先创建目标表（与上游表结构相同）
+-- Account级别：同步整个账号
+CREATE DOWNSTREAM S3 SYNC sync_account
+  S3 CONFIG (...);
+
+-- Database级别：同步整个数据库
+CREATE DOWNSTREAM S3 SYNC sync_tpcc
+  DATABASE tpcc_replica
+  S3 CONFIG (...);
+
+-- Table级别：同步单张表（需先创建表结构）
 CREATE TABLE tpcc_replica.orders LIKE tpcc.orders;
 
--- 自动模式：持续跟随最新数据
 CREATE DOWNSTREAM S3 SYNC sync_orders
-  TARGET DATABASE tpcc_replica TABLE orders
-  S3 CONFIG (
-    ENDPOINT 'https://s3.us-west-2.amazonaws.com',
-    REGION 'us-west-2',
-    BUCKET 'mo-cross-sync',
-    DIR 'cluster-a/sync_orders',
-    ACCESS_KEY 'AKIAIOSFODNN7EXAMPLE',
-    SECRET_KEY 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
-  )
-  SYNC_MODE 'auto';
-  SYNC_INTERVAL 3600;  -- 每小时同步一次
-
--- 手动模式：定时同步到当前时间戳
-CREATE DOWNSTREAM S3 SYNC sync_orders_manual
-  TARGET DATABASE tpcc_replica TABLE orders
+  DATABASE tpcc_replica TABLE orders
   S3 CONFIG (...)
-  SYNC_MODE 'manual'
+  SYNC_MODE 'auto'
+  SYNC_INTERVAL 60;
 ```
 
 ---
@@ -209,29 +228,69 @@ DROP S3 SYNC TASK <task_name>;
 
 ## 4. 系统表设计
 
-### 4.1 mo_s3_sync_tasks
+### 4.1 mo_s3_sync_configs（同步配置表）
 
 **存储位置**：`mo_catalog` 数据库
 
-**作用**：记录所有S3同步任务的配置和状态
+**作用**：记录S3同步任务的配置信息，支持account/database/table三个级别
 
 **Schema**：
 
 ```sql
-CREATE TABLE mo_catalog.mo_s3_sync_tasks (
+CREATE TABLE mo_catalog.mo_s3_sync_configs (
     -- 任务标识
     task_id              VARCHAR(36) PRIMARY KEY,
     task_name            VARCHAR(128) NOT NULL,
     cluster_role         VARCHAR(16) NOT NULL,           -- 'upstream' 或 'downstream'
     
-    -- 表信息
+    -- 同步级别和范围
+    sync_level           VARCHAR(16) NOT NULL,           -- 'account', 'database', 'table'
     account_id           BIGINT NOT NULL,
-    db_name              VARCHAR(128) NOT NULL,
-    table_name           VARCHAR(128) NOT NULL,
-    table_id             BIGINT NOT NULL,
+    db_name              VARCHAR(128),                   -- database/table级别必填
+    table_name           VARCHAR(128),                   -- table级别必填
     
     -- S3配置（JSON格式）
     s3_config            JSON NOT NULL,                  -- {endpoint, region, bucket, dir, access_key, secret_key}
+    
+    -- 同步配置（JSON格式）
+    sync_config          JSON NOT NULL,                  -- {retention_days, sync_mode, sync_interval}
+    
+    -- 任务控制
+    state                VARCHAR(16) NOT NULL DEFAULT 'running',  -- 'running', 'stopped'
+    
+    -- 时间戳
+    created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    
+    -- 约束
+    UNIQUE KEY uk_config (config_name, cluster_role),
+    INDEX idx_level (sync_level),
+    INDEX idx_account (account_id),
+    INDEX idx_state (state)
+);
+```
+
+---
+
+### 4.2 mo_s3_sync_tasks（表级同步任务表）
+
+**存储位置**：`mo_catalog` 数据库
+
+**作用**：记录每张具体表的同步状态，每行对应一张表
+
+**Schema**：
+
+```sql
+CREATE TABLE mo_catalog.mo_s3_sync_tasks (
+    -- 表标识
+    task_id              VARCHAR(36) PRIMARY KEY,        -- 自动生成的UUID
+    
+    -- 表信息
+    account_id           BIGINT NOT NULL,
+    db_id                BIGINT NOT NULL,
+    db_name              VARCHAR(128) NOT NULL,
+    table_id             BIGINT NOT NULL,
+    table_name           VARCHAR(128) NOT NULL,
     
     -- 同步状态 - data对象
     data_watermark       TIMESTAMP(6) NOT NULL DEFAULT '1970-01-01 00:00:00',
@@ -241,10 +300,8 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
     tombstone_watermark  TIMESTAMP(6) NOT NULL DEFAULT '1970-01-01 00:00:00',
     tombstone_snapshot_watermark TIMESTAMP(6),           -- tombstone快照的watermark（上游）
     
-    sync_config          JSON NOT NULL,                  -- RETENTION_DAYS, sync_mode, sync_interval
-    
-    -- 任务控制
-    state                VARCHAR(16) NOT NULL DEFAULT 'running',  -- 'running', 'stopped'
+    -- Job状态
+    job_state            VARCHAR(16) NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'complete'
     cn_uuid              VARCHAR(64),                    -- 执行任务的CN标识
     job_lsn              BIGINT DEFAULT 0,               -- Job序列号
     
@@ -256,10 +313,10 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
     updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     
     -- 约束
-    UNIQUE KEY uk_task_name (task_name, cluster_role),
-    INDEX idx_state (state),
+    UNIQUE KEY uk_table (task_id, table_id),
+    INDEX idx_config (config_id),
+    INDEX idx_job_state (job_state),
     INDEX idx_cn_uuid (cn_uuid),
-    INDEX idx_role (cluster_role)
 );
 ```
 
@@ -334,12 +391,23 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 
 ## 6. 上游处理流程
 
-### 6.1 Executor启动
+### 6.1 Executor和Scanner启动
 
+**S3SyncExecutor**：
 1. CN启动时创建S3SyncExecutor（单例，上下游共用）
-2. 从`mo_s3_sync_tasks`加载所有任务
-3. 重启时将所有`state='pending'`或`'running'`的任务置为`'complete'`（Job是幂等的）
-4. 提交UpstreamSyncJob和SnapshotGCJob
+2. 从`mo_s3_sync_tasks`加载所有表级任务
+3. 重启时将所有`job_state='pending'`或`'running'`的任务置为`'complete'`（Job是幂等的）
+4. 为每张表提交UpstreamSyncJob和SnapshotGCJob
+
+**S3SyncTaskScanner**：
+1. CN启动时创建TaskScanner（单例）
+2. 从`mo_s3_sync_configs`加载所有配置
+3. 定期（如每分钟）扫描：
+   - account级别：扫描账号下所有数据库和表
+   - database级别：扫描数据库下所有表
+   - table级别：检查表是否存在和table_id是否变化
+4. 发现新表：在`mo_s3_sync_tasks`中创建新记录
+5. 表ID变化（如truncate后）：更新`mo_s3_sync_tasks`中的table_id，重置watermark
 
 ### 6.2 UpstreamSyncJob
 
@@ -492,6 +560,30 @@ Job可安全重试，下游应用前检查object是否已存在
 - 不会阻塞系统的正常运行
 - 下游可以按自己的节奏消费数据
 - 适合批量或定时同步场景
+
+### 8.7 多级别同步支持
+
+**三个级别**：
+- **account级别**：同步整个账号下的所有表，适合全局备份
+- **database级别**：同步指定数据库下的所有表，适合按库同步
+- **table级别**：同步指定表，适合精细控制
+
+**实现机制**：
+- 配置存储在`mo_s3_sync_configs`表，一个配置对应一个同步级别
+- 实际任务存储在`mo_s3_sync_tasks`表，每行对应一张具体的表
+- TaskScanner根据配置扫描并生成/更新表级任务
+
+### 8.8 表Truncate处理
+
+**问题**：表truncate后table_id会变化，但表名不变
+
+**解决方案**：
+- TaskScanner定期检查表的table_id
+- 发现table_id变化时：
+  - 更新`mo_s3_sync_tasks`中的table_id
+  - 重置watermark为0
+  - 从头开始同步该表
+- 保证同名表truncate后能正确同步
 
 ---
 
