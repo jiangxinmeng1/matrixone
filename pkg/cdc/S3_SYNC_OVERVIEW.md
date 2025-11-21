@@ -366,17 +366,15 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 - 两个目录下的结构完全相同
 
 **快照目录（0-{snapshot_ts}）**：
-- 包含从表创建到snapshot_ts时间点的所有可见数据
-- 所有object按CreateTS排序
+- 包含snapshot_ts时间点的所有可见数据
 - 只保留一个快照
 
 **增量目录（{start_ts}-{end_ts}）**：
-- 包含该时间段内的aobj和cnobj
-- 按CreateTS排序
+- 包含该时间段内的obj
 - 保留最近`retention_days`天的数据
 
 **object_list.meta**：
-- 序列化的ObjectEntry列表
+- ObjectEntry列表
 - 包含：ObjectStats、is_deleted（标记该object是否已被删除）
 
 **manifest.json**：
@@ -403,7 +401,7 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
    - database级别：扫描数据库下所有表
    - table级别：检查表是否存在和table_id是否变化
 4. 发现新表：在`mo_s3_sync_tasks`中创建新记录
-5. 表ID变化（如truncate后）：更新`mo_s3_sync_tasks`中的table_id，重置watermark
+5. 表ID变化（如truncate后）：停止旧任务，创建新任务
 
 ### 6.2 UpstreamSyncJob
 
@@ -417,7 +415,6 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 - 选择某个已刷盘aobj的最大commit ts之前的某个时间戳作为new_watermark
   - 保证该时间戳之前的所有数据都已刷盘
   - 不需要考虑内存中的数据
-- aobj是首尾相接的（前一个aobj的CreateTS等于后一个aobj的起始位置）
 
 **Object选择策略**：
 - data对象：选取所有CreateTS或DeleteTS落在`(current_watermark, new_watermark]`区间内的object
@@ -430,6 +427,7 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 - data对象：创建`data/{current_watermark}-{new_watermark}/`目录并复制
 - tombstone对象：创建`tombstone/{current_watermark}-{new_watermark}/`目录并复制
   - 如果有被剪裁的aobj，写入剪裁后的版本
+- 写入之前按Pk排序，下游能作为nobj应用
 - 分别写入object_list.meta和manifest.json
 
 **状态管理和并发控制**：
@@ -442,7 +440,6 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 
 **data和tombstone分开处理**：
 - Job对data对象和tombstone对象分别执行快照生成和GC
-- 使用各自的snapshot_watermark
 - 分别在data/和tombstone/目录下操作
 
 **快照生成**：
@@ -488,10 +485,7 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 **确定消费范围**：
 - 扫描S3目录，列出所有批次目录
 - 如果watermark=0，从快照开始消费（data和tombstone都从快照开始）
-- 否则，找到所有start_ts >= watermark的增量目录
-- 根据sync_mode决定消费策略：
-  - `auto`模式：消费所有可用批次（到最新）
-  - `manual`模式：消费到当前时间戳为止
+- 否则，找到所有start_ts = watermark + 1 的增量目录
 
 **应用数据**：
 - 按时间顺序遍历批次目录
@@ -523,14 +517,8 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
   - cn_uuid必须匹配当前CN
   - job_lsn必须与传入的一致
   - state必须为'pending'
-- 更新系统表时再次验证上述字段（乐观锁）
+- 更新系统表时再次验证上述字段
 - 重启时将pending/running的任务置为complete，新Job会覆盖
-
-### 8.2 快照生成策略
-
-快照生成过程类似增量同步，只是object选择策略不同：
-- 增量：选择CreateTS > watermark的aobj/cnobj
-- 快照：选择snapshot_ts时可见的所有object
 
 ### 8.3 Watermark选择策略
 
