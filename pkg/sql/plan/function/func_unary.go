@@ -964,6 +964,21 @@ func Collation(_ []*vector.Vector, result vector.FunctionResultWrapper, proc *pr
 	})
 }
 
+func Coercibility(_ []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	// According to MySQL documentation, coercibility values are:
+	// 0 - Explicit collation
+	// 1 - No collation
+	// 2 - Implicit collation  
+	// 3 - System constant
+	// 4 - Coercible (default for string literals and column values)
+	// 5 - Ignorable
+	// 6 - Numeric
+	// For simplicity, we return 4 (coercible) for all string types
+	return opNoneParamToFixed[int64](result, proc, length, func() int64 {
+		return 4
+	})
+}
+
 func ConnectionID(_ []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
 	r := proc.GetSessionInfo().ConnectionID
 	return opNoneParamToFixed[uint64](result, proc, length, func() uint64 {

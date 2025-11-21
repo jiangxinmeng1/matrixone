@@ -512,6 +512,14 @@ SELECT COLLATION('test');
 SELECT COLLATION('你好');
 
 -- @case
+-- @desc: Test COERCIBILITY() function
+-- @label:bvt
+SELECT COERCIBILITY('test');
+SELECT COERCIBILITY('abc');
+SELECT COERCIBILITY('你好');
+SELECT COERCIBILITY('Hello World');
+
+-- @case
 -- @desc: Test comparison operators with different collations
 -- @label:bvt
 CREATE TABLE t_comparison (

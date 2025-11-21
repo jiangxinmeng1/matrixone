@@ -5536,6 +5536,29 @@ var supportedOthersBuiltIns = []FuncNew{
 		},
 	},
 
+	// function `coercibility`
+	{
+		functionId: COERCIBILITY,
+		class:      plan.Function_STRICT,
+		layout:     STANDARD_FUNCTION,
+		checkFn:    fixedTypeMatch,
+
+		Overloads: []overload{
+			{
+				overloadId:      0,
+				args:            []types.T{types.T_varchar},
+				volatile:        true,
+				realTimeRelated: true,
+				retType: func(parameters []types.Type) types.Type {
+					return types.T_int64.ToType()
+				},
+				newOp: func() executeLogicOfOverload {
+					return Coercibility
+				},
+			},
+		},
+	},
+
 	// function `connection_id`
 	{
 		functionId: CONNECTION_ID,
