@@ -10087,7 +10087,7 @@ simple_expr:
     }
 |   simple_expr COLLATE collate_name
     {
-        $$ = $1
+        $$ = tree.NewCollateExpr($1, $3)
     }
 |   MATCH '(' index_column_list ')' AGAINST '(' search_pattern fulltext_search_opt ')'
     {

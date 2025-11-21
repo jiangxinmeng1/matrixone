@@ -130,6 +130,15 @@ func (b *baseBinder) baseBindExpr(astExpr tree.Expr, depth int32, isRoot bool) (
 	case *tree.BitCastExpr:
 		expr, err = b.bindFuncExprImplByAstExpr("bit_cast", []tree.Expr{astExpr}, depth)
 
+	case *tree.CollateExpr:
+		// Bind the inner expression first
+		expr, err = b.impl.BindExpr(exprImpl.Expr, depth, false)
+		if err != nil {
+			return
+		}
+		// Explicit COLLATE expressions have coercibility 0
+		setCoercibility(expr, 0)
+
 	case *tree.IsNullExpr:
 		expr, err = b.bindFuncExprImplByAstExpr("isnull", []tree.Expr{exprImpl.Expr}, depth)
 

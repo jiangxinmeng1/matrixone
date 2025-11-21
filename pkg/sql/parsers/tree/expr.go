@@ -1255,6 +1255,41 @@ func NewBitCastExpr(e Expr, t ResolvableTypeReference) *BitCastExpr {
 	}
 }
 
+// the Collate expression: expr COLLATE collation_name
+type CollateExpr struct {
+	exprImpl
+	Expr     Expr
+	Collation string
+}
+
+func (node *CollateExpr) Format(ctx *FmtCtx) {
+	node.Expr.Format(ctx)
+	ctx.WriteString(" COLLATE ")
+	ctx.WriteString(node.Collation)
+}
+
+// Accept implements NodeChecker interface
+func (node *CollateExpr) Accept(v Visitor) (Expr, bool) {
+	newNode, skipChildren := v.Enter(node)
+	if skipChildren {
+		return v.Exit(newNode)
+	}
+	node = newNode.(*CollateExpr)
+	tmpNode, ok := node.Expr.Accept(v)
+	if !ok {
+		return node, false
+	}
+	node.Expr = tmpNode
+	return v.Exit(node)
+}
+
+func NewCollateExpr(e Expr, collation string) *CollateExpr {
+	return &CollateExpr{
+		Expr:      e,
+		Collation: collation,
+	}
+}
+
 // the parenthesized list of expressions.
 type Tuple struct {
 	exprImpl

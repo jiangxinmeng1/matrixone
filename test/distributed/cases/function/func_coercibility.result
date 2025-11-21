@@ -1,48 +1,33 @@
-SELECT COERCIBILITY('abc') AS result1;
-result1
+SELECT COERCIBILITY('abc') AS string_literal;
+string_literal
 4
-SELECT COERCIBILITY('test string') AS result2;
-result2
+SELECT COERCIBILITY('') AS empty_string;
+empty_string
 4
-SELECT COERCIBILITY('') AS result3;
-result3
+SELECT COERCIBILITY('你好😀') AS unicode_string;
+unicode_string
 4
-SELECT COERCIBILITY('Hello World!') AS result4;
-result4
-4
-SELECT COERCIBILITY(NULL) AS null_result;
-null_result
+SELECT COERCIBILITY(NULL) AS null_value;
+null_value
 NULL
-SELECT COERCIBILITY(123) AS int_result;
-int_result
+SELECT COERCIBILITY(123) AS int_value;
+int_value
 6
-SELECT COERCIBILITY(0123) AS octal_result;
-octal_result
+SELECT COERCIBILITY(0123) AS octal_value;
+octal_value
 6
 SELECT COERCIBILITY('0123') AS string_0123;
 string_0123
 4
-SELECT COERCIBILITY(45.67) AS float_result;
-float_result
+SELECT COERCIBILITY(45.67) AS float_value;
+float_value
 6
-SELECT COERCIBILITY(CAST(100 AS BIGINT)) AS bigint_result;
-bigint_result
+SELECT COERCIBILITY(CAST(100 AS BIGINT)) AS bigint_value;
+bigint_value
 6
-SELECT COERCIBILITY(CAST(200 AS DECIMAL(10,2))) AS decimal_result;
-decimal_result
+SELECT COERCIBILITY(CAST(200 AS DECIMAL(10,2))) AS decimal_value;
+decimal_value
 6
-SELECT COERCIBILITY('你好') AS result5;
-result5
-4
-SELECT COERCIBILITY('こんにちは') AS result6;
-result6
-4
-SELECT COERCIBILITY('안녕하세요') AS result7;
-result7
-4
-SELECT COERCIBILITY('😀🎉') AS result8;
-result8
-4
 CREATE TABLE test_coercibility (
 id INT PRIMARY KEY,
 name VARCHAR(100),
@@ -79,18 +64,24 @@ concat_result
 SELECT COERCIBILITY(UPPER('test')) AS upper_result;
 upper_result
 4
-SELECT COERCIBILITY(LOWER('TEST')) AS lower_result;
-lower_result
+SELECT COERCIBILITY(CONCAT(UPPER('a'), 'b')) AS nested_expr;
+nested_expr
 4
 SELECT COERCIBILITY(SUBSTRING('Hello World', 1, 5)) AS substring_result;
 substring_result
 4
 SELECT COERCIBILITY('abc' COLLATE utf8mb4_bin) AS explicit_collate_0;
 explicit_collate_0
-4
+0
 SELECT COERCIBILITY('test' COLLATE utf8mb4_general_ci) AS explicit_collate_1;
 explicit_collate_1
-4
+0
+SELECT COERCIBILITY('hello' COLLATE utf8mb4_unicode_ci) AS explicit_collate_2;
+explicit_collate_2
+0
+SELECT COERCIBILITY('测试' COLLATE utf8mb4_bin) AS explicit_collate_3;
+explicit_collate_3
+0
 SELECT COERCIBILITY(USER()) AS user_result;
 user_result
 3
@@ -100,6 +91,15 @@ version_result
 SELECT COERCIBILITY(DATABASE()) AS database_result;
 database_result
 3
+SELECT COERCIBILITY(SCHEMA()) AS schema_result;
+schema_result
+3
+SELECT COERCIBILITY(CURRENT_USER()) AS current_user_result;
+current_user_result
+3
+SELECT COERCIBILITY(SYSTEM_USER()) AS system_user_result;
+system_user_result
+3
 SELECT COERCIBILITY(CAST('test' AS VARBINARY(100))) AS binary_result;
 binary_result
 1
@@ -108,16 +108,19 @@ binary_literal
 1
 SELECT COERCIBILITY('hello' COLLATE utf8mb4_bin) AS collate_0_1;
 collate_0_1
-4
+0
 SELECT COERCIBILITY('world' COLLATE utf8mb4_unicode_ci) AS collate_0_2;
 collate_0_2
-4
+0
 SELECT COERCIBILITY('测试' COLLATE utf8mb4_bin) AS collate_0_3;
 collate_0_3
-4
+0
 SELECT COERCIBILITY(CAST('test' AS CHAR(50)) COLLATE utf8mb4_general_ci) AS collate_0_4;
 collate_0_4
-4
+0
+SELECT COERCIBILITY(REPEAT('A', 1000) COLLATE utf8mb4_bin) AS collate_0_long;
+collate_0_long
+0
 CREATE TABLE test_coercibility_cols (
 col1 VARCHAR(50),
 col2 CHAR(100),
@@ -154,6 +157,9 @@ null_5_3
 NULL
 SELECT COERCIBILITY(CAST(NULL AS DECIMAL(10,2))) AS null_5_4;
 null_5_4
+NULL
+SELECT COERCIBILITY(CAST(NULL AS VARBINARY(100))) AS null_5_binary;
+null_5_binary
 NULL
 CREATE TABLE test_coercibility_null (
 id INT,
