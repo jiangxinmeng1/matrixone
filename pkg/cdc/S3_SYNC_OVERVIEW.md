@@ -293,12 +293,8 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
     lsn                  BIGINT NOT NULL,
     
     -- 同步状态 - data对象
-    data_watermark       TIMESTAMP(6) NOT NULL DEFAULT '1970-01-01 00:00:00',
-    data_snapshot_watermark TIMESTAMP(6),                -- data快照的watermark（上游）
-    
-    -- 同步状态 - tombstone对象
-    tombstone_watermark  TIMESTAMP(6) NOT NULL DEFAULT '1970-01-01 00:00:00',
-    tombstone_snapshot_watermark TIMESTAMP(6),           -- tombstone快照的watermark（上游）
+    watermark       TIMESTAMP(6) NOT NULL DEFAULT '1970-01-01 00:00:00',
+    snapshot_watermark TIMESTAMP(6),                -- data快照的watermark（上游）
     
     -- Job状态
     job_state            VARCHAR(16) NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'complete'
@@ -413,26 +409,33 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 
 **data和tombstone分开处理**：
 - Job对data对象和tombstone对象分别执行同步流程
-- 使用各自的watermark（data_watermark / tombstone_watermark）
+- 但tombstone的watermark必须等于data的watermark（保证同步进度一致）
 - 分别写入到data/和tombstone/目录
 
-**Object选择策略**：
+**Watermark选择策略**：
 - 从CN的Partition State读取ObjectEntry列表
-- 选择某个已经刷盘的aobj的create at作为watermark
-  - 选取所有create ts/delete ts落在这个区间里的obj
-- 每次以某个aobj的CreateTS作为结束时间戳（new_watermark）
+- 选择某个已刷盘aobj的最大commit ts之前的某个时间戳作为new_watermark
+  - 保证该时间戳之前的所有数据都已刷盘
+  - 不需要考虑内存中的数据
 - aobj是首尾相接的（前一个aobj的CreateTS等于后一个aobj的起始位置）
-- 每次tombstone的watermark大于等于data的watermark
+
+**Object选择策略**：
+- data对象：选取所有CreateTS或DeleteTS落在`(current_watermark, new_watermark]`区间内的object
+- tombstone对象：选取所有CreateTS或DeleteTS落在`(current_watermark, new_watermark]`区间内的object
+  - 如果tombstone的aobj跨越watermark边界，需要剪裁该aobj
+  - 只包含watermark之前的部分数据
+  - 下次同步会用完整的object覆盖
 
 **复制到S3**：
 - data对象：创建`data/{current_watermark}-{new_watermark}/`目录并复制
 - tombstone对象：创建`tombstone/{current_watermark}-{new_watermark}/`目录并复制
+  - 如果有被剪裁的aobj，写入剪裁后的版本
 - 分别写入object_list.meta和manifest.json
 
 **状态管理和并发控制**：
 - 执行前检查cn_uuid、job_lsn、state是否一致
-- 完成后更新data_watermark、tombstone_watermark、updated_at
-- 将state更新为'complete'
+- 完成后同时更新data_watermark和tombstone_watermark为new_watermark
+- 更新updated_at，将job_state更新为'complete'
 - 清理S3中上次未完成的同步目录
 
 ### 6.3 SnapshotGCJob
@@ -471,38 +474,39 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 
 **data和tombstone分开处理**：
 - Job对data对象和tombstone对象分别执行消费流程
-- 使用各自的watermark（data_watermark / tombstone_watermark）
+- data_watermark和tombstone_watermark保持相等（与上游一致）
 - 分别从data/和tombstone/目录消费
 
 **watermark落后检测**：
-- 读取系统表的watermark和S3快照的snapshot_ts
+- 读取系统表的watermark（data和tombstone的watermark相等）和S3快照的snapshot_ts
 - 如果watermark < snapshot_ts：
   - 下游数据已过期，无法继续增量同步
-  - 清理本地表的所有object
-  - 重置watermark为0
+  - 清理本地表的所有object（data和tombstone）
+  - 重置data_watermark和tombstone_watermark为0
   - 从快照重新开始应用
 
 **确定消费范围**：
 - 扫描S3目录，列出所有批次目录
-- 如果watermark=0，从快照开始消费
+- 如果watermark=0，从快照开始消费（data和tombstone都从快照开始）
 - 否则，找到所有start_ts >= watermark的增量目录
 - 根据sync_mode决定消费策略：
   - `auto`模式：消费所有可用批次（到最新）
   - `manual`模式：消费到当前时间戳为止
 
 **应用数据**：
-- 分别按时间顺序遍历data和tombstone的批次目录
-- 对每个批次：
-  - 检查manifest.json是否存在
-  - 读取object_list.meta
+- 按时间顺序遍历批次目录
+- 对每个批次同时消费data和tombstone：
+  - 检查data/和tombstone/目录下的manifest.json是否存在
+  - 读取各自的object_list.meta
   - 开启新事务
+  - 先应用data对象，再应用tombstone对象
   - 遍历ObjectEntry，检查幂等性，下载并创建CN类型ObjectEntry
   - 提交事务
 
 **状态管理和并发控制**：
-- 执行前检查cn_uuid、job_lsn、state是否一致
-- 每个批次成功后分别更新data_watermark或tombstone_watermark
-- 完成后将state更新为'complete'
+- 执行前检查cn_uuid、job_lsn、job_state是否一致
+- 每个批次成功后同时更新data_watermark和tombstone_watermark（保持相等）
+- 完成后将job_state更新为'complete'
 
 ---
 
