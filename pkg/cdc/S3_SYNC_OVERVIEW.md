@@ -460,6 +460,7 @@ s3://{bucket}/{dir}/
    - account级别：扫描账号下所有数据库和表
    - database级别：扫描数据库下所有表
    - table级别：检查表是否存在和table_id是否变化
+   - 上游从mo_catalog里读，下游从s3的ddl目录里读
 4. 发现新表：在`mo_s3_sync_tasks`中创建新记录
 5. 表ID变化（如truncate后）：停止旧任务，创建新任务
 
