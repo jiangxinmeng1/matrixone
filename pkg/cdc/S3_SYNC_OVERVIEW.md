@@ -438,8 +438,9 @@ s3://{bucket}/{dir}/
 - data/ 和 tombstone/ 目录下各自有独立的 manifest.json
 
 **DDL目录（ddl/）**：
-- 存储账号级别的DDL变更信息，与数据目录并列
-- 内容是mo_tables, mo_databases, mo_columns + timestamp + is_delete
+- 存储账号级别的DDL变更信息，与数据目录并列分tail和snapshot
+- snapshot 是某个ts时的mo_tables, mo_databases, mo_columns
+- tail内容是mo_tables, mo_databases, mo_columns + timestamp + is_delete
 
 ---
 
