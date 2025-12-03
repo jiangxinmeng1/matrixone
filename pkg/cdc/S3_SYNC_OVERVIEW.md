@@ -368,43 +368,45 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
 
 ```
 s3://{bucket}/{dir}/
-{account_id}/{db_id}/{table_id}/
+├── {account_id}/                                # 数据目录
+│   └── {db_id}/{table_id}/
+│       ├── 0-{snapshot_ts}/                    # 历史快照（只保留1个）
+│       │   ├── data/                           # 数据对象
+│       │   │   ├── object_list.meta            # 排序后的ObjectEntry列表
+│       │   │   ├── {object_uuid_1}             # TAE Object文件
+│       │   │   ├── {object_uuid_2}
+│       │   │   ├── ...
+│       │   │   └── manifest.json               # 完成标记
+│       │   │
+│       │   └── tombstone/                      # 墓碑对象
+│       │       ├── object_list.meta
+│       │       ├── {object_uuid}...
+│       │       └── manifest.json
+│       │
+│       ├── {start_ts}-{end_ts}/                # 增量数据（最近N天）
+│       │   ├── data/                           # 数据对象
+│       │   │   ├── object_list.meta            # 排序后的增量ObjectEntry
+│       │   │   ├── {object_uuid}...
+│       │   │   └── manifest.json
+│       │   │
+│       │   └── tombstone/                      # 墓碑对象
+│       │       ├── object_list.meta
+│       │       ├── {object_uuid}...
+│       │       └── manifest.json
+│       │
+│       ├── {start_ts}-{end_ts}/                # 更早的增量
+│       │   ├── data/
+│       │   │   └── ...
+│       │   └── tombstone/
+│       │       └── ...
+│       │
+│       └── {start_ts}-{end_ts}/                # 最新的增量
+│           ├── data/
+│           │   └── ...
+│           └── tombstone/
+│               └── ...
 │
-├── 0-{snapshot_ts}/                            # 历史快照（只保留1个）
-│   ├── data/                                   # 数据对象
-│   │   ├── object_list.meta                    # 排序后的ObjectEntry列表
-│   │   ├── {object_uuid_1}                     # TAE Object文件
-│   │   ├── {object_uuid_2}
-│   │   ├── ...
-│   │   └── manifest.json                       # 完成标记
-│   │
-│   └── tombstone/                              # 墓碑对象
-│       ├── object_list.meta
-│       ├── {object_uuid}...
-│       └── manifest.json
-│
-├── {start_ts}-{end_ts}/                        # 增量数据（最近N天）
-│   ├── data/                                   # 数据对象
-│   │   ├── object_list.meta                    # 排序后的增量ObjectEntry
-│   │   ├── {object_uuid}...
-│   │   └── manifest.json
-│   │
-│   └── tombstone/                              # 墓碑对象
-│       ├── object_list.meta
-│       ├── {object_uuid}...
-│       └── manifest.json
-│
-├── {start_ts}-{end_ts}/                        # 更早的增量
-│   ├── data/
-│   │   └── ...
-│   └── tombstone/
-│       └── ...
-│
-└── {start_ts}-{end_ts}/                        # 最新的增量
-    ├── data/
-    │   └── ...
-    └── tombstone/
-        └── ...
+└── ddl/                                         # DDL变化目录
 ```
 
 ### 5.2 目录结构说明
@@ -434,6 +436,10 @@ s3://{bucket}/{dir}/
 - 标记批次写入完成
 - 内容：start_ts、end_ts、object_count、is_snapshot、state、created_at
 - data/ 和 tombstone/ 目录下各自有独立的 manifest.json
+
+**DDL目录（ddl/）**：
+- 存储账号级别的DDL变更信息，与数据目录并列
+- 内容是mo_tables, mo_databases, mo_columns + timestamp + is_delete
 
 ---
 
