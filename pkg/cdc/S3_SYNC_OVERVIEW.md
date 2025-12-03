@@ -415,61 +415,70 @@ CREATE TABLE mo_catalog.mo_stages (
 ```
 s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 │
-├── data/                                       # 数据对象
-│   ├── 0-{snapshot_ts}/                        # 历史快照（只保留1个）
+├── 0-{snapshot_ts}/                            # 历史快照（只保留1个）
+│   ├── data/                                   # 数据对象
 │   │   ├── object_list.meta                    # 排序后的ObjectEntry列表
 │   │   ├── {object_uuid_1}                     # TAE Object文件
 │   │   ├── {object_uuid_2}
 │   │   ├── ...
 │   │   └── manifest.json                       # 完成标记
 │   │
-│   ├── {start_ts}-{end_ts}/                    # 增量数据（最近N天）
+│   └── tombstone/                              # 墓碑对象
+│       ├── object_list.meta
+│       ├── {object_uuid}...
+│       └── manifest.json
+│
+├── {start_ts}-{end_ts}/                        # 增量数据（最近N天）
+│   ├── data/                                   # 数据对象
 │   │   ├── object_list.meta                    # 排序后的增量ObjectEntry
 │   │   ├── {object_uuid}...
 │   │   └── manifest.json
 │   │
-│   ├── {start_ts}-{end_ts}/                    # 更早的增量
+│   └── tombstone/                              # 墓碑对象
+│       ├── object_list.meta
+│       ├── {object_uuid}...
+│       └── manifest.json
+│
+├── {start_ts}-{end_ts}/                        # 更早的增量
+│   ├── data/
 │   │   └── ...
-│   │
-│   └── {start_ts}-{end_ts}/                    # 最新的增量
+│   └── tombstone/
 │       └── ...
 │
-└── tombstone/                                  # 墓碑对象
-    ├── 0-{snapshot_ts}/                        # 历史快照
-    │   ├── object_list.meta
-    │   ├── {object_uuid}...
-    │   └── manifest.json
-    │
-    ├── {start_ts}-{end_ts}/                    # 增量数据
+└── {start_ts}-{end_ts}/                        # 最新的增量
+    ├── data/
     │   └── ...
-    │
-    └── {start_ts}-{end_ts}/
+    └── tombstone/
         └── ...
 ```
 
 ### 5.2 目录结构说明
 
-**data/ 和 tombstone/**：
-- 按object类型分离存储
-- data：存储普通数据对象
-- tombstone：存储墓碑对象（用于标记删除）
-- 两个目录下的结构完全相同
+**时间戳目录（{start_ts}-{end_ts} 或 0-{snapshot_ts}）**：
+- 每个时间戳目录下包含 data/ 和 tombstone/ 两个子目录
+- data/：存储普通数据对象
+- tombstone/：存储墓碑对象（用于标记删除）
+- 同一时间段的 data 和 tombstone 放在同一个时间戳目录下，保证同步进度一致
 
 **快照目录（0-{snapshot_ts}）**：
-- 包含snapshot_ts时间点的所有可见数据
+- 包含snapshot_ts时间点的所有可见数据（data和tombstone）
 - 只保留一个快照
+- 快照目录下包含 data/ 和 tombstone/ 子目录
 
 **增量目录（{start_ts}-{end_ts}）**：
-- 包含该时间段内的obj
+- 包含该时间段内的数据对象（data和tombstone）
 - 保留最近`retention_days`天的数据
+- 每个增量目录下包含 data/ 和 tombstone/ 子目录
 
 **object_list.meta**：
 - ObjectEntry列表
 - 包含：ObjectStats、is_deleted（标记该object是否已被删除）
+- data/ 和 tombstone/ 目录下各自有独立的 object_list.meta
 
 **manifest.json**：
 - 标记批次写入完成
 - 内容：start_ts、end_ts、object_count、is_snapshot、state、created_at
+- data/ 和 tombstone/ 目录下各自有独立的 manifest.json
 
 ---
 
@@ -514,11 +523,13 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
   - 下次同步会用完整的object覆盖
 
 **复制到S3**：
-- data对象：创建`data/{current_watermark}-{new_watermark}/`目录并复制
-- tombstone对象：创建`tombstone/{current_watermark}-{new_watermark}/`目录并复制
+- 创建时间戳目录：`{current_watermark}-{new_watermark}/`
+- 在该目录下创建 `data/` 和 `tombstone/` 子目录
+- data对象：复制到 `{current_watermark}-{new_watermark}/data/` 目录
+- tombstone对象：复制到 `{current_watermark}-{new_watermark}/tombstone/` 目录
   - 如果有被剪裁的aobj，写入剪裁后的版本
 - 写入之前按Pk排序，下游能作为nobj应用
-- 分别写入object_list.meta和manifest.json
+- 分别在 data/ 和 tombstone/ 目录下写入各自的 object_list.meta 和 manifest.json
 
 **状态管理和并发控制**：
 - 执行前检查cn_uuid、job_lsn、state是否一致
@@ -538,15 +549,15 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
   - 从TN的Partition State读取，基于snapshot_ts判断可见性
   - 包含所有CreateTS <= snapshot_ts且未被删除的object
 - 生成过程类似增量同步：
-  - 创建快照目录：`0-{new_snapshot_ts}`
+  - 创建快照目录：`0-{new_snapshot_ts}/`
+  - 在该目录下创建 `data/` 和 `tombstone/` 子目录
   - 按CreateTS排序object
-  - 复制object文件
-  - 写入object_list.meta
-  - 生成manifest.json
+  - 分别复制data和tombstone的object文件到对应子目录
+  - 分别在 data/ 和 tombstone/ 目录下写入 object_list.meta 和 manifest.json
 
 **GC清理**：
-- 分别删除data和tombstone的旧快照（如果存在）
-- 分别删除超过retention_days的增量目录
+- 删除旧的快照目录（如果存在）：`0-{old_snapshot_ts}/`（包含其下的 data/ 和 tombstone/）
+- 删除超过retention_days的增量目录：`{start_ts}-{end_ts}/`（包含其下的 data/ 和 tombstone/）
 - 更新系统表的data_snapshot_watermark和tombstone_snapshot_watermark
 
 **原子性保证**：
@@ -578,10 +589,10 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 - 否则，找到所有start_ts = watermark + 1 的增量目录
 
 **应用数据**：
-- 按时间顺序遍历批次目录
-- 对每个批次同时消费data和tombstone：
-  - 检查data/和tombstone/目录下的manifest.json是否存在
-  - 读取各自的object_list.meta
+- 按时间顺序遍历时间戳目录（`{start_ts}-{end_ts}/` 或 `0-{snapshot_ts}/`）
+- 对每个时间戳目录同时消费data和tombstone：
+  - 检查 `{time_dir}/data/` 和 `{time_dir}/tombstone/` 目录下的 manifest.json 是否存在
+  - 读取各自的 object_list.meta
   - 开启新事务
   - 先应用data对象，再应用tombstone对象
   - 遍历ObjectEntry，检查幂等性，下载并创建CN类型ObjectEntry
