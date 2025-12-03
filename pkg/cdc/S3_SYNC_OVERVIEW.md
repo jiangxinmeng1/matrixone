@@ -96,7 +96,7 @@
 ### 3.1 创建S3 Stage（存储凭证）
 
 **语法**：
-
+* 现有
 ```sql
 CREATE/REPLACE STAGE <stage_name>
   URL = 's3://<bucket>/<dir>/'
@@ -413,7 +413,8 @@ CREATE TABLE mo_catalog.mo_stages (
 ### 5.1 分层存储策略
 
 ```
-s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
+s3://{bucket}/{dir}/
+{account_id}/{db_id}/{table_id}/
 │
 ├── 0-{snapshot_ts}/                            # 历史快照（只保留1个）
 │   ├── data/                                   # 数据对象
