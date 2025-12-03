@@ -93,10 +93,9 @@
 
 ## 3. SQL接口
 
-### 3.1 创建S3 Stage（存储凭证）
+### 3.1 创建S3 Stage（已支持）
 
 **语法**：
-* 现有
 ```sql
 CREATE/REPLACE STAGE <stage_name>
   URL = 's3://<bucket>/<dir>/'
