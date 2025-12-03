@@ -108,22 +108,6 @@ CREATE/REPLACE STAGE <stage_name>
   );
 ```
 
-**参数说明**：
-- `stage_name`：Stage名称，用于后续在REPLICATION GROUP中引用
-- `URL`：S3存储路径，格式为 `s3://bucket/path/`
-- `ENDPOINT`：S3服务端点
-- `REGION`：S3区域
-- `CREDENTIALS`：S3访问凭证
-  - `AWS_KEY_ID`：访问密钥ID
-  - `AWS_SECRET_KEY`：访问密钥（**存储时自动加密**）
-
-**安全说明**：
-- 敏感凭证信息（如 `AWS_SECRET_KEY`）在存储到 `mo_stages` 表时会自动加密
-- 使用 AES-CTR 模式加密，密钥从 `mo_data_key` 表加载
-- 读取时会自动解密，对用户透明
-- stage只能创建或替换，不能读取
-- 详细加密机制参见 [4.3 mo_stages（Stage配置表）](#43-mo_stagesstage配置表)
-
 **示例**：
 
 ```sql
@@ -376,36 +360,6 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
     updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 );
 ```
-
----
-
-### 4.3 mo_stages（Stage配置表）
-
-**存储位置**：`mo_catalog` 数据库
-
-**作用**：存储S3 Stage的配置信息，包括URL和访问凭证。**敏感凭证信息（如AWS_SECRET_KEY）以加密形式存储**。
-
-**Schema**：
-
-```sql
-CREATE TABLE mo_catalog.mo_stages (
-    stage_id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    stage_name            VARCHAR(64) UNIQUE KEY NOT NULL,
-    url                   TEXT NOT NULL,                    -- S3 URL，如 's3://bucket/path/'
-    stage_credentials     TEXT,                              -- 加密后的凭证信息
-    created_time          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    comment               TEXT
-);
-```
-
-**加密机制**：
-
-1. **加密字段**：`stage_credentials` 字段存储加密后的凭证信息
-   - 敏感字段的值（如 `AWS_SECRET_KEY`）会被加密存储
-
-2. **加密算法**：
-   - 使用 **AES-CTR** 模式加密
-   - 加密密钥：从 `mo_data_key` 表读取并解密得到的 `AesKey`
 
 ---
 ## 5. S3目录结构
