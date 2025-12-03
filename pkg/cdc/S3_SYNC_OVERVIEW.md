@@ -41,10 +41,10 @@
 │      │       │                           │      │       │
 │      ├──→ UpstreamSyncJob                │      ├──→ DownstreamConsumeJob
 │      └──→ SnapshotGCJob                  │      │       │
-│                                           │      │       │
+│                                          │      │       │
 └──────┼───────┘                           └──────┼───────┘
        │                                          │
-       │ 读取Partition State                     │ 应用到Catalog
+       │ 读取Partition State                      │ 应用到Catalog
        ↓                                          ↓
 ┌──────────────┐                           ┌──────────────┐
 │   TN Node    │                           │   TN Node    │
@@ -98,7 +98,7 @@
 **语法**：
 
 ```sql
-CREATE OR REPLACE STAGE <stage_name>
+CREATE/REPLACE STAGE <stage_name>
   URL = 's3://<bucket>/<dir>/'
   ENDPOINT = '<s3_endpoint>'
   REGION = '<s3_region>'
@@ -121,12 +121,13 @@ CREATE OR REPLACE STAGE <stage_name>
 - 敏感凭证信息（如 `AWS_SECRET_KEY`）在存储到 `mo_stages` 表时会自动加密
 - 使用 AES-CTR 模式加密，密钥从 `mo_data_key` 表加载
 - 读取时会自动解密，对用户透明
+- stage只能创建或替换，不能读取
 - 详细加密机制参见 [4.3 mo_stages（Stage配置表）](#43-mo_stagesstage配置表)
 
 **示例**：
 
 ```sql
-CREATE OR REPLACE STAGE s3_sync_stage
+CREATE STAGE s3_sync_stage
   URL = 's3://mo-cross-sync/cluster-a/account/'
   ENDPOINT = 'https://s3.us-west-2.amazonaws.com'
   REGION = 'us-west-2'
@@ -173,7 +174,7 @@ CREATE REPLICATION GROUP <task_name>
   - `table`：同步指定表
 - `ALLOWED_DATABASES`：database/table级别必填，指定数据库名称
 - `ALLOWED_TABLES`：table级别必填，指定表名称
-- `STAGE`：引用之前创建的Stage名称，包含上游的S3配置信息
+- `STAGE`：引用之前创建的Stage名称，要和上游的s3一致
 - `SYNC_INTERVAL`：同步间隔（秒），默认60秒
 - `RETENTION_DAYS`：增量数据保留天数，默认7天
 
@@ -309,34 +310,28 @@ DROP REPLICATION GROUP <task_name>;
 ```sql
 CREATE TABLE mo_catalog.mo_s3_sync_configs (
     -- 任务标识
-    task_id              VARCHAR(36) PRIMARY KEY,
-    task_name            VARCHAR(128) NOT NULL,
+    task_id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    task_name            VARCHAR(5000) NOT NULL,
     cluster_role         VARCHAR(16) NOT NULL,           -- 'upstream' 或 'downstream'
     
     -- 同步级别和范围
     sync_level           VARCHAR(16) NOT NULL,           -- 'account', 'database', 'table'
     account_id           BIGINT NOT NULL,
-    db_name              VARCHAR(128),                   -- database/table级别必填
-    table_name           VARCHAR(128),                   -- table级别必填
+    db_name              VARCHAR(5000),                   -- database/table级别必填
+    table_name           VARCHAR(5000),                   -- table级别必填
     
     -- S3配置（JSON格式）
-    s3_config            JSON NOT NULL,                  -- {endpoint, region, bucket, dir, access_key, secret_key}
+    stage_name            VARCHAR(5000),                  -- {endpoint, region, bucket, dir, access_key, secret_key}
     
     -- 同步配置（JSON格式）
     sync_config          JSON NOT NULL,                  -- {retention_days, sync_mode, sync_interval}
     
     -- 任务控制
-    state                VARCHAR(16) NOT NULL DEFAULT 'running',  -- 'running', 'stopped'
+    state                TINYINT,  -- 'running', 'stopped'
     
     -- 时间戳
     created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    -- 约束
-    UNIQUE KEY uk_config (config_name, cluster_role),
-    INDEX idx_level (sync_level),
-    INDEX idx_account (account_id),
-    INDEX idx_state (state)
 );
 ```
 
@@ -352,38 +347,33 @@ CREATE TABLE mo_catalog.mo_s3_sync_configs (
 
 ```sql
 CREATE TABLE mo_catalog.mo_s3_sync_tasks (
-    -- 表标识
-    task_id              VARCHAR(36) PRIMARY KEY,        -- 自动生成的UUID
+    job_id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+
+    task_id              INT UNSIGNED
     
     -- 表信息
     account_id           BIGINT NOT NULL,
     db_id                BIGINT NOT NULL,
-    db_name              VARCHAR(128) NOT NULL,
+    db_name              VARCHAR(5000) NOT NULL,
     table_id             BIGINT NOT NULL,
-    table_name           VARCHAR(128) NOT NULL,
-    lsn                  BIGINT NOT NULL,
+    table_name           VARCHAR(5000) NOT NULL, 
+    lsn      
     
     -- 同步状态 - data对象
-    watermark       TIMESTAMP(6) NOT NULL DEFAULT '1970-01-01 00:00:00',
-    snapshot_watermark TIMESTAMP(6),                -- data快照的watermark（上游）
+    watermark            TIMESTAMP(6) NOT NULL DEFAULT '1970-01-01 00:00:00',
+    snapshot_watermark   TIMESTAMP(6),                -- data快照的watermark（上游）
     
     -- Job状态
-    job_state            VARCHAR(16) NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'complete'
+    job_state            TINYINT NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'complete'
     cn_uuid              VARCHAR(64),                    -- 执行任务的CN标识
     job_lsn              BIGINT DEFAULT 0,               -- Job序列号
     
     -- 错误信息
-    error_message        VARCHAR(1024),                  -- 最后错误信息
+    error_message        VARCHAR(5000),                  -- 最后错误信息
     
     -- 时间戳
     created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    -- 约束
-    UNIQUE KEY uk_table (task_id, table_id),
-    INDEX idx_config (config_id),
-    INDEX idx_job_state (job_state),
-    INDEX idx_cn_uuid (cn_uuid),
 );
 ```
 
@@ -403,7 +393,6 @@ CREATE TABLE mo_catalog.mo_stages (
     stage_name            VARCHAR(64) UNIQUE KEY NOT NULL,
     url                   TEXT NOT NULL,                    -- S3 URL，如 's3://bucket/path/'
     stage_credentials     TEXT,                              -- 加密后的凭证信息
-    stage_status          VARCHAR(64) NOT NULL,             -- 'in_use', 'disabled'
     created_time          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     comment               TEXT
 );
