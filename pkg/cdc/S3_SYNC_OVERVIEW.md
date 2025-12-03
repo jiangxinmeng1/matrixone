@@ -516,8 +516,7 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
   - 不需要考虑内存中的数据
 
 **Object选择策略**：
-- data对象：选取所有CreateTS或DeleteTS落在`(current_watermark, new_watermark]`区间内的object
-- tombstone对象：选取所有CreateTS或DeleteTS落在`(current_watermark, new_watermark]`区间内的object
+- 选取所有CreateTS或DeleteTS落在`(current_watermark, new_watermark]`区间内的object
   - 如果tombstone的aobj跨越watermark边界，需要剪裁该aobj
   - 只包含watermark之前的部分数据
   - 下次同步会用完整的object覆盖
@@ -532,10 +531,10 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 - 分别在 data/ 和 tombstone/ 目录下写入各自的 object_list.meta 和 manifest.json
 
 **状态管理和并发控制**：
-- 执行前检查cn_uuid、job_lsn、state是否一致
-- 完成后同时更新data_watermark和tombstone_watermark为new_watermark
-- 更新updated_at，将job_state更新为'complete'
+- 执行前检查cn_uuid、job_lsn、state是否一致，更新state
 - 清理S3中上次未完成的同步目录
+- 完成后更新watermark
+- 更新updated_at，将job_state更新为'complete'
 
 ### 6.3 SnapshotGCJob
 
@@ -545,15 +544,7 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 
 **快照生成**：
 - 触发条件：最旧的增量目录超过retention_days
-- Object选择策略：读取快照时间戳（snapshot_ts）时所有可见的object
-  - 从TN的Partition State读取，基于snapshot_ts判断可见性
-  - 包含所有CreateTS <= snapshot_ts且未被删除的object
-- 生成过程类似增量同步：
-  - 创建快照目录：`0-{new_snapshot_ts}/`
-  - 在该目录下创建 `data/` 和 `tombstone/` 子目录
-  - 按CreateTS排序object
-  - 分别复制data和tombstone的object文件到对应子目录
-  - 分别在 data/ 和 tombstone/ 目录下写入 object_list.meta 和 manifest.json
+- 旧的文件合并成新的snapshot
 
 **GC清理**：
 - 删除旧的快照目录（如果存在）：`0-{old_snapshot_ts}/`（包含其下的 data/ 和 tombstone/）
@@ -600,6 +591,7 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 
 **状态管理和并发控制**：
 - 执行前检查cn_uuid、job_lsn、job_state是否一致
+- 检查startts是否低于新的snapshot
 - 每个批次成功后同时更新data_watermark和tombstone_watermark（保持相等）
 - 完成后将job_state更新为'complete'
 
@@ -621,7 +613,7 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 - 更新系统表时再次验证上述字段
 - 重启时将pending/running的任务置为complete，新Job会覆盖
 
-### 8.3 Watermark选择策略
+### 8.2 Watermark选择策略
 
 **关键设计**：选择某个已刷盘aobj的最大commit ts之前的某个时间戳作为watermark
 
@@ -640,11 +632,7 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 - 下次同步会用完整的object覆盖这个被剪裁的aobj
 - 保证最终数据完整性
 
-### 8.4 幂等性保证
-
-Job可安全重试，下游应用前检查object是否已存在
-
-### 8.5 下游Object不参与Merge
+### 8.3 下游Object不参与Merge
 
 **设计理念**：下游只负责复制数据，不参与数据整理
 
