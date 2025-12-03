@@ -349,7 +349,7 @@ CREATE TABLE mo_catalog.mo_s3_sync_configs (
 CREATE TABLE mo_catalog.mo_s3_sync_tasks (
     job_id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
 
-    task_id              INT UNSIGNED
+    task_id              INT UNSIGNED NOT NULL，
     
     -- 表信息
     account_id           BIGINT NOT NULL,
@@ -559,7 +559,7 @@ s3://{bucket}/{dir}/{account_id}/{db_id}/{table_id}/
 
 ## 7. 下游处理流程
 
-### 7.2 DownstreamConsumeJob
+### 7.1 DownstreamConsumeJob
 
 **data和tombstone分开处理**：
 - Job对data对象和tombstone对象分别执行消费流程
