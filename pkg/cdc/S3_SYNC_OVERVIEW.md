@@ -93,34 +93,81 @@
 
 ## 3. SQL接口
 
-### 3.1 上游 - 创建同步任务
+### 3.1 创建S3 Stage（存储凭证）
 
 **语法**：
 
 ```sql
-CREATE UPSTREAM S3 SYNC <task_name>
-  [ACCOUNT <account_name>]
-  [DATABASE <db_name>]
-  [TABLE <table_name>]
-  S3 CONFIG (
-    ENDPOINT '<s3_endpoint>',
-    REGION '<s3_region>',
-    BUCKET '<s3_bucket>',
-    DIR '<s3_dir>',
-    ACCESS_KEY '<access_key>',
-    SECRET_KEY '<secret_key>'
-  )
-  [SYNC_INTERVAL <seconds>]
-  [RETENTION_DAYS <days>];
+CREATE OR REPLACE STAGE <stage_name>
+  URL = 's3://<bucket>/<dir>/'
+  ENDPOINT = '<s3_endpoint>'
+  REGION = '<s3_region>'
+  CREDENTIALS = (
+    AWS_KEY_ID = '<access_key>',
+    AWS_SECRET_KEY = '<secret_key>'
+  );
+```
+
+**参数说明**：
+- `stage_name`：Stage名称，用于后续在REPLICATION GROUP中引用
+- `URL`：S3存储路径，格式为 `s3://bucket/path/`
+- `ENDPOINT`：S3服务端点
+- `REGION`：S3区域
+- `CREDENTIALS`：S3访问凭证
+  - `AWS_KEY_ID`：访问密钥ID
+  - `AWS_SECRET_KEY`：访问密钥
+
+**示例**：
+
+```sql
+CREATE OR REPLACE STAGE s3_sync_stage
+  URL = 's3://mo-cross-sync/cluster-a/account/'
+  ENDPOINT = 'https://s3.us-west-2.amazonaws.com'
+  REGION = 'us-west-2'
+  CREDENTIALS = (
+    AWS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE',
+    AWS_SECRET_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+  );
+```
+
+---
+
+### 3.2 上游 - 创建同步任务
+
+**语法**：
+
+```sql
+CREATE REPLICATION GROUP <task_name>
+  OBJECT_TYPES = account
+  STAGE = <stage_name>
+  [SYNC_INTERVAL = <seconds>]
+  [RETENTION_DAYS = <days>];
+
+CREATE REPLICATION GROUP <task_name>
+  OBJECT_TYPES = database
+  ALLOWED_DATABASES = <db_name>
+  STAGE = <stage_name>
+  [SYNC_INTERVAL = <seconds>]
+  [RETENTION_DAYS = <days>];
+
+CREATE REPLICATION GROUP <task_name>
+  OBJECT_TYPES = table
+  ALLOWED_DATABASES = <db_name>
+  ALLOWED_TABLES = <table_name>
+  STAGE = <stage_name>
+  [SYNC_INTERVAL = <seconds>]
+  [RETENTION_DAYS = <days>];
 ```
 
 **参数说明**：
 - `task_name`：配置名称，集群内唯一
-- 同步级别（三选一，不指定则为account级别）：
-  - `ACCOUNT`：同步整个账号下的所有表
-  - `DATABASE`：同步指定数据库下的所有表
-  - `TABLE`：同步指定表
-- `S3 CONFIG`：S3配置信息
+- `OBJECT_TYPES`：同步级别，支持：
+  - `account`：同步整个账号下的所有表
+  - `database`：同步指定数据库下的所有表
+  - `table`：同步指定表
+- `ALLOWED_DATABASES`：database/table级别必填，指定数据库名称
+- `ALLOWED_TABLES`：table级别必填，指定表名称
+- `STAGE`：引用之前创建的Stage名称，包含上游的S3配置信息
 - `SYNC_INTERVAL`：同步间隔（秒），默认60秒
 - `RETENTION_DAYS`：增量数据保留天数，默认7天
 
@@ -128,54 +175,65 @@ CREATE UPSTREAM S3 SYNC <task_name>
 
 ```sql
 -- Account级别：同步整个账号
-CREATE UPSTREAM S3 SYNC sync_account
-  S3 CONFIG (
-    ENDPOINT 'https://s3.us-west-2.amazonaws.com',
-    REGION 'us-west-2',
-    BUCKET 'mo-cross-sync',
-    DIR 'cluster-a/account',
-    ACCESS_KEY 'AKIAIOSFODNN7EXAMPLE',
-    SECRET_KEY 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
-  );
+CREATE REPLICATION GROUP sync_account
+  OBJECT_TYPES = account
+  STAGE = s3_sync_stage;
 
 -- Database级别：同步整个数据库
-CREATE UPSTREAM S3 SYNC sync_tpcc
-  DATABASE tpcc
-  S3 CONFIG (...);
+CREATE REPLICATION GROUP sync_tpcc
+  OBJECT_TYPES = database
+  ALLOWED_DATABASES = tpcc
+  STAGE = s3_sync_stage;
 
 -- Table级别：同步单张表
-CREATE UPSTREAM S3 SYNC sync_orders
-  DATABASE tpcc TABLE orders
-  S3 CONFIG (...)
-  SYNC_INTERVAL 60
-  RETENTION_DAYS 7;
+CREATE REPLICATION GROUP sync_orders
+  OBJECT_TYPES = table
+  ALLOWED_DATABASES = tpcc
+  ALLOWED_TABLES = orders
+  STAGE = s3_sync_stage
+  SYNC_INTERVAL = 60
+  RETENTION_DAYS = 7;
 ```
 
 ---
 
-### 3.2 下游 - 创建消费任务
+### 3.3 下游 - 创建消费任务
 
 **语法**：
 
 ```sql
-CREATE DOWNSTREAM S3 SYNC <task_name>
-  [ACCOUNT <account_name>]
-  [DATABASE <db_name>]
-  [TABLE <table_name>]
-  S3 CONFIG (
-    ENDPOINT '<s3_endpoint>',
-    REGION '<s3_region>',
-    BUCKET '<s3_bucket>',
-    DIR '<s3_dir>',
-    ACCESS_KEY '<access_key>',
-    SECRET_KEY '<secret_key>'
-  )
-  [SYNC_MODE <mode>]
-  [SYNC_INTERVAL <seconds>];
+CREATE REPLICATION GROUP <task_name>
+  AS REPLICA OF <upstream_task_name>
+  OBJECT_TYPES = account
+  STAGE = <stage_name>
+  [SYNC_MODE = <mode>]
+  [SYNC_INTERVAL = <seconds>];
+
+CREATE REPLICATION GROUP <task_name>
+  AS REPLICA OF <upstream_task_name>
+  OBJECT_TYPES = database
+  ALLOWED_DATABASES = <db_name>
+  STAGE = <stage_name>
+  [SYNC_MODE = <mode>]
+  [SYNC_INTERVAL = <seconds>];
+
+CREATE REPLICATION GROUP <task_name>
+  AS REPLICA OF <upstream_task_name>
+  OBJECT_TYPES = table
+  ALLOWED_DATABASES = <db_name>
+  ALLOWED_TABLES = <table_name>
+  STAGE = <stage_name>
+  [SYNC_MODE = <mode>]
+  [SYNC_INTERVAL = <seconds>];
 ```
 
 **参数说明**：
-- 同步级别：与上游对应，可以是account/database/table级别
+- `task_name`：下游任务名称，集群内唯一
+- `AS REPLICA OF`：指定上游任务的名称
+- `OBJECT_TYPES`：同步级别，与上游对应，支持 account/database/table
+- `ALLOWED_DATABASES`：database/table级别必填，指定下游数据库名称
+- `ALLOWED_TABLES`：table级别必填，指定下游表名称
+- `STAGE`：引用之前创建的Stage名称，包含S3配置信息
 - `SYNC_MODE`：同步模式
   - `'auto'`（默认）：自动跟随最新数据，持续同步
   - `'manual'`：定时同步到当前时间戳，不自动跟随
@@ -185,42 +243,49 @@ CREATE DOWNSTREAM S3 SYNC <task_name>
 
 ```sql
 -- Account级别：同步整个账号
-CREATE DOWNSTREAM S3 SYNC sync_account
-  S3 CONFIG (...);
+CREATE REPLICATION GROUP sync_account_replica
+  AS REPLICA OF sync_account
+  OBJECT_TYPES = account
+  STAGE = s3_sync_stage;
 
 -- Database级别：同步整个数据库
-CREATE DOWNSTREAM S3 SYNC sync_tpcc
-  DATABASE tpcc_replica
-  S3 CONFIG (...);
+CREATE REPLICATION GROUP sync_tpcc_replica
+  AS REPLICA OF sync_tpcc
+  OBJECT_TYPES = database
+  ALLOWED_DATABASES = tpcc_replica
+  STAGE = s3_sync_stage;
 
 -- Table级别：同步单张表（需先创建表结构）
 CREATE TABLE tpcc_replica.orders LIKE tpcc.orders;
 
-CREATE DOWNSTREAM S3 SYNC sync_orders
-  DATABASE tpcc_replica TABLE orders
-  S3 CONFIG (...)
-  SYNC_MODE 'auto'
-  SYNC_INTERVAL 60;
+CREATE REPLICATION GROUP sync_orders_replica
+  AS REPLICA OF sync_orders
+  OBJECT_TYPES = table
+  ALLOWED_DATABASES = tpcc_replica
+  ALLOWED_TABLES = orders
+  STAGE = s3_sync_stage
+  SYNC_MODE = 'auto'
+  SYNC_INTERVAL = 60;
 ```
 
 ---
 
-### 3.3 查看任务状态
+### 3.4 查看任务状态
 
 ```sql
 -- 查看所有任务
-SHOW S3 SYNC TASKS;
+SHOW REPLICATION GROUPS;
 
 -- 查看特定任务
-SHOW S3 SYNC TASK <task_name>;
+SHOW REPLICATION GROUP <task_name>;
 ```
 
 ---
 
-### 3.4 删除任务
+### 3.5 删除任务
 
 ```sql
-DROP S3 SYNC TASK <task_name>;
+DROP REPLICATION GROUP <task_name>;
 ```
 
 ---
