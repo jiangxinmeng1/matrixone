@@ -127,36 +127,21 @@ CREATE STAGE s3_sync_stage
 **语法**：
 
 ```sql
-CREATE REPLICATION GROUP <task_name>
-  OBJECT_TYPES = account
-  STAGE = <stage_name>
-  [SYNC_INTERVAL = <seconds>]
-  [RETENTION_DAYS = <days>];
-
-CREATE REPLICATION GROUP <task_name>
-  OBJECT_TYPES = database
-  ALLOWED_DATABASES = <db_name>
-  STAGE = <stage_name>
-  [SYNC_INTERVAL = <seconds>]
-  [RETENTION_DAYS = <days>];
-
-CREATE REPLICATION GROUP <task_name>
-  OBJECT_TYPES = table
-  ALLOWED_DATABASES = <db_name>
-  ALLOWED_TABLES = <table_name>
-  STAGE = <stage_name>
+CREATE PUBLICATION <publication_name>
+  DATABASE <db_name>
+  [TABLE <table_name>]
+  TO STAGE <stage_name>
   [SYNC_INTERVAL = <seconds>]
   [RETENTION_DAYS = <days>];
 ```
 
 **参数说明**：
-- `task_name`：配置名称，集群内唯一
-- `OBJECT_TYPES`：同步级别，支持：
-  - `account`：同步整个账号下的所有表
+- `publication_name`：配置名称，集群内唯一
+- 同步级别，支持：
   - `database`：同步指定数据库下的所有表
   - `table`：同步指定表
-- `ALLOWED_DATABASES`：database/table级别必填，指定数据库名称
-- `ALLOWED_TABLES`：table级别必填，指定表名称
+- `DATABASE`：指定数据库名称
+- `TABLE`：table级别必填，指定表名称
 - `STAGE`：引用之前创建的Stage名称，要和上游的s3一致
 - `SYNC_INTERVAL`：同步间隔（秒），默认60秒
 - `RETENTION_DAYS`：增量数据保留天数，默认7天
@@ -164,23 +149,16 @@ CREATE REPLICATION GROUP <task_name>
 **示例**：
 
 ```sql
--- Account级别：同步整个账号
-CREATE REPLICATION GROUP sync_account
-  OBJECT_TYPES = account
-  STAGE = s3_sync_stage;
-
 -- Database级别：同步整个数据库
-CREATE REPLICATION GROUP sync_tpcc
-  OBJECT_TYPES = database
-  ALLOWED_DATABASES = tpcc
-  STAGE = s3_sync_stage;
+CREATE PUBLICATION sync_tpcc
+  DATABASE tpcc
+  TO STAGE s3_sync_stage;
 
 -- Table级别：同步单张表
-CREATE REPLICATION GROUP sync_orders
-  OBJECT_TYPES = table
-  ALLOWED_DATABASES = tpcc
-  ALLOWED_TABLES = orders
-  STAGE = s3_sync_stage
+CREATE PUBLICATION sync_orders
+  DATABASE = tpcc
+  TABLE = orders
+  TO STAGE s3_sync_stage
   SYNC_INTERVAL = 60
   RETENTION_DAYS = 7;
 ```
@@ -192,27 +170,10 @@ CREATE REPLICATION GROUP sync_orders
 **语法**：
 
 ```sql
-CREATE REPLICATION GROUP <task_name>
-  AS REPLICA OF <upstream_task_name>
-  OBJECT_TYPES = account
-  STAGE = <stage_name>
-  [SYNC_MODE = <mode>]
-  [SYNC_INTERVAL = <seconds>];
 
-CREATE REPLICATION GROUP <task_name>
-  AS REPLICA OF <upstream_task_name>
-  OBJECT_TYPES = database
-  ALLOWED_DATABASES = <db_name>
-  STAGE = <stage_name>
-  [SYNC_MODE = <mode>]
-  [SYNC_INTERVAL = <seconds>];
-
-CREATE REPLICATION GROUP <task_name>
-  AS REPLICA OF <upstream_task_name>
-  OBJECT_TYPES = table
-  ALLOWED_DATABASES = <db_name>
-  ALLOWED_TABLES = <table_name>
-  STAGE = <stage_name>
+CREATE DATABASE <db_name>
+  [TABLE table_name]
+  FROM STAGE <stage_name>
   [SYNC_MODE = <mode>]
   [SYNC_INTERVAL = <seconds>];
 ```
@@ -232,28 +193,15 @@ CREATE REPLICATION GROUP <task_name>
 **示例**：
 
 ```sql
--- Account级别：同步整个账号
-CREATE REPLICATION GROUP sync_account_replica
-  AS REPLICA OF sync_account
-  OBJECT_TYPES = account
-  STAGE = s3_sync_stage;
 
 -- Database级别：同步整个数据库
-CREATE REPLICATION GROUP sync_tpcc_replica
-  AS REPLICA OF sync_tpcc
-  OBJECT_TYPES = database
-  ALLOWED_DATABASES = tpcc_replica
-  STAGE = s3_sync_stage;
+CREATE DATABASE tpcc_replica
+  FROM STAGE s3_sync_stage;
 
--- Table级别：同步单张表（需先创建表结构）
-CREATE TABLE tpcc_replica.orders LIKE tpcc.orders;
-
-CREATE REPLICATION GROUP sync_orders_replica
-  AS REPLICA OF sync_orders
-  OBJECT_TYPES = table
-  ALLOWED_DATABASES = tpcc_replica
-  ALLOWED_TABLES = orders
-  STAGE = s3_sync_stage
+-- Table级别：同步单张表
+CREATE DATABASE tpcc_replica
+  TABLE orders
+  from STAGE s3_sync_stage
   SYNC_MODE = 'auto'
   SYNC_INTERVAL = 60;
 ```
@@ -294,7 +242,7 @@ DROP REPLICATION GROUP <task_name>;
 CREATE TABLE mo_catalog.mo_s3_sync_configs (
     -- 任务标识
     task_id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    task_name            VARCHAR(5000) NOT NULL,
+    task_name            VARCHAR(5000) NOT NULL,         -- 下游：accountid_dbname_tablename
     cluster_role         VARCHAR(16) NOT NULL,           -- 'upstream' 或 'downstream'
     
     -- 同步级别和范围
