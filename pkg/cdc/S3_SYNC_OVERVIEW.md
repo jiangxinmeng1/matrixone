@@ -67,22 +67,22 @@
 
 ### 2.2 核心组件
 
-**TaskScanner**：
-- **S3SyncTaskScanner**：处理ddl变化
+**Task Scanner**：
+- **S3 Sync Task Scanner**：处理ddl变化
 - 处理database级别订阅里新建的表
 - 处理表truncate后的table_id变化
 
 **Executor**：
-- **S3SyncExecutor**：CN启动时创建，用同一个Executor处理本集群作为上游或下游的job
+- **S3 Sync Executor**：CN启动时创建，用同一个Executor处理本集群作为上游或下游的job
 - 处理每个表的同步
 - 为每个表任务提交相应的Iteration
 
 **上游**：
-- **UpstreamIteration**：读取增量数据并复制到S3
+- **Upstream Iteration**：读取增量数据并复制到S3
 - **Snapshot & GC**：生成快照并清理过期增量数据
 
 **下游**：
-- **DownstreamIteration**：从S3消费数据并应用到Catalog
+- **Downstream Iteration**：从S3消费数据并应用到Catalog
 
 ---
 
@@ -412,13 +412,13 @@ s3://{bucket}/{dir}/s3_publication/{publication_name}
 
 ### 6.1 Executor和Scanner启动
 
-**S3SyncExecutor**：
-1. 集群启动时创建S3SyncExecutor（单例，作为上游/下游使用同一个executor）
+**S3 Sync Executor**：
+1. 集群启动时创建S3 Sync Executor（单例，作为上游/下游使用同一个executor）
 2. 从`mo_s3_sync_tasks`加载所有表级任务
 3. 重启时将所有`job_state='pending'`或`'running'`的任务置为`'complete'`（Iteration是幂等的）
 4. 为每张表提交UpstreamIteration,DownstreamIteration和GC
 
-**S3SyncTaskScanner**：
+**S3 Sync Task Scanner**：
 1. 集群启动时创建TaskScanner（单例）
 2. 从`mo_s3_sync_configs`加载所有配置
 3. 定期（如每分钟）扫描：
@@ -428,7 +428,7 @@ s3://{bucket}/{dir}/s3_publication/{publication_name}
 4. 发现新表：在`mo_s3_sync_tasks`中创建新记录
 5. 表ID变化（如truncate后）：停止旧任务，创建新任务
 
-### 6.2 UpstreamIteration
+### 6.2 Upstream Iteration
 
 **Watermark选择策略**：
 - 从CN的Partition State读取ObjectEntry列表
@@ -466,7 +466,7 @@ s3://{bucket}/{dir}/s3_publication/{publication_name}
 
 ## 7. 下游处理流程
 
-### 7.1 DownstreamIteration
+### 7.1 Downstream Iteration
 
 **确定消费范围**：
 - 扫描S3目录，列出所有批次目录
