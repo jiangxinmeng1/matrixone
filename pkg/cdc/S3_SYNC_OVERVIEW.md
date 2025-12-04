@@ -149,7 +149,6 @@ CREATE TABLE mo_catalog.mo_sync_configs (
     
     -- 同步级别和范围
     sync_level           VARCHAR(16) NOT NULL,           -- 'database', 'table'
-    account_id           BIGINT NOT NULL,
     db_name              VARCHAR(5000),                   -- database/table级别必填
     table_name           VARCHAR(5000),                   -- table级别必填
     
