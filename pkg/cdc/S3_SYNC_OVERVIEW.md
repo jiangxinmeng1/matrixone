@@ -177,7 +177,7 @@ CREATE DATABASE <db_name>
 - `TABLE`：table级别必填，指定下游表名称
 - `STAGE`：引用之前创建的Stage名称，包含S3配置信息，和上游一致
 - `publication_name`:上游的publication name
-- `SYNC_INTERVAL`：检查间隔（秒），默认60秒
+- `SYNC_INTERVAL`：同步间隔（秒），默认60秒
 
 **示例**：
 
