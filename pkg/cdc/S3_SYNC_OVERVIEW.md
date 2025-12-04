@@ -33,17 +33,21 @@
 ┌──────────────┐                           ┌──────────────┐
 │   CN Node    │                           │   CN Node    │
 │              │                           │ ┌──────────┐ │
-│              │                           │ │  Sync    │ │
+│              │◄────── SQL连接 ────────────┤ │  Sync    │ │
 │              │                           │ │ Executor │ │
-│              │                           │ └────┬─────┘ │
-│              │                           │      │       │
-│              │                           │      | DownstreamIteration
-│              │                           │      │       │
-│              │                           │      │ 连接到上游
-│              │                           │      │ 获取Snapshot
-│              │                           │      │ 获取ObjectList
-│              │                           │      │ 应用数据
-│              │                           │      ↓       │
+│              │                           │ └──────────┘ │
+│              │                           │              │
+│              │◄─── 1. SQL请求做snapshot ─┤              │
+│              │◄───    SQL查询三表 ───────┤              │
+│              │                           │              │
+│              │◄─── 2. SQL查询objectlist ─┤              │
+│              │      diff                 │              │
+│              │                           │              │
+│              │◄─── 3. SQL依次获取object ─┤              │
+│              │                           │              │
+│              │◄─── 4. SQL删除上上次 ────┤              │
+│              │      snapshot             │              │
+│              │                           │              │
 └──────────────┘                           └──────────────┘
 ```
 
@@ -231,19 +235,23 @@ CREATE TABLE mo_catalog.mo_sync_tasks (
 
 **处理步骤**：
 
-1. **在同一事务中执行**：
+1. **请求上游做snapshot并查询DDL diff**：
    - 连接到上游集群
-   - 在上游打snapshot，获取DDL diff
-   - 获取两个snapshot里的objectlist diff
+   - 请求上游创建新的snapshot
+   - 查询上游mo_catalog三表（mo_databases、mo_tables、mo_columns）获取DDL diff
+   - 应用DDL变更到下游
 
-2. **获取ObjectList差异**：
-   - 比较当前watermark对应的snapshot和最新snapshot
-   - 获取objectlist的差异（新增、删除的object）
+2. **查询objectlist diff**：
+   - 查询上游两个snapshot（当前watermark对应的snapshot和最新snapshot）的objectlist
+   - 计算objectlist差异（新增、删除的object）
 
-3. **逐个获取并应用Object**：
-   - 下游按objectlist一个一个获取object
+3. **依次获取并应用Object**：
+   - 下游按objectlist逐个向上游请求获取object
    - 将object应用到下游Catalog
-   - 更新watermark
+   - 更新watermark和snapshot_ts
+
+4. **清理旧snapshot**：
+   - 删除上上次的snapshot（保留当前和上一次snapshot）
 
 **状态管理和并发控制**：
 - 执行前检查cn_uuid、iteration_lsn、iteration_state是否一致
