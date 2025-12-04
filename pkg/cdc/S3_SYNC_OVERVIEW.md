@@ -64,20 +64,20 @@
 
 ## 3. SQL接口
 
-上游：
+### 3.1 上游 - 创建Publication任务(现有的publication)
 ```sql
 CREATE PUBLICATION <pub_name> ACCOUNT <account_name> DATABASE <db_name> TABLE <table_name>;
 ```
 
-### 3.1 下游 - 创建Cross-Cluster Replication任务
+### 3.1 下游 - 创建Subscription任务
 
 **语法**：
 
 ```sql
-CREATE SUBSCRIPTION <subscription_name>
-  DATABASE <db_name>
+CREATE DATABASE <db_name>
   [TABLE <table_name>]
   FROM 'mysql://<account>#<user>:<password>@<host>:<port>'
+  PUBLICATION <pub_name>
   [SYNC_INTERVAL = <seconds>];
 ```
 
@@ -95,15 +95,15 @@ CREATE SUBSCRIPTION <subscription_name>
 
 ```sql
 -- Database级别：复制整个数据库
-CREATE SUBSCRIPTION sync_tpcc
-  DATABASE tpcc
-  FROM 'mysql://myaccount#root:password@127.0.0.1:6001';
+CREATE DATABASE tpcc
+  FROM 'mysql://myaccount#root:password@127.0.0.1:6001' 
+  PUBLICATION my_publication;
 
 -- Table级别：复制单张表
-CREATE SUBSCRIPTION sync_orders
-  DATABASE tpcc
+CREATE DATABASE tpcc
   TABLE orders
   FROM 'mysql://myaccount#root:password@127.0.0.1:6001'
+  PUBLICATION my_publication
   SYNC_INTERVAL = 60;
 ```
 
@@ -111,26 +111,14 @@ CREATE SUBSCRIPTION sync_orders
 
 ### 3.2 查看任务状态
 
-```sql
-SHOW SUBSCRIPTIONS;
-
-showSubscriptionsOutputColumns = [8]Column{
-    "subscription_name",      // VARCHAR - 订阅名称
-    "upstream_conn",          // VARCHAR - 上游连接字符串
-    "database",               // VARCHAR - 数据库名称
-    "tables",                 // TEXT - 表列表（* 表示所有表）
-    "sync_interval",          // INT - 复制间隔（秒）
-    "status",                 // TINYINT - 状态（0=Normal, 其他=Deleted/Error）
-    "create_time",            // TIMESTAMP - 创建时间
-    "update_time",            // TIMESTAMP - 更新时间
-}
-```
+- SHOW PUBLICATION, SHOW SUBSCRIPTIONS 和现有的一致;
 
 ---
 
 ### 3.3 删除任务
 
 ```sql
+DROP PUBLICATION <publication_name>;
 DROP SUBSCRIPTION <subscription_name>;
 ```
 
