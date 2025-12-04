@@ -132,7 +132,7 @@ CREATE PUBLICATION <publication_name>
   [TABLE <table_name>]
   TO STAGE <stage_name>
   [SYNC_INTERVAL = <seconds>]
-  [RETENTION_DAYS = <days>];
+  [RETENTION = <duration>];
 ```
 
 **参数说明**：
@@ -144,7 +144,7 @@ CREATE PUBLICATION <publication_name>
 - `TABLE`：table级别必填，指定表名称
 - `STAGE`：引用之前创建的Stage名称，要和上游的s3一致
 - `SYNC_INTERVAL`：同步间隔（秒），默认60秒
-- `RETENTION_DAYS`：增量数据保留天数，默认7天
+- `RETENTION`：增量数据保留时间，默认1天
 
 **示例**：
 
@@ -174,7 +174,6 @@ CREATE PUBLICATION sync_orders
 CREATE DATABASE <db_name>
   [TABLE table_name]
   FROM STAGE <stage_name>.<publication_name>
-  [SYNC_MODE = <mode>]
   [SYNC_INTERVAL = <seconds>];
 ```
 
@@ -182,9 +181,7 @@ CREATE DATABASE <db_name>
 - `DATABASE`：指定下游数据库名称
 - `TABLE`：table级别必填，指定下游表名称
 - `STAGE`：引用之前创建的Stage名称，包含S3配置信息
-- `SYNC_MODE`：同步模式
-  - `'auto'`（默认）：自动跟随最新数据，持续同步
-  - `'manual'`：定时同步到当前时间戳，不自动跟随
+- `publication_name`:上游的publication name]
 - `SYNC_INTERVAL`：检查间隔（秒），默认60秒
 
 **示例**：
@@ -199,7 +196,6 @@ CREATE DATABASE tpcc_replica
 CREATE DATABASE tpcc_replica
   TABLE orders
   from STAGE s3_sync_stage
-  SYNC_MODE = 'auto'
   SYNC_INTERVAL = 60;
 ```
 
@@ -209,7 +205,7 @@ CREATE DATABASE tpcc_replica
 
 在原有基础上加了stage列：
 ```sql
-SHOW PUBLICATIONS [<publication_name>];
+SHOW PUBLICATIONS;
 
 showPublicationsOutputColumns = [8]Column{
     "publication",           // VARCHAR - 发布名称
@@ -264,7 +260,7 @@ DROP TABLE <table_name>;
 CREATE TABLE mo_catalog.mo_s3_sync_configs (
     -- 任务标识
     task_id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    task_name            VARCHAR(5000) NOT NULL,         -- 下游：accountid_dbname_tablename
+    publication_name     VARCHAR(5000) NOT NULL,         
     cluster_role         VARCHAR(16) NOT NULL,           -- 'upstream' 或 'downstream'
     
     -- 同步级别和范围
@@ -273,8 +269,8 @@ CREATE TABLE mo_catalog.mo_s3_sync_configs (
     db_name              VARCHAR(5000),                   -- database/table级别必填
     table_name           VARCHAR(5000),                   -- table级别必填
     
-    -- S3配置（JSON格式）
-    stage_name            VARCHAR(5000),                  -- {endpoint, region, bucket, dir, access_key, secret_key}
+    -- S3配置
+    stage_name            VARCHAR(5000),                  
     
     -- 同步配置（JSON格式）
     sync_config          JSON NOT NULL,                  -- {retention_days, sync_mode, sync_interval}
@@ -310,14 +306,13 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
     db_name              VARCHAR(5000) NOT NULL,
     table_id             BIGINT NOT NULL,
     table_name           VARCHAR(5000) NOT NULL, 
-    lsn      
     
     -- 同步状态 - data对象
     watermark            TIMESTAMP(6) NOT NULL DEFAULT '1970-01-01 00:00:00',
     snapshot_watermark   TIMESTAMP(6),                -- data快照的watermark（上游）
     
     -- Job状态
-    job_state            TINYINT NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'complete'
+    job_state            TINYINT NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'complete', 'error', 'cancel'
     cn_uuid              VARCHAR(64),                    -- 执行任务的CN标识
     job_lsn              BIGINT DEFAULT 0,               -- Job序列号
     
@@ -337,8 +332,8 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
 
 ```
 s3://{bucket}/{dir}/s3_publication/{publication_name}
-├── {account_id}/                                # 数据目录
-│   └── {db_id}/{table_id}/
+├── {account_id}/{db_id}/{table_id}/            # 数据目录
+│       |
 │       ├── 0-{snapshot_ts}/                    # 历史快照（只保留1个）
 │       │   ├── data/                           # 数据对象
 │       │   │   ├── object_list.meta            # 排序后的ObjectEntry列表
@@ -418,69 +413,49 @@ s3://{bucket}/{dir}/s3_publication/{publication_name}
 ### 6.1 Executor和Scanner启动
 
 **S3SyncExecutor**：
-1. CN启动时创建S3SyncExecutor（单例，上下游共用）
+1. 集群启动时创建S3SyncExecutor（单例，上下游共用）
 2. 从`mo_s3_sync_tasks`加载所有表级任务
-3. 重启时将所有`job_state='pending'`或`'running'`的任务置为`'complete'`（Job是幂等的）
-4. 为每张表提交UpstreamSyncJob和SnapshotGCJob
+3. 重启时将所有`job_state='pending'`或`'running'`的任务置为`'complete'`（Iteration是幂等的）
+4. 为每张表提交UpstreamIteration,DownstreamIteration和GC
 
 **S3SyncTaskScanner**：
-1. CN启动时创建TaskScanner（单例）
+1. 集群启动时创建TaskScanner（单例）
 2. 从`mo_s3_sync_configs`加载所有配置
 3. 定期（如每分钟）扫描：
-   - account级别：扫描账号下所有数据库和表
    - database级别：扫描数据库下所有表
    - table级别：检查表是否存在和table_id是否变化
    - 上游从mo_catalog里读，下游从s3的ddl目录里读
 4. 发现新表：在`mo_s3_sync_tasks`中创建新记录
 5. 表ID变化（如truncate后）：停止旧任务，创建新任务
 
-### 6.2 UpstreamSyncJob
-
-**data和tombstone分开处理**：
-- Job对data对象和tombstone对象分别执行同步流程
-- 但tombstone的watermark必须等于data的watermark（保证同步进度一致）
-- 分别写入到data/和tombstone/目录
+### 6.2 UpstreamIteration
 
 **Watermark选择策略**：
 - 从CN的Partition State读取ObjectEntry列表
-- 选择某个已刷盘aobj的最大commit ts之前的某个时间戳作为new_watermark
+- 选择某个已刷盘data aobj的最大commit ts之前的某个时间戳作为new_watermark
   - 保证该时间戳之前的所有数据都已刷盘
   - 不需要考虑内存中的数据
+  - tombstone的watermark必须等于data的watermark（保证同步进度一致）
+  - 如果tombstone的aobj跨越watermark边界，需要剪裁该aobj
 
 **Object选择策略**：
 - 选取所有CreateTS或DeleteTS落在`(current_watermark, new_watermark]`区间内的object
-  - 如果tombstone的aobj跨越watermark边界，需要剪裁该aobj
-  - 只包含watermark之前的部分数据
-  - 下次同步会用完整的object覆盖
-
-**复制到S3**：
-- 创建时间戳目录：`{current_watermark}-{new_watermark}/`
-- 在该目录下创建 `data/` 和 `tombstone/` 子目录
-- data对象：复制到 `{current_watermark}-{new_watermark}/data/` 目录
-- tombstone对象：复制到 `{current_watermark}-{new_watermark}/tombstone/` 目录
-  - 如果有被剪裁的aobj，写入剪裁后的版本
-- 写入之前按Pk排序，下游能作为nobj应用
-- 分别在 data/ 和 tombstone/ 目录下写入各自的 object_list.meta 和 manifest.json
+  - 复制新建的object
+  - 删除的object只记录在objectlist里
 
 **状态管理和并发控制**：
-- 执行前检查cn_uuid、job_lsn、state是否一致，更新state
+- 执行后前检查cn_uuid、job_lsn、state是否一致，更新state，watermark
 - 清理S3中上次未完成的同步目录
-- 完成后更新watermark
-- 更新updated_at，将job_state更新为'complete'
 
-### 6.3 SnapshotGCJob
-
-**data和tombstone分开处理**：
-- Job对data对象和tombstone对象分别执行快照生成和GC
-- 分别在data/和tombstone/目录下操作
+### 6.3 GC
 
 **快照生成**：
 - 触发条件：最旧的增量目录超过retention_days
 - 旧的文件合并成新的snapshot
 
 **GC清理**：
-- 删除旧的快照目录（如果存在）：`0-{old_snapshot_ts}/`（包含其下的 data/ 和 tombstone/）
-- 删除超过retention_days的增量目录：`{start_ts}-{end_ts}/`（包含其下的 data/ 和 tombstone/）
+- 删除旧的快照目录（如果存在）：`0-{old_snapshot_ts}/`
+- 删除超过retention_days的增量目录：`{start_ts}-{end_ts}/`
 - 更新系统表的data_snapshot_watermark和tombstone_snapshot_watermark
 
 **原子性保证**：
@@ -491,80 +466,38 @@ s3://{bucket}/{dir}/s3_publication/{publication_name}
 
 ## 7. 下游处理流程
 
-### 7.1 DownstreamConsumeJob
+### 7.1 DownstreamIteration
 
-**data和tombstone分开处理**：
-- Job对data对象和tombstone对象分别执行消费流程
-- data_watermark和tombstone_watermark保持相等（与上游一致）
-- 分别从data/和tombstone/目录消费
+**确定消费范围**：
+- 扫描S3目录，列出所有批次目录
+- 如果watermark=0，从快照开始消费
+- 否则，找到所有start_ts = watermark + 1 的增量目录
+
+**应用数据**：
+- 按时间顺序遍历时间戳目录
+- 对每个时间戳目录同时消费data和tombstone：
+  - 遍历ObjectEntry，下载并创建CN类型ObjectEntry
+  - 可能上个iteration应用了被切分的aobj，这次覆盖这个aobj
+  - 为了保证原子性，在一个事务里执行
 
 **watermark落后检测**：
 - 读取系统表的watermark（data和tombstone的watermark相等）和S3快照的snapshot_ts
 - 如果watermark < snapshot_ts：
   - 下游数据已过期，无法继续增量同步
   - 清理本地表的所有object（data和tombstone）
-  - 重置data_watermark和tombstone_watermark为0
-  - 从快照重新开始应用
-
-**确定消费范围**：
-- 扫描S3目录，列出所有批次目录
-- 如果watermark=0，从快照开始消费（data和tombstone都从快照开始）
-- 否则，找到所有start_ts = watermark + 1 的增量目录
-
-**应用数据**：
-- 按时间顺序遍历时间戳目录（`{start_ts}-{end_ts}/` 或 `0-{snapshot_ts}/`）
-- 对每个时间戳目录同时消费data和tombstone：
-  - 检查 `{time_dir}/data/` 和 `{time_dir}/tombstone/` 目录下的 manifest.json 是否存在
-  - 读取各自的 object_list.meta
-  - 开启新事务
-  - 先应用data对象，再应用tombstone对象
-  - 遍历ObjectEntry，检查幂等性，下载并创建CN类型ObjectEntry
-  - 提交事务
+  - 重置watermark为0
+  - 从0重新开始应用
 
 **状态管理和并发控制**：
 - 执行前检查cn_uuid、job_lsn、job_state是否一致
-- 检查startts是否低于新的snapshot
-- 每个批次成功后同时更新data_watermark和tombstone_watermark（保持相等）
+- 检查上游是否做了GC，如果GC了iteration用到的数据，数据可能有确实，需要重试
 - 完成后将job_state更新为'complete'
 
 ---
 
 ## 8. 关键设计要点
 
-### 8.1 防止重复执行
-
-**问题**：多个CN可能同时运行Executor，或Job重复提交
-
-**解决方案**：
-- 系统表记录cn_uuid，标识任务归属的CN
-- Executor提交Job前检查cn_uuid是否匹配
-- Job执行时检查cn_uuid、job_lsn、state：
-  - cn_uuid必须匹配当前CN
-  - job_lsn必须与传入的一致
-  - state必须为'pending'
-- 更新系统表时再次验证上述字段
-- 重启时将pending/running的任务置为complete，新Job会覆盖
-
-### 8.2 Watermark选择策略
-
-**关键设计**：选择某个已刷盘aobj的最大commit ts之前的某个时间戳作为watermark
-
-**保证**：
-- 该时间戳之前的所有数据都已经刷盘
-- 不需要考虑内存中的数据
-- 避免数据不完整或丢失
-
-**data和tombstone的watermark关系**：
-- tombstone的watermark必须等于data的watermark
-- 保证data和tombstone的同步进度一致
-
-**tombstone的aobj剪裁**：
-- 如果tombstone的aobj的CreateTS跨越了watermark边界
-- 需要对该aobj进行剪裁（只保留watermark之前的部分）
-- 下次同步会用完整的object覆盖这个被剪裁的aobj
-- 保证最终数据完整性
-
-### 8.3 下游Object不参与Merge
+### 8.1 下游Object不参与Merge
 
 **设计理念**：下游只负责复制数据，不参与数据整理
 
