@@ -179,11 +179,8 @@ CREATE DATABASE <db_name>
 ```
 
 **参数说明**：
-- `task_name`：下游任务名称，集群内唯一
-- `AS REPLICA OF`：指定上游任务的名称
-- `OBJECT_TYPES`：同步级别，与上游对应，支持 account/database/table
-- `ALLOWED_DATABASES`：database/table级别必填，指定下游数据库名称
-- `ALLOWED_TABLES`：table级别必填，指定下游表名称
+- `DATABASE`：指定下游数据库名称
+- `TABLE`：table级别必填，指定下游表名称
 - `STAGE`：引用之前创建的Stage名称，包含S3配置信息
 - `SYNC_MODE`：同步模式
   - `'auto'`（默认）：自动跟随最新数据，持续同步
@@ -211,19 +208,17 @@ CREATE DATABASE tpcc_replica
 ### 3.4 查看任务状态
 
 ```sql
--- 查看所有任务
-SHOW REPLICATION GROUPS;
-
--- 查看特定任务
-SHOW REPLICATION GROUP <task_name>;
+SHOW REPLICATIONS [<publication_name>];
+SHOW SUBSRIPTIONS;
 ```
-
 ---
 
 ### 3.5 删除任务
 
 ```sql
-DROP REPLICATION GROUP <task_name>;
+DROP REPLICATIONS;
+DROP DATABASE <db_name>;
+DROP TABLE <table_name>;
 ```
 
 ---
