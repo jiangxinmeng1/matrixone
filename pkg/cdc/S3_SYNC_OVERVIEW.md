@@ -207,6 +207,7 @@ CREATE DATABASE tpcc_replica
 
 ### 3.4 查看任务状态
 
+在原有基础上加了stage列：
 ```sql
 SHOW PUBLICATIONS [<publication_name>];
 
