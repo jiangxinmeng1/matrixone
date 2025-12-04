@@ -209,7 +209,7 @@ CREATE DATABASE tpcc_replica
 
 ```sql
 SHOW REPLICATIONS [<publication_name>];
-SHOW SUBSRIPTIONS;
+SHOW SUBSCRIPTIONS;
 ```
 ---
 
