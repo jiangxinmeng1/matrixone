@@ -137,7 +137,7 @@ CREATE PUBLICATION <publication_name>
   - `table`：同步指定表
 - `DATABASE`：指定数据库名称
 - `TABLE`：table级别必填，指定表名称
-- `STAGE`：引用之前创建的Stage名称，要和上游的s3一致
+- `STAGE`：引用之前创建的Stage名称
 - `SYNC_INTERVAL`：同步间隔（秒），默认60秒
 - `RETENTION`：增量数据保留时间，默认1天
 
@@ -175,7 +175,7 @@ CREATE DATABASE <db_name>
 **参数说明**：
 - `DATABASE`：指定下游数据库名称
 - `TABLE`：table级别必填，指定下游表名称
-- `STAGE`：引用之前创建的Stage名称，包含S3配置信息
+- `STAGE`：引用之前创建的Stage名称，包含S3配置信息，和上游一致
 - `publication_name`:上游的publication name
 - `SYNC_INTERVAL`：检查间隔（秒），默认60秒
 
