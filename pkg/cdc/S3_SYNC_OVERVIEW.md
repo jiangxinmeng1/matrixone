@@ -173,7 +173,7 @@ CREATE PUBLICATION sync_orders
 
 CREATE DATABASE <db_name>
   [TABLE table_name]
-  FROM STAGE <stage_name>
+  FROM STAGE <stage_name>.<publication_name>
   [SYNC_MODE = <mode>]
   [SYNC_INTERVAL = <seconds>];
 ```
@@ -243,7 +243,7 @@ showSubscriptionsOutputColumns = [9]Column{
 ### 3.5 删除任务
 
 ```sql
-DROP REPLICATIONS;
+DROP PUBLICATION <publication_name>;
 DROP DATABASE <db_name>;
 DROP TABLE <table_name>;
 ```
@@ -336,7 +336,7 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
 ### 5.1 分层存储策略
 
 ```
-s3://{bucket}/{dir}/
+s3://{bucket}/{dir}/{publication_name}
 ├── {account_id}/                                # 数据目录
 │   └── {db_id}/{table_id}/
 │       ├── 0-{snapshot_ts}/                    # 历史快照（只保留1个）
