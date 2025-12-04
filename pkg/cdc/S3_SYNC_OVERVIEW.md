@@ -200,13 +200,14 @@ CREATE TABLE mo_catalog.mo_sync_configs (
    - 应用DDL变更到下游
 
 2. **查询objectlist diff**：
-   - 查询上游两个snapshot（当前watermark对应的snapshot和最新snapshot）的objectlist
+   - 查询上游两个snapshot（当前watermark对应的snapshot和最新snapshot）的objectlist和新的ts
    - 计算objectlist差异（新增、删除的object）
 
 3. **依次获取并应用Object**：
    - 下游按objectlist逐个向上游请求获取object
    - 将object应用到下游Catalog
    - 更新watermark和snapshot_ts
+   - 某些object要按ts做truncate
 
 4. **清理旧snapshot**：
    - 删除上上次的snapshot（保留当前和上一次snapshot）
