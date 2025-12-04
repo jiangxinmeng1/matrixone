@@ -162,43 +162,11 @@ CREATE TABLE mo_catalog.mo_sync_configs (
     -- 任务控制
     state                TINYINT,  -- 'running', 'stopped'
     
-    -- 时间戳
-    created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-);
-```
-
----
-
-### 4.2 mo_sync_tasks（同步任务状态表）
-
-**存储位置**：`mo_catalog` 数据库
-
-**作用**：记录同步任务中每张表的状态信息
-
-**Schema**：
-
-```sql
-CREATE TABLE mo_catalog.mo_sync_tasks (
-    job_id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-
-    task_id              INT UNSIGNED NOT NULL,
-    
-    -- 表信息
-    account_id           BIGINT NOT NULL,
-    db_id                BIGINT NOT NULL,
-    db_name              VARCHAR(5000) NOT NULL,
-    table_id             BIGINT NOT NULL,
-    table_name           VARCHAR(5000) NOT NULL, 
-    
-    -- 同步状态
-    watermark            TIMESTAMP(6) NOT NULL DEFAULT '1970-01-01 00:00:00',
-    snapshot_ts          TIMESTAMP(6),                    -- 当前使用的快照时间戳
-    
-    -- Job状态
+    -- 执行状态
     iteration_state      TINYINT NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'complete', 'error', 'cancel'
-    cn_uuid              VARCHAR(64),                    -- 执行任务的CN标识
     iteration_lsn        BIGINT DEFAULT 0,               -- Job序列号
+    context              JSON,                           -- iteration上下文，如snapshot名称等
+    cn_uuid              VARCHAR(64),                    -- 执行任务的CN标识
     
     -- 错误信息
     error_message        VARCHAR(5000),                  -- 错误信息
