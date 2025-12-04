@@ -1,4 +1,4 @@
-# MatrixOne 跨集群数据物理同步 - 概要设计
+# MatrixOne Cross-Cluster Replication - 概要设计
 
 **创建日期**: 2025-11-19  
 **文档类型**: 概要设计文档
@@ -20,7 +20,7 @@
 
 ### 1.1 目标
 
-实现MatrixOne跨集群（跨区域、跨云）的数据实时同步，通过SQL直接连接上游集群获取数据。
+实现MatrixOne跨集群（跨区域、跨云）的Cross-Cluster Replication，通过SQL直接连接上游集群获取数据。
 
 ---
 
@@ -54,17 +54,22 @@
 ### 2.2 核心组件
 
 **Executor**：
-- **Sync Executor**：CN启动时创建，只在下游运行
-- 处理整个同步任务，一起执行所有表的同步
+- **Cross-Cluster Replication Executor**：CN启动时创建，只在下游运行
+- 处理整个Cross-Cluster Replication任务，一起执行所有表的复制
 
-**下游**：
-- **Downstream Iteration**：连接到上游集群，获取数据并应用到Catalog
+**Iteration**：
+- 连接到上游集群，获取数据并应用到Catalog
 
 ---
 
 ## 3. SQL接口
 
-### 3.1 下游 - 创建同步任务
+上游：
+```sql
+CREATE PUBLICATION <pub_name> ACCOUNT <account_name> DATABASE <db_name> TABLE <table_name>;
+```
+
+### 3.1 下游 - 创建Cross-Cluster Replication任务
 
 **语法**：
 
@@ -78,23 +83,23 @@ CREATE SUBSCRIPTION <subscription_name>
 
 **参数说明**：
 - `subscription_name`：订阅名称，集群内唯一
-- 同步级别，支持：
-  - `database`：同步指定数据库下的所有表
-  - `table`：同步指定表
+- 复制级别，支持：
+  - `database`：复制指定数据库下的所有表
+  - `table`：复制指定表
 - `DATABASE`：指定数据库名称
 - `TABLE`：table级别必填，指定表名称
 - `FROM`：上游MatrixOne集群的连接字符串
-- `SYNC_INTERVAL`：同步间隔（秒），默认60秒
+- `SYNC_INTERVAL`：复制间隔（秒），默认60秒
 
 **示例**：
 
 ```sql
--- Database级别：同步整个数据库
+-- Database级别：复制整个数据库
 CREATE SUBSCRIPTION sync_tpcc
   DATABASE tpcc
   FROM 'mysql://myaccount#root:password@127.0.0.1:6001';
 
--- Table级别：同步单张表
+-- Table级别：复制单张表
 CREATE SUBSCRIPTION sync_orders
   DATABASE tpcc
   TABLE orders
@@ -114,7 +119,7 @@ showSubscriptionsOutputColumns = [8]Column{
     "upstream_conn",          // VARCHAR - 上游连接字符串
     "database",               // VARCHAR - 数据库名称
     "tables",                 // TEXT - 表列表（* 表示所有表）
-    "sync_interval",          // INT - 同步间隔（秒）
+    "sync_interval",          // INT - 复制间隔（秒）
     "status",                 // TINYINT - 状态（0=Normal, 其他=Deleted/Error）
     "create_time",            // TIMESTAMP - 创建时间
     "update_time",            // TIMESTAMP - 更新时间
@@ -133,11 +138,11 @@ DROP SUBSCRIPTION <subscription_name>;
 
 ## 4. 系统表设计
 
-### 4.1 mo_sync_configs（同步配置表）
+### 4.1 mo_sync_configs（Cross-Cluster Replication配置表）
 
 **存储位置**：`mo_catalog` 数据库
 
-**作用**：记录同步任务的配置信息，支持database/table级别
+**作用**：记录Cross-Cluster Replication任务的配置信息，支持database/table级别
 
 **Schema**：
 
@@ -147,7 +152,7 @@ CREATE TABLE mo_catalog.mo_sync_configs (
     task_id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     subscription_name    VARCHAR(5000) NOT NULL,
     
-    -- 同步级别和范围
+    -- 复制级别和范围
     sync_level           VARCHAR(16) NOT NULL,           -- 'database', 'table'
     db_name              VARCHAR(5000),                   -- database/table级别必填
     table_name           VARCHAR(5000),                   -- table级别必填
@@ -155,7 +160,7 @@ CREATE TABLE mo_catalog.mo_sync_configs (
     -- 上游连接配置
     upstream_conn         VARCHAR(5000) NOT NULL,          -- MySQL连接字符串
     
-    -- 同步配置（JSON格式）
+    -- 复制配置（JSON格式）
     sync_config          JSON NOT NULL,                  -- {sync_interval}
     
     -- 任务控制
@@ -182,11 +187,11 @@ CREATE TABLE mo_catalog.mo_sync_configs (
 
 ### 5.1 Executor启动
 
-**Sync Executor**：
-1. 集群启动时创建Sync Executor（单例，只在下游运行）
-2. 从`mo_sync_configs`加载所有同步任务配置
+**Cross-Cluster Replication Executor**：
+1. 集群启动时创建Cross-Cluster Replication Executor（单例，只在下游运行）
+2. 从`mo_sync_configs`加载所有Cross-Cluster Replication任务配置
 3. 重启时将所有`iteration_state='pending'`或`'running'`的任务置为`'complete'`（执行是幂等的）
-4. 定期执行整个同步任务，一起处理所有表
+4. 定期执行整个Cross-Cluster Replication任务，一起处理所有表
 
 ### 5.2 Downstream Iteration
 
