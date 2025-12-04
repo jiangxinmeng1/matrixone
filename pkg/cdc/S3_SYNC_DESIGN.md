@@ -1,4 +1,4 @@
-# MatrixOne 基于S3的跨集群数据同步设计文档
+# MatrixOne 基于跨集群数据同步设计文档
 
 **版本**: 1.0  
 **创建日期**: 2025-11-19
@@ -34,34 +34,10 @@
 - 错误: error message，retry count, first error ts
 - 执行的worker的配置：cn uuid，task status(pending, running, complete, error/cancel)，job lsn
 
-## 3. S3目录结构
 
-```
-s3://{dir}/{account_id}/{db_id}/{table_id}/
-├── {watermark_start}-{watermark_end}/
-│   ├── object_list.meta             # ObjectEntry列表序列化文件
-│   ├── {object_uuid_1}              # TAE Object文件
-│   ├── {object_uuid_2}              # TAE Object文件
-│   ├── ...
-│   └── manifest.json                # 完成标记（上游写完后生成）
-├── {watermark_start}-{watermark_end}/
-│   └── ...
-└── consumer_status.json             # 下游消费状态反馈
-```
+## 3. 核心组件
 
-**说明**：
-- 每个表一个独立目录，路径为 `{account_id}/{db_id}/{table_id}`
-- 每次同步创建一个以watermark范围命名的子目录：`{上次watermark}-{本次watermark}`
-- `object_list.meta`：序列化的ObjectEntry列表，包含CreateTS、DeleteTS、ObjectStats等
-- `{object_uuid}`：TAE的实际数据块文件
-- `manifest.json`：上游写完所有文件后最后生成，标记本次同步完成，下游检测到此文件才开始消费
-- `consumer_status.json`：下游写入的消费状态，上游定期读取
-
----
-
-## 4. 核心组件
-
-### 4.1 UpstreamSyncExecutor（上游同步执行器）
+### 3.1 UpstreamSyncExecutor（上游同步执行器）
 
 **部署位置**：CN节点，每集群一个实例，CN启动时创建
 
@@ -78,7 +54,7 @@ s3://{dir}/{account_id}/{db_id}/{table_id}/
 
 ---
 
-### 4.2 DownstreamSyncExecutor（下游同步执行器）
+### 3.2 DownstreamSyncExecutor（下游同步执行器）
 
 **部署位置**：CN节点，每集群一个实例，CN启动时创建
 
@@ -94,7 +70,7 @@ s3://{dir}/{account_id}/{db_id}/{table_id}/
 
 ---
 
-### 4.3 UpstreamSyncJob（上游同步任务）
+### 3.3 UpstreamSyncJob（上游同步任务）
 
 **执行位置**：CN的TaskService
 
@@ -142,7 +118,7 @@ s3://{dir}/{account_id}/{db_id}/{table_id}/
 
 ---
 
-### 4.4 DownstreamConsumeJob（下游消费任务）
+### 3.4 DownstreamConsumeJob（下游消费任务）
 
 **执行位置**：CN的TaskService
 
@@ -196,7 +172,7 @@ s3://{dir}/{account_id}/{db_id}/{table_id}/
 
 ---
 
-## 5. 关键设计要点
+## 4. 关键设计要点
 
 ### 5.1 防止重复执行
 
@@ -224,7 +200,7 @@ s3://{dir}/{account_id}/{db_id}/{table_id}/
 
 ---
 
-## 6. 总结
+## 5. 总结
 
 本设计通过Executor+Job的架构实现基于S3的跨MO集群数据同步：
 
