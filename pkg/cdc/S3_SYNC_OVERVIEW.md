@@ -45,7 +45,7 @@
 │              │                           │              │
 │              │◄─── 3. SQL依次获取object ─┤              │
 │              │                           │              │
-│              │◄─── 4. SQL删除上上次 ────┤              │
+│              │◄─── 4. SQL删除上上次 ──────┤              │
 │              │      snapshot             │              │
 │              │                           │              │
 └──────────────┘                           └──────────────┘
@@ -55,8 +55,7 @@
 
 **Executor**：
 - **Sync Executor**：CN启动时创建，只在下游运行
-- 处理每个表的同步
-- 为每个表任务提交相应的Iteration
+- 处理整个同步任务，一起执行所有表的同步
 
 **下游**：
 - **Downstream Iteration**：连接到上游集群，获取数据并应用到Catalog
@@ -171,11 +170,11 @@ CREATE TABLE mo_catalog.mo_sync_configs (
 
 ---
 
-### 4.2 mo_sync_tasks（表级同步任务表）
+### 4.2 mo_sync_tasks（同步任务状态表）
 
 **存储位置**：`mo_catalog` 数据库
 
-**作用**：记录每张具体表的同步状态，每行对应一张表
+**作用**：记录同步任务中每张表的状态信息
 
 **Schema**：
 
@@ -214,22 +213,13 @@ CREATE TABLE mo_catalog.mo_sync_tasks (
 
 ## 5. 下游处理流程
 
-### 5.1 Executor和Scanner启动
+### 5.1 Executor启动
 
 **Sync Executor**：
 1. 集群启动时创建Sync Executor（单例，只在下游运行）
-2. 从`mo_sync_tasks`加载所有表级任务
-3. 重启时将所有`iteration_state='pending'`或`'running'`的任务置为`'complete'`（Iteration是幂等的）
-4. 为每张表提交DownstreamIteration
-
-**Task Scanner**：
-1. 集群启动时创建TaskScanner（单例）
-2. 从`mo_sync_configs`加载所有配置
-3. 定期（如每分钟）扫描：
-   - database级别：通过连接上游集群，扫描数据库下所有表
-   - table级别：检查表是否存在和table_id是否变化
-4. 发现新表：在`mo_sync_tasks`中创建新记录
-5. 表ID变化（如truncate后）：停止旧任务，创建新任务
+2. 从`mo_sync_configs`加载所有同步任务配置
+3. 重启时将所有`iteration_state='pending'`或`'running'`的任务置为`'complete'`（执行是幂等的）
+4. 定期执行整个同步任务，一起处理所有表
 
 ### 5.2 Downstream Iteration
 
