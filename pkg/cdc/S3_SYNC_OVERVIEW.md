@@ -208,8 +208,34 @@ CREATE DATABASE tpcc_replica
 ### 3.4 查看任务状态
 
 ```sql
-SHOW REPLICATIONS [<publication_name>];
+SHOW PUBLICATIONS [<publication_name>];
+
+showPublicationsOutputColumns = [8]Column{
+    "publication",           // VARCHAR - 发布名称
+    "database",              // VARCHAR - 数据库名称
+    "tables",                // TEXT - 表列表（* 表示所有表）
+    "sub_account",           // TEXT - 集群内发布
+    "subscribed_accounts",    // TEXT - 集群内发布
+    "stage",                 // TEXT - 发布的stage
+    "create_time",           // TIMESTAMP - 创建时间
+    "update_time",           // TIMESTAMP - 更新时间（可为NULL）
+    "comments",              // TEXT - 注释
+}
+
 SHOW SUBSCRIPTIONS;
+
+showSubscriptionsOutputColumns = [9]Column{
+    "pub_name",              // VARCHAR - 发布名称
+    "pub_account",           // VARCHAR - 集群内部发布
+    "stage",                 // VARCHAR - 发布的stage
+    "pub_database",          // VARCHAR - 发布的数据库名称
+    "pub_tables",            // TEXT - 发布的表列表（* 表示所有表）
+    "pub_comment",           // TEXT - 发布注释
+    "pub_time",              // TIMESTAMP - 发布时间
+    "sub_name",              // VARCHAR - 订阅数据库名称（关键字段）
+    "sub_time",              // TIMESTAMP - 订阅时间
+    "status",                // TINYINT - 状态（0=Normal, 其他=Deleted/NotAuthorized）
+}
 ```
 ---
 
