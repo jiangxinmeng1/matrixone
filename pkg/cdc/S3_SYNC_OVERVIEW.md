@@ -336,7 +336,7 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
 ### 5.1 分层存储策略
 
 ```
-s3://{bucket}/{dir}/{publication_name}
+s3://{bucket}/{dir}/s3_publication/{publication_name}
 ├── {account_id}/                                # 数据目录
 │   └── {db_id}/{table_id}/
 │       ├── 0-{snapshot_ts}/                    # 历史快照（只保留1个）
