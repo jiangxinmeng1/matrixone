@@ -39,28 +39,24 @@
 │ │ Executor │ │                           │ │ Executor │ │
 │ └────┬─────┘ │                           │ └────┬─────┘ │
 │      │       │                           │      │       │
-│      ├──→ UpstreamSyncJob                │      ├──→ DownstreamConsumeJob
-│      └──→ SnapshotGCJob                  │      │       │
-│                                          │      │       │
+│      | UpstreamIteration                 │      | DownstreamIteration
+│      | Snapshot&GC                     │      │       │
+│      │                                   │      │       │
+│      │ 读取Partition State               │      │ 应用到Catalog
+│      │ 复制Object到S3                     │      │ 下载Object
+│      ↓                                   │      |       │
 └──────┼───────┘                           └──────┼───────┘
        │                                          │
-       │ 读取Partition State                      │ 应用到Catalog
-       ↓                                          ↓
-┌──────────────┐                           ┌──────────────┐
-│   TN Node    │                           │   TN Node    │
-│ Table Catalog│                           │ Table Catalog│
-└──────────────┘                           └──────────────┘
-       │                                          ↑
        │ 复制Object + GC                          │ 下载Object
-       ↓                                          │
+       ↓                                          ↑
 ┌─────────────────────────────────────────────────────────┐
 │              S3 存储（分层结构）                         │
 │  {table_id}/                                            │
-│    ├── 0-{snapshot_ts}/          # 历史快照（只保留1个）│
+│    ├── 0-{snapshot_ts}/          # 历史快照（只保留1个） │
 │    │   ├── object_list.meta                             │
 │    │   ├── {objects}...                                 │
 │    │   └── manifest.json                                │
-│    ├── {start_ts}-{end_ts}/      # 增量数据（保留N天） │
+│    ├── {start_ts}-{end_ts}/      # 增量数据（保留N天）   │
 │    │   ├── object_list.meta                             │
 │    │   ├── {objects}...                                 │
 │    │   └── manifest.json                                │
@@ -71,23 +67,22 @@
 
 ### 2.2 核心组件
 
-**Executor**：
-- **S3SyncExecutor**：CN启动时创建，用同一个Executor处理本集群作为上游或下游的job
-- 启动时从系统表加载所有任务（上游和下游）
-- 为每个表任务提交相应的Job到TaskService
-
 **TaskScanner**：
-- **S3SyncTaskScanner**：定期扫描组件
-- 根据`mo_s3_sync_configs`中的配置扫描数据库和表
-- 发现新表或表ID变化时，在`mo_s3_sync_tasks`中创建或更新记录
+- **S3SyncTaskScanner**：处理ddl变化
+- 处理database级别订阅里新建的表
 - 处理表truncate后的table_id变化
 
-**上游Job**：
-- **UpstreamSyncJob**：读取增量数据并复制到S3
-- **SnapshotGCJob**：生成快照并清理过期增量数据
+**Executor**：
+- **S3SyncExecutor**：CN启动时创建，用同一个Executor处理本集群作为上游或下游的job
+- 处理每个表的同步
+- 为每个表任务提交相应的Iteration
 
-**下游Job**：
-- **DownstreamConsumeJob**：从S3消费数据并应用到Catalog
+**上游**：
+- **UpstreamIteration**：读取增量数据并复制到S3
+- **Snapshot & GC**：生成快照并清理过期增量数据
+
+**下游**：
+- **DownstreamIteration**：从S3消费数据并应用到Catalog
 
 ---
 
@@ -181,7 +176,7 @@ CREATE DATABASE <db_name>
 - `DATABASE`：指定下游数据库名称
 - `TABLE`：table级别必填，指定下游表名称
 - `STAGE`：引用之前创建的Stage名称，包含S3配置信息
-- `publication_name`:上游的publication name]
+- `publication_name`:上游的publication name
 - `SYNC_INTERVAL`：检查间隔（秒），默认60秒
 
 **示例**：
@@ -252,7 +247,7 @@ DROP TABLE <table_name>;
 
 **存储位置**：`mo_catalog` 数据库
 
-**作用**：记录S3同步任务的配置信息，支持account/database/table三个级别
+**作用**：记录S3同步任务的配置信息，支持database/table级别
 
 **Schema**：
 
@@ -264,7 +259,7 @@ CREATE TABLE mo_catalog.mo_s3_sync_configs (
     cluster_role         VARCHAR(16) NOT NULL,           -- 'upstream' 或 'downstream'
     
     -- 同步级别和范围
-    sync_level           VARCHAR(16) NOT NULL,           -- 'account', 'database', 'table'
+    sync_level           VARCHAR(16) NOT NULL,           -- 'database', 'table'
     account_id           BIGINT NOT NULL,
     db_name              VARCHAR(5000),                   -- database/table级别必填
     table_name           VARCHAR(5000),                   -- table级别必填
@@ -273,7 +268,7 @@ CREATE TABLE mo_catalog.mo_s3_sync_configs (
     stage_name            VARCHAR(5000),                  
     
     -- 同步配置（JSON格式）
-    sync_config          JSON NOT NULL,                  -- {retention_days, sync_mode, sync_interval}
+    sync_config          JSON NOT NULL,                  -- {retention_days, sync_interval}
     
     -- 任务控制
     state                TINYINT,  -- 'running', 'stopped'
@@ -312,12 +307,12 @@ CREATE TABLE mo_catalog.mo_s3_sync_tasks (
     snapshot_watermark   TIMESTAMP(6),                -- data快照的watermark（上游）
     
     -- Job状态
-    job_state            TINYINT NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'complete', 'error', 'cancel'
+    iteration_state      TINYINT NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'complete', 'error', 'cancel'
     cn_uuid              VARCHAR(64),                    -- 执行任务的CN标识
-    job_lsn              BIGINT DEFAULT 0,               -- Job序列号
+    iteration_lsn        BIGINT DEFAULT 0,               -- Job序列号
     
     -- 错误信息
-    error_message        VARCHAR(5000),                  -- 最后错误信息
+    error_message        VARCHAR(5000),                  -- 错误信息
     
     -- 时间戳
     created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -371,6 +366,9 @@ s3://{bucket}/{dir}/s3_publication/{publication_name}
 │               └── ...
 │
 └── ddl/                                         # DDL变化目录
+|
+
+└── metadata                                    #publication的信息
 ```
 
 ### 5.2 目录结构说明
@@ -406,6 +404,8 @@ s3://{bucket}/{dir}/s3_publication/{publication_name}
 - snapshot 是某个ts时的mo_tables, mo_databases, mo_columns
 - tail内容是mo_tables, mo_databases, mo_columns + timestamp + is_delete
 
+**metadata**
+- publicaion的信息
 ---
 
 ## 6. 上游处理流程
@@ -413,7 +413,7 @@ s3://{bucket}/{dir}/s3_publication/{publication_name}
 ### 6.1 Executor和Scanner启动
 
 **S3SyncExecutor**：
-1. 集群启动时创建S3SyncExecutor（单例，上下游共用）
+1. 集群启动时创建S3SyncExecutor（单例，作为上游/下游使用同一个executor）
 2. 从`mo_s3_sync_tasks`加载所有表级任务
 3. 重启时将所有`job_state='pending'`或`'running'`的任务置为`'complete'`（Iteration是幂等的）
 4. 为每张表提交UpstreamIteration,DownstreamIteration和GC
@@ -444,7 +444,7 @@ s3://{bucket}/{dir}/s3_publication/{publication_name}
   - 删除的object只记录在objectlist里
 
 **状态管理和并发控制**：
-- 执行后前检查cn_uuid、job_lsn、state是否一致，更新state，watermark
+- 执行后前检查cn_uuid、iteration_lsn、state是否一致，更新state，watermark
 - 清理S3中上次未完成的同步目录
 
 ### 6.3 GC
@@ -489,7 +489,7 @@ s3://{bucket}/{dir}/s3_publication/{publication_name}
   - 从0重新开始应用
 
 **状态管理和并发控制**：
-- 执行前检查cn_uuid、job_lsn、job_state是否一致
+- 执行前检查cn_uuid、iteration_lsn、job_state是否一致
 - 检查上游是否做了GC，如果GC了iteration用到的数据，数据可能有确实，需要重试
 - 完成后将job_state更新为'complete'
 
