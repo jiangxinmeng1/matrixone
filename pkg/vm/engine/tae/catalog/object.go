@@ -127,7 +127,9 @@ func (entry *ObjectEntry) GetPrevVersion() *ObjectEntry {
 func (entry *ObjectEntry) IsCEntry() bool {
 	return entry.prevVersion == nil
 }
-
+func (entry *ObjectEntry) SetTable(table *TableEntry) {
+	entry.table = table
+}
 func (entry *ObjectEntry) HasDCounterpart() bool {
 	return entry.nextVersion != nil
 }

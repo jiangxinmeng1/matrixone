@@ -42,3 +42,11 @@ type = "distributed-tae"
 
 [cn.frontend]
 port = 16001
+
+[[fileservice]]
+name = "SHARED"
+backend = "S3"
+
+[fileservice.s3]
+endpoint = "DISK"
+bucket = "mo-data/shared"

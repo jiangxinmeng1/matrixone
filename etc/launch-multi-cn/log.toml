@@ -10,3 +10,11 @@ max-size = 512
 
 [observability]
 status-port = 7001
+
+[[fileservice]]
+name = "SHARED"
+backend = "S3"
+
+[fileservice.s3]
+endpoint = "DISK"
+bucket = "mo-data/shared"

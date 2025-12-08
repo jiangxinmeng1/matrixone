@@ -16,6 +16,7 @@ package db
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"sync/atomic"
@@ -23,7 +24,9 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
@@ -34,6 +37,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/options"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 )
 
 const (
@@ -207,6 +211,47 @@ func Open(
 	}
 	db.Controller.Start()
 
+	database, err := db.Catalog.GetDatabaseByID(272518)
+	if err != nil {
+		return
+	}
+	table, err := database.GetTableEntryByID(272519)
+	if err != nil {
+		return
+	}
+	newTS := types.BuildTS(2, 0)
+
+	stats1, _ := base64.StdEncoding.DecodeString("AZroL/CkdIO35gecXkJHFgEAMDE5YWU4MmYtZjBhNC03NDgzLWI3ZTYtMDc5YzVlNDI0NzE2XzAwMDAxAf43lAZIBwAABRsAAABgAAADAAAAOWIxNGZlYWE2ODc1NzhjN2MwZTBiMDVjMjFmOTA2HmFmNzliNmVjMThjMGU2NTZmM2Q5MDg1NTdhNWMxZh6APYY/lAYu+/0Iog==")
+	obj1 := &catalog.ObjectEntry{
+		ObjectMVCCNode: catalog.ObjectMVCCNode{ObjectStats: objectio.ObjectStats(stats1)},
+		EntryMVCCNode:  catalog.EntryMVCCNode{CreatedAt: newTS},
+		CreateNode:     txnbase.NewTxnMVCCNodeWithTS(newTS),
+		ObjectNode:     catalog.ObjectNode{IsTombstone: false},
+	}
+	obj1.SetTable(table)
+	table.AddEntryLocked(obj1)
+
+	stats2, _ := base64.StdEncoding.DecodeString("AZroL/CkdIO35gecXkJHFgIAMDE5YWU4MmYtZjBhNC03NDgzLWI3ZTYtMDc5YzVlNDI0NzE2XzAwMDAyAXu+bwTmBwAABRsAAJ1CAAADAAAAYWY3OWRlZTMxMDE0YzA4YjQ2YWMwMTUxYjQ2MTQ2HmM4MDlhYWExZjdmNDQxZDNkMzU0Zjc0ZGViYjIyOB6APaHGbwS1mDEGog==")
+	obj2 := &catalog.ObjectEntry{
+		ObjectMVCCNode: catalog.ObjectMVCCNode{ObjectStats: objectio.ObjectStats(stats2)},
+		EntryMVCCNode:  catalog.EntryMVCCNode{CreatedAt: newTS},
+		CreateNode:     txnbase.NewTxnMVCCNodeWithTS(newTS),
+		ObjectNode:     catalog.ObjectNode{IsTombstone: false},
+	}
+	obj2.SetTable(table)
+	table.AddEntryLocked(obj2)
+
+	stats3, _ := base64.StdEncoding.DecodeString("AZr8K2RCd/CqADJg12PlQwAAMDE5YWZjMmItNjQ0Mi03N2YwLWFhMDAtMzI2MGQ3NjNlNTQzXzAwMDAwAds+lQBOEAAAzjsAAFolAwAaAAAAAZrkjgype2iWYaXzQxQktQIAAAABAAAAAAAAAAAAGAGa+++AX32tkoDzSxdB01sAAAAAGAAAAAAAAAAAABiAZWlPlQBGOC4BAg==")
+	obj3 := &catalog.ObjectEntry{
+		ObjectMVCCNode: catalog.ObjectMVCCNode{ObjectStats: objectio.ObjectStats(stats3)},
+		EntryMVCCNode:  catalog.EntryMVCCNode{CreatedAt: newTS},
+		CreateNode:     txnbase.NewTxnMVCCNodeWithTS(newTS),
+		ObjectNode:     catalog.ObjectNode{IsTombstone: true},
+	}
+	obj3.SetTable(table)
+	table.AddEntryLocked(obj3)
+
+	db.ForceCheckpoint(ctx, db.TxnMgr.Now())
 	return
 }
 

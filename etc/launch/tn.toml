@@ -11,3 +11,11 @@ port-base = 19000
 [malloc]
 check-fraction = 65536
 enable-metrics = true
+
+[[fileservice]]
+name = "SHARED"
+backend = "S3"
+
+[fileservice.s3]
+endpoint = "DISK"
+bucket = "mo-data/shared"
