@@ -78,7 +78,7 @@ CREATE DATABASE [IF NOT EXISTS] db_name FROM connection_string PUBLICATION pub_n
 ```
 
 ```sql
-CREATE TABLE [IF NOT EXISTS] table_name FROM connection_string PUBLICATION pub_name [SYNC INTERVAL interval]
+CREATE TABLE [IF NOT EXISTS] dbname.table_name FROM connection_string PUBLICATION pub_name [SYNC INTERVAL interval]
 ```
 
 ```sql
@@ -104,8 +104,7 @@ CREATE DATABASE tpcc
   PUBLICATION my_publication;
 
 -- Table级别：复制单张表
-CREATE DATABASE tpcc
-  TABLE orders
+CREATE TABLE tpcc.orders
   FROM 'mysql://myaccount#root:password@127.0.0.1:6001'
   PUBLICATION my_publication
   SYNC_INTERVAL = 60;
