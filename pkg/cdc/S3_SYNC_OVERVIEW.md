@@ -74,11 +74,15 @@ CREATE PUBLICATION <pub_name> ACCOUNT <account_name> DATABASE <db_name> TABLE <t
 **语法**：
 
 ```sql
-CREATE DATABASE <db_name>
-  [TABLE <table_name>]
-  FROM 'mysql://<account>#<user>:<password>@<host>:<port>'
-  PUBLICATION <pub_name>
-  [SYNC_INTERVAL = <seconds>];
+CREATE DATABASE [IF NOT EXISTS] db_name FROM connection_string PUBLICATION pub_name [SYNC INTERVAL interval]
+```
+
+```sql
+CREATE TABLE [IF NOT EXISTS] table_name FROM connection_string PUBLICATION pub_name [SYNC INTERVAL interval]
+```
+
+```sql
+CREATE ACCOUNT FROM connection_string PUBLICATION pub_name [SYNC INTERVAL interval]
 ```
 
 **参数说明**：
@@ -111,15 +115,39 @@ CREATE DATABASE tpcc
 
 ### 3.2 查看任务状态
 
-- SHOW PUBLICATION, SHOW SUBSCRIPTIONS 和现有的一致;
+- SHOW PUBLICATION和现有的一致;
+
+- SHOW CCPR SUBSCRIPTIONS [pub_name]
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| pub_name | VARCHAR | Publication 名称 |
+| pub_account | VARCHAR | 上游账号名 |
+| pub_database | VARCHAR | 上游数据库名（可为NULL） |
+| pub_tables | VARCHAR | 上游表名（可为NULL） |
+| create_time | TIMESTAMP | 创建时间 |
+| drop_time | TIMESTAMP | 删除时间，如果还没drop就是null |
+| state | TINYINT | 订阅状态（0=pending, 1=running, 2=complete, 3 error, 4 cancel） |
+| sync_level | VARCHAR | 同步级别（'account', 'database', 'table'）|
+| upstream_conn | VARCHAR | 上游连接(密码被模糊处理)|
+| iteration_lsn | BIGINT | 当前迭代 LSN |
+| error_message | varchar | 错误信息（如果没有错误，为空） |
+| watermark | TIMESTAMP | 水位 |
 
 ---
 
 ### 3.3 删除任务
 
+下游和drop account/database/table一样
+```
+DROP DATABASE [IF EXISTS] db_name
+DROP TABLE [IF EXISTS] table_name
+DROP ACCOUNT [IF EXISTS] account_name
+```
+
+drop publication和原先一样
 ```sql
 DROP PUBLICATION <publication_name>;
-DROP SUBSCRIPTION <subscription_name>;
 ```
 
 ---
