@@ -90,6 +90,7 @@ CREATE ACCOUNT FROM connection_string PUBLICATION pub_name [SYNC INTERVAL interv
 - 复制级别，支持：
   - `database`：复制指定数据库下的所有表
   - `table`：复制指定表
+  - `account`: 复制当前account
 - `DATABASE`：指定数据库名称
 - `TABLE`：table级别必填，指定表名称
 - `FROM`：上游MatrixOne集群的连接字符串
