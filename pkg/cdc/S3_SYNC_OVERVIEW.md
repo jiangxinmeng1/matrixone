@@ -82,7 +82,7 @@ CREATE TABLE [IF NOT EXISTS] dbname.table_name FROM connection_string PUBLICATIO
 ```
 
 ```sql
-CREATE ACCOUNT account_name FROM connection_string PUBLICATION pub_name [SYNC INTERVAL interval]
+CREATE ACCOUNT FROM connection_string PUBLICATION pub_name [SYNC INTERVAL interval]
 ```
 
 **参数说明**：
