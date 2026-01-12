@@ -117,7 +117,9 @@ CREATE TABLE tpcc.orders
 
 - SHOW PUBLICATION和现有的一致;
 
-- SHOW CCPR SUBSCRIPTIONS [pub_name]
+- SHOW CCPR SUBSCRIPTIONS 
+
+- SHOW CCPR SUBSCRIPTION [pub_name]
 
 | 列名 | 类型 | 说明 |
 |------|------|------|
@@ -140,7 +142,7 @@ CREATE TABLE tpcc.orders
 
 下游删除同步记录会停止同步，不会删除现有的database/table
 ```
-DROP CCPR SUBSTRIPTIONS <publication_name>;
+DROP CCPR SUBSTRIPTION <publication_name>;
 ```
 
 drop publication和原先一样
