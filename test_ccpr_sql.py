@@ -289,11 +289,30 @@ def test_create_database_from_publication():
             f"CREATE PUBLICATION `{PUBLICATION_NAME}` DATABASE `{TEST_DB_NAME}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
         )
         
+        # Update publication to ensure it exists and is properly configured
+        try:
+            cluster1_account_client.execute(
+                f"ALTER PUBLICATION `{PUBLICATION_NAME}` DATABASE `{TEST_DB_NAME}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
+            )
+            print_success(f"Updated publication {PUBLICATION_NAME} in cluster1")
+        except Exception as e:
+            print_warning(f"Failed to update publication {PUBLICATION_NAME}: {e}")
+        
         # Create a separate publication for TEST_DB_NAME2 (for SYNC INTERVAL test)
         cleanup_publication(cluster1_account_client, PUBLICATION_NAME2)
         cluster1_account_client.execute(
             f"CREATE PUBLICATION `{PUBLICATION_NAME2}` DATABASE `{TEST_DB_NAME2}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
         )
+        
+        # Update publication2 to ensure it exists and is properly configured
+        try:
+            cluster1_account_client.execute(
+                f"ALTER PUBLICATION `{PUBLICATION_NAME2}` DATABASE `{TEST_DB_NAME2}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
+            )
+            print_success(f"Updated publication {PUBLICATION_NAME2} in cluster1")
+        except Exception as e:
+            print_warning(f"Failed to update publication {PUBLICATION_NAME2}: {e}")
+        
         print_success("Setup upstream databases and publications")
         
         # Get connection string
@@ -450,6 +469,15 @@ def test_create_table_from_publication():
             f"CREATE PUBLICATION `{PUBLICATION_NAME}` DATABASE `{TEST_DB_NAME}` TABLE `{TEST_TABLE_NAME}`, `{TEST_TABLE_NAME2}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
         )
         
+        # Update publication to ensure it exists and is properly configured
+        try:
+            cluster1_account_client.execute(
+                f"ALTER PUBLICATION `{PUBLICATION_NAME}` DATABASE `{TEST_DB_NAME}` TABLE `{TEST_TABLE_NAME}`, `{TEST_TABLE_NAME2}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
+            )
+            print_success(f"Updated publication {PUBLICATION_NAME} in cluster1")
+        except Exception as e:
+            print_warning(f"Failed to update publication {PUBLICATION_NAME}: {e}")
+        
         # Setup downstream database
         cleanup_database(cluster2_account_client, TEST_DB_NAME)
         cluster2_account_client.execute(f"CREATE DATABASE `{TEST_DB_NAME}`")
@@ -581,6 +609,15 @@ def test_create_account_from_publication():
             f"CREATE PUBLICATION `{PUBLICATION_NAME}` DATABASE `{TEST_DB_NAME}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
         )
         
+        # Update publication to ensure it exists and is properly configured
+        try:
+            cluster1_account_client.execute(
+                f"ALTER PUBLICATION `{PUBLICATION_NAME}` DATABASE `{TEST_DB_NAME}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
+            )
+            print_success(f"Updated publication {PUBLICATION_NAME} in cluster1")
+        except Exception as e:
+            print_warning(f"Failed to update publication {PUBLICATION_NAME}: {e}")
+        
         conn_str = get_connection_string(CLUSTER1_ACCOUNT, ACCOUNT_ADMIN, ACCOUNT_PASSWORD,
                                         CLUSTER1_HOST, CLUSTER1_PORT)
         
@@ -684,6 +721,15 @@ def test_drop_operations():
         cluster1_account_client.execute(
             f"CREATE PUBLICATION `{PUBLICATION_NAME}` DATABASE `{TEST_DB_NAME}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
         )
+        
+        # Update publication to ensure it exists and is properly configured
+        try:
+            cluster1_account_client.execute(
+                f"ALTER PUBLICATION `{PUBLICATION_NAME}` DATABASE `{TEST_DB_NAME}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
+            )
+            print_success(f"Updated publication {PUBLICATION_NAME} in cluster1")
+        except Exception as e:
+            print_warning(f"Failed to update publication {PUBLICATION_NAME}: {e}")
         
         conn_str = get_connection_string(CLUSTER1_ACCOUNT, ACCOUNT_ADMIN, ACCOUNT_PASSWORD,
                                         CLUSTER1_HOST, CLUSTER1_PORT)
@@ -864,6 +910,15 @@ def test_repeated_creation():
             f"CREATE PUBLICATION `{PUBLICATION_NAME}` DATABASE `{TEST_DB_NAME}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
         )
         
+        # Update publication to ensure it exists and is properly configured
+        try:
+            cluster1_account_client.execute(
+                f"ALTER PUBLICATION `{PUBLICATION_NAME}` DATABASE `{TEST_DB_NAME}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
+            )
+            print_success(f"Updated publication {PUBLICATION_NAME} in cluster1")
+        except Exception as e:
+            print_warning(f"Failed to update publication {PUBLICATION_NAME}: {e}")
+        
         conn_str = get_connection_string(CLUSTER1_ACCOUNT, ACCOUNT_ADMIN, ACCOUNT_PASSWORD,
                                         CLUSTER1_HOST, CLUSTER1_PORT)
         
@@ -986,10 +1041,29 @@ def test_show_ccpr_subscriptions():
             f"CREATE PUBLICATION `{PUBLICATION_NAME}` DATABASE `{TEST_DB_NAME}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
         )
         
+        # Update publication to ensure it exists and is properly configured
+        try:
+            cluster1_account_client.execute(
+                f"ALTER PUBLICATION `{PUBLICATION_NAME}` DATABASE `{TEST_DB_NAME}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
+            )
+            print_success(f"Updated publication {PUBLICATION_NAME} in cluster1")
+        except Exception as e:
+            print_warning(f"Failed to update publication {PUBLICATION_NAME}: {e}")
+        
         cleanup_publication(cluster1_account_client, PUBLICATION_NAME2)
         cluster1_account_client.execute(
             f"CREATE PUBLICATION `{PUBLICATION_NAME2}` DATABASE `{TEST_DB_NAME2}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
         )
+        
+        # Update publication2 to ensure it exists and is properly configured
+        try:
+            cluster1_account_client.execute(
+                f"ALTER PUBLICATION `{PUBLICATION_NAME2}` DATABASE `{TEST_DB_NAME2}` ACCOUNT `{CLUSTER1_ACCOUNT}`"
+            )
+            print_success(f"Updated publication {PUBLICATION_NAME2} in cluster1")
+        except Exception as e:
+            print_warning(f"Failed to update publication {PUBLICATION_NAME2}: {e}")
+        
         print_success("Setup upstream databases and publications")
         
         # Get connection string
