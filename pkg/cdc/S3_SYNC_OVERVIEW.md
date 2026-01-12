@@ -138,11 +138,16 @@ CREATE TABLE tpcc.orders
 
 ### 3.3 删除任务
 
-下游和drop account/database/table一样
+下游和drop account/database/table一样，会同时删除同步记录
 ```
 DROP DATABASE [IF EXISTS] db_name
 DROP TABLE [IF EXISTS] table_name
 DROP ACCOUNT [IF EXISTS] account_name
+```
+
+也可以单独删除同步记录，删除同步记录会停止同步，不会删除现有的database/table
+```
+DROP CCPR SUBSTRIPTIONS <publication_name>;
 ```
 
 drop publication和原先一样
