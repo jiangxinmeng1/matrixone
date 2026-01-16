@@ -439,8 +439,8 @@ N:1704067200:table does not exist
 
 ### 7.1 同步延迟问题
 
-在没有设置SYNC INTERVAL参数时，为了等上游刷盘，下游依然会有几秒到一分钟的延迟
-设置SYNC INTERVAL后，每次同步间隔为SYNC INTERVAL + 等待上游刷盘时常
+在没有设置SYNC INTERVAL参数时，为了等上游刷盘，下游依然会有几秒到一分钟的延迟。
+设置SYNC INTERVAL后，每次同步间隔为SYNC INTERVAL + 等待上游刷盘时常。
 
 **数据同步延迟较大可能原因**：
 - 上游集群负载高，响应慢
