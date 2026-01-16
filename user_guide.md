@@ -193,12 +193,6 @@ CREATE DATABASE tpcc
 SHOW CCPR SUBSCRIPTIONS;
 ```
 
-查看所有订阅（LIKE模式）：
-
-```sql
-SHOW CCPR SUBSCRIPTIONS LIKE 'pattern%';
-```
-
 ### 4.2 查看特定订阅
 
 查看特定名称的订阅详情：
