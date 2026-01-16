@@ -142,12 +142,19 @@ CREATE TABLE tpcc.orders
 
 下游删除同步记录会停止同步，不会删除现有的database/table
 ```
-DROP CCPR SUBSTRIPTION <publication_name>;
+DROP CCPR SUBSCRIPTION <publication_name>;
 ```
 
 drop publication和原先一样
 ```sql
 DROP PUBLICATION <publication_name>;
+```
+
+### 3.4 resume & pause
+
+```
+RESUME CCPR SUBSCRIPTION <publication_name>;
+PAUSE CCPR SUBSCRIPTION <publication_name>;
 ```
 
 ---
@@ -180,10 +187,10 @@ CREATE TABLE mo_catalog.mo_sync_configs (
     sync_config          JSON NOT NULL,                  -- {sync_interval}
     
     -- 任务控制
-    state                TINYINT,  -- 'running', 'stopped'
+    state                TINYINT,  -- 'running', 'stopped', 'dropped'
     
     -- 执行状态
-    iteration_state      TINYINT NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'complete', 'error', 'cancel'
+    iteration_state      TINYINT NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'complete', 'error'
     iteration_lsn        BIGINT DEFAULT 0,               -- Job序列号
     context              JSON,                           -- iteration上下文，如snapshot名称等
     cn_uuid              VARCHAR(64),                    -- 执行任务的CN标识
