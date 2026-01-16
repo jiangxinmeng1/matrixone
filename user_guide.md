@@ -376,7 +376,7 @@ WHERE state = 1;
 #### 6.1.3 错误元数据格式
 
 iteration内部的重试不会更新error_message，只有iteration失败后error_message会被更新。
-重试过程中state为running。如果不在用新的iteration重试，state会被置成error。
+重试过程中state为running。如果不再用新的iteration重试，state会被置成error。
 自动重试的错误在 `error_message` 字段中会包含元数据信息，格式如下：
 
 **可重试错误格式**：
