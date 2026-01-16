@@ -1,6 +1,6 @@
 # MatrixOne Cross-Cluster Replication (CCPR) 用户指南
 
-**创建日期**: 2025-01-XX  
+**创建日期**: 2025-01-16  
 **文档类型**: 用户使用指南
 
 ---
