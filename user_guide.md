@@ -232,6 +232,12 @@ SHOW CCPR SUBSCRIPTION subscription_name;
 
 订阅任务的元数据存储在 `mo_catalog.mo_ccpr_log` 系统表中，可以通过SQL直接查询（需要系统账户权限）。
 
+### 4.4 观测试图
+
+- 复制的object数量和大小总合
+- 有ddl更新的table数量
+- 错误重试次数
+
 ### 4.4 暂停订阅
 
 暂停订阅会停止同步任务，但保留订阅配置和数据：
@@ -453,6 +459,10 @@ N:1704067200:table does not exist
 2. 检查网络连接质量
 3. 调整 `SYNC INTERVAL` 参数（如果业务允许）
 4. 检查下游集群的资源使用情况
+
+### 7.1 上游DDL变化
+
+CCPR能自动捕捉到上游的DDL变化，更新到下游
 
 ---
 
