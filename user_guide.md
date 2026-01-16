@@ -78,8 +78,6 @@ CREATE PUBLICATION my_publication DATABASE tpcc ACCOUNT account1;
 - `DATABASE tpcc`：指定要发布的数据库
 - `ACCOUNT account1`：授权给account1，允许下游用其订阅此Publication
 
-**发布限制**
-
 #### 权限限制
 - 只有 admin 角色可以创建、修改、删除 publication
 - 只有 sys account 和授权的 normal accounts 可以发布到所有账户（account all）
