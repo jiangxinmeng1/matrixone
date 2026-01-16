@@ -78,6 +78,32 @@ CREATE PUBLICATION my_publication DATABASE tpcc ACCOUNT account1;
 - `DATABASE tpcc`：指定要发布的数据库
 - `ACCOUNT account1`：授权给account1，允许下游用其订阅此Publication
 
+**发布限制**
+
+#### 权限限制
+- 只有 admin 角色可以创建、修改、删除 publication
+- 只有 sys account 和授权的 normal accounts 可以发布到所有账户（account all）
+
+#### 账户限制
+- 不能发布到自己（can't publish to self）
+- 不能订阅自己（can not subscribe to self）
+- 指定的账户必须存在
+- 发布账户如果被暂停（suspended），订阅时会失败
+
+#### 数据库限制
+- 不能发布系统数据库（如 mo_catalog）
+- 只能发布用户数据库（dat_type 为空）
+- 数据库必须存在
+
+#### 表限制
+- 指定的表必须存在于数据库中
+
+#### Alter Publication 限制
+- 如果 publication 使用 account all 选项，不能添加或删除账户
+
+#### 订阅权限限制
+- 账户必须被包含在 publication 的订阅账户列表中才能订阅
+
 ### 2.2 下游集群创建Subscription
 
 在下游集群创建订阅任务，有三种方式：
