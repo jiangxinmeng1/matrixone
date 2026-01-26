@@ -157,7 +157,7 @@ CREATE TABLE tpcc.orders
 ```
 
 - 创建订阅的时候会检查connection link和上游的publication，如果上游publication验证失败，会创建任务失败。
-- 不接受订阅部分publication。如果上游publication范围为db1,下游订阅db1下某个table会报错
+- 接受订阅部分publication。如果上游publication范围为db1,下游订阅db1下某个table会成功
 
 ---
 
