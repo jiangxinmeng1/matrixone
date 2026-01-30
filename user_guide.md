@@ -223,15 +223,16 @@ SHOW CCPR SUBSCRIPTIONS;
 查看特定名称的订阅详情：
 
 ```sql
-SHOW CCPR SUBSCRIPTION subscription_name;
+SHOW CCPR SUBSCRIPTION pub_name;
 ```
 
 **返回字段说明**：
 
 | 字段名 | 类型 | 说明 |
 |--------|------|------|
-| pub_name | VARCHAR | Publication 名称 |
-| pub_account | VARCHAR | 上游账号名 |
+| task_id | UUID | 任务唯一标识，用于PAUSE/RESUME/DROP操作 |
+| pub_name | VARCHAR | Publication 名称（对应 mo_ccpr_log.subscription_name） |
+| pub_account | VARCHAR | 上游授权账号名（对应 mo_ccpr_log.subscription_account_name） |
 | pub_database | VARCHAR | 上游数据库名（可为NULL，Account级别时为NULL） |
 | pub_tables | VARCHAR | 上游表名（可为NULL，Account/Database级别时为NULL） |
 | create_time | TIMESTAMP | 创建时间 |
@@ -246,16 +247,48 @@ SHOW CCPR SUBSCRIPTION subscription_name;
 **示例输出**：
 
 ```
-+------------------+-------------+-------------+-----------+---------------------+-----------+------------+------------------+----------------+------------------+-------------+---------------------+
-| pub_name         | pub_account | pub_database| pub_tables| create_time         | drop_time | state      | sync_level       | upstream_conn  | iteration_lsn    | error_message| watermark           |
-+------------------+-------------+-------------+-----------+---------------------+-----------+------------+------------------+----------------+------------------+-------------+---------------------+
-| my_publication   | account1    | tpcc        | orders    | 2025-01-01 10:00:00 | NULL      | 1          | table            | mysql://***@...| 12345            | NULL         | 2025-01-01 12:00:00 |
-+------------------+-------------+-------------+-----------+---------------------+-----------+------------+------------------+----------------+------------------+-------------+---------------------+
++--------------------------------------+------------------+-------------+-------------+-----------+---------------------+-----------+-------+------------+----------------+---------------+-------------+---------------------+
+| task_id                              | pub_name         | pub_account | pub_database| pub_tables| create_time         | drop_time | state | sync_level | upstream_conn  | iteration_lsn | error_message| watermark           |
++--------------------------------------+------------------+-------------+-------------+-----------+---------------------+-----------+-------+------------+----------------+---------------+-------------+---------------------+
+| 550e8400-e29b-41d4-a716-446655440000 | my_publication   | account1    | tpcc        | orders    | 2025-01-01 10:00:00 | NULL      | 0     | table      | mysql://***@...| 12345         | NULL         | 2025-01-01 12:00:00 |
++--------------------------------------+------------------+-------------+-------------+-----------+---------------------+-----------+-------+------------+----------------+---------------+-------------+---------------------+
 ```
+
+**说明**：获取 `task_id` 后，可用于执行 `PAUSE`、`RESUME`、`DROP` 操作。
 
 ### 4.3 查看mo_ccpr_log
 
 订阅任务的元数据存储在 `mo_catalog.mo_ccpr_log` 系统表中，可以通过SQL直接查询（需要系统账户权限）。
+
+```sql
+SELECT * FROM mo_catalog.mo_ccpr_log;
+```
+
+**mo_ccpr_log 表结构说明**：
+
+| 字段名 | 类型 | 说明 |
+|--------|------|------|
+| task_id | UUID | 任务唯一标识（主键） |
+| subscription_name | VARCHAR(5000) | 订阅名称（Publication名称） |
+| subscription_account_name | VARCHAR(5000) | 订阅账户名称（上游授权的账户名） |
+| sync_level | VARCHAR(16) | 同步级别（'account', 'database', 'table'） |
+| account_id | INT UNSIGNED | 下游账户ID |
+| db_name | VARCHAR(5000) | 数据库名称（可为NULL） |
+| table_name | VARCHAR(5000) | 表名称（可为NULL） |
+| upstream_conn | VARCHAR(5000) | 上游连接字符串 |
+| sync_config | JSON | 同步配置（包含sync_interval等） |
+| state | TINYINT | 订阅状态（0=running, 1=error, 2=pause, 3=dropped） |
+| iteration_state | TINYINT | 迭代状态（0=pending, 1=running, 2=complete, 3=error） |
+| iteration_lsn | BIGINT | 当前迭代LSN |
+| context | JSON | 迭代上下文信息 |
+| cn_uuid | VARCHAR(64) | 执行任务的CN节点UUID |
+| error_message | VARCHAR(5000) | 错误信息 |
+| created_at | TIMESTAMP | 创建时间 |
+| drop_at | TIMESTAMP | 删除时间（如果已删除） |
+
+**说明**：
+- `subscription_name` 对应上游的 Publication 名称
+- `subscription_account_name` 是上游授权的账户名，系统在与上游通信时会携带此信息用于权限验证
 
 ### 4.4 观测试图
 
@@ -268,7 +301,20 @@ SHOW CCPR SUBSCRIPTION subscription_name;
 暂停订阅会停止同步任务，但保留订阅配置和数据：
 
 ```sql
-PAUSE CCPR SUBSCRIPTION subscription_name;
+PAUSE CCPR SUBSCRIPTION task_id;
+```
+
+**参数说明**：
+- `task_id`：订阅任务的UUID，可通过 `SHOW CCPR SUBSCRIPTIONS` 或查询 `mo_ccpr_log` 表获取
+
+**示例**：
+
+```sql
+-- 先查看订阅获取task_id
+SHOW CCPR SUBSCRIPTIONS;
+
+-- 暂停指定的订阅任务
+PAUSE CCPR SUBSCRIPTION '550e8400-e29b-41d4-a716-446655440000';
 ```
 
 **使用场景**：
@@ -280,7 +326,17 @@ PAUSE CCPR SUBSCRIPTION subscription_name;
 恢复订阅会清除错误状态，重新开始同步：
 
 ```sql
-RESUME CCPR SUBSCRIPTION subscription_name;
+RESUME CCPR SUBSCRIPTION task_id;
+```
+
+**参数说明**：
+- `task_id`：订阅任务的UUID
+
+**示例**：
+
+```sql
+-- 恢复指定的订阅任务
+RESUME CCPR SUBSCRIPTION '550e8400-e29b-41d4-a716-446655440000';
 ```
 
 **使用场景**：
@@ -294,7 +350,17 @@ RESUME CCPR SUBSCRIPTION subscription_name;
 删除订阅会停止同步并移除订阅配置，但**不会删除**已同步的数据和数据库/表：
 
 ```sql
-DROP CCPR SUBSCRIPTION subscription_name;
+DROP CCPR SUBSCRIPTION task_id;
+```
+
+**参数说明**：
+- `task_id`：订阅任务的UUID
+
+**示例**：
+
+```sql
+-- 删除指定的订阅任务
+DROP CCPR SUBSCRIPTION '550e8400-e29b-41d4-a716-446655440000';
 ```
 
 **注意**：
@@ -446,12 +512,18 @@ N:1704067200:table does not exist
 
 1. **查看错误信息**
    ```sql
-   SHOW CCPR SUBSCRIPTION subscription_name;
+   -- 查看所有订阅
+   SHOW CCPR SUBSCRIPTIONS;
+   
+   -- 或查询mo_ccpr_log表获取详细信息
+   SELECT task_id, subscription_name, state, error_message 
+   FROM mo_catalog.mo_ccpr_log 
+   WHERE state = 1;
    ```
    查看 `error_message` 字段了解具体错误。
 
 2. **判断错误类型**
-   - 如果`state`字段为error，表示不再自动重试，需要手动恢复
+   - 如果`state`字段为error（值为1），表示不再自动重试，需要手动恢复
 
 3. **解决根本问题**
    - **网络问题**：检查网络连接、防火墙、上游集群状态
@@ -460,9 +532,9 @@ N:1704067200:table does not exist
    - **配置错误**：检查连接字符串、Publication配置等
 
 4. **恢复订阅**
-   问题解决后，使用 `RESUME` 命令恢复订阅：
+   问题解决后，使用 `RESUME` 命令恢复订阅（使用task_id）：
    ```sql
-   RESUME CCPR SUBSCRIPTION subscription_name;
+   RESUME CCPR SUBSCRIPTION '550e8400-e29b-41d4-a716-446655440000';
    ```
 ---
 
