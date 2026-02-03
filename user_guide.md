@@ -223,35 +223,29 @@ SHOW CCPR SUBSCRIPTIONS;
 查看特定名称的订阅详情：
 
 ```sql
-SHOW CCPR SUBSCRIPTION pub_name;
+SHOW CCPR SUBSCRIPTION task_id;
 ```
 
 **返回字段说明**：
 
 | 字段名 | 类型 | 说明 |
 |--------|------|------|
-| task_id | UUID | 任务唯一标识，用于PAUSE/RESUME/DROP操作 |
-| pub_name | VARCHAR | Publication 名称（对应 mo_ccpr_log.subscription_name） |
-| pub_account | VARCHAR | 上游授权账号名（对应 mo_ccpr_log.subscription_account_name） |
-| pub_database | VARCHAR | 上游数据库名（可为NULL，Account级别时为NULL） |
-| pub_tables | VARCHAR | 上游表名（可为NULL，Account/Database级别时为NULL） |
-| create_time | TIMESTAMP | 创建时间 |
-| drop_time | TIMESTAMP | 删除时间，如果还没drop就是NULL |
-| state | TINYINT | 订阅状态（0=running, 1=error, 2=pause, 3=dropped） |
+| task_id | VARCHAR | 任务唯一标识，用于PAUSE/RESUME/DROP操作 |
+| database_name | VARCHAR | 数据库名称（可为NULL，Account级别时为NULL） |
+| table_name | VARCHAR | 表名称（可为NULL，Account/Database级别时为NULL） |
 | sync_level | VARCHAR | 同步级别（'account', 'database', 'table'） |
-| upstream_conn | VARCHAR | 上游连接字符串（密码已被模糊处理） |
-| iteration_lsn | BIGINT | 当前迭代 LSN |
+| state | TINYINT | 订阅状态（0=running, 1=error, 2=pause, 3=dropped） |
 | error_message | VARCHAR | 错误信息（如果没有错误，为NULL） |
 | watermark | TIMESTAMP | 水位时间戳（最后一次成功同步的时间点） |
 
 **示例输出**：
 
 ```
-+--------------------------------------+------------------+-------------+-------------+-----------+---------------------+-----------+-------+------------+----------------+---------------+-------------+---------------------+
-| task_id                              | pub_name         | pub_account | pub_database| pub_tables| create_time         | drop_time | state | sync_level | upstream_conn  | iteration_lsn | error_message| watermark           |
-+--------------------------------------+------------------+-------------+-------------+-----------+---------------------+-----------+-------+------------+----------------+---------------+-------------+---------------------+
-| 550e8400-e29b-41d4-a716-446655440000 | my_publication   | account1    | tpcc        | orders    | 2025-01-01 10:00:00 | NULL      | 0     | table      | mysql://***@...| 12345         | NULL         | 2025-01-01 12:00:00 |
-+--------------------------------------+------------------+-------------+-------------+-----------+---------------------+-----------+-------+------------+----------------+---------------+-------------+---------------------+
++------------------+---------------+------------+------------+-------+---------------+---------------------+
+| task_id          | database_name | table_name | sync_level | state | error_message | watermark           |
++------------------+---------------+------------+------------+-------+---------------+---------------------+
+| my_publication   | tpcc          | orders     | table      | 0     | NULL          | 2025-01-01 12:00:00 |
++------------------+---------------+------------+------------+-------+---------------+---------------------+
 ```
 
 **说明**：获取 `task_id` 后，可用于执行 `PAUSE`、`RESUME`、`DROP` 操作。
@@ -290,13 +284,13 @@ SELECT * FROM mo_catalog.mo_ccpr_log;
 - `subscription_name` 对应上游的 Publication 名称
 - `subscription_account_name` 是上游授权的账户名，系统在与上游通信时会携带此信息用于权限验证
 
-### 4.4 观测试图
+### 4.4 观测视图
 
 - 复制的object数量和大小总合
 - 有ddl更新的table数量
 - 错误重试次数
 
-### 4.4 暂停订阅
+### 4.5 暂停订阅
 
 暂停订阅会停止同步任务，但保留订阅配置和数据：
 
@@ -305,7 +299,7 @@ PAUSE CCPR SUBSCRIPTION task_id;
 ```
 
 **参数说明**：
-- `task_id`：订阅任务的UUID，可通过 `SHOW CCPR SUBSCRIPTIONS` 或查询 `mo_ccpr_log` 表获取
+- `task_id`：订阅任务的ID，可通过 `SHOW CCPR SUBSCRIPTIONS` 或查询 `mo_ccpr_log` 表获取
 
 **示例**：
 
@@ -314,14 +308,14 @@ PAUSE CCPR SUBSCRIPTION task_id;
 SHOW CCPR SUBSCRIPTIONS;
 
 -- 暂停指定的订阅任务
-PAUSE CCPR SUBSCRIPTION '550e8400-e29b-41d4-a716-446655440000';
+PAUSE CCPR SUBSCRIPTION 'my_publication';
 ```
 
 **使用场景**：
 - 临时停止同步，但希望保留订阅配置
 - 等待上游集群问题解决
 
-### 4.5 恢复订阅
+### 4.6 恢复订阅
 
 恢复订阅会清除错误状态，重新开始同步：
 
@@ -345,7 +339,7 @@ RESUME CCPR SUBSCRIPTION '550e8400-e29b-41d4-a716-446655440000';
 
 **注意**：`RESUME` 会将 `iteration_state` 重置为 `complete`，并清除 `error_message`。
 
-### 4.6 删除订阅
+### 4.7 删除订阅
 
 删除订阅会停止同步并移除订阅配置，但**不会删除**已同步的数据和数据库/表：
 
@@ -367,7 +361,7 @@ DROP CCPR SUBSCRIPTION '550e8400-e29b-41d4-a716-446655440000';
 - 删除订阅不会删除下游集群中的数据
 - 如果需要删除数据，需要手动执行 `DROP DATABASE` 或 `DROP TABLE`
 
-### 4.7 删除Publication
+### 4.8 删除Publication
 
 在上游集群删除Publication：
 
