@@ -693,9 +693,9 @@ func doDropCcprSubscription(ctx context.Context, ses *Session, dcs *tree.DropCcp
 		return nil
 	}
 
-	// Update mo_ccpr_log to set drop_at = now()
+	// Update mo_ccpr_log to set drop_at = now() and state = 3 (dropped)
 	updateSQL := fmt.Sprintf(
-		"UPDATE mo_catalog.mo_ccpr_log SET drop_at = now() WHERE task_id = '%s' AND drop_at IS NULL",
+		"UPDATE mo_catalog.mo_ccpr_log SET drop_at = now(), state = 3 WHERE task_id = '%s' AND drop_at IS NULL",
 		escapedTaskID,
 	)
 	if accountId != catalog.System_Account {
@@ -1810,7 +1810,7 @@ func doShowCcprSubscriptions(ctx context.Context, ses *Session, scs *tree.ShowCc
 		err = finishTxn(ctx, bh, err)
 	}()
 
-	// Build SQL query
+	// Build SQL query (show all subscriptions, state will show 'dropped' for deleted ones)
 	sql := "SELECT task_id, db_name, table_name, sync_level, state, error_message, watermark FROM mo_catalog.mo_ccpr_log WHERE 1=1"
 
 	// Filter by task_id if specified
