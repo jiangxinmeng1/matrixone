@@ -3933,6 +3933,15 @@ func doDropAccount(ctx context.Context, bh BackgroundExec, ses *Session, da *dro
 			}
 		}
 
+		// mark all ccpr subscriptions of this account as dropped by setting drop_at
+		// this must be done before dropping databases to allow dropping CCPR shared databases
+		sql = fmt.Sprintf("UPDATE mo_catalog.mo_ccpr_log SET drop_at = now() WHERE account_id = %d AND drop_at IS NULL", accountId)
+		ses.Infof(ctx, "dropAccount %s sql: %s", da.Name, sql)
+		rtnErr = bh.Exec(ctx, sql)
+		if rtnErr != nil {
+			return rtnErr
+		}
+
 		//drop databases created by user
 		databases = make(map[string]int8)
 		dbSql = "show databases;"
