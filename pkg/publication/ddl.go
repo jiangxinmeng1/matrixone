@@ -456,9 +456,10 @@ func ProcessDDLChanges(
 				if err := removeIndexTableMappings(ctx, iterationCtx, tableID, rel); err != nil {
 					return moerr.NewInternalErrorf(ctx, "failed to remove index table mappings: %v", err)
 				}
-				// Execute each ALTER statement
+				// Execute each ALTER statement with database context
+				// Using ExecSQLInDatabase to set default database for statements that need it
 				for _, alterSQL := range ddlInfo.AlterStatements {
-					result, cancel, err := iterationCtx.LocalExecutor.ExecSQL(downstreamCtx, nil, iterationCtx.SrcInfo.AccountID, alterSQL, true, true, time.Minute)
+					result, cancel, err := iterationCtx.LocalExecutor.ExecSQLInDatabase(downstreamCtx, nil, iterationCtx.SrcInfo.AccountID, alterSQL, dbName, true, true, time.Minute)
 					if err != nil {
 						return moerr.NewInternalErrorf(ctx, "failed to execute alter inplace for %s.%s: %v, SQL: %s", dbName, tableName, err, alterSQL)
 					}
@@ -1315,8 +1316,13 @@ type indexInfo struct {
 	name      string
 	unique    bool
 	columns   []string
-	indexType string // BTREE, FULLTEXT, etc.
+	indexType string // BTREE, FULLTEXT, IVFFLAT, HNSW, etc.
 	visible   bool
+	// Vector index parameters
+	algoParamList         int64  // LISTS parameter for IVFFLAT
+	algoParamVectorOpType string // OP_TYPE parameter for vector indexes
+	hnswM                 int64  // M parameter for HNSW
+	hnswEfConstruction    int64  // ef_construction parameter for HNSW
 }
 
 // foreignKeyInfo stores foreign key information for comparison
@@ -1396,6 +1402,12 @@ func buildIndexMap(stmt *tree.CreateTable) map[string]*indexInfo {
 			}
 			if idx.IndexOption != nil {
 				info.visible = idx.IndexOption.Visible == tree.VISIBLE_TYPE_VISIBLE
+				// Extract index type and vector index parameters
+				info.indexType = idx.IndexOption.IType.ToString()
+				info.algoParamList = idx.IndexOption.AlgoParamList
+				info.algoParamVectorOpType = idx.IndexOption.AlgoParamVectorOpType
+				info.hnswM = idx.IndexOption.HnswM
+				info.hnswEfConstruction = idx.IndexOption.HnswEfConstruction
 			}
 		case *tree.UniqueIndex:
 			info = &indexInfo{
@@ -1572,21 +1584,52 @@ func generateAddIndexStatement(fullTableName string, idxName string, idx *indexI
 	}
 
 	var stmt string
-	if idx.indexType == "FULLTEXT" {
+	switch strings.ToLower(idx.indexType) {
+	case "fulltext":
 		stmt = fmt.Sprintf("ALTER TABLE %s ADD FULLTEXT INDEX `%s` (%s)",
 			fullTableName,
 			escapeSQLIdentifierForDDL(idxName),
 			strings.Join(cols, ", "))
-	} else if idx.unique {
-		stmt = fmt.Sprintf("ALTER TABLE %s ADD UNIQUE INDEX `%s` (%s)",
+	case "ivfflat":
+		// Vector index with IVFFLAT algorithm
+		// Format: ALTER TABLE t ADD INDEX idx USING ivfflat (col) LISTS=n OP_TYPE 'xxx'
+		stmt = fmt.Sprintf("ALTER TABLE %s ADD INDEX `%s` USING ivfflat (%s)",
 			fullTableName,
 			escapeSQLIdentifierForDDL(idxName),
 			strings.Join(cols, ", "))
-	} else {
-		stmt = fmt.Sprintf("ALTER TABLE %s ADD INDEX `%s` (%s)",
+		if idx.algoParamList > 0 {
+			stmt += fmt.Sprintf(" LISTS = %d", idx.algoParamList)
+		}
+		if idx.algoParamVectorOpType != "" {
+			stmt += fmt.Sprintf(" OP_TYPE '%s'", idx.algoParamVectorOpType)
+		}
+	case "hnsw":
+		// Vector index with HNSW algorithm
+		stmt = fmt.Sprintf("ALTER TABLE %s ADD INDEX `%s` USING hnsw (%s)",
 			fullTableName,
 			escapeSQLIdentifierForDDL(idxName),
 			strings.Join(cols, ", "))
+		if idx.hnswM > 0 {
+			stmt += fmt.Sprintf(" M = %d", idx.hnswM)
+		}
+		if idx.hnswEfConstruction > 0 {
+			stmt += fmt.Sprintf(" EF_CONSTRUCTION = %d", idx.hnswEfConstruction)
+		}
+		if idx.algoParamVectorOpType != "" {
+			stmt += fmt.Sprintf(" OP_TYPE '%s'", idx.algoParamVectorOpType)
+		}
+	default:
+		if idx.unique {
+			stmt = fmt.Sprintf("ALTER TABLE %s ADD UNIQUE INDEX `%s` (%s)",
+				fullTableName,
+				escapeSQLIdentifierForDDL(idxName),
+				strings.Join(cols, ", "))
+		} else {
+			stmt = fmt.Sprintf("ALTER TABLE %s ADD INDEX `%s` (%s)",
+				fullTableName,
+				escapeSQLIdentifierForDDL(idxName),
+				strings.Join(cols, ", "))
+		}
 	}
 	return stmt
 }

@@ -178,6 +178,9 @@ type SQLExecutor interface {
 	// Returns: result, cancel function (may be nil if no timeout context was created), error
 	// IMPORTANT: caller MUST call the cancel function after finishing with the result (if cancel is not nil)
 	ExecSQL(ctx context.Context, ar *ActiveRoutine, accountID uint32, query string, useTxn bool, needRetry bool, timeout time.Duration) (*Result, context.CancelFunc, error)
+	// ExecSQLInDatabase executes a SQL statement with a specific default database context
+	// This is useful for DDL statements that may require a default database to be set
+	ExecSQLInDatabase(ctx context.Context, ar *ActiveRoutine, accountID uint32, query string, database string, useTxn bool, needRetry bool, timeout time.Duration) (*Result, context.CancelFunc, error)
 }
 
 var _ SQLExecutor = (*UpstreamExecutor)(nil)
@@ -630,6 +633,24 @@ func (e *UpstreamExecutor) ExecSQL(
 	}
 
 	return result, lastCancel, nil
+}
+
+// ExecSQLInDatabase executes SQL with a specific default database context.
+// For UpstreamExecutor, the database parameter is ignored since the connection
+// string already specifies the database, and table names should be fully qualified.
+func (e *UpstreamExecutor) ExecSQLInDatabase(
+	ctx context.Context,
+	ar *ActiveRoutine,
+	accountID uint32,
+	query string,
+	database string,
+	useTxn bool,
+	needRetry bool,
+	timeout time.Duration,
+) (*Result, context.CancelFunc, error) {
+	// For upstream, we ignore the database parameter and just call ExecSQL
+	// The table names in the query should already be fully qualified
+	return e.ExecSQL(ctx, ar, accountID, query, useTxn, needRetry, timeout)
 }
 
 // execWithRetry executes a function with retry logic

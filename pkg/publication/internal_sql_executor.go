@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+
 	// "math"
 	"time"
 
@@ -359,6 +360,149 @@ func (e *InternalSQLExecutor) ExecSQL(
 	}
 
 	// On error, cancel the last context if exists
+	if lastCancel != nil {
+		lastCancel()
+	}
+
+	logutil.Error("internal sql executor max retries exceeded",
+		zap.String("query", truncateSQL(query)),
+		zap.Int("retryCount", attemptCount-1),
+		zap.Error(lastErr),
+	)
+
+	return nil, nil, err
+}
+
+// ExecSQLInDatabase executes SQL with a specific default database set.
+// This is useful for DDL statements that may require a default database context.
+func (e *InternalSQLExecutor) ExecSQLInDatabase(
+	ctx context.Context,
+	ar *ActiveRoutine,
+	accountID uint32,
+	query string,
+	database string,
+	useTxn bool,
+	needRetry bool,
+	timeout time.Duration,
+) (*Result, context.CancelFunc, error) {
+	// If useTxn is true, check if transaction is available
+	if useTxn && e.txnOp == nil {
+		return nil, nil, moerr.NewInternalError(ctx, "transaction required but no active transaction found. Call SetTxn() first")
+	}
+	// Check for cancellation
+	if ar != nil {
+		select {
+		case <-ar.Pause:
+			return nil, nil, moerr.NewInternalError(ctx, "task paused")
+		case <-ar.Cancel:
+			return nil, nil, moerr.NewInternalError(ctx, "task cancelled")
+		default:
+		}
+	}
+
+	// Create base context with account ID
+	baseCtx := ctx
+	if accountID != InvalidAccountID {
+		baseCtx = context.WithValue(ctx, defines.TenantIDKey{}, accountID)
+	} else if e.useAccountID {
+		baseCtx = context.WithValue(ctx, defines.TenantIDKey{}, e.accountID)
+	}
+
+	// For other statements, use internal executor with retry logic
+	opts := executor.Options{}.
+		WithDisableIncrStatement()
+
+	// Set default database if specified
+	if database != "" {
+		opts = opts.WithDatabase(database)
+	}
+
+	// Only use transaction if useTxn is true and txnOp is available
+	if useTxn && e.txnOp != nil {
+		opts = opts.WithTxn(e.txnOp)
+	}
+
+	// Reset error counter for new SQL query
+	e.errorCount = 0
+
+	var execResult executor.Result
+	var lastErr error
+	var attemptCount int
+	var lastCancel context.CancelFunc
+
+	backoff := &defChangedBackoff{
+		baseInterval: e.retryOpt.RetryInterval,
+		getLastErr:   func() error { return lastErr },
+		getAttempt:   func() int { return attemptCount },
+	}
+
+	policy := Policy{
+		MaxAttempts: e.retryOpt.MaxRetries + 1,
+		Backoff:     backoff,
+		Classifier:  e.retryOpt.Classifier,
+	}
+
+	var err error
+	err = policy.Do(ctx, func() error {
+		attemptCount++
+
+		if lastCancel != nil {
+			lastCancel()
+			lastCancel = nil
+		}
+
+		execCtx := baseCtx
+		if timeout > 0 {
+			execCtx, lastCancel = context.WithTimeout(baseCtx, timeout)
+		}
+
+		if ar != nil {
+			select {
+			case <-ar.Pause:
+				return moerr.NewInternalError(ctx, "task paused")
+			case <-ar.Cancel:
+				return moerr.NewInternalError(ctx, "task cancelled")
+			default:
+			}
+		}
+
+		var injectErr error
+		if e.utHelper != nil {
+			injectErr = e.utHelper.OnSQLExecFailed(ctx, query, e.errorCount)
+		}
+		if injectErr != nil {
+			e.errorCount++
+			return injectErr
+		}
+
+		execResult, err = e.internalExec.Exec(execCtx, query, opts)
+		if err == nil {
+			if attemptCount > 1 {
+				logutil.Info("internal sql executor retry succeeded",
+					zap.String("query", truncateSQL(query)),
+					zap.Int("retryCount", attemptCount-1),
+				)
+			}
+			return nil
+		}
+
+		logutil.Warn("internal sql executor retry attempt",
+			zap.String("query", truncateSQL(query)),
+			zap.Int("retryCount", attemptCount-1),
+			zap.Int("maxRetries", e.retryOpt.MaxRetries),
+			zap.Error(err),
+		)
+
+		return err
+	})
+
+	if err == nil {
+		if lastCancel == nil {
+			lastCancel = func() {}
+		}
+		return convertExecutorResult(execResult), lastCancel, nil
+	}
+
 	if lastCancel != nil {
 		lastCancel()
 	}
