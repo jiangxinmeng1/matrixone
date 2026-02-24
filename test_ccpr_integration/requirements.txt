@@ -1,0 +1,2 @@
+# CCPR Integration Test Requirements
+pymysql>=1.0.0
