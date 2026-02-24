@@ -2184,6 +2184,12 @@ func (s *Scope) handleVectorIvfFlatIndex(
 		}
 	}
 
+	// Skip index data population for CCPR tables when this is a CCPR task transaction.
+	// The index data will be synced via CCPR data synchronization instead.
+	if c.isCCPRTaskTransaction() && isTableFromPublication(originalTableDef) {
+		return nil
+	}
+
 	async, err := catalog.IsIndexAsync(indexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata].IndexAlgoParams)
 	if err != nil {
 		return err

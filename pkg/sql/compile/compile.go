@@ -4879,12 +4879,21 @@ func (c *Compile) shouldBlockCCPRReadOnly(tableDef *plan.TableDef) bool {
 		return false
 	}
 	// If this is a CCPR task transaction with a valid task ID, allow the operation
+	if c.isCCPRTaskTransaction() {
+		return false
+	}
+	return true
+}
+
+// isCCPRTaskTransaction checks if the current transaction is a CCPR task transaction.
+// Returns true if the transaction has a valid CCPR task ID.
+func (c *Compile) isCCPRTaskTransaction() bool {
 	if txnOp := c.proc.GetTxnOperator(); txnOp != nil {
 		if ws := txnOp.GetWorkspace(); ws != nil {
 			if ws.GetCCPRTaskID() != "" {
-				return false
+				return true
 			}
 		}
 	}
-	return true
+	return false
 }

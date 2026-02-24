@@ -63,6 +63,11 @@ func (s *Scope) handleUniqueIndexTable(
 
 func (s *Scope) createAndInsertForUniqueOrRegularIndexTable(c *Compile, indexDef *plan.IndexDef,
 	qryDatabase string, originalTableDef *plan.TableDef, indexInfo *plan.CreateTable) error {
+	// Skip index data population for CCPR tables when this is a CCPR task transaction.
+	// The index data will be synced via CCPR data synchronization instead.
+	if c.isCCPRTaskTransaction() && isTableFromPublication(originalTableDef) {
+		return nil
+	}
 	insertSQL := genInsertIndexTableSql(originalTableDef, indexDef, qryDatabase, indexDef.Unique)
 	err := c.runSql(insertSQL)
 	if err != nil {
@@ -114,6 +119,12 @@ func (s *Scope) handleMasterIndexTable(
 		return err
 	}
 
+	// Skip index data population for CCPR tables when this is a CCPR task transaction.
+	// The index data will be synced via CCPR data synchronization instead.
+	if c.isCCPRTaskTransaction() && isTableFromPublication(originalTableDef) {
+		return nil
+	}
+
 	insertSQLs := genInsertIndexTableSqlForMasterIndex(originalTableDef, indexDef, qryDatabase)
 	for _, insertSQL := range insertSQLs {
 		err = c.runSql(insertSQL)
@@ -145,6 +156,12 @@ func (s *Scope) handleFullTextIndexTable(
 		if err != nil {
 			return err
 		}
+	}
+
+	// Skip index data population for CCPR tables when this is a CCPR task transaction.
+	// The index data will be synced via CCPR data synchronization instead.
+	if c.isCCPRTaskTransaction() && isTableFromPublication(originalTableDef) {
+		return nil
 	}
 
 	async, err := catalog.IsIndexAsync(indexDef.IndexAlgoParams)
@@ -640,6 +657,12 @@ func (s *Scope) handleVectorHnswIndex(
 				return err
 			}
 		}
+	}
+
+	// Skip index data population for CCPR tables when this is a CCPR task transaction.
+	// The index data will be synced via CCPR data synchronization instead.
+	if c.isCCPRTaskTransaction() && isTableFromPublication(originalTableDef) {
+		return nil
 	}
 
 	// clear the cache (it only work in standalone mode though)
