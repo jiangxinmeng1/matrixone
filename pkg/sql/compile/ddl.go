@@ -705,10 +705,20 @@ func (s *Scope) AlterTableInplace(c *Compile) error {
 			multiTableIndexes := make(map[string]*MultiTableIndex)
 			for _, indexDef := range indexTableDef.Indexes {
 
+				// Check for duplicate index names
+				// For vector indexes (IVFFLAT/HNSW), multiple indexDefs share the same IndexName
+				// but have different IndexAlgoTableType (metadata, centroids, entries).
+				// We need to check both IndexName and IndexAlgoTableType for duplicates.
+				isDuplicate := false
 				for i := range addIndex {
-					if indexDef.IndexName == addIndex[i].IndexName {
-						return moerr.NewDuplicateKey(c.proc.Ctx, indexDef.IndexName)
+					if indexDef.IndexName == addIndex[i].IndexName &&
+						indexDef.IndexAlgoTableType == addIndex[i].IndexAlgoTableType {
+						isDuplicate = true
+						break
 					}
+				}
+				if isDuplicate {
+					return moerr.NewDuplicateKey(c.proc.Ctx, indexDef.IndexName)
 				}
 				addIndex = append(addIndex, indexDef)
 

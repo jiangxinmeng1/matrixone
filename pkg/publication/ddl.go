@@ -1400,10 +1400,11 @@ func buildIndexMap(stmt *tree.CreateTable) map[string]*indexInfo {
 					info.columns = append(info.columns, string(col.ColName.ColName()))
 				}
 			}
+			// Extract index type from KeyType (ivfflat, hnsw, etc.)
+			info.indexType = idx.KeyType.ToString()
 			if idx.IndexOption != nil {
 				info.visible = idx.IndexOption.Visible == tree.VISIBLE_TYPE_VISIBLE
-				// Extract index type and vector index parameters
-				info.indexType = idx.IndexOption.IType.ToString()
+				// Extract vector index parameters from IndexOption
 				info.algoParamList = idx.IndexOption.AlgoParamList
 				info.algoParamVectorOpType = idx.IndexOption.AlgoParamVectorOpType
 				info.hnswM = idx.IndexOption.HnswM

@@ -762,9 +762,10 @@ func doResumeCcprSubscription(ctx context.Context, ses *Session, rcs *tree.Resum
 		return moerr.NewInternalErrorf(ctx, "subscription with task_id '%s' does not exist", taskID)
 	}
 
-	// Update mo_ccpr_log: set state to running (0), reset iteration_state and error_message
+	// Update mo_ccpr_log: set state to running (0), set iteration_state to completed (2) so it will be scheduled
+	// The scheduler only picks tasks where state=running AND iteration_state=completed
 	updateSQL := fmt.Sprintf(
-		"UPDATE mo_catalog.mo_ccpr_log SET state = 0, iteration_state = 0, error_message = NULL WHERE task_id = '%s' AND drop_at IS NULL",
+		"UPDATE mo_catalog.mo_ccpr_log SET state = 0, iteration_state = 2, error_message = NULL WHERE task_id = '%s' AND drop_at IS NULL",
 		escapedTaskID,
 	)
 	if accountId != catalog.System_Account {
