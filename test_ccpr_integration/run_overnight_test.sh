@@ -1,14 +1,16 @@
 #!/bin/bash
 #
-# CCPR Integration Overnight Test Runner
+# CCPR Integration Long Test Runner
 #
-# This script runs the CCPR integration test overnight.
-# It handles setup, execution, and cleanup.
+# 按TEST_PLAN.md运行长时间测试:
+# - 同时跑account/db/table三种level
+# - 上下游都在不同account下
+# - 6个阶段流程: DML + checkpoint + ALTER
 #
 
 set -e
 
-# Default configuration
+# 默认配置
 UPSTREAM_HOST="${UPSTREAM_HOST:-127.0.0.1}"
 UPSTREAM_PORT="${UPSTREAM_PORT:-6001}"
 DOWNSTREAM_HOST="${DOWNSTREAM_HOST:-127.0.0.1}"
@@ -16,26 +18,26 @@ DOWNSTREAM_PORT="${DOWNSTREAM_PORT:-6002}"
 USER="${DB_USER:-root}"
 PASSWORD="${DB_PASSWORD:-111}"
 
-# Test duration (8 hours by default)
+# 测试时长 (默认8小时)
 DURATION="${TEST_DURATION:-28800}"
 
-# Sync interval (10 seconds by default)
+# 同步间隔 (默认10秒)
 SYNC_INTERVAL="${SYNC_INTERVAL:-10}"
 
-# Output directory
+# 输出目录
 OUTPUT_DIR="${OUTPUT_DIR:-./test_output}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="${OUTPUT_DIR}/ccpr_test_${TIMESTAMP}.log"
+LOG_FILE="${OUTPUT_DIR}/ccpr_long_test_${TIMESTAMP}.log"
 REPORT_FILE="${OUTPUT_DIR}/ccpr_report_${TIMESTAMP}.json"
 
-# Script directory
+# 脚本目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Colors for output
+# 颜色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 print_header() {
     echo -e "${GREEN}========================================${NC}"
@@ -54,24 +56,24 @@ print_error() {
 check_prerequisites() {
     print_header "Checking Prerequisites"
     
-    # Check Python
+    # 检查Python
     if ! command -v python3 &> /dev/null; then
         print_error "Python3 is not installed"
         exit 1
     fi
     print_info "Python3: $(python3 --version)"
     
-    # Check pymysql
+    # 检查pymysql
     if ! python3 -c "import pymysql" 2>/dev/null; then
         print_info "Installing pymysql..."
-        pip3 install pymysql
+        pip3 install pymysql || pip install pymysql
     fi
     print_info "pymysql: installed"
     
-    # Check connectivity
+    # 检查连接
     print_info "Checking cluster connectivity..."
     
-    if ! python3 -c "
+    python3 -c "
 import pymysql
 try:
     conn = pymysql.connect(host='$UPSTREAM_HOST', port=$UPSTREAM_PORT, user='$USER', password='$PASSWORD', connect_timeout=5)
@@ -80,12 +82,9 @@ try:
 except Exception as e:
     print(f'Upstream: FAILED - {e}')
     exit(1)
-" ; then
-        print_error "Cannot connect to upstream cluster"
-        exit 1
-    fi
+"
     
-    if ! python3 -c "
+    python3 -c "
 import pymysql
 try:
     conn = pymysql.connect(host='$DOWNSTREAM_HOST', port=$DOWNSTREAM_PORT, user='$USER', password='$PASSWORD', connect_timeout=5)
@@ -94,11 +93,7 @@ try:
 except Exception as e:
     print(f'Downstream: FAILED - {e}')
     exit(1)
-" ; then
-        print_error "Cannot connect to downstream cluster"
-        exit 1
-    fi
-    
+"
     echo ""
 }
 
@@ -110,20 +105,21 @@ setup_output_dir() {
 }
 
 run_test() {
-    print_header "Starting CCPR Integration Test"
+    print_header "Starting CCPR Long Test"
     
-    DURATION_HOURS=$(echo "scale=1; $DURATION / 3600" | bc)
+    DURATION_HOURS=$(echo "scale=2; $DURATION / 3600" | bc)
     print_info "Duration: $DURATION seconds ($DURATION_HOURS hours)"
+    print_info "Sync interval: $SYNC_INTERVAL seconds"
     print_info "Start time: $(date)"
-    print_info "Expected end time: $(date -d "+$DURATION seconds")"
+    print_info "Expected end time: $(date -d "+$DURATION seconds" 2>/dev/null || date -v+${DURATION}S 2>/dev/null || echo "N/A")"
     
     echo ""
-    print_info "Running test..."
+    print_info "Running long test (3 CCPR tasks: account/db/table levels)..."
     
     cd "$SCRIPT_DIR"
     
     python3 main.py \
-        --overnight \
+        --long-test \
         --duration "$DURATION" \
         --upstream-host "$UPSTREAM_HOST" \
         --upstream-port "$UPSTREAM_PORT" \
@@ -137,9 +133,7 @@ run_test() {
         --log-level INFO \
         2>&1 | tee -a "$LOG_FILE"
     
-    EXIT_CODE=${PIPESTATUS[0]}
-    
-    return $EXIT_CODE
+    return ${PIPESTATUS[0]}
 }
 
 print_summary() {
@@ -155,14 +149,12 @@ print_summary() {
 import json
 with open('$REPORT_FILE') as f:
     data = json.load(f)
-    if 'overall_success' in data:
-        print(f'  Overall Success: {data[\"overall_success\"]}')
-    if 'scenario_tests' in data:
-        st = data['scenario_tests']
-        print(f'  Scenario Pass Rate: {st.get(\"pass_rate\", \"N/A\"):.1f}%')
-    if 'performance_test' in data:
-        pt = data['performance_test']
-        print(f'  Performance Test: {\"PASSED\" if pt.get(\"success\") else \"FAILED\"}')
+    print(f'  Success: {data.get(\"success\", False)}')
+    print(f'  Errors: {len(data.get(\"errors\", []))}')
+    if 'tasks' in data:
+        print(f'  Tasks:')
+        for task in data['tasks']:
+            print(f'    - {task[\"level\"]}: {task[\"name\"]}')
 "
     fi
 }
@@ -170,33 +162,41 @@ with open('$REPORT_FILE') as f:
 usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
+    echo "按TEST_PLAN.md运行CCPR长时间测试"
+    echo ""
+    echo "测试内容:"
+    echo "  - 同时运行3个CCPR任务: account/database/table level"
+    echo "  - 上下游分别在不同的account下运行"
+    echo "  - 6个阶段: 持续DML + checkpoint + ALTER操作"
+    echo ""
     echo "Options:"
-    echo "  -h, --help              Show this help message"
-    echo "  -d, --duration SECONDS  Test duration in seconds (default: 28800 = 8 hours)"
-    echo "  --upstream-host HOST    Upstream cluster host (default: 127.0.0.1)"
-    echo "  --upstream-port PORT    Upstream cluster port (default: 6001)"
-    echo "  --downstream-host HOST  Downstream cluster host (default: 127.0.0.1)"
-    echo "  --downstream-port PORT  Downstream cluster port (default: 6002)"
-    echo "  --user USER             Database user (default: root)"
-    echo "  --password PASSWORD     Database password (default: 111)"
-    echo "  --output-dir DIR        Output directory (default: ./test_output)"
+    echo "  -h, --help              显示帮助"
+    echo "  -d, --duration SECONDS  测试时长(秒), 默认28800=8小时"
+    echo "  --upstream-host HOST    上游集群地址 (默认: 127.0.0.1)"
+    echo "  --upstream-port PORT    上游集群端口 (默认: 6001)"
+    echo "  --downstream-host HOST  下游集群地址 (默认: 127.0.0.1)"
+    echo "  --downstream-port PORT  下游集群端口 (默认: 6002)"
+    echo "  --user USER             数据库用户 (默认: root)"
+    echo "  --password PASSWORD     数据库密码 (默认: 111)"
+    echo "  --sync-interval SECS    CCPR同步间隔 (默认: 10)"
+    echo "  --output-dir DIR        输出目录 (默认: ./test_output)"
     echo ""
     echo "Environment variables:"
     echo "  UPSTREAM_HOST, UPSTREAM_PORT, DOWNSTREAM_HOST, DOWNSTREAM_PORT"
     echo "  DB_USER, DB_PASSWORD, TEST_DURATION, SYNC_INTERVAL, OUTPUT_DIR"
     echo ""
     echo "Examples:"
-    echo "  # Run 8-hour overnight test"
+    echo "  # 运行8小时长测试"
     echo "  $0"
     echo ""
-    echo "  # Run 1-hour test"
-    echo "  $0 -d 3600"
+    echo "  # 运行5分钟测试 (试运行)"
+    echo "  $0 -d 300"
     echo ""
-    echo "  # Run with custom cluster ports"
-    echo "  $0 --upstream-port 6001 --downstream-port 6002"
+    echo "  # 自定义同步间隔为5分钟"
+    echo "  $0 -d 3600 --sync-interval 300"
 }
 
-# Parse arguments
+# 解析参数
 while [[ $# -gt 0 ]]; do
     case $1 in
         -h|--help)
@@ -231,6 +231,10 @@ while [[ $# -gt 0 ]]; do
             PASSWORD="$2"
             shift 2
             ;;
+        --sync-interval)
+            SYNC_INTERVAL="$2"
+            shift 2
+            ;;
         --output-dir)
             OUTPUT_DIR="$2"
             shift 2
@@ -243,9 +247,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Main execution
+# 主流程
 main() {
-    print_header "CCPR Integration Test"
+    print_header "CCPR Long Test Runner"
+    print_info "按TEST_PLAN.md运行: 同时跑account/db/table三种level"
     
     check_prerequisites
     setup_output_dir

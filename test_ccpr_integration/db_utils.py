@@ -245,12 +245,22 @@ def create_account(conn: pymysql.Connection, account_name: str,
                    admin_user: str = "admin", admin_password: str = "111") -> bool:
     """Create a new account"""
     try:
+        logger.debug(f"Dropping account if exists: {account_name}")
         execute_sql(conn, f"DROP ACCOUNT IF EXISTS {account_name}")
+        logger.debug(f"Creating account: {account_name}")
         execute_sql(conn, f"CREATE ACCOUNT {account_name} ADMIN_NAME '{admin_user}' IDENTIFIED BY '{admin_password}'")
         logger.info(f"Created account: {account_name}")
+        
+        # 验证account是否创建成功
+        result = execute_sql(conn, f"SELECT account_name FROM mo_catalog.mo_account WHERE account_name = '{account_name}'", fetch=True)
+        if not result:
+            logger.error(f"Account {account_name} not found after creation")
+            return False
         return True
     except Exception as e:
         logger.error(f"Failed to create account {account_name}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
 
 

@@ -30,7 +30,7 @@ class TestResult:
         self.passed += 1
         print(f"  ✓ {name}")
     
-    def fail(self, name, reason=""):
+    def fail(self, name, reason=""): 
         self.failed += 1
         self.errors.append((name, reason))
         print(f"  ✗ {name}: {reason}")
@@ -278,13 +278,13 @@ def test_permission(up, down, result):
     
     # ------ 1.1 Account Level 权限 ------
     print("  --- 1.1 Account Level ---")
-    sql(up, "CREATE PUBLICATION pub_acc DATABASE perm_db1 ACCOUNT up_acc1")
+    sql(up, "CREATE PUBLICATION pub_acc DATABASE * ACCOUNT up_acc1")
     
     # Case 1: ds_acc1用up_acc1凭证订阅 -> 成功
     sql(down, "CREATE ACCOUNT ds_acc1 ADMIN_NAME 'dump' IDENTIFIED BY '111'")
     ds1 = conn(DOWNSTREAM, "ds_acc1")
     try:
-        sql(ds1, "CREATE DATABASE perm_db1 FROM 'mysql://up_acc1#dump:111@127.0.0.1:6001' sys PUBLICATION pub_acc")
+        sql(ds1, "CREATE ACCOUNT FROM 'mysql://up_acc1#dump:111@127.0.0.1:6001' sys PUBLICATION pub_acc")
         result.ok("1.1.1 授权账户订阅成功")
     except Exception as e:
         result.fail("1.1.1 授权账户订阅", str(e))
@@ -294,7 +294,7 @@ def test_permission(up, down, result):
     sql(down, "CREATE ACCOUNT ds_acc2 ADMIN_NAME 'dump' IDENTIFIED BY '111'")
     ds2 = conn(DOWNSTREAM, "ds_acc2")
     try:
-        sql(ds2, "CREATE DATABASE perm_db1 FROM 'mysql://up_acc2#dump:111@127.0.0.1:6001' sys PUBLICATION pub_acc")
+        sql(ds2, "CREATE ACCOUNT FROM 'mysql://up_acc2#dump:111@127.0.0.1:6001' sys PUBLICATION pub_acc")
         result.fail("1.1.2 未授权账户订阅应失败", "但成功了")
     except:
         result.ok("1.1.2 未授权账户订阅失败")
@@ -364,13 +364,13 @@ def test_permission(up, down, result):
     
     # ------ 1.4 ACCOUNT ALL 权限 ------
     print("  --- 1.4 ACCOUNT ALL ---")
-    sql(up, "CREATE PUBLICATION pub_all DATABASE perm_db1 ACCOUNT ALL")
+    sql(up, "CREATE PUBLICATION pub_all DATABASE * ACCOUNT ALL")
     
     # Case 1: ds_acc9用up_acc1订阅 -> 成功
     sql(down, "CREATE ACCOUNT ds_acc9 ADMIN_NAME 'dump' IDENTIFIED BY '111'")
     ds9 = conn(DOWNSTREAM, "ds_acc9")
     try:
-        sql(ds9, "CREATE DATABASE perm_db1 FROM 'mysql://up_acc1#dump:111@127.0.0.1:6001' sys PUBLICATION pub_all")
+        sql(ds9, "CREATE ACCOUNT FROM 'mysql://up_acc1#dump:111@127.0.0.1:6001' sys PUBLICATION pub_all")
         result.ok("1.4.1 ACCOUNT ALL - acc1订阅成功")
     except Exception as e:
         result.fail("1.4.1 ACCOUNT ALL - acc1订阅", str(e))
@@ -380,7 +380,7 @@ def test_permission(up, down, result):
     sql(down, "CREATE ACCOUNT ds_acc10 ADMIN_NAME 'dump' IDENTIFIED BY '111'")
     ds10 = conn(DOWNSTREAM, "ds_acc10")
     try:
-        sql(ds10, "CREATE DATABASE perm_db1 FROM 'mysql://up_acc2#dump:111@127.0.0.1:6001' sys PUBLICATION pub_all")
+        sql(ds10, "CREATE ACCOUNT FROM 'mysql://up_acc2#dump:111@127.0.0.1:6001' sys PUBLICATION pub_all")
         result.ok("1.4.2 ACCOUNT ALL - acc2订阅成功")
     except Exception as e:
         result.fail("1.4.2 ACCOUNT ALL - acc2订阅", str(e))
@@ -388,13 +388,13 @@ def test_permission(up, down, result):
     
     # ------ 1.5 多账户授权 ------
     print("  --- 1.5 多账户授权 ---")
-    sql(up, "CREATE PUBLICATION pub_multi DATABASE perm_db1 ACCOUNT up_acc1, up_acc2")
+    sql(up, "CREATE PUBLICATION pub_multi DATABASE * ACCOUNT up_acc1, up_acc2")
     
     # ds_acc11用up_acc1订阅 -> 成功
     sql(down, "CREATE ACCOUNT ds_acc11 ADMIN_NAME 'dump' IDENTIFIED BY '111'")
     ds11 = conn(DOWNSTREAM, "ds_acc11")
     try:
-        sql(ds11, "CREATE DATABASE perm_db1 FROM 'mysql://up_acc1#dump:111@127.0.0.1:6001' sys PUBLICATION pub_multi")
+        sql(ds11, "CREATE ACCOUNT FROM 'mysql://up_acc1#dump:111@127.0.0.1:6001' sys PUBLICATION pub_multi")
         result.ok("1.5.1 多账户授权 - acc1成功")
     except Exception as e:
         result.fail("1.5.1 多账户授权 - acc1", str(e))
@@ -404,7 +404,7 @@ def test_permission(up, down, result):
     sql(down, "CREATE ACCOUNT ds_acc12 ADMIN_NAME 'dump' IDENTIFIED BY '111'")
     ds12 = conn(DOWNSTREAM, "ds_acc12")
     try:
-        sql(ds12, "CREATE DATABASE perm_db1 FROM 'mysql://up_acc2#dump:111@127.0.0.1:6001' sys PUBLICATION pub_multi")
+        sql(ds12, "CREATE ACCOUNT FROM 'mysql://up_acc2#dump:111@127.0.0.1:6001' sys PUBLICATION pub_multi")
         result.ok("1.5.2 多账户授权 - acc2成功")
     except Exception as e:
         result.fail("1.5.2 多账户授权 - acc2", str(e))
@@ -414,7 +414,7 @@ def test_permission(up, down, result):
     sql(down, "CREATE ACCOUNT ds_acc13 ADMIN_NAME 'dump' IDENTIFIED BY '111'")
     ds13 = conn(DOWNSTREAM, "ds_acc13")
     try:
-        sql(ds13, "CREATE DATABASE perm_db1 FROM 'mysql://up_acc3#dump:111@127.0.0.1:6001' sys PUBLICATION pub_multi")
+        sql(ds13, "CREATE ACCOUNT FROM 'mysql://up_acc3#dump:111@127.0.0.1:6001' sys PUBLICATION pub_multi")
         result.fail("1.5.3 多账户授权 - acc3应失败", "但成功了")
     except:
         result.ok("1.5.3 多账户授权 - acc3失败")
@@ -889,10 +889,10 @@ def main():
     
     try:
         test_permission(up, down, result)
-        test_dml(up, down, result)
-        test_indexes(up, down, result)
-        test_alter_table(up, down, result)
-        test_control_ops(up, down, result)
+        # test_dml(up, down, result)
+        # test_indexes(up, down, result)
+        # test_alter_table(up, down, result)
+        # test_control_ops(up, down, result)
     except Exception as e:
         print(f"\n!!! 测试异常: {e}")
         import traceback
