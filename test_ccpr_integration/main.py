@@ -577,8 +577,9 @@ class CCPRLongTest:
                 
                 if up_count != down_count:
                     msg = f"[{task.name}] Count mismatch: upstream={up_count}, downstream={down_count}"
-                    self.errors.append(msg)
                     logger.error(msg)
+                    # 数据不一致，直接退出
+                    raise RuntimeError(msg)
                 else:
                     logger.info(f"[{task.name}] Data consistent: {up_count} rows")
             
