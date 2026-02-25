@@ -215,11 +215,14 @@ func doCreateSnapshot(ctx context.Context, ses *Session, stmt *tree.CreateSnapSh
 	pubAccountName := string(stmt.Object.AccountName)
 	pubName := string(stmt.Object.PubName)
 
+	// pubAccountID is used to store the account ID from publication for later use in objId
+	var pubAccountID uint64
 	if len(pubAccountName) > 0 && len(pubName) > 0 {
 		accountID, accountName, err := getAccountFromPublication(ctx, bh, pubAccountName, pubName, currentAccount)
 		if err != nil {
 			return err
 		}
+		pubAccountID = accountID
 		currentAccount = accountName
 		ctx = defines.AttachAccountId(ctx, uint32(accountID))
 	}
@@ -318,7 +321,11 @@ func doCreateSnapshot(ctx context.Context, ses *Session, stmt *tree.CreateSnapSh
 
 		// if sys tenant create snapshots for other tenant, get the account id
 		// otherwise, get the account id from tenantInfo
-		if currentAccount == sysAccountName && currentAccount != snapshotForAccount {
+		// For publication-based snapshot, use the account ID from publication
+		if pubAccountID > 0 {
+			// Publication mode: use the account ID from getAccountFromPublication
+			objId = pubAccountID
+		} else if currentAccount == sysAccountName && currentAccount != snapshotForAccount {
 			objId, err = getAccountIdFunc(snapshotForAccount)
 			if err != nil {
 				return err

@@ -746,7 +746,7 @@ def setup_logging(log_file: str, log_level: str):
     logging.getLogger('pymysql').setLevel(logging.WARNING)
 
 
-def run_long_test(config: TestConfig, duration: int) -> Dict[str, Any]:
+def run_long_test(config: TestConfig, duration: int, no_cleanup: bool = False) -> Dict[str, Any]:
     """运行长时间测试"""
     test = CCPRLongTest(config)
     
@@ -761,7 +761,10 @@ def run_long_test(config: TestConfig, duration: int) -> Dict[str, Any]:
         
         return report
     finally:
-        test.cleanup()
+        if not no_cleanup:
+            test.cleanup()
+        else:
+            logger.info("Skipping cleanup (--no-cleanup specified)")
 
 
 def main():
@@ -815,6 +818,10 @@ Examples:
                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--report-file", default="ccpr_report.json")
     
+    # 清理控制
+    parser.add_argument("--no-cleanup", action="store_true",
+                       help="测试结束后不清理环境（保留账户和数据库）")
+    
     args = parser.parse_args()
     
     # 构建配置
@@ -853,7 +860,9 @@ Examples:
     
     # 默认运行长时间测试
     logger.info(f"Running long test for {args.duration} seconds ({args.duration/3600:.1f} hours)")
-    results = run_long_test(config, args.duration)
+    if args.no_cleanup:
+        logger.info("Cleanup disabled - environment will be preserved after test")
+    results = run_long_test(config, args.duration, no_cleanup=args.no_cleanup)
     
     # 保存报告
     with open(args.report_file, 'w') as f:
