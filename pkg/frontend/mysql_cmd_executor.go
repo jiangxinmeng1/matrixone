@@ -940,6 +940,7 @@ func doShowVariables(ses *Session, execCtx *ExecCtx, sv *tree.ShowVariables) err
 	}
 
 	var err error
+	useGlobal := sv.Global
 
 	col1 := new(MysqlColumn)
 	col1.SetColumnType(defines.MYSQL_TYPE_VARCHAR)
@@ -977,7 +978,7 @@ func doShowVariables(ses *Session, execCtx *ExecCtx, sv *tree.ShowVariables) err
 		}
 
 		var value interface{}
-		if sv.Global {
+		if useGlobal {
 			if value, err = ses.GetGlobalSysVar(name); err != nil {
 				continue
 			}
@@ -2698,23 +2699,6 @@ func executeStmtWithResponse(ses *Session,
 	err = executeStmtWithTxn(ses, nil, execCtx)
 	if err != nil {
 		return err
-	}
-
-	// TODO put in one txn
-	// insert data after create table in "create table ... as select ..." stmt
-	if ses.createAsSelectSql != "" {
-		ses.EnterFPrint(FPStmtWithResponseCreateAsSelect)
-		defer ses.ExitFPrint(FPStmtWithResponseCreateAsSelect)
-		sql := ses.createAsSelectSql
-		ses.createAsSelectSql = ""
-		tempExecCtx := ExecCtx{
-			ses:    ses,
-			reqCtx: execCtx.reqCtx,
-		}
-		defer tempExecCtx.Close()
-		if err = doComQuery(ses, &tempExecCtx, &UserInput{sql: sql}); err != nil {
-			return err
-		}
 	}
 
 	err = respClientWhenSuccess(ses, execCtx)
