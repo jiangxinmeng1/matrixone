@@ -328,8 +328,8 @@ class CCPRLongTest:
             for phase in phases:
                 if time.time() - start_time >= duration:
                     break
-    
-    logger.info(f"\n{'='*60}")
+                
+                logger.info(f"\n{'='*60}")
                 logger.info(f"Starting {phase.name}")
                 logger.info(f"{'='*60}")
                 
@@ -523,8 +523,8 @@ class CCPRLongTest:
         logger.info(f"[{task.name}] Starting checkpoint...")
         
         try:
-            # 1. 查询task_id
-            result = execute_sql(task.downstream_conn.get_connection(),
+            # 1. 查询task_id (用sys租户查询系统表)
+            result = execute_sql(self.sys_downstream_conn.get_connection(),
                 f"SELECT task_id FROM mo_catalog.mo_ccpr_log WHERE subscription_name='{task.pub_name}' AND drop_at IS NULL",
                 fetch=True)
             if not result or not result[0][0]:
@@ -533,16 +533,16 @@ class CCPRLongTest:
             task_id = result[0][0]
             logger.info(f"[{task.name}] Found task_id: {task_id}")
             
-            # 2. PAUSE (使用task_id带引号)
-            execute_sql(task.downstream_conn.get_connection(),
+            # 2. PAUSE (使用task_id带引号，用sys租户)
+            execute_sql(self.sys_downstream_conn.get_connection(),
                 f"PAUSE CCPR SUBSCRIPTION '{task_id}'")
             logger.info(f"[{task.name}] Paused subscription")
             
             # 2. Sleep
             time.sleep(10)
             
-            # 3. 读取状态
-            statuses = get_ccpr_status(task.downstream_conn.get_connection(),
+            # 3. 读取状态 (用sys租户查询系统表)
+            statuses = get_ccpr_status(self.sys_downstream_conn.get_connection(),
                 subscription_name=task.pub_name)
             
             if statuses:
@@ -582,8 +582,8 @@ class CCPRLongTest:
                 else:
                     logger.info(f"[{task.name}] Data consistent: {up_count} rows")
             
-            # 7. RESUME (使用task_id带引号)
-            execute_sql(task.downstream_conn.get_connection(),
+            # 7. RESUME (使用task_id带引号，用sys租户)
+            execute_sql(self.sys_downstream_conn.get_connection(),
                 f"RESUME CCPR SUBSCRIPTION '{task_id}'")
             logger.info(f"[{task.name}] Resumed subscription")
             
@@ -592,13 +592,13 @@ class CCPRLongTest:
         except Exception as e:
             logger.error(f"[{task.name}] Checkpoint failed: {e}")
             self.errors.append(str(e))
-            # 尝试resume (需要重新查询task_id)
+            # 尝试resume (需要重新查询task_id，用sys租户)
             try:
-                result = execute_sql(task.downstream_conn.get_connection(),
+                result = execute_sql(self.sys_downstream_conn.get_connection(),
                     f"SELECT task_id FROM mo_catalog.mo_ccpr_log WHERE subscription_name='{task.pub_name}' AND drop_at IS NULL",
                     fetch=True)
                 if result and result[0][0]:
-                    execute_sql(task.downstream_conn.get_connection(),
+                    execute_sql(self.sys_downstream_conn.get_connection(),
                         f"RESUME CCPR SUBSCRIPTION '{result[0][0]}'")
             except:
                 pass
