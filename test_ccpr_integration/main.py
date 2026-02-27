@@ -110,15 +110,8 @@ class CCPRLongTest:
             self.sys_downstream_conn = DatabaseConnection(self.config.downstream)
             self.sys_downstream_conn.connect()
             
-<<<<<<< HEAD
-            # 为3种level分别创建上下游account和CCPR任务
-            levels = [
-                (SyncLevel.ACCOUNT, "account"),
-                (SyncLevel.DATABASE, "database"),
-=======
             # 只运行table level测试
             levels = [
->>>>>>> publication
                 (SyncLevel.TABLE, "table"),
             ]
             
