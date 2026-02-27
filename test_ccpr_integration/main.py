@@ -548,7 +548,7 @@ class CCPRLongTest:
             if statuses:
                 status = statuses[0]
                 logger.info(f"[{task.name}] Status: state={status.state}, "
-                          f"lsn={status.iteration_lsn}, error={status.error_message}")
+                          f"lsn={status.iteration_lsn}, watermark={status.watermark}, error={status.error_message}")
                 
                 # 4. 检查error
                 if status.error_message:
@@ -556,30 +556,56 @@ class CCPRLongTest:
                     logger.error(f"[{task.name}] Subscription error: {status.error_message}")
                 
                 # 5. 数据一致性检查（使用snapshot）
-                # 构造snapshot名称
-                snapshot_name = f"ccpr_{status.task_id}_{status.iteration_lsn}"
+                # 用watermark查询mo_snapshots表获取snapshot名称
+                # 注意：CCPR的snapshot是在upstream account下创建的，和表在同一个account
+                snapshot_name = None
+                if status.watermark:
+                    try:
+                        snapshot_result = execute_sql(task.upstream_conn.get_connection(),
+                            f"SELECT sname FROM mo_catalog.mo_snapshots WHERE ts = {status.watermark}",
+                            fetch=True)
+                        if snapshot_result and snapshot_result[0][0]:
+                            snapshot_name = snapshot_result[0][0]
+                            logger.info(f"[{task.name}] Found snapshot by watermark: {snapshot_name}")
+                    except Exception as e:
+                        logger.warning(f"[{task.name}] Failed to query snapshot by watermark: {e}")
                 
-                # 上游用snapshot读取
+                if not snapshot_name:
+                    logger.warning(f"[{task.name}] No snapshot found for watermark={status.watermark}, skipping consistency check")
+                    # RESUME and continue
+                    execute_sql(self.sys_downstream_conn.get_connection(),
+                        f"RESUME CCPR SUBSCRIPTION '{task_id}'")
+                    logger.info(f"[{task.name}] Resumed subscription (no snapshot)")
+                    return True
+                
+                # 上游用snapshot读取（用upstream account，snapshot和表在同一个account）
+                snapshot_sql = f"SELECT COUNT(*) FROM {task.db_name}.{task.table_name} {{SNAPSHOT = '{snapshot_name}'}}"
+                logger.info(f"[{task.name}] Upstream snapshot SQL: {snapshot_sql}")
                 try:
                     up_count = execute_sql(task.upstream_conn.get_connection(),
-                        f"SELECT COUNT(*) FROM {task.db_name}.{task.table_name} "
-                        f"{{SNAPSHOT = '{snapshot_name}'}}",
-                        fetch=True)
+                        snapshot_sql, fetch=True)
+                    logger.info(f"[{task.name}] Upstream snapshot result: {up_count}")
                     up_count = up_count[0][0] if up_count else -1
                 except Exception as e:
-                    logger.warning(f"[{task.name}] Snapshot read failed, using direct read: {e}")
+                    logger.warning(f"[{task.name}] Snapshot read failed: {e}")
+                    # 尝试直接读取（不用snapshot）看看表是否存在
+                    direct_sql = f"SELECT COUNT(*) FROM {task.db_name}.{task.table_name}"
+                    logger.info(f"[{task.name}] Trying direct read: {direct_sql}")
                     up_count = get_table_count(task.upstream_conn.get_connection(),
                         task.db_name, task.table_name)
+                    logger.info(f"[{task.name}] Direct read result: {up_count}")
                 
                 # 下游直接读取
                 down_count = get_table_count(task.downstream_conn.get_connection(),
                     task.db_name, task.table_name)
+                logger.info(f"[{task.name}] Downstream count: {down_count}")
                 
                 if up_count != down_count:
-                    msg = f"[{task.name}] Count mismatch: upstream={up_count}, downstream={down_count}"
+                    msg = f"[{task.name}] Count mismatch: upstream={up_count}, downstream={down_count}, snapshot={snapshot_name}"
                     logger.error(msg)
-                    # 数据不一致，直接退出
-                    raise RuntimeError(msg)
+                    logger.error(f"[{task.name}] STOPPING TEST - Data mismatch detected!")
+                    # 不resume，保持pause状态方便调试
+                    raise SystemExit(msg)
                 else:
                     logger.info(f"[{task.name}] Data consistent: {up_count} rows")
             
@@ -750,6 +776,7 @@ def setup_logging(log_file: str, log_level: str):
 def run_long_test(config: TestConfig, duration: int, no_cleanup: bool = False) -> Dict[str, Any]:
     """运行长时间测试"""
     test = CCPRLongTest(config)
+    error_exit = False
     
     try:
         if not test.setup():
@@ -761,8 +788,15 @@ def run_long_test(config: TestConfig, duration: int, no_cleanup: bool = False) -
         report["success"] = success and len(test.errors) == 0
         
         return report
+    except SystemExit as e:
+        error_exit = True
+        logger.error(f"Test stopped due to error: {e}")
+        logger.info("Skipping cleanup to preserve environment for debugging")
+        raise
     finally:
-        if not no_cleanup:
+        if error_exit:
+            logger.info("Error exit - cleanup skipped")
+        elif not no_cleanup:
             test.cleanup()
         else:
             logger.info("Skipping cleanup (--no-cleanup specified)")

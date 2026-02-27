@@ -113,6 +113,7 @@ class CCPRStatus:
     error_message: Optional[str]
     created_at: Any
     sync_level: str
+    watermark: Optional[int] = None  # watermark timestamp from mo_ccpr_log
 
 
 def get_ccpr_status(conn: pymysql.Connection, task_id: Optional[str] = None,
@@ -120,7 +121,7 @@ def get_ccpr_status(conn: pymysql.Connection, task_id: Optional[str] = None,
     """Query mo_ccpr_log for subscription status"""
     sql = """
         SELECT task_id, subscription_name, db_name, table_name, state, 
-               iteration_state, iteration_lsn, error_message, created_at, sync_level
+               iteration_state, iteration_lsn, error_message, created_at, sync_level, watermark
         FROM mo_catalog.mo_ccpr_log
         WHERE drop_at IS NULL
     """
@@ -146,7 +147,8 @@ def get_ccpr_status(conn: pymysql.Connection, task_id: Optional[str] = None,
                     iteration_lsn=row[6] or 0,
                     error_message=row[7],
                     created_at=row[8],
-                    sync_level=row[9] or "table"
+                    sync_level=row[9] or "table",
+                    watermark=row[10] if len(row) > 10 else None
                 ))
             except Exception as e:
                 logger.warning(f"Failed to parse CCPR status row: {e}")
