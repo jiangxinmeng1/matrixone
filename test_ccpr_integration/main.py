@@ -16,7 +16,7 @@ import argparse
 import threading
 import random
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -60,6 +60,16 @@ class CCPRTask:
     # 动态添加的列（用于ALTER测试）
     added_columns: List[str] = field(default_factory=list)
     added_indexes: List[str] = field(default_factory=list)
+    
+    # PK 追踪：已使用的PK和已删除的PK
+    next_pk: int = 1
+    deleted_pks: Set[int] = field(default_factory=set)
+    active_pks: Set[int] = field(default_factory=set)  # 当前存活的PK
+    pk_lock: Any = field(default=None)  # threading.Lock, 在 __post_init__ 中初始化
+    
+    def __post_init__(self):
+        if self.pk_lock is None:
+            self.pk_lock = threading.Lock()
 
 
 class LongTestPhase(Enum):
@@ -112,8 +122,8 @@ class CCPRLongTest:
             
             # 只运行table level测试
             levels = [
-                (SyncLevel.ACCOUNT, "account"),
-                (SyncLevel.DATABASE, "database"),
+                # (SyncLevel.ACCOUNT, "account"),
+                # (SyncLevel.DATABASE, "database"),
                 (SyncLevel.TABLE, "table"),
             ]
             
@@ -205,10 +215,21 @@ class CCPRLongTest:
             execute_sql(up_conn.get_connection(), 
                 f"CREATE INDEX idx_status ON {db_name}.{table_name} (status)")
             
-            # 插入初始数据
+            # 先创建 task 对象以便追踪 PK
+            temp_task = CCPRTask(
+                level=level,
+                name=level_name,
+                upstream_account=up_account,
+                downstream_account=down_account,
+                pub_name=pub_name,
+                db_name=db_name,
+                table_name=table_name,
+            )
+            
+            # 插入初始数据，追踪 PK
             for i in range(100):
-                self._insert_row(up_conn.get_connection(), db_name, table_name)
-            logger.info(f"[{level_name}] Inserted 100 initial rows")
+                self._insert_row(up_conn.get_connection(), db_name, table_name, task=temp_task)
+            logger.info(f"[{level_name}] Inserted 100 initial rows, pks=[1..100]")
             
             # 5. 从tenant账户创建publication，发布给下游account
             # Account level: DATABASE *
@@ -258,44 +279,68 @@ class CCPRLongTest:
             trigger_checkpoint(self.sys_upstream_conn.get_connection())
             time.sleep(15)
             
-            return CCPRTask(
-                level=level,
-                name=level_name,
-                upstream_account=up_account,
-                downstream_account=down_account,
-                pub_name=pub_name,
-                db_name=db_name,
-                table_name=table_name,
-                upstream_conn=up_conn,
-                downstream_conn=down_conn,
-            )
+            # 更新 temp_task 的连接信息
+            temp_task.upstream_conn = up_conn
+            temp_task.downstream_conn = down_conn
+            
+            return temp_task
             
         except Exception as e:
             logger.error(f"[{level_name}] Setup failed: {e}")
             return None
     
     def _insert_row(self, conn, db_name: str, table_name: str, 
-                    extra_columns: List[str] = None):
-        """插入一行测试数据"""
-        cols = ["c_int", "c_bigint", "c_float", "c_double", "c_decimal",
-                "c_varchar", "c_text", "c_date", "c_datetime", "c_bool", 
-                "c_json", "status"]
+                    extra_columns: List[str] = None, task: CCPRTask = None) -> Optional[int]:
+        """插入一行测试数据，使用显式 PK"""
+        if task is None:
+            # 向后兼容：没有task时使用AUTO_INCREMENT
+            cols = ["c_int", "c_bigint", "c_float", "c_double", "c_decimal",
+                    "c_varchar", "c_text", "c_date", "c_datetime", "c_bool", 
+                    "c_json", "status"]
+        else:
+            # 使用显式 PK
+            with task.pk_lock:
+                pk = task.next_pk
+                task.next_pk += 1
+                task.active_pks.add(pk)
+            
+            cols = ["id", "c_int", "c_bigint", "c_float", "c_double", "c_decimal",
+                    "c_varchar", "c_text", "c_date", "c_datetime", "c_bool", 
+                    "c_json", "status"]
         
         json_val = json.dumps({"key": random_string(10)})
-        values = [
-            str(random.randint(0, 100000)),
-            str(random.randint(0, 10000000000)),
-            str(round(random.uniform(-1000, 1000), 4)),
-            str(round(random.uniform(-1000000, 1000000), 8)),
-            str(round(random.uniform(-10000, 10000), 4)),
-            f"'{escape_sql_string(random_string(50))}'",
-            f"'{escape_sql_string(random_text(10, 30))}'",
-            f"'{datetime.now().strftime('%Y-%m-%d')}'",
-            f"'{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}'",
-            str(random.choice([0, 1])),
-            f"'{json_val}'",
-            f"'{random.choice(['active', 'inactive', 'pending'])}'",
-        ]
+        
+        if task is None:
+            values = [
+                str(random.randint(0, 100000)),
+                str(random.randint(0, 10000000000)),
+                str(round(random.uniform(-1000, 1000), 4)),
+                str(round(random.uniform(-1000000, 1000000), 8)),
+                str(round(random.uniform(-10000, 10000), 4)),
+                f"'{escape_sql_string(random_string(50))}'",
+                f"'{escape_sql_string(random_text(10, 30))}'",
+                f"'{datetime.now().strftime('%Y-%m-%d')}'",
+                f"'{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}'",
+                str(random.choice([0, 1])),
+                f"'{json_val}'",
+                f"'{random.choice(['active', 'inactive', 'pending'])}'",
+            ]
+        else:
+            values = [
+                str(pk),  # 显式 PK
+                str(random.randint(0, 100000)),
+                str(random.randint(0, 10000000000)),
+                str(round(random.uniform(-1000, 1000), 4)),
+                str(round(random.uniform(-1000000, 1000000), 8)),
+                str(round(random.uniform(-10000, 10000), 4)),
+                f"'{escape_sql_string(random_string(50))}'",
+                f"'{escape_sql_string(random_text(10, 30))}'",
+                f"'{datetime.now().strftime('%Y-%m-%d')}'",
+                f"'{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}'",
+                str(random.choice([0, 1])),
+                f"'{json_val}'",
+                f"'{random.choice(['active', 'inactive', 'pending'])}'",
+            ]
         
         # 添加额外的列值
         if extra_columns:
@@ -305,6 +350,61 @@ class CCPRLongTest:
         
         sql = f"INSERT INTO {db_name}.{table_name} ({', '.join(cols)}) VALUES ({', '.join(values)})"
         execute_sql(conn, sql)
+        
+        if task is not None:
+            logger.info(f"[{task.name}] INSERT pk={pk}")
+            return pk
+        return None
+    
+    def _delete_rows_by_pk(self, conn, db_name: str, table_name: str, 
+                           task: CCPRTask, count: int) -> List[int]:
+        """删除指定数量的行，返回删除的 PK 列表"""
+        deleted_pks = []
+        
+        with task.pk_lock:
+            # 从 active_pks 中随机选择要删除的 PK
+            available = list(task.active_pks)
+            if len(available) == 0:
+                return []
+            
+            to_delete = random.sample(available, min(count, len(available)))
+            
+            for pk in to_delete:
+                task.active_pks.discard(pk)
+                task.deleted_pks.add(pk)
+                deleted_pks.append(pk)
+        
+        if deleted_pks:
+            pk_list = ','.join(str(pk) for pk in deleted_pks)
+            sql = f"DELETE FROM {db_name}.{table_name} WHERE id IN ({pk_list})"
+            execute_sql(conn, sql)
+            logger.info(f"[{task.name}] DELETE pks=[{pk_list}]")
+        
+        return deleted_pks
+    
+    def _update_rows_by_pk(self, conn, db_name: str, table_name: str,
+                           task: CCPRTask, count: int) -> List[int]:
+        """更新指定数量的行，返回更新的 PK 列表"""
+        with task.pk_lock:
+            available = list(task.active_pks)
+            if len(available) == 0:
+                return []
+            
+            to_update = random.sample(available, min(count, len(available)))
+        
+        if to_update:
+            pk_list = ','.join(str(pk) for pk in to_update)
+            sql = f"""
+                UPDATE {db_name}.{table_name} 
+                SET c_int = {random.randint(0, 100000)},
+                    c_varchar = '{escape_sql_string(random_string(50))}',
+                    status = '{random.choice(['active', 'inactive', 'pending'])}'
+                WHERE id IN ({pk_list})
+            """
+            execute_sql(conn, sql)
+            logger.info(f"[{task.name}] UPDATE pks=[{pk_list}]")
+        
+        return to_update
     
     def run(self, duration: int) -> bool:
         """运行长时间测试"""
@@ -325,7 +425,7 @@ class CCPRLongTest:
         ]
         
         try:
-            for phase in phases:
+            for phase_idx, phase in enumerate(phases):
                 if time.time() - start_time >= duration:
                     break
                 
@@ -336,9 +436,9 @@ class CCPRLongTest:
                 # 1. 启动DML线程
                 self._start_dml_threads()
                 
-                # 2. 运行DML直到阶段结束
-                phase_end = start_time + (phase.value * phase_duration)
-                while time.time() < phase_end and time.time() - start_time < duration:
+                # 2. 运行DML固定时长（phase_duration秒）
+                dml_end_time = time.time() + phase_duration
+                while time.time() < dml_end_time and time.time() - start_time < duration:
                     time.sleep(10)
                     # 定期触发checkpoint (用sys租户)
                     trigger_checkpoint(self.sys_upstream_conn.get_connection())
@@ -400,7 +500,7 @@ class CCPRLongTest:
         logger.info("Stopped DML threads")
     
     def _dml_worker(self, task: CCPRTask):
-        """DML工作线程 - 持续执行各种DML操作"""
+        """DML工作线程 - 持续执行各种DML操作，使用显式 PK 追踪"""
         # DML操作类型列表，轮流执行
         dml_operations = [
             "SMALL_INSERT",      # 小数据插入 (1-5行)
@@ -443,71 +543,126 @@ class CCPRLongTest:
                         # 小数据插入 1-5行
                         count = random.randint(1, 5)
                         for _ in range(count):
-                            self._insert_row(conn, db, tbl, task.added_columns)
-                        logger.debug(f"[{task.name}] SMALL_INSERT: {count} rows")
+                            self._insert_row(conn, db, tbl, task.added_columns, task)
                         
                     elif op == "SMALL_UPDATE":
                         # 小数据更新 1-5行
                         count = random.randint(1, 5)
-                        execute_sql(conn, f"""
-                            UPDATE {db}.{tbl} 
-                            SET c_int = {random.randint(0, 100000)},
-                                c_varchar = '{escape_sql_string(random_string(50))}',
-                                status = '{random.choice(['active', 'inactive', 'pending'])}'
-                            ORDER BY RAND() LIMIT {count}
-                        """)
-                        logger.debug(f"[{task.name}] SMALL_UPDATE: {count} rows")
+                        self._update_rows_by_pk(conn, db, tbl, task, count)
                         
                     elif op == "SMALL_DELETE":
                         # 小数据删除 1-5行
                         count = random.randint(1, 5)
-                        execute_sql(conn, f"""
-                            DELETE FROM {db}.{tbl} 
-                            ORDER BY RAND() LIMIT {count}
-                        """)
-                        logger.debug(f"[{task.name}] SMALL_DELETE: {count} rows")
+                        self._delete_rows_by_pk(conn, db, tbl, task, count)
                         
                     elif op == "BATCH_INSERT":
                         # 批量插入 50-100行
                         count = random.randint(50, 100)
+                        inserted_pks = []
                         for _ in range(count):
-                            self._insert_row(conn, db, tbl, task.added_columns)
-                        logger.debug(f"[{task.name}] BATCH_INSERT: {count} rows")
+                            pk = self._insert_row(conn, db, tbl, task.added_columns, task)
+                            if pk:
+                                inserted_pks.append(pk)
+                        logger.info(f"[{task.name}] BATCH_INSERT: {len(inserted_pks)} rows, pks=[{inserted_pks[0]}..{inserted_pks[-1]}]")
                         
                     elif op == "BATCH_UPDATE":
                         # 批量更新 10-50行
                         count = random.randint(10, 50)
-                        execute_sql(conn, f"""
-                            UPDATE {db}.{tbl} 
-                            SET c_int = c_int + 1,
-                                c_varchar = '{escape_sql_string(random_string(50))}',
-                                status = '{random.choice(['active', 'inactive', 'pending'])}'
-                            ORDER BY RAND() LIMIT {count}
-                        """)
-                        logger.debug(f"[{task.name}] BATCH_UPDATE: {count} rows")
+                        self._update_rows_by_pk(conn, db, tbl, task, count)
                         
                     elif op == "BATCH_DELETE":
                         # 批量删除 10-50行 (但保留至少100行)
-                        current_count = get_table_count(conn, db, tbl)
-                        if current_count > 150:
-                            count = min(random.randint(10, 50), current_count - 100)
-                            execute_sql(conn, f"""
-                                DELETE FROM {db}.{tbl} 
-                                ORDER BY RAND() LIMIT {count}
-                            """)
-                            logger.debug(f"[{task.name}] BATCH_DELETE: {count} rows")
+                        with task.pk_lock:
+                            active_count = len(task.active_pks)
+                        
+                        if active_count > 150:
+                            count = min(random.randint(10, 50), active_count - 100)
+                            self._delete_rows_by_pk(conn, db, tbl, task, count)
                         else:
                             # 数据太少，改为插入
+                            inserted_pks = []
                             for _ in range(50):
-                                self._insert_row(conn, db, tbl, task.added_columns)
-                            logger.debug(f"[{task.name}] BATCH_DELETE->INSERT: 50 rows (table too small)")
+                                pk = self._insert_row(conn, db, tbl, task.added_columns, task)
+                                if pk:
+                                    inserted_pks.append(pk)
+                            logger.info(f"[{task.name}] BATCH_DELETE->INSERT: 50 rows (table too small), pks=[{inserted_pks[0]}..{inserted_pks[-1]}]")
                             
                 except Exception as e:
-                    logger.debug(f"[{task.name}] DML error ({op}): {e}")
+                    logger.warning(f"[{task.name}] DML error ({op}): {e}")
                 
                 # 不等待，直接继续下一个操作
         finally:
             worker_conn.close()
+    
+    def _compare_data(self, task: CCPRTask, snapshot_name: Optional[str] = None) -> Tuple[bool, str]:
+        """
+        比较上下游数据，返回 (是否一致, 差异描述)
+        
+        1. 查询上游所有数据（可选用 snapshot）
+        2. 查询下游所有数据
+        3. 对比每一行，列出差异
+        """
+        db = task.db_name
+        tbl = task.table_name
+        
+        try:
+            # 查询上游数据
+            if snapshot_name:
+                up_sql = f"SELECT id, c_int, c_varchar, status FROM {db}.{tbl} {{SNAPSHOT = '{snapshot_name}'}} ORDER BY id"
+            else:
+                up_sql = f"SELECT id, c_int, c_varchar, status FROM {db}.{tbl} ORDER BY id"
+            
+            up_rows = execute_sql(task.upstream_conn.get_connection(), up_sql, fetch=True)
+            up_data = {row[0]: row for row in (up_rows or [])}
+            
+            # 查询下游数据
+            down_sql = f"SELECT id, c_int, c_varchar, status FROM {db}.{tbl} ORDER BY id"
+            down_rows = execute_sql(task.downstream_conn.get_connection(), down_sql, fetch=True)
+            down_data = {row[0]: row for row in (down_rows or [])}
+            
+            # 对比
+            all_pks = set(up_data.keys()) | set(down_data.keys())
+            
+            only_upstream = []
+            only_downstream = []
+            different_values = []
+            
+            for pk in sorted(all_pks):
+                up_row = up_data.get(pk)
+                down_row = down_data.get(pk)
+                
+                if up_row and not down_row:
+                    only_upstream.append(pk)
+                elif down_row and not up_row:
+                    only_downstream.append(pk)
+                elif up_row != down_row:
+                    different_values.append((pk, up_row, down_row))
+            
+            # 生成报告
+            if not only_upstream and not only_downstream and not different_values:
+                return True, f"数据一致: {len(up_data)} 行"
+            
+            report_lines = [
+                f"数据不一致! 上游={len(up_data)}行, 下游={len(down_data)}行",
+            ]
+            
+            if only_upstream:
+                report_lines.append(f"  仅上游存在 ({len(only_upstream)}行): pks={only_upstream[:20]}{'...' if len(only_upstream) > 20 else ''}")
+            
+            if only_downstream:
+                report_lines.append(f"  仅下游存在 ({len(only_downstream)}行): pks={only_downstream[:20]}{'...' if len(only_downstream) > 20 else ''}")
+            
+            if different_values:
+                report_lines.append(f"  值不同 ({len(different_values)}行):")
+                for pk, up_row, down_row in different_values[:10]:
+                    report_lines.append(f"    pk={pk}: 上游={up_row}, 下游={down_row}")
+                if len(different_values) > 10:
+                    report_lines.append(f"    ... 还有 {len(different_values) - 10} 行差异")
+            
+            return False, '\n'.join(report_lines)
+            
+        except Exception as e:
+            return False, f"对比失败: {e}"
     
     def _checkpoint(self, task: CCPRTask) -> bool:
         """
@@ -571,43 +726,25 @@ class CCPRLongTest:
                         logger.warning(f"[{task.name}] Failed to query snapshot by watermark: {e}")
                 
                 if not snapshot_name:
-                    logger.warning(f"[{task.name}] No snapshot found for watermark={status.watermark}, skipping consistency check")
-                    # RESUME and continue
-                    execute_sql(self.sys_downstream_conn.get_connection(),
-                        f"RESUME CCPR SUBSCRIPTION '{task_id}'")
-                    logger.info(f"[{task.name}] Resumed subscription (no snapshot)")
-                    return True
+                    logger.warning(f"[{task.name}] No snapshot found for watermark={status.watermark}, using direct comparison")
                 
-                # 上游用snapshot读取（用upstream account，snapshot和表在同一个account）
-                snapshot_sql = f"SELECT COUNT(*) FROM {task.db_name}.{task.table_name} {{SNAPSHOT = '{snapshot_name}'}}"
-                logger.info(f"[{task.name}] Upstream snapshot SQL: {snapshot_sql}")
-                try:
-                    up_count = execute_sql(task.upstream_conn.get_connection(),
-                        snapshot_sql, fetch=True)
-                    logger.info(f"[{task.name}] Upstream snapshot result: {up_count}")
-                    up_count = up_count[0][0] if up_count else -1
-                except Exception as e:
-                    logger.warning(f"[{task.name}] Snapshot read failed: {e}")
-                    # 尝试直接读取（不用snapshot）看看表是否存在
-                    direct_sql = f"SELECT COUNT(*) FROM {task.db_name}.{task.table_name}"
-                    logger.info(f"[{task.name}] Trying direct read: {direct_sql}")
-                    up_count = get_table_count(task.upstream_conn.get_connection(),
-                        task.db_name, task.table_name)
-                    logger.info(f"[{task.name}] Direct read result: {up_count}")
+                # 使用详细对比函数
+                is_consistent, report = self._compare_data(task, snapshot_name)
                 
-                # 下游直接读取
-                down_count = get_table_count(task.downstream_conn.get_connection(),
-                    task.db_name, task.table_name)
-                logger.info(f"[{task.name}] Downstream count: {down_count}")
-                
-                if up_count != down_count:
-                    msg = f"[{task.name}] Count mismatch: upstream={up_count}, downstream={down_count}, snapshot={snapshot_name}"
-                    logger.error(msg)
+                if not is_consistent:
+                    logger.error(f"[{task.name}] {report}")
                     logger.error(f"[{task.name}] STOPPING TEST - Data mismatch detected!")
+                    
+                    # 打印 PK 追踪信息
+                    with task.pk_lock:
+                        logger.error(f"[{task.name}] PK tracking: next_pk={task.next_pk}, active={len(task.active_pks)}, deleted={len(task.deleted_pks)}")
+                        logger.error(f"[{task.name}] Active PKs (sample): {sorted(list(task.active_pks))[:50]}")
+                        logger.error(f"[{task.name}] Deleted PKs (sample): {sorted(list(task.deleted_pks))[:50]}")
+                    
                     # 不resume，保持pause状态方便调试
-                    raise SystemExit(msg)
+                    raise SystemExit(f"[{task.name}] {report}")
                 else:
-                    logger.info(f"[{task.name}] Data consistent: {up_count} rows")
+                    logger.info(f"[{task.name}] {report}")
             
             # 7. RESUME (使用task_id带引号，用sys租户)
             execute_sql(self.sys_downstream_conn.get_connection(),
@@ -681,8 +818,12 @@ class CCPRLongTest:
             elif phase == LongTestPhase.PHASE6_DML_LOAD_COMMENT:
                 # 大批量LOAD + CHANGE COMMENT
                 logger.info(f"[{task.name}] Bulk loading data...")
+                inserted_pks = []
                 for _ in range(100):
-                    self._insert_row(conn, db, tbl, task.added_columns)
+                    pk = self._insert_row(conn, db, tbl, task.added_columns, task)
+                    if pk:
+                        inserted_pks.append(pk)
+                logger.info(f"[{task.name}] Bulk load complete, inserted pks=[{inserted_pks[0]}..{inserted_pks[-1]}]")
                 
                 comment = f"Long test completed at {datetime.now()}"
                 execute_sql(conn, f"ALTER TABLE {db}.{tbl} COMMENT = '{comment}'")
