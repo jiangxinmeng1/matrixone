@@ -106,6 +106,8 @@ class CCPRLongTest:
         self.stop_event = threading.Event()
         self.errors: List[str] = []
         self.dml_threads: List[threading.Thread] = []
+        self.watermark_monitor_thread: Optional[threading.Thread] = None
+        self.last_watermarks: Dict[str, int] = {}  # task_name -> last_watermark
         
     def setup(self) -> bool:
         """初始化测试环境"""
@@ -489,7 +491,12 @@ class CCPRLongTest:
             t.start()
             self.dml_threads.append(t)
         
-        logger.info(f"Started {len(self.dml_threads)} DML threads")
+        # 启动 watermark 监控线程
+        self.watermark_monitor_thread = threading.Thread(
+            target=self._watermark_monitor_worker, daemon=True)
+        self.watermark_monitor_thread.start()
+        
+        logger.info(f"Started {len(self.dml_threads)} DML threads + 1 watermark monitor thread")
     
     def _stop_dml_threads(self):
         """停止DML线程"""
@@ -497,7 +504,11 @@ class CCPRLongTest:
         for t in self.dml_threads:
             t.join(timeout=10)
         self.dml_threads = []
-        logger.info("Stopped DML threads")
+        # 停止 watermark 监控线程
+        if self.watermark_monitor_thread:
+            self.watermark_monitor_thread.join(timeout=10)
+            self.watermark_monitor_thread = None
+        logger.info("Stopped DML threads and watermark monitor")
     
     def _dml_worker(self, task: CCPRTask):
         """DML工作线程 - 持续执行各种DML操作，使用显式 PK 追踪"""
@@ -593,6 +604,105 @@ class CCPRLongTest:
                 # 不等待，直接继续下一个操作
         finally:
             worker_conn.close()
+    
+    def _watermark_monitor_worker(self):
+        """
+        Watermark 监控线程 - 监控每个 task 的 watermark 变化，发现变化时进行数据一致性检查
+        """
+        logger.info("[WatermarkMonitor] Started")
+        
+        # 为监控线程创建独立的下游连接
+        monitor_down_conn = DatabaseConnection(self.config.downstream)
+        try:
+            monitor_down_conn.connect()
+        except Exception as e:
+            logger.error(f"[WatermarkMonitor] Failed to connect: {e}")
+            return
+        
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    for task in self.tasks:
+                        # 查询当前 watermark
+                        result = execute_sql(monitor_down_conn.get_connection(),
+                            f"SELECT task_id, watermark FROM mo_catalog.mo_ccpr_log "
+                            f"WHERE subscription_name='{task.pub_name}' AND drop_at IS NULL",
+                            fetch=True)
+                        
+                        if not result or not result[0][0]:
+                            continue
+                        
+                        task_id = result[0][0]
+                        current_watermark = result[0][1] or 0
+                        last_watermark = self.last_watermarks.get(task.name, 0)
+                        
+                        # 检查 watermark 是否有变化
+                        if current_watermark != last_watermark and last_watermark != 0:
+                            logger.info(f"[WatermarkMonitor] [{task.name}] Watermark changed: {last_watermark} -> {current_watermark}")
+                            
+                            # 执行数据一致性检查（不 PAUSE，直接用 snapshot 对比）
+                            self._check_consistency_on_watermark_change(task, task_id, current_watermark)
+                        
+                        # 更新 last_watermark
+                        self.last_watermarks[task.name] = current_watermark
+                        
+                except Exception as e:
+                    logger.warning(f"[WatermarkMonitor] Error: {e}")
+                
+                # 每 5 秒检查一次
+                for _ in range(50):  # 5秒，每0.1秒检查一次stop_event
+                    if self.stop_event.is_set():
+                        break
+                    time.sleep(0.1)
+        finally:
+            monitor_down_conn.close()
+            logger.info("[WatermarkMonitor] Stopped")
+    
+    def _check_consistency_on_watermark_change(self, task: CCPRTask, task_id: str, watermark: int):
+        """
+        Watermark 变化时的数据一致性检查（不 PAUSE，使用 snapshot 对比）
+        """
+        try:
+            # 根据 watermark 查询对应的 snapshot
+            snapshot_name = None
+            try:
+                snapshot_result = execute_sql(task.upstream_conn.get_connection(),
+                    f"SELECT sname FROM mo_catalog.mo_snapshots WHERE ts = {watermark}",
+                    fetch=True)
+                if snapshot_result and snapshot_result[0][0]:
+                    snapshot_name = snapshot_result[0][0]
+                    logger.info(f"[WatermarkMonitor] [{task.name}] Found snapshot: {snapshot_name}")
+            except Exception as e:
+                logger.warning(f"[WatermarkMonitor] [{task.name}] Failed to query snapshot: {e}")
+            
+            if not snapshot_name:
+                logger.warning(f"[WatermarkMonitor] [{task.name}] No snapshot found for watermark={watermark}, skipping check")
+                return
+            
+            # 使用详细对比函数
+            is_consistent, report = self._compare_data(task, snapshot_name)
+            
+            if not is_consistent:
+                logger.error(f"[WatermarkMonitor] [{task.name}] {report}")
+                logger.error(f"[WatermarkMonitor] [{task.name}] STOPPING TEST - Data mismatch detected!")
+                
+                # 打印 PK 追踪信息
+                with task.pk_lock:
+                    logger.error(f"[WatermarkMonitor] [{task.name}] PK tracking: next_pk={task.next_pk}, "
+                               f"active={len(task.active_pks)}, deleted={len(task.deleted_pks)}")
+                    logger.error(f"[WatermarkMonitor] [{task.name}] Active PKs (sample): {sorted(list(task.active_pks))[:50]}")
+                    logger.error(f"[WatermarkMonitor] [{task.name}] Deleted PKs (sample): {sorted(list(task.deleted_pks))[:50]}")
+                
+                # 停止测试
+                self.errors.append(f"[WatermarkMonitor] [{task.name}] {report}")
+                raise SystemExit(f"[WatermarkMonitor] [{task.name}] {report}")
+            else:
+                logger.info(f"[WatermarkMonitor] [{task.name}] ✓ {report}")
+                
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.warning(f"[WatermarkMonitor] [{task.name}] Check failed: {e}")
     
     def _compare_data(self, task: CCPRTask, snapshot_name: Optional[str] = None) -> Tuple[bool, str]:
         """
