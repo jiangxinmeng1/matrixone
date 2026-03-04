@@ -888,11 +888,11 @@ def main():
     down = conn(DOWNSTREAM)
     
     try:
-        # test_permission(up, down, result)
+        test_permission(up, down, result)
         test_dml(up, down, result)
-        # test_indexes(up, down, result)
-        # test_alter_table(up, down, result)
-        # test_control_ops(up, down, result)
+        test_indexes(up, down, result)
+        test_alter_table(up, down, result)
+        test_control_ops(up, down, result)
     except Exception as e:
         print(f"\n!!! 测试异常: {e}")
         import traceback
