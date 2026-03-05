@@ -409,13 +409,14 @@ class CCPRLongTest:
         return to_update
     
     def run(self, duration: int) -> bool:
-        """运行长时间测试"""
+        """运行长时间测试 - 每10分钟做一次ALTER TABLE"""
         logger.info("="*60)
         logger.info(f"Starting Long Test for {duration} seconds ({duration/3600:.1f} hours)")
+        logger.info(f"ALTER TABLE will be executed every 10 minutes")
         logger.info("="*60)
         
         start_time = time.time()
-        phase_duration = duration / 6  # 每个阶段的时间
+        alter_interval = 10 * 60  # 每10分钟做一次ALTER
         
         phases = [
             LongTestPhase.PHASE1_DML_ADD_COLUMN,
@@ -427,40 +428,56 @@ class CCPRLongTest:
         ]
         
         try:
-            for phase_idx, phase in enumerate(phases):
-                if time.time() - start_time >= duration:
-                    break
+            # 启动DML线程（持续运行到测试结束）
+            self._start_dml_threads()
+            
+            phase_idx = 0
+            last_alter_time = start_time
+            
+            while time.time() - start_time < duration:
+                current_time = time.time()
                 
-                logger.info(f"\n{'='*60}")
-                logger.info(f"Starting {phase.name}")
-                logger.info(f"{'='*60}")
-                
-                # 1. 启动DML线程
-                self._start_dml_threads()
-                
-                # 2. 运行DML固定时长（phase_duration秒）
-                dml_end_time = time.time() + phase_duration
-                while time.time() < dml_end_time and time.time() - start_time < duration:
-                    time.sleep(10)
-                    # 定期触发checkpoint (用sys租户)
-                    trigger_checkpoint(self.sys_upstream_conn.get_connection())
-                
-                # 3. 停止DML
-                self._stop_dml_threads()
-                
-                # 4. 检查点：PAUSE -> 一致性检查 -> RESUME
-                logger.info(f"\n--- Checkpoint for {phase.name} ---")
-                for task in self.tasks:
-                    self._checkpoint(task)
-                
-                # 5. 执行ALTER操作
-                logger.info(f"\n--- ALTER operations for {phase.name} ---")
-                for task in self.tasks:
-                    self._execute_alter(task, phase)
-                
-                # 等待ALTER同步 (用sys租户触发checkpoint)
+                # 每10秒触发一次checkpoint
                 trigger_checkpoint(self.sys_upstream_conn.get_connection())
-                time.sleep(self.config.sync_interval + 5)
+                
+                # 检查是否到了执行ALTER的时间（每10分钟）
+                if current_time - last_alter_time >= alter_interval:
+                    phase = phases[phase_idx % len(phases)]
+                    phase_idx += 1
+                    
+                    logger.info(f"\n{'='*60}")
+                    logger.info(f"ALTER interval reached - executing {phase.name}")
+                    logger.info(f"Elapsed: {(current_time - start_time)/60:.1f} min, "
+                              f"ALTER count: {phase_idx}")
+                    logger.info(f"{'='*60}")
+                    
+                    # 1. 停止DML线程
+                    self._stop_dml_threads()
+                    
+                    # 2. 检查点：PAUSE -> 一致性检查 -> RESUME
+                    logger.info(f"\n--- Checkpoint for {phase.name} ---")
+                    for task in self.tasks:
+                        self._checkpoint(task)
+                    
+                    # 3. 执行ALTER操作
+                    logger.info(f"\n--- ALTER operations for {phase.name} ---")
+                    for task in self.tasks:
+                        self._execute_alter(task, phase)
+                    
+                    # 4. 等待ALTER同步
+                    trigger_checkpoint(self.sys_upstream_conn.get_connection())
+                    time.sleep(self.config.sync_interval + 5)
+                    
+                    # 5. 重启DML线程
+                    self._start_dml_threads()
+                    
+                    last_alter_time = time.time()
+                
+                # 等待10秒后继续循环
+                time.sleep(10)
+            
+            # 停止DML线程
+            self._stop_dml_threads()
             
             # 最终检查
             logger.info("\n" + "="*60)
