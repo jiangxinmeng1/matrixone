@@ -27,16 +27,12 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"go.uber.org/zap"
 )
 
 const (
-	PublicationWorkerThread  = 10
-	FilterObjectWorkerThread = 1000
-	GetChunkWorkerThread     = 10
-	WriteObjectWorkerThread  = 100
-
 	SubmitRetryTimes    = 1000
 	SubmitRetryDuration = time.Hour
 
@@ -415,7 +411,7 @@ func (w *worker) RunStatsPrinter() {
 }
 
 func (w *worker) Run() {
-	for i := 0; i < PublicationWorkerThread; i++ {
+	for i := 0; i < GetPublicationWorkerThread(); i++ {
 		w.wg.Add(1)
 		go func() {
 			defer w.wg.Done()
@@ -446,7 +442,7 @@ func (w *worker) onItem(taskCtx *TaskContext) {
 	// Create retry option for executor operations
 	executorRetryOpt := &ExecutorRetryOption{
 		RetryTimes:    SubmitRetryTimes,
-		RetryInterval: DefaultRetryInterval,
+		RetryInterval: GetRetryInterval(),
 		RetryDuration: SubmitRetryDuration,
 	}
 
@@ -521,144 +517,8 @@ func (w *worker) Stop() {
 }
 
 // ============================================================================
-// Sync Protection KeepAlive Management
+// Sync Protection Management (currently disabled, kept for future use)
 // ============================================================================
-
-// RunSyncProtectionKeepAlive runs a single goroutine that manages keepalive for all registered sync protection jobs
-// func (w *worker) RunSyncProtectionKeepAlive() {
-// 	w.syncProtectionTicker = time.NewTicker(SyncProtectionRenewInterval)
-// 	w.syncProtectionStarted.Store(true)
-// 	defer w.syncProtectionTicker.Stop()
-
-// 	for {
-// 		select {
-// 		case <-w.ctx.Done():
-// 			logutil.Info("ccpr-worker sync protection keepalive stopped due to context cancellation")
-// 			return
-// 		case <-w.syncProtectionTicker.C:
-// 			w.renewAllSyncProtections()
-// 		}
-// 	}
-// }
-
-// renewAllSyncProtections renews TTL for all registered sync protection jobs
-// func (w *worker) renewAllSyncProtections() {
-// 	w.syncProtectionMu.RLock()
-// 	jobs := make([]*syncProtectionEntry, 0, len(w.syncProtectionJobs))
-// 	for _, job := range w.syncProtectionJobs {
-// 		jobs = append(jobs, job)
-// 	}
-// 	w.syncProtectionMu.RUnlock()
-
-// 	if len(jobs) == 0 {
-// 		return
-// 	}
-
-// 	// Create an internal SQL executor for renewal operations
-// 	executor, err := NewInternalSQLExecutor(
-// 		w.cnUUID,
-// 		w.cnTxnClient,
-// 		w.cnEngine,
-// 		catalog.System_Account,
-// 		&SQLExecutorRetryOption{
-// 			MaxRetries:    DefaultSQLExecutorRetryOption().MaxRetries,
-// 			RetryInterval: DefaultSQLExecutorRetryOption().RetryInterval,
-// 			Classifier:    NewDownstreamCommitClassifier(),
-// 		},
-// 		true,
-// 	)
-// 	if err != nil {
-// 		logutil.Warn("ccpr-worker failed to create executor for sync protection renewal",
-// 			zap.Error(err),
-// 		)
-// 		return
-// 	}
-// 	defer executor.Close()
-
-// 	var jobsToRemove []string
-
-// 	for _, job := range jobs {
-// 		newTTLExpireTS := time.Now().UnixNano()
-// 		err := w.renewSyncProtectionWithRetry(executor, job.jobID, newTTLExpireTS)
-// 		if err != nil {
-// 			// Handle specific errors - non-retryable errors
-// 			if IsSyncProtectionNotFoundError(err) || IsSyncProtectionSoftDeleteError(err) ||
-// 				IsSyncProtectionInvalidError(err) {
-// 				// Job no longer exists or invalid, remove from worker
-// 				logutil.Warn("ccpr-worker sync protection not found/soft deleted/invalid, removing from keepalive",
-// 					zap.String("job_id", job.jobID),
-// 					zap.Error(err),
-// 				)
-// 				jobsToRemove = append(jobsToRemove, job.jobID)
-// 			} else {
-// 				// Retryable errors (GC running, max count) were already retried
-// 				// Just log and continue, will retry in next interval
-// 				logutil.Warn("ccpr-worker sync protection renew failed after retries",
-// 					zap.String("job_id", job.jobID),
-// 					zap.Error(err),
-// 				)
-// 			}
-// 		} else {
-// 			job.ttlExpireTS.Store(newTTLExpireTS)
-// 			logutil.Debug("ccpr-worker sync protection renewed",
-// 				zap.String("job_id", job.jobID),
-// 				zap.Int64("new_ttl_expire_ts", newTTLExpireTS),
-// 			)
-// 		}
-// 	}
-
-// 	// Remove jobs that are no longer valid
-// 	if len(jobsToRemove) > 0 {
-// 		w.syncProtectionMu.Lock()
-// 		for _, jobID := range jobsToRemove {
-// 			delete(w.syncProtectionJobs, jobID)
-// 			logutil.Info("ccpr-worker removed invalid sync protection job",
-// 				zap.String("job_id", jobID),
-// 			)
-// 		}
-// 		w.syncProtectionMu.Unlock()
-// 	}
-// }
-
-// renewSyncProtectionWithRetry renews sync protection with retry for retryable errors
-// Retryable errors: GC is running, max count reached
-// Non-retryable errors: not found, soft deleted, invalid
-// func (w *worker) renewSyncProtectionWithRetry(executor SQLExecutor, jobID string, newTTLExpireTS int64) error {
-// 	const maxRetries = 3
-// 	const retryInterval = 10 * time.Second
-
-// 	var lastErr error
-// 	for i := 0; i < maxRetries; i++ {
-// 		err := RenewSyncProtection(w.ctx, executor, jobID, newTTLExpireTS)
-// 		if err == nil {
-// 			return nil
-// 		}
-
-// 		lastErr = err
-
-// 		// Check if error is retryable
-// 		if IsGCRunningError(err) || IsSyncProtectionMaxCountError(err) {
-// 			logutil.Warn("ccpr-worker sync protection renew retryable error, will retry",
-// 				zap.String("job_id", jobID),
-// 				zap.Int("attempt", i+1),
-// 				zap.Int("max_retries", maxRetries),
-// 				zap.Error(err),
-// 			)
-// 			// Wait before retry
-// 			select {
-// 			case <-w.ctx.Done():
-// 				return w.ctx.Err()
-// 			case <-time.After(retryInterval):
-// 			}
-// 			continue
-// 		}
-
-// 		// Non-retryable error, return immediately
-// 		return err
-// 	}
-
-// 	return lastErr
-// }
 
 // RegisterSyncProtection registers a sync protection job for keepalive
 func (w *worker) RegisterSyncProtection(jobID string, ttlExpireTS int64) {
@@ -759,7 +619,7 @@ func NewFilterObjectWorker() FilterObjectWorker {
 }
 
 func (w *filterObjectWorker) Run() {
-	for i := 0; i < FilterObjectWorkerThread; i++ {
+	for i := 0; i < GetFilterObjectWorkerThread(); i++ {
 		w.wg.Add(1)
 		go func() {
 			defer w.wg.Done()
@@ -769,7 +629,14 @@ func (w *filterObjectWorker) Run() {
 					return
 				case job := <-w.jobChan:
 					globalJobStats.IncrementFilterObjectRunning()
+					v2.CCPRFilterObjectQueueSizeGauge.Dec()
+					v2.CCPRRunningFilterObjectJobsGauge.Inc()
+					startTime := time.Now()
 					job.Execute()
+					duration := time.Since(startTime)
+					v2.CCPRRunningFilterObjectJobsGauge.Dec()
+					v2.CCPRFilterObjectJobDurationHistogram.Observe(duration.Seconds())
+					v2.CCPRFilterObjectJobCompletedCounter.Inc()
 					globalJobStats.DecrementFilterObjectRunning()
 				}
 			}
@@ -782,6 +649,7 @@ func (w *filterObjectWorker) SubmitFilterObject(job Job) error {
 		return moerr.NewInternalError(context.Background(), "FilterObjectWorker is closed")
 	}
 	globalJobStats.IncrementFilterObjectPending()
+	v2.CCPRFilterObjectQueueSizeGauge.Inc()
 	w.jobChan <- job
 	return nil
 }
@@ -816,7 +684,7 @@ func NewGetChunkWorker() GetChunkWorker {
 }
 
 func (w *getChunkWorker) Run() {
-	workerThreadCount := GetChunkWorkerThread
+	workerThreadCount := GetGetChunkWorkerThread()
 	for i := 0; i < workerThreadCount; i++ {
 		w.wg.Add(1)
 		go func() {
@@ -969,17 +837,30 @@ func NewWriteObjectWorker() WriteObjectWorker {
 	return &writeObjectWorker{
 		simpleJobWorker: newSimpleJobWorker(
 			"WriteObjectWorker",
-			WriteObjectWorkerThread,
-			globalJobStats.IncrementWriteObjectPending,
-			globalJobStats.IncrementWriteObjectRunning,
-			globalJobStats.DecrementWriteObjectRunning,
+			GetWriteObjectWorkerThread(),
+			func() {
+				globalJobStats.IncrementWriteObjectPending()
+				v2.CCPRWriteObjectQueueSizeGauge.Inc()
+			},
+			func() {
+				globalJobStats.IncrementWriteObjectRunning()
+				v2.CCPRWriteObjectQueueSizeGauge.Dec()
+				v2.CCPRRunningWriteObjectJobsGauge.Inc()
+			},
+			func() {
+				globalJobStats.DecrementWriteObjectRunning()
+				v2.CCPRRunningWriteObjectJobsGauge.Dec()
+				v2.CCPRWriteObjectJobCompletedCounter.Inc()
+			},
 			func(job Job, duration time.Duration) {
+				v2.CCPRWriteObjectJobDurationHistogram.Observe(duration.Seconds())
 				if writeJobInfo, ok := job.(WriteObjectJobInfo); ok {
 					globalJobStats.RecordWriteObjectDuration(
 						writeJobInfo.GetObjectName(),
 						writeJobInfo.GetObjectSize(),
 						duration,
 					)
+					v2.CCPRObjectSizeBytesHistogram.Observe(float64(writeJobInfo.GetObjectSize()))
 				}
 			},
 		),
