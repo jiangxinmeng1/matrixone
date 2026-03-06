@@ -1,0 +1,4 @@
+# Requirements for CCPR test script
+# Install with: pip install -r test_ccpr_requirements.txt
+
+PyMySQL>=1.0.0
