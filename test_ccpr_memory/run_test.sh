@@ -25,7 +25,12 @@ DATA_LINES="${DATA_LINES:-1000000}"
 
 # 集群启动脚本
 CLUSTER_SCRIPT="${ROOT_DIR}/start-two-clusters-minio.sh"
-CLUSTER_LOG="${SCRIPT_DIR}/cluster_startup.log"
+# 集群日志放在单独目录，避免与 run_test.sh 的输出混淆
+CLUSTER_LOG_DIR="${SCRIPT_DIR}/cluster_logs"
+mkdir -p "$CLUSTER_LOG_DIR"
+CLUSTER_LOG="${CLUSTER_LOG_DIR}/cluster_$(date +%Y%m%d_%H%M%S).log"
+# 最新日志的软链接
+CLUSTER_LOG_LATEST="${CLUSTER_LOG_DIR}/latest.log"
 
 # 等待MySQL连接的超时时间（秒）
 MYSQL_WAIT_TIMEOUT="${MYSQL_WAIT_TIMEOUT:-300}"
@@ -140,11 +145,8 @@ start_cluster() {
     # 检查是否有mo-service进程在运行
     if pgrep -f "mo-service" > /dev/null; then
         log_warn "mo-service processes found, but MySQL not accessible"
-        log_warn "You may need to manually check the cluster status"
-        read -p "Continue waiting for MySQL? [Y/n]: " response
-        if [ "$response" = "n" ] || [ "$response" = "N" ]; then
-            exit 1
-        fi
+        log_warn "Continuing to wait for MySQL (non-interactive mode)..."
+        # 非交互模式下继续等待，不询问用户
     else
         # 启动集群（后台运行）
         log_info "Starting clusters with: $CLUSTER_SCRIPT"
@@ -153,6 +155,10 @@ start_cluster() {
         cd "$ROOT_DIR"
         nohup "$CLUSTER_SCRIPT" > "$CLUSTER_LOG" 2>&1 &
         CLUSTER_PID=$!
+        
+        # 更新最新日志的软链接
+        ln -sf "$CLUSTER_LOG" "$CLUSTER_LOG_LATEST"
+        log_info "Latest cluster log link: $CLUSTER_LOG_LATEST"
         
         log_info "Cluster startup script started with PID: $CLUSTER_PID"
         
@@ -220,10 +226,13 @@ download_data() {
         local line_count=$(wc -l < "$DATA_FILE")
         log_info "File has $line_count lines"
         
-        read -p "Re-download? [y/N]: " response
-        if [ "$response" != "y" ] && [ "$response" != "Y" ]; then
-            log_info "Using existing data file"
+        # 非交互模式：如果文件存在且行数足够，直接使用
+        if [ "$line_count" -ge "$DATA_LINES" ]; then
+            log_info "Using existing data file (non-interactive mode)"
             return 0
+        else
+            log_warn "File exists but has fewer lines than expected ($line_count < $DATA_LINES)"
+            log_info "Re-downloading data file..."
         fi
     fi
     
@@ -593,6 +602,11 @@ show_help() {
     echo "  $0 ccpr            # Run CCPR test (cluster must be running)"
     echo "  $0 status          # Check cluster status"
     echo "  $0 stop            # Stop clusters"
+    echo ""
+    echo "Running with nohup:"
+    echo "  nohup ./run_test.sh > test_output.log 2>&1 &"
+    echo "  tail -f test_output.log                # Watch test progress"
+    echo "  tail -f cluster_logs/latest.log        # Watch cluster logs"
 }
 
 # 检查状态
