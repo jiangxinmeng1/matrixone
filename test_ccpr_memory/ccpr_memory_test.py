@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 class ClusterConfig:
     host: str = "127.0.0.1"
     port: int = 6001
-    user: str = "root"
+    user: str = "dump"
     password: str = "111"
 
 
@@ -854,7 +854,7 @@ def main():
     parser.add_argument("--upstream-port", type=int, default=6001)
     parser.add_argument("--downstream-host", default="127.0.0.1")
     parser.add_argument("--downstream-port", type=int, default=6002)
-    parser.add_argument("--user", default="root")
+    parser.add_argument("--user", default="dump")
     parser.add_argument("--password", default="111")
     
     # 数据配置
