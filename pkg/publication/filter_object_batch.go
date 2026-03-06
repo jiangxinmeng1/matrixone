@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"unsafe"
 
 	"github.com/RoaringBitmap/roaring"
 	"github.com/matrixorigin/matrixone/pkg/common/malloc"
@@ -90,7 +91,20 @@ func readSingleBlockToBatch(
 		var decompressedBuf fscache.Data
 
 		if ext.Alg() == compress.None {
-			decompressedData = append([]byte(nil), colData...)
+			// Use memory controller if available
+			mc := GetGlobalMemoryController()
+			if mc != nil {
+				var err error
+				decompressedData, err = mc.Alloc(ctx, len(colData), MemoryTypeDecompressBuffer)
+				if err != nil {
+					// Fallback to regular allocation
+					decompressedData = append([]byte(nil), colData...)
+				} else {
+					copy(decompressedData, colData)
+				}
+			} else {
+				decompressedData = append([]byte(nil), colData...)
+			}
 		} else {
 			decompressedBuf = allocator.AllocateCacheDataWithHint(ctx, int(ext.OriginSize()), malloc.NoClear)
 			bs, err := compress.Decompress(colData, decompressedBuf.Bytes(), compress.Lz4)
@@ -103,8 +117,19 @@ func readSingleBlockToBatch(
 				}
 				return nil, moerr.NewInternalErrorf(ctx, "failed to decompress column data: %v", err)
 			}
-			decompressedData = decompressedBuf.Bytes()[:len(bs)]
-			decompressedData = append([]byte(nil), decompressedData...)
+			// Use memory controller for cloning decompressed data
+			mc := GetGlobalMemoryController()
+			if mc != nil {
+				decompressedData, err = mc.Alloc(ctx, len(bs), MemoryTypeDecompressBuffer)
+				if err != nil {
+					// Fallback to regular allocation
+					decompressedData = append([]byte(nil), decompressedBuf.Bytes()[:len(bs)]...)
+				} else {
+					copy(decompressedData, decompressedBuf.Bytes()[:len(bs)])
+				}
+			} else {
+				decompressedData = append([]byte(nil), decompressedBuf.Bytes()[:len(bs)]...)
+			}
 			if decompressedBuf != nil {
 				decompressedBuf.Release()
 			}
@@ -325,7 +350,20 @@ func convertObjectToBatch(
 
 			if ext.Alg() == compress.None { // Clone non-compressed data to avoid buffer sharing with objectContent
 				// objectContent may be reused/pooled, and UnmarshalBinary doesn't copy data
-				decompressedData = append([]byte(nil), colData...)
+				// Use memory controller if available
+				mc := GetGlobalMemoryController()
+				if mc != nil {
+					var err error
+					decompressedData, err = mc.Alloc(ctx, len(colData), MemoryTypeDecompressBuffer)
+					if err != nil {
+						// Fallback to regular allocation
+						decompressedData = append([]byte(nil), colData...)
+					} else {
+						copy(decompressedData, colData)
+					}
+				} else {
+					decompressedData = append([]byte(nil), colData...)
+				}
 			} else {
 				// Allocate buffer for decompressed data
 				decompressedBuf = allocator.AllocateCacheDataWithHint(ctx, int(ext.OriginSize()), malloc.NoClear)
@@ -336,9 +374,19 @@ func convertObjectToBatch(
 					}
 					return nil, moerr.NewInternalErrorf(ctx, "failed to decompress column data: %v", err)
 				}
-				decompressedData = decompressedBuf.Bytes()[:len(bs)]
-				// Clone the data to ensure decoded vector doesn't hold reference to buffer
-				decompressedData = append([]byte(nil), decompressedData...)
+				// Clone the data using memory controller if available
+				mc := GetGlobalMemoryController()
+				if mc != nil {
+					decompressedData, err = mc.Alloc(ctx, len(bs), MemoryTypeDecompressBuffer)
+					if err != nil {
+						// Fallback to regular allocation
+						decompressedData = append([]byte(nil), decompressedBuf.Bytes()[:len(bs)]...)
+					} else {
+						copy(decompressedData, decompressedBuf.Bytes()[:len(bs)])
+					}
+				} else {
+					decompressedData = append([]byte(nil), decompressedBuf.Bytes()[:len(bs)]...)
+				}
 				// Release buffer immediately after cloning
 				if decompressedBuf != nil {
 					decompressedBuf.Release()
@@ -452,7 +500,33 @@ func createObjectFromBatch(
 		return objectio.ObjectStats{}, nil, moerr.NewInternalErrorf(ctx, "batch has no columns")
 	}
 	pkIdx := 0 // Primary key is the first column
-	sortedIdx := make([]int64, cnBat.Vecs[0].Length())
+	n := cnBat.Vecs[0].Length()
+
+	// Allocate sorted index using memory controller if available
+	var sortedIdx []int64
+	var sortedIdxRelease func()
+	mc := GetGlobalMemoryController()
+	if mc != nil {
+		sortedIdxBytes, err := mc.Alloc(ctx, n*8, MemoryTypeSortIndex)
+		if err != nil {
+			// Fallback to regular allocation
+			sortedIdx = make([]int64, n)
+		} else {
+			// Convert bytes to []int64 slice
+			sortedIdx = bytesToInt64Slice(sortedIdxBytes, n)
+			sortedIdxRelease = func() {
+				mc.Free(sortedIdxBytes, MemoryTypeSortIndex)
+			}
+		}
+	} else {
+		sortedIdx = make([]int64, n)
+	}
+	defer func() {
+		if sortedIdxRelease != nil {
+			sortedIdxRelease()
+		}
+	}()
+
 	for i := 0; i < len(sortedIdx); i++ {
 		sortedIdx[i] = int64(i)
 	}
@@ -577,4 +651,15 @@ func createObjectFromBatch(
 	// Step 5: Get and return objectio.ObjectStats
 	objStats := writer.GetObjectStats(objectio.WithSorted(), objectio.WithCNCreated())
 	return objStats, rowOffsetMap, nil
+}
+
+// bytesToInt64Slice converts a byte slice to an int64 slice
+// The byte slice must be at least n*8 bytes long
+func bytesToInt64Slice(data []byte, n int) []int64 {
+	if len(data) < n*8 {
+		return nil
+	}
+	// Use unsafe to convert byte slice to int64 slice without copy
+	// This is safe as long as the byte slice is properly aligned (which mpool guarantees)
+	return (*[1 << 30]int64)(unsafe.Pointer(&data[0]))[:n:n]
 }

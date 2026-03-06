@@ -143,11 +143,14 @@ func filterAppendableObject(
 	// Get object name from stats (upstream aobj UUID)
 	upstreamAObjUUID := stats.ObjectName().ObjectId()
 
-	// Get object file from upstream using GETOBJECT
-	objectContent, err := GetObjectFromUpstreamWithWorker(ctx, upstreamExecutor, stats.ObjectName().String(), getChunkWorker, subscriptionAccountName, pubName)
+	// Get object file from upstream using GETOBJECT with memory pool
+	objectHandle, err := GetObjectFromUpstreamWithWorkerPooled(ctx, upstreamExecutor, stats.ObjectName().String(), getChunkWorker, subscriptionAccountName, pubName)
 	if err != nil {
 		return nil, moerr.NewInternalErrorf(ctx, "failed to get object from upstream: %v", err)
 	}
+	// Ensure memory is released when function returns
+	defer objectHandle.Release()
+	objectContent := objectHandle.Data
 
 	// Check TTL after getting object
 	if ttlChecker != nil && ttlChecker() {
@@ -340,11 +343,14 @@ func filterNonAppendableObject(
 	// Get upstream object name from stats
 	upstreamObjectName := stats.ObjectName().String()
 
-	// Get object file from upstream
-	objectContent, err := GetObjectFromUpstreamWithWorker(ctx, upstreamExecutor, upstreamObjectName, getChunkWorker, subscriptionAccountName, pubName)
+	// Get object file from upstream with memory pool
+	objectHandle, err := GetObjectFromUpstreamWithWorkerPooled(ctx, upstreamExecutor, upstreamObjectName, getChunkWorker, subscriptionAccountName, pubName)
 	if err != nil {
 		return objectio.ObjectStats{}, moerr.NewInternalErrorf(ctx, "failed to get object from upstream: %v", err)
 	}
+	// Note: For tombstone rewrite, we need to keep objectHandle alive until rewrite completes
+	// For data objects write, we pass objectContent to WriteObjectJob which copies it
+	objectContent := objectHandle.Data
 
 	// Check TTL after getting object
 	if ttlChecker != nil && ttlChecker() {
@@ -356,6 +362,8 @@ func filterNonAppendableObject(
 		objStats, err := rewriteNonAppendableTombstoneWithSinker(
 			ctx, objectContent, stats, localFS, mp, aobjectMap,
 		)
+		// Release memory after processing
+		objectHandle.Release()
 		if err != nil {
 			return objectio.ObjectStats{}, err
 		}
@@ -370,6 +378,8 @@ func filterNonAppendableObject(
 		writeJob.Execute()
 	}
 	writeResult := writeJob.WaitDone().(*WriteObjectJobResult)
+	// Release memory after write job completes (WriteObjectJob copies the data internally)
+	objectHandle.Release()
 	if writeResult.Err != nil {
 		return objectio.ObjectStats{}, writeResult.Err
 	}
@@ -378,7 +388,23 @@ func filterNonAppendableObject(
 	return *stats, nil
 }
 
+// ObjectContentHandle wraps object content with a release function for memory management
+type ObjectContentHandle struct {
+	Data    []byte
+	release func()
+}
+
+// Release releases the memory back to the pool
+func (h *ObjectContentHandle) Release() {
+	if h.release != nil {
+		h.release()
+		h.release = nil
+	}
+	h.Data = nil
+}
+
 // GetObjectFromUpstreamWithWorker gets object file from upstream using GETOBJECT SQL with worker pool
+// Returns ObjectContentHandle which must be released after use
 var GetObjectFromUpstreamWithWorker = func(
 	ctx context.Context,
 	upstreamExecutor SQLExecutor,
@@ -387,6 +413,25 @@ var GetObjectFromUpstreamWithWorker = func(
 	subscriptionAccountName string,
 	pubName string,
 ) ([]byte, error) {
+	handle, err := GetObjectFromUpstreamWithWorkerPooled(ctx, upstreamExecutor, objectName, getChunkWorker, subscriptionAccountName, pubName)
+	if err != nil {
+		return nil, err
+	}
+	// For backward compatibility, return the data directly
+	// Caller is responsible for not holding reference after use
+	return handle.Data, nil
+}
+
+// GetObjectFromUpstreamWithWorkerPooled gets object file from upstream using memory pool
+// Returns ObjectContentHandle which must be released after use to return memory to pool
+var GetObjectFromUpstreamWithWorkerPooled = func(
+	ctx context.Context,
+	upstreamExecutor SQLExecutor,
+	objectName string,
+	getChunkWorker GetChunkWorker,
+	subscriptionAccountName string,
+	pubName string,
+) (*ObjectContentHandle, error) {
 	if upstreamExecutor == nil {
 		return nil, moerr.NewInternalError(ctx, "upstream executor is nil")
 	}
@@ -406,6 +451,7 @@ var GetObjectFromUpstreamWithWorker = func(
 	}
 
 	totalChunks := metaResult.TotalChunks
+	totalSize := metaResult.TotalSize
 
 	// Fetch data chunks starting from chunk 1
 	// chunk 0 is metadata, chunks 1 to totalChunks are data chunks
@@ -433,17 +479,54 @@ var GetObjectFromUpstreamWithWorker = func(
 		allChunks[i] = chunkResult.ChunkData
 	}
 
-	// Combine all chunks
-	totalLen := 0
-	for _, chunk := range allChunks {
-		totalLen += len(chunk)
+	// Combine all chunks using memory controller if available
+	mc := GetGlobalMemoryController()
+	var objectContent []byte
+	var releaseFunc func()
+
+	if mc != nil {
+		// Use memory pool allocation
+		var err error
+		objectContent, err = mc.Alloc(ctx, int(totalSize), MemoryTypeObjectContent)
+		if err != nil {
+			// Fallback to regular allocation
+			objectContent = make([]byte, 0, totalSize)
+			releaseFunc = nil
+		} else {
+			releaseFunc = func() {
+				mc.Free(objectContent, MemoryTypeObjectContent)
+			}
+			// Copy chunks into pooled memory
+			offset := 0
+			for _, chunk := range allChunks {
+				copy(objectContent[offset:], chunk)
+				offset += len(chunk)
+			}
+			objectContent = objectContent[:offset]
+
+			return &ObjectContentHandle{
+				Data:    objectContent,
+				release: releaseFunc,
+			}, nil
+		}
+	} else {
+		// Regular allocation (no memory controller)
+		totalLen := 0
+		for _, chunk := range allChunks {
+			totalLen += len(chunk)
+		}
+		objectContent = make([]byte, 0, totalLen)
 	}
-	objectContent := make([]byte, 0, totalLen)
+
+	// Append chunks (for regular allocation path)
 	for _, chunk := range allChunks {
 		objectContent = append(objectContent, chunk...)
 	}
 
-	return objectContent, nil
+	return &ObjectContentHandle{
+		Data:    objectContent,
+		release: releaseFunc,
+	}, nil
 }
 
 // extractSortKeyFromObject extracts sortkey seqnum from object metadata
