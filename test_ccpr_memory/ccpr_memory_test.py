@@ -226,6 +226,7 @@ def get_connection(config: ClusterConfig) -> pymysql.Connection:
         read_timeout=3600,
         write_timeout=3600,
         ssl_disabled=True,
+        local_infile=True,
     )
 
 
@@ -419,7 +420,7 @@ class CCPRMemoryTest:
                 # 使用绝对路径
                 abs_path = os.path.abspath(self.config.data_file)
                 load_sql = f"""
-                    LOAD DATA INFILE '{abs_path}'
+                    LOAD DATA LOCAL INFILE '{abs_path}'
                     INTO TABLE {db}.{table}
                     FIELDS TERMINATED BY ',' ENCLOSED BY '"' LINES TERMINATED BY '\\n'
                     IGNORE 1 LINES
