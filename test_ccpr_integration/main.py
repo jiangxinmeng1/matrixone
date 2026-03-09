@@ -80,6 +80,7 @@ class LongTestPhase(Enum):
     PHASE4_DML_RENAME_COLUMN = 4   # 持续DML -> RENAME COLUMN (inplace)
     PHASE5_DML_DROP_COLUMN = 5     # 持续DML -> DROP COLUMN (non-inplace)
     PHASE6_DML_LOAD_COMMENT = 6    # 持续DML + 大批量LOAD -> CHANGE COMMENT (inplace)
+    PHASE7_DELETE_ALL = 7          # DELETE FROM 删除上游所有数据，再重新插入
 
 
 # =============================================================================
@@ -425,6 +426,7 @@ class CCPRLongTest:
             LongTestPhase.PHASE4_DML_RENAME_COLUMN,
             LongTestPhase.PHASE5_DML_DROP_COLUMN,
             LongTestPhase.PHASE6_DML_LOAD_COMMENT,
+            LongTestPhase.PHASE7_DELETE_ALL,
         ]
         
         try:
@@ -955,6 +957,24 @@ class CCPRLongTest:
                 comment = f"Long test completed at {datetime.now()}"
                 execute_sql(conn, f"ALTER TABLE {db}.{tbl} COMMENT = '{comment}'")
                 logger.info(f"[{task.name}] Changed comment")
+                
+            elif phase == LongTestPhase.PHASE7_DELETE_ALL:
+                # DELETE FROM 删除上游所有数据
+                with task.pk_lock:
+                    old_active_count = len(task.active_pks)
+                    task.deleted_pks.update(task.active_pks)
+                    task.active_pks.clear()
+                
+                execute_sql(conn, f"DELETE FROM {db}.{tbl}")
+                logger.info(f"[{task.name}] DELETE ALL: removed {old_active_count} rows")
+                
+                # 重新插入一批数据，确保后续阶段有数据可用
+                inserted_pks = []
+                for _ in range(100):
+                    pk = self._insert_row(conn, db, tbl, task.added_columns, task)
+                    if pk:
+                        inserted_pks.append(pk)
+                logger.info(f"[{task.name}] Re-inserted 100 rows after DELETE ALL, pks=[{inserted_pks[0]}..{inserted_pks[-1]}]")
                 
         except Exception as e:
             logger.error(f"[{task.name}] ALTER failed in {phase.name}: {e}")
