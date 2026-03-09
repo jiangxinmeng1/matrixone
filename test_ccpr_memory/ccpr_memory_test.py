@@ -48,7 +48,7 @@ class ClusterConfig:
     port: int = 6001
     user: str = "dump"
     password: str = "111"
-    pprof_port: int = 7001  # Go pprof/metrics 端口
+    pprof_port: int = 6060  # Go pprof debug 端口
 
 
 @dataclass
@@ -73,9 +73,9 @@ class TestConfig:
     
     def __post_init__(self):
         if self.upstream is None:
-            self.upstream = ClusterConfig(port=6001, pprof_port=7001)
+            self.upstream = ClusterConfig(port=6001, pprof_port=6060)
         if self.downstream is None:
-            self.downstream = ClusterConfig(port=6002, pprof_port=7002)
+            self.downstream = ClusterConfig(port=6002, pprof_port=6070)
 
 
 # =============================================================================
@@ -1228,10 +1228,10 @@ def main():
                        help="Memory check interval in seconds (default: 10)")
     parser.add_argument("--pprof-dir", default="./pprof_dumps",
                        help="Directory for pprof dumps (default: ./pprof_dumps)")
-    parser.add_argument("--upstream-pprof-port", type=int, default=7001,
-                       help="Upstream pprof/metrics port (default: 7001)")
-    parser.add_argument("--downstream-pprof-port", type=int, default=7002,
-                       help="Downstream pprof/metrics port (default: 7002)")
+    parser.add_argument("--upstream-pprof-port", type=int, default=6060,
+                       help="Upstream pprof debug port (default: 6060)")
+    parser.add_argument("--downstream-pprof-port", type=int, default=6070,
+                       help="Downstream pprof debug port (default: 6070)")
     
     args = parser.parse_args()
     

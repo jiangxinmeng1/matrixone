@@ -20,6 +20,8 @@ MO_USER="${MO_USER:-dump}"
 MO_PASSWORD="${MO_PASSWORD:-111}"
 METRICS_PORT="${METRICS_PORT:-7001}"
 METRICS_PORT_DOWN="${METRICS_PORT_DOWN:-7002}"
+PPROF_PORT="${PPROF_PORT:-6060}"
+PPROF_PORT_DOWN="${PPROF_PORT_DOWN:-6070}"
 DATA_FILE="${DATA_FILE:-sample_1m.csv}"
 DATA_LINES="${DATA_LINES:-1000000}"
 
@@ -223,6 +225,13 @@ download_data() {
     
     if [ -f "$DATA_FILE" ]; then
         log_info "Data file already exists: $DATA_FILE"
+        
+        # 先打印文件大小（快速操作）
+        local file_size=$(ls -lh "$DATA_FILE" | awk '{print $5}')
+        log_info "File size: $file_size"
+        
+        # 计算行数（可能较慢，显示进度）
+        log_info "Counting lines (this may take a while for large files)..."
         local line_count=$(wc -l < "$DATA_FILE")
         log_info "File has $line_count lines"
         
@@ -271,14 +280,20 @@ mkdir -p "$OUTPUT_DIR"
 
 log_info "Output directory: $OUTPUT_DIR"
 
-# 收集CCPR metrics函数
+# 收集CCPR metrics函数（上下游都收集）
 collect_metrics() {
     local label="$1"
     local output_file="$OUTPUT_DIR/metrics_${label}.txt"
     
     log_info "Collecting metrics: $label"
     
-    curl -s "http://${MO_HOST}:${METRICS_PORT}/metrics" | grep "^mo_ccpr" > "$output_file" 2>/dev/null || true
+    {
+        echo "=== Upstream (${METRICS_PORT}) ==="
+        curl -s "http://${MO_HOST}:${METRICS_PORT}/metrics" 2>/dev/null | grep "^mo_ccpr" || echo "No CCPR metrics"
+        echo ""
+        echo "=== Downstream (${METRICS_PORT_DOWN}) ==="
+        curl -s "http://${MO_HOST}:${METRICS_PORT_DOWN}/metrics" 2>/dev/null | grep "^mo_ccpr" || echo "No CCPR metrics"
+    } > "$output_file"
     
     if [ -s "$output_file" ]; then
         log_info "Metrics saved to $output_file"
@@ -287,18 +302,23 @@ collect_metrics() {
     fi
 }
 
-# 收集内存相关metrics
+# 收集内存相关metrics（从下游抓，CCPR memory controller 跑在下游）
 collect_memory_metrics() {
     local label="$1"
     local output_file="$OUTPUT_DIR/memory_${label}.txt"
     
-    log_info "Collecting memory metrics: $label"
+    log_info "Collecting memory metrics: $label (from downstream ${METRICS_PORT_DOWN})"
     
     {
         echo "=== CCPR Memory Metrics at $label ==="
         echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
         echo ""
         
+        echo "--- Downstream (${METRICS_PORT_DOWN}) ---"
+        curl -s "http://${MO_HOST}:${METRICS_PORT_DOWN}/metrics" 2>/dev/null | grep -E "^mo_ccpr_memory|^mo_ccpr_pool" || echo "No memory metrics found"
+        
+        echo ""
+        echo "--- Upstream (${METRICS_PORT}) ---"
         curl -s "http://${MO_HOST}:${METRICS_PORT}/metrics" 2>/dev/null | grep -E "^mo_ccpr_memory|^mo_ccpr_pool" || echo "No memory metrics found"
         
         echo ""
@@ -350,16 +370,16 @@ run_sql_file() {
     log_info "SQL file completed in ${duration}s"
 }
 
-# 监控metrics (后台运行)
+# 监控metrics (后台运行，从下游抓，CCPR memory controller 跑在下游)
 start_metrics_monitor() {
-    log_info "Starting metrics monitor..."
+    log_info "Starting metrics monitor (scraping downstream ${METRICS_PORT_DOWN})..."
     
     local monitor_file="$OUTPUT_DIR/metrics_monitor.csv"
     echo "timestamp,memory_total,memory_object_content,memory_decompress,pool_hit_rate" > "$monitor_file"
     
     while true; do
         local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-        local metrics=$(curl -s "http://${MO_HOST}:${METRICS_PORT}/metrics" 2>/dev/null)
+        local metrics=$(curl -s "http://${MO_HOST}:${METRICS_PORT_DOWN}/metrics" 2>/dev/null)
         
         local mem_total=$(echo "$metrics" | grep 'mo_ccpr_memory_bytes{type="total"}' | awk '{print $2}' || echo "0")
         local mem_object=$(echo "$metrics" | grep 'mo_ccpr_memory_bytes{type="object_content"}' | awk '{print $2}' || echo "0")
@@ -461,6 +481,8 @@ run_ccpr_test() {
         --user "$MO_USER" \
         --password "$MO_PASSWORD" \
         --data-file "$DATA_FILE" \
+        --upstream-pprof-port "$PPROF_PORT" \
+        --downstream-pprof-port "$PPROF_PORT_DOWN" \
         2>&1 | tee "$OUTPUT_DIR/ccpr_test.log"
     
     CCPR_EXIT_CODE=${PIPESTATUS[0]}
@@ -582,6 +604,8 @@ show_help() {
     echo "  MO_PASSWORD        MatrixOne password (default: 111)"
     echo "  METRICS_PORT       Upstream metrics port (default: 7001)"
     echo "  METRICS_PORT_DOWN  Downstream metrics port (default: 7002)"
+    echo "  PPROF_PORT         Upstream pprof debug port (default: 6060)"
+    echo "  PPROF_PORT_DOWN    Downstream pprof debug port (default: 6070)"
     echo "  DATA_FILE          Data file name (default: sample_1m.csv)"
     echo "  DATA_LINES         Number of lines to download (default: 1000000)"
     echo "  MYSQL_WAIT_TIMEOUT Timeout for MySQL connection (default: 300s)"
@@ -662,8 +686,8 @@ check_status() {
     
     # 检查端口
     echo "=== Listening Ports ==="
-    netstat -tlnp 2>/dev/null | grep -E ":(6001|6002|7001|7002|9000|9001|9002|9003) " || \
-    ss -tlnp 2>/dev/null | grep -E ":(6001|6002|7001|7002|9000|9001|9002|9003) " || \
+    netstat -tlnp 2>/dev/null | grep -E ":(6001|6002|6060|6070|7001|7002|9000|9001|9002|9003) " || \
+    ss -tlnp 2>/dev/null | grep -E ":(6001|6002|6060|6070|7001|7002|9000|9001|9002|9003) " || \
     echo "Unable to check ports"
 }
 
