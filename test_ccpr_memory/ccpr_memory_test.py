@@ -225,6 +225,7 @@ def get_connection(config: ClusterConfig) -> pymysql.Connection:
         connect_timeout=30,
         read_timeout=3600,
         write_timeout=3600,
+        ssl_disabled=True,
     )
 
 
