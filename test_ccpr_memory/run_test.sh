@@ -64,7 +64,7 @@ log_section() {
 # 检查MySQL是否可连接 (指定端口)
 check_mysql_connection_port() {
     local port="$1"
-    mysql -h "$MO_HOST" -P "$port" -u "$MO_USER" -p"$MO_PASSWORD" -e "SELECT 1" &>/dev/null
+    mysql -h "$MO_HOST" -P "$port" -u "$MO_USER" -p"$MO_PASSWORD" --skip-ssl -e "SELECT 1" &>/dev/null
     return $?
 }
 
@@ -317,7 +317,7 @@ run_sql() {
     
     local start_time=$(date +%s.%N)
     
-    mysql -h "$MO_HOST" -P "$MO_PORT" -u "$MO_USER" -p"$MO_PASSWORD" -e "$sql" 2>&1 || {
+    mysql -h "$MO_HOST" -P "$MO_PORT" -u "$MO_USER" -p"$MO_PASSWORD" --skip-ssl -e "$sql" 2>&1 || {
         log_error "SQL execution failed: $description"
         return 1
     }
@@ -339,7 +339,7 @@ run_sql_file() {
     
     local start_time=$(date +%s.%N)
     
-    mysql -h "$MO_HOST" -P "$MO_PORT" -u "$MO_USER" -p"$MO_PASSWORD" < "$sql_file" 2>&1 | tee "$OUTPUT_DIR/sql_output.log" || {
+    mysql -h "$MO_HOST" -P "$MO_PORT" -u "$MO_USER" -p"$MO_PASSWORD" --skip-ssl < "$sql_file" 2>&1 | tee "$OUTPUT_DIR/sql_output.log" || {
         log_error "SQL file execution failed: $sql_file"
         return 1
     }
@@ -635,7 +635,7 @@ check_status() {
     echo "=== Upstream MySQL (${MO_HOST}:${MO_PORT}) ==="
     if check_mysql_connection; then
         log_info "Upstream MySQL is accessible"
-        mysql -h "$MO_HOST" -P "$MO_PORT" -u "$MO_USER" -p"$MO_PASSWORD" -e "SELECT VERSION();" 2>/dev/null || true
+        mysql -h "$MO_HOST" -P "$MO_PORT" -u "$MO_USER" -p"$MO_PASSWORD" --skip-ssl -e "SELECT VERSION();" 2>/dev/null || true
     else
         log_warn "Upstream MySQL is NOT accessible"
     fi
@@ -645,7 +645,7 @@ check_status() {
     echo "=== Downstream MySQL (${MO_HOST}:${MO_PORT_DOWN}) ==="
     if check_mysql_connection_downstream; then
         log_info "Downstream MySQL is accessible"
-        mysql -h "$MO_HOST" -P "$MO_PORT_DOWN" -u "$MO_USER" -p"$MO_PASSWORD" -e "SELECT VERSION();" 2>/dev/null || true
+        mysql -h "$MO_HOST" -P "$MO_PORT_DOWN" -u "$MO_USER" -p"$MO_PASSWORD" --skip-ssl -e "SELECT VERSION();" 2>/dev/null || true
     else
         log_warn "Downstream MySQL is NOT accessible"
     fi
@@ -654,7 +654,7 @@ check_status() {
     # 检查CCPR状态
     echo "=== CCPR Status ==="
     if check_mysql_connection_downstream; then
-        mysql -h "$MO_HOST" -P "$MO_PORT_DOWN" -u "$MO_USER" -p"$MO_PASSWORD" \
+        mysql -h "$MO_HOST" -P "$MO_PORT_DOWN" -u "$MO_USER" -p"$MO_PASSWORD" --skip-ssl \
             -e "SELECT subscription_name, state, watermark, error_message FROM mo_catalog.mo_ccpr_log WHERE drop_at IS NULL;" 2>/dev/null || \
             echo "No CCPR subscriptions found or unable to query"
     fi
