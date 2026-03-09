@@ -20,10 +20,12 @@ import logging
 import argparse
 import threading
 import random
+import subprocess
+import urllib.request
 import pymysql
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # 配置日志
 logging.basicConfig(
@@ -46,6 +48,7 @@ class ClusterConfig:
     port: int = 6001
     user: str = "dump"
     password: str = "111"
+    pprof_port: int = 7001  # Go pprof/metrics 端口
 
 
 @dataclass
@@ -63,11 +66,148 @@ class TestConfig:
     # Watermark 检查间隔
     watermark_check_interval: float = 5.0
     
+    # 内存监控配置
+    memory_threshold_percent: float = 70.0  # 内存使用超过此百分比时收集 pprof
+    memory_check_interval: float = 10.0     # 内存检查间隔（秒）
+    pprof_output_dir: str = "./pprof_dumps"  # pprof 输出目录
+    
     def __post_init__(self):
         if self.upstream is None:
-            self.upstream = ClusterConfig(port=6001)
+            self.upstream = ClusterConfig(port=6001, pprof_port=7001)
         if self.downstream is None:
-            self.downstream = ClusterConfig(port=6002)
+            self.downstream = ClusterConfig(port=6002, pprof_port=7002)
+
+
+# =============================================================================
+# 内存监控和 pprof 工具
+# =============================================================================
+
+def get_system_memory_info() -> Dict[str, Any]:
+    """获取系统内存信息（从 /proc/meminfo）"""
+    mem_info = {}
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                parts = line.split(':')
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    value = parts[1].strip().split()[0]  # 只取数字部分
+                    mem_info[key] = int(value) * 1024  # 转换为字节
+        
+        total = mem_info.get('MemTotal', 0)
+        available = mem_info.get('MemAvailable', 0)
+        used = total - available
+        percent = (used / total * 100) if total > 0 else 0
+        
+        return {
+            'total': total,
+            'available': available,
+            'used': used,
+            'percent': percent,
+            'total_gb': total / (1024**3),
+            'used_gb': used / (1024**3),
+            'available_gb': available / (1024**3),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to read memory info: {e}")
+        return {'percent': 0, 'total': 0, 'used': 0, 'available': 0}
+
+
+def get_process_memory_by_name(process_name: str) -> List[Dict[str, Any]]:
+    """通过进程名获取进程内存使用（使用 ps 命令）"""
+    try:
+        result = subprocess.run(
+            ['ps', 'aux'],
+            capture_output=True,
+            text=True
+        )
+        processes = []
+        for line in result.stdout.strip().split('\n')[1:]:  # 跳过标题行
+            parts = line.split(None, 10)
+            if len(parts) >= 11 and process_name in parts[10]:
+                processes.append({
+                    'pid': int(parts[1]),
+                    'cpu_percent': float(parts[2]),
+                    'mem_percent': float(parts[3]),
+                    'vsz_kb': int(parts[4]),
+                    'rss_kb': int(parts[5]),
+                    'command': parts[10]
+                })
+        return processes
+    except Exception as e:
+        logger.warning(f"Failed to get process memory: {e}")
+        return []
+
+
+def collect_pprof(host: str, port: int, output_dir: str, prefix: str = "") -> Dict[str, str]:
+    """收集 Go pprof 信息"""
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    results = {}
+    
+    # pprof 端点列表
+    profiles = [
+        ('heap', '/debug/pprof/heap'),
+        ('goroutine', '/debug/pprof/goroutine'),
+        ('allocs', '/debug/pprof/allocs'),
+    ]
+    
+    for name, path in profiles:
+        try:
+            url = f"http://{host}:{port}{path}"
+            filename = f"{output_dir}/{prefix}{name}_{timestamp}.pb.gz"
+            
+            # 使用 curl 下载（更可靠）
+            result = subprocess.run(
+                ['curl', '-s', '-o', filename, url],
+                capture_output=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0 and os.path.exists(filename) and os.path.getsize(filename) > 0:
+                results[name] = filename
+                logger.info(f"[Pprof] Collected {name}: {filename}")
+            else:
+                # 尝试用 urllib
+                try:
+                    urllib.request.urlretrieve(url, filename)
+                    if os.path.exists(filename) and os.path.getsize(filename) > 0:
+                        results[name] = filename
+                        logger.info(f"[Pprof] Collected {name}: {filename}")
+                except Exception as e2:
+                    logger.warning(f"[Pprof] Failed to collect {name}: {e2}")
+                    
+        except Exception as e:
+            logger.warning(f"[Pprof] Failed to collect {name}: {e}")
+    
+    return results
+
+
+def collect_pprof_with_go_tool(host: str, port: int, output_dir: str, prefix: str = "", duration: int = 30) -> Dict[str, str]:
+    """使用 go tool pprof 收集更详细的信息"""
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    results = {}
+    
+    base_url = f"http://{host}:{port}"
+    
+    # 收集 CPU profile (需要时间)
+    try:
+        cpu_file = f"{output_dir}/{prefix}cpu_{timestamp}.pb.gz"
+        logger.info(f"[Pprof] Collecting CPU profile for {duration}s...")
+        result = subprocess.run(
+            ['go', 'tool', 'pprof', '-proto', '-output', cpu_file, 
+             f"{base_url}/debug/pprof/profile?seconds={duration}"],
+            capture_output=True,
+            timeout=duration + 30
+        )
+        if os.path.exists(cpu_file) and os.path.getsize(cpu_file) > 0:
+            results['cpu'] = cpu_file
+            logger.info(f"[Pprof] Collected CPU: {cpu_file}")
+    except Exception as e:
+        logger.warning(f"[Pprof] CPU profile failed: {e}")
+    
+    return results
 
 
 # =============================================================================
@@ -149,6 +289,12 @@ class CCPRMemoryTest:
         # DDL 阶段计数
         self.ddl_phase: int = 0
         
+        # 内存监控
+        self.memory_thread: Optional[threading.Thread] = None
+        self.pprof_collected_count: int = 0
+        self.last_pprof_time: float = 0
+        self.pprof_cooldown: float = 60.0  # 两次 pprof 收集之间的最小间隔（秒）
+        
     def connect(self) -> bool:
         """连接到上下游集群"""
         try:
@@ -162,18 +308,65 @@ class CCPRMemoryTest:
             return True
         except Exception as e:
             logger.error(f"Connection failed: {e}")
+    
+    def _reconnect_upstream(self) -> bool:
+        """重新连接上游集群"""
+        try:
+            logger.info("Reconnecting to upstream...")
+            if self.upstream_conn:
+                try:
+                    self.upstream_conn.close()
+                except:
+                    pass
+            self.upstream_conn = get_connection(self.config.upstream)
+            logger.info("Upstream reconnected")
+            return True
+        except Exception as e:
+            logger.error(f"Upstream reconnect failed: {e}")
             return False
     
+    def _reconnect_downstream(self) -> bool:
+        """重新连接下游集群"""
+        try:
+            logger.info("Reconnecting to downstream...")
+            if self.downstream_conn:
+                try:
+                    self.downstream_conn.close()
+                except:
+                    pass
+            self.downstream_conn = get_connection(self.config.downstream)
+            logger.info("Downstream reconnected")
+            return True
+        except Exception as e:
+            logger.error(f"Downstream reconnect failed: {e}")
+            return False
+    
+    def _is_connection_error(self, e: Exception) -> bool:
+        """检查是否为连接断开错误"""
+        if isinstance(e, tuple) and len(e) >= 1:
+            code = e[0]
+            # 2006: MySQL server has gone away
+            # 2013: Lost connection during query
+            # 0: Connection closed
+            return code in (0, 2006, 2013)
+        err_str = str(e).lower()
+        return any(x in err_str for x in ['lost connection', 'gone away', 'connection', 'closed'])
+    
     def setup_ccpr(self) -> bool:
-        """设置 CCPR: 创建数据库、表、Publication、Subscription"""
+        """设置 CCPR: 创建数据库、表、Publication、Subscription，然后再加载数据"""
         try:
             db = self.config.db_name
             table = self.config.table_name
             pub = self.config.pub_name
             
-            # 1. 在上游创建数据库和表
+            # 1. 清理旧的 publication 和 subscription（必须先删 publication 再删 database）
+            logger.info(f"[Upstream] Cleaning up old publication if exists: {pub}")
+            execute_sql_safe(self.upstream_conn, f"DROP PUBLICATION IF EXISTS {pub}")
+            execute_sql_safe(self.downstream_conn, f"DROP DATABASE IF EXISTS {db}")
+            
+            # 2. 在上游创建数据库和空表
             logger.info(f"[Upstream] Creating database: {db}")
-            execute_sql(self.upstream_conn, f"DROP DATABASE IF EXISTS {db}")
+            execute_sql_safe(self.upstream_conn, f"DROP DATABASE IF EXISTS {db}")
             execute_sql(self.upstream_conn, f"CREATE DATABASE {db}")
             
             logger.info(f"[Upstream] Creating table: {table}")
@@ -199,7 +392,27 @@ class CCPRMemoryTest:
             """
             execute_sql(self.upstream_conn, create_table_sql)
             
-            # 2. 加载数据
+            # 3. 创建 DATABASE level Publication（先建 CCPR 再加载数据）
+            logger.info(f"[Upstream] Creating publication: {pub}")
+            execute_sql(self.upstream_conn, 
+                f"CREATE PUBLICATION {pub} DATABASE {db} ACCOUNT ALL")
+            
+            # 4. 在下游创建 Subscription (DATABASE FROM)
+            logger.info(f"[Downstream] Creating subscription...")
+            
+            # 使用 sys 账户连接字符串
+            conn_str = f"mysql://root:{self.config.upstream.password}@{self.config.upstream.host}:{self.config.upstream.port}"
+            # 语法: CREATE DATABASE db FROM 'conn_str' account_name PUBLICATION pub_name
+            sub_sql = f"CREATE DATABASE {db} FROM '{conn_str}' sys PUBLICATION {pub}"
+            execute_sql(self.downstream_conn, sub_sql)
+            
+            logger.info("[Downstream] Subscription created, waiting for initial sync...")
+            time.sleep(5)
+            
+            # 5. 获取 task_id
+            self._update_task_id()
+            
+            # 6. 现在加载数据（CCPR 会自动同步）
             if os.path.exists(self.config.data_file):
                 logger.info(f"[Upstream] Loading data from: {self.config.data_file}")
                 # 使用绝对路径
@@ -225,28 +438,11 @@ class CCPRMemoryTest:
                     """)
                 logger.info("[Upstream] Inserted 1000 sample rows")
             
-            # 3. 创建 Publication
-            logger.info(f"[Upstream] Creating publication: {pub}")
-            execute_sql_safe(self.upstream_conn, f"DROP PUBLICATION IF EXISTS {pub}")
-            execute_sql(self.upstream_conn, 
-                f"CREATE PUBLICATION {pub} DATABASE {db} TABLE {table} ACCOUNT ALL")
-            
-            # 4. 在下游创建 Subscription (DATABASE FROM)
-            logger.info(f"[Downstream] Creating subscription...")
-            execute_sql_safe(self.downstream_conn, f"DROP DATABASE IF EXISTS {db}")
-            
-            # 使用 sys 账户连接字符串
-            conn_str = f"mysql://root:{self.config.upstream.password}@{self.config.upstream.host}:{self.config.upstream.port}"
-            sub_sql = f"CREATE DATABASE {db} FROM '{conn_str}' PUBLICATION {pub}"
-            execute_sql(self.downstream_conn, sub_sql)
-            
-            logger.info("[Downstream] Subscription created, waiting for initial sync...")
+            # 7. 等待数据同步完成
+            logger.info("[Downstream] Waiting for data sync...")
             time.sleep(10)
             
-            # 5. 获取 task_id
-            self._update_task_id()
-            
-            # 6. 检查初始同步
+            # 8. 检查初始同步
             up_count = get_table_count(self.upstream_conn, db, table)
             down_count = get_table_count(self.downstream_conn, db, table)
             logger.info(f"Initial sync check: upstream={up_count}, downstream={down_count}")
@@ -326,6 +522,7 @@ class CCPRMemoryTest:
     def _watermark_monitor(self):
         """Watermark 监控线程"""
         logger.info("[WatermarkMonitor] Started")
+        consecutive_failures = 0
         
         while not self.stop_event.is_set():
             try:
@@ -355,9 +552,19 @@ class CCPRMemoryTest:
                             logger.warning(f"[WatermarkMonitor] Row count difference: {diff}")
                 
                 self.last_watermark = current_watermark
+                consecutive_failures = 0  # 重置失败计数
                 
             except Exception as e:
+                consecutive_failures += 1
                 logger.warning(f"[WatermarkMonitor] Error: {e}")
+                
+                # 连接问题，尝试重连下游
+                if self._is_connection_error(e) or consecutive_failures >= 3:
+                    logger.info("[WatermarkMonitor] Attempting to reconnect downstream...")
+                    if self._reconnect_downstream():
+                        consecutive_failures = 0
+                    else:
+                        time.sleep(5)
             
             # 等待检查间隔
             for _ in range(int(self.config.watermark_check_interval * 10)):
@@ -379,6 +586,108 @@ class CCPRMemoryTest:
         if self.watermark_thread:
             self.watermark_thread.join(timeout=10)
         logger.info("Watermark monitor stopped")
+    
+    # =========================================================================
+    # 内存监控和 Pprof 收集
+    # =========================================================================
+    
+    def _memory_monitor(self):
+        """内存监控线程 - 监控内存使用，高内存时自动收集 pprof"""
+        logger.info("[MemoryMonitor] Started")
+        logger.info(f"[MemoryMonitor] Threshold: {self.config.memory_threshold_percent}%")
+        logger.info(f"[MemoryMonitor] Check interval: {self.config.memory_check_interval}s")
+        
+        while not self.stop_event.is_set():
+            try:
+                # 获取系统内存信息
+                mem_info = get_system_memory_info()
+                mem_percent = mem_info.get('percent', 0)
+                
+                # 获取 mo-service 进程内存
+                mo_processes = get_process_memory_by_name('mo-service')
+                mo_total_rss = sum(p.get('rss_kb', 0) for p in mo_processes) / 1024  # MB
+                
+                # 每分钟打印一次内存状态
+                if int(time.time()) % 60 < self.config.memory_check_interval:
+                    logger.info(f"[MemoryMonitor] System: {mem_percent:.1f}% used "
+                               f"({mem_info.get('used_gb', 0):.1f}/{mem_info.get('total_gb', 0):.1f} GB), "
+                               f"mo-service RSS: {mo_total_rss:.0f} MB")
+                
+                # 检查是否需要收集 pprof
+                should_collect = False
+                reason = ""
+                
+                if mem_percent >= self.config.memory_threshold_percent:
+                    should_collect = True
+                    reason = f"System memory {mem_percent:.1f}% >= {self.config.memory_threshold_percent}%"
+                elif mo_total_rss >= 8000:  # mo-service 使用超过 8GB
+                    should_collect = True
+                    reason = f"mo-service RSS {mo_total_rss:.0f}MB >= 8000MB"
+                
+                # 检查冷却时间
+                now = time.time()
+                if should_collect and (now - self.last_pprof_time) >= self.pprof_cooldown:
+                    logger.warning(f"[MemoryMonitor] High memory detected! {reason}")
+                    self._collect_all_pprof()
+                    self.last_pprof_time = now
+                    self.pprof_collected_count += 1
+                    
+            except Exception as e:
+                logger.warning(f"[MemoryMonitor] Error: {e}")
+            
+            # 等待下次检查
+            for _ in range(int(self.config.memory_check_interval * 10)):
+                if self.stop_event.is_set():
+                    break
+                time.sleep(0.1)
+        
+        logger.info(f"[MemoryMonitor] Stopped. Total pprof collected: {self.pprof_collected_count}")
+    
+    def _collect_all_pprof(self):
+        """收集所有集群的 pprof"""
+        output_dir = self.config.pprof_output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 收集上游 pprof
+        logger.info(f"[Pprof] Collecting from upstream ({self.config.upstream.host}:{self.config.upstream.pprof_port})...")
+        upstream_results = collect_pprof(
+            self.config.upstream.host,
+            self.config.upstream.pprof_port,
+            output_dir,
+            prefix="upstream_"
+        )
+        
+        # 收集下游 pprof
+        logger.info(f"[Pprof] Collecting from downstream ({self.config.downstream.host}:{self.config.downstream.pprof_port})...")
+        downstream_results = collect_pprof(
+            self.config.downstream.host,
+            self.config.downstream.pprof_port,
+            output_dir,
+            prefix="downstream_"
+        )
+        
+        total = len(upstream_results) + len(downstream_results)
+        logger.info(f"[Pprof] Collection complete. {total} profiles saved to {output_dir}")
+        
+        return upstream_results, downstream_results
+    
+    def collect_pprof_now(self, reason: str = "manual"):
+        """立即收集 pprof（可手动触发）"""
+        logger.info(f"[Pprof] Collecting pprof ({reason})...")
+        self._collect_all_pprof()
+        self.pprof_collected_count += 1
+    
+    def start_memory_monitor(self):
+        """启动内存监控"""
+        self.memory_thread = threading.Thread(target=self._memory_monitor, daemon=True)
+        self.memory_thread.start()
+        logger.info("Memory monitor started")
+    
+    def stop_memory_monitor(self):
+        """停止内存监控"""
+        if self.memory_thread:
+            self.memory_thread.join(timeout=10)
+        logger.info("Memory monitor stopped")
     
     # =========================================================================
     # 大批量 DML 操作
@@ -496,6 +805,8 @@ class CCPRMemoryTest:
         total_inserted = 0
         total_updated = 0
         total_deleted = 0
+        consecutive_failures = 0
+        max_consecutive_failures = 10
         
         while not self.stop_event.is_set():
             op_name, op_count = operations[op_idx % len(operations)]
@@ -503,6 +814,7 @@ class CCPRMemoryTest:
             
             try:
                 start = time.time()
+                rows = 0
                 
                 if op_name == "BATCH_INSERT":
                     rows = self._batch_insert(op_count)
@@ -521,9 +833,30 @@ class CCPRMemoryTest:
                     total_deleted += rows
                     elapsed = time.time() - start
                     logger.info(f"[DML] DELETE {rows} rows in {elapsed:.2f}s (total deleted: {total_deleted})")
+                
+                # 成功执行，重置失败计数
+                if rows > 0:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
                     
             except Exception as e:
+                consecutive_failures += 1
                 logger.warning(f"[DML] Operation {op_name} failed: {e}")
+                
+                # 检测连接错误，尝试重连
+                if self._is_connection_error(e) or consecutive_failures >= 3:
+                    logger.info("[DML] Attempting to reconnect upstream...")
+                    if self._reconnect_upstream():
+                        consecutive_failures = 0
+                    else:
+                        time.sleep(5)  # 重连失败，等待一会再试
+            
+            # 如果连续失败太多次，可能有大问题
+            if consecutive_failures >= max_consecutive_failures:
+                logger.error(f"[DML] Too many consecutive failures ({consecutive_failures}), stopping DML worker")
+                self.errors.append(f"DML worker stopped due to {consecutive_failures} consecutive failures")
+                break
             
             # 操作间隔
             time.sleep(self.dml_interval)
@@ -745,6 +1078,9 @@ class CCPRMemoryTest:
         # 启动 watermark 监控
         self.start_watermark_monitor()
         
+        # 启动内存监控（自动收集 pprof）
+        self.start_memory_monitor()
+        
         # 启动 DML 工作线程
         self.start_dml_worker()
         
@@ -818,7 +1154,12 @@ class CCPRMemoryTest:
         finally:
             self.stop_event.set()
             self.stop_watermark_monitor()
+            self.stop_memory_monitor()
             self.stop_dml_worker()
+            
+            # 测试结束时收集最后一次 pprof
+            logger.info("Collecting final pprof...")
+            self.collect_pprof_now("test_end")
         
         if self.errors:
             logger.error("\n" + "="*60)
@@ -878,6 +1219,18 @@ def main():
     parser.add_argument("--batch-delete", type=int, default=10000,
                        help="Batch delete size (default: 10000)")
     
+    # 内存监控配置
+    parser.add_argument("--memory-threshold", type=float, default=70.0,
+                       help="Memory usage threshold %% to trigger pprof collection (default: 70)")
+    parser.add_argument("--memory-check-interval", type=float, default=10.0,
+                       help="Memory check interval in seconds (default: 10)")
+    parser.add_argument("--pprof-dir", default="./pprof_dumps",
+                       help="Directory for pprof dumps (default: ./pprof_dumps)")
+    parser.add_argument("--upstream-pprof-port", type=int, default=7001,
+                       help="Upstream pprof/metrics port (default: 7001)")
+    parser.add_argument("--downstream-pprof-port", type=int, default=7002,
+                       help="Downstream pprof/metrics port (default: 7002)")
+    
     args = parser.parse_args()
     
     config = TestConfig()
@@ -885,17 +1238,24 @@ def main():
         host=args.upstream_host,
         port=args.upstream_port,
         user=args.user,
-        password=args.password
+        password=args.password,
+        pprof_port=args.upstream_pprof_port
     )
     config.downstream = ClusterConfig(
         host=args.downstream_host,
         port=args.downstream_port,
         user=args.user,
-        password=args.password
+        password=args.password,
+        pprof_port=args.downstream_pprof_port
     )
     config.data_file = args.data_file
     config.db_name = args.db_name
     config.pub_name = args.pub_name
+    
+    # 内存监控配置
+    config.memory_threshold_percent = args.memory_threshold
+    config.memory_check_interval = args.memory_check_interval
+    config.pprof_output_dir = args.pprof_dir
     
     test = CCPRMemoryTest(config)
     
@@ -914,6 +1274,12 @@ def main():
     logger.info(f"  Batch INSERT: {test.batch_insert_size} rows")
     logger.info(f"  Batch UPDATE: {test.batch_update_size} rows")
     logger.info(f"  Batch DELETE: {test.batch_delete_size} rows")
+    logger.info(f"Memory Monitoring:")
+    logger.info(f"  Threshold: {config.memory_threshold_percent}%")
+    logger.info(f"  Check interval: {config.memory_check_interval}s")
+    logger.info(f"  Pprof output: {config.pprof_output_dir}")
+    logger.info(f"  Upstream pprof: {config.upstream.host}:{config.upstream.pprof_port}")
+    logger.info(f"  Downstream pprof: {config.downstream.host}:{config.downstream.pprof_port}")
     
     try:
         # 连接
