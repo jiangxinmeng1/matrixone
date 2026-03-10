@@ -125,8 +125,8 @@ class CCPRLongTest:
             
             # 只运行table level测试
             levels = [
-                # (SyncLevel.ACCOUNT, "account"),
-                # (SyncLevel.DATABASE, "database"),
+                (SyncLevel.ACCOUNT, "account"),
+                (SyncLevel.DATABASE, "database"),
                 (SyncLevel.TABLE, "table"),
             ]
             
