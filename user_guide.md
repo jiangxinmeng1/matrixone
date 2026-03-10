@@ -231,7 +231,7 @@ SHOW CCPR SUBSCRIPTION 'task_id';
 | table_name | VARCHAR | 表名称（可为NULL，Account/Database级别时为NULL） |
 | sync_level | VARCHAR | 同步级别（'account', 'database', 'table'） |
 | state | VARCHAR | 订阅状态（'running', 'error', 'pause', 'dropped'） |
-| error_message | VARCHAR | 错误信息（如果没有错误，为NULL） |
+| error_message | VARCHAR | 错误信息（如果没有错误，为''） |
 | watermark | TIMESTAMP | 水位时间戳（最后一次成功同步的时间点） |
 
 **示例输出**：
