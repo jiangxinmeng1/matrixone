@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"strings"
 
 	"golang.org/x/exp/constraints"
 
@@ -112,9 +113,9 @@ type Type struct {
 	// XXX Dummies.  T is uint8, make it 4 bytes aligned, otherwise, it may contain
 	// garbage data.  In theory these unused garbage should not be a problem, but
 	// it is.  Give it a name will zero fill it ...
-	Charset uint8
-	notNull uint8
-	dummy2  uint8
+	Charset   uint8
+	notNull   uint8
+	Collation uint8
 
 	Size int32
 	// Width means max Display width for float and double, char and varchar
@@ -137,7 +138,7 @@ func (t *Type) MarshalToSizedBuffer(data []byte) (int, error) {
 	binary.BigEndian.PutUint16(data[0:], uint16(t.Oid))
 	binary.BigEndian.PutUint16(data[2:], uint16(t.Charset))
 	binary.BigEndian.PutUint16(data[4:], uint16(t.notNull))
-	binary.BigEndian.PutUint16(data[6:], uint16(t.dummy2))
+	binary.BigEndian.PutUint16(data[6:], uint16(t.Collation))
 	binary.BigEndian.PutUint32(data[8:], Int32ToUint32(t.Size))
 	binary.BigEndian.PutUint32(data[12:], Int32ToUint32(t.Width))
 	binary.BigEndian.PutUint32(data[16:], Int32ToUint32(t.Scale))
@@ -168,7 +169,7 @@ func (t *Type) Unmarshal(data []byte) error {
 	t.Oid = T(binary.BigEndian.Uint16(data[0:]))
 	t.Charset = uint8(binary.BigEndian.Uint16(data[2:]))
 	t.notNull = uint8(binary.BigEndian.Uint16(data[4:]))
-	t.dummy2 = uint8(binary.BigEndian.Uint16(data[6:]))
+	t.Collation = uint8(binary.BigEndian.Uint16(data[6:]))
 	t.Size = Uint32ToInt32(binary.BigEndian.Uint32(data[8:]))
 	t.Width = Uint32ToInt32(binary.BigEndian.Uint32(data[12:]))
 	t.Scale = Uint32ToInt32(binary.BigEndian.Uint32(data[16:]))
@@ -443,8 +444,56 @@ func CharsetType(oid T) uint8 {
 	}
 }
 
+// Collation IDs matching MySQL collation IDs.
+const (
+	CollationBinary           uint8 = 0 // default, binary comparison
+	CollationUtf8GeneralCI    uint8 = 33
+	CollationUtf8mb4GeneralCI uint8 = 45
+	CollationUtf8mb4Bin       uint8 = 46
+	CollationUtf8Bin          uint8 = 83
+	CollationUtf8UnicodeCI    uint8 = 192
+	CollationUtf8mb4UnicodeCI uint8 = 224
+	CollationUtf8mb40900AICI  uint8 = 255
+)
+
+// IsCaseInsensitive returns true if the collation is case-insensitive.
+func (t *Type) IsCaseInsensitive() bool {
+	switch t.Collation {
+	case CollationUtf8GeneralCI, CollationUtf8mb4GeneralCI,
+		CollationUtf8UnicodeCI, CollationUtf8mb4UnicodeCI,
+		CollationUtf8mb40900AICI:
+		return true
+	default:
+		return false
+	}
+}
+
 func TypeSize(oid T) int {
 	return oid.TypeLen()
+}
+
+// CollationNameToID maps a collation name to its ID.
+func CollationNameToID(name string) uint8 {
+	switch strings.ToLower(name) {
+	case "utf8_general_ci":
+		return CollationUtf8GeneralCI
+	case "utf8mb4_general_ci":
+		return CollationUtf8mb4GeneralCI
+	case "utf8_unicode_ci":
+		return CollationUtf8UnicodeCI
+	case "utf8mb4_unicode_ci":
+		return CollationUtf8mb4UnicodeCI
+	case "utf8mb4_0900_ai_ci":
+		return CollationUtf8mb40900AICI
+	case "utf8_bin":
+		return CollationUtf8Bin
+	case "utf8mb4_bin":
+		return CollationUtf8mb4Bin
+	case "binary":
+		return CollationBinary
+	default:
+		return CollationBinary
+	}
 }
 
 func (t *Type) SetNotNull(b bool) {

@@ -670,16 +670,18 @@ func makeSimplePlan2Type(typT types.T) plan.Type {
 
 func makePlan2Type(typ *types.Type) plan.Type {
 	return plan.Type{
-		Id:    int32(typ.Oid),
-		Width: typ.Width,
-		Scale: typ.Scale,
+		Id:        int32(typ.Oid),
+		Width:     typ.Width,
+		Scale:     typ.Scale,
+		Collation: int32(typ.Collation),
 	}
 }
 func makePlan2TypeValue(typ *types.Type) plan.Type {
 	return plan.Type{
-		Id:    int32(typ.Oid),
-		Width: typ.Width,
-		Scale: typ.Scale,
+		Id:        int32(typ.Oid),
+		Width:     typ.Width,
+		Scale:     typ.Scale,
+		Collation: int32(typ.Collation),
 	}
 }
 
@@ -688,14 +690,18 @@ var MakePlan2TypeValue = makePlan2TypeValue
 
 func makeTypeByPlan2Type(typ plan.Type) types.Type {
 	oid := types.T(typ.Id)
-	return types.New(oid, typ.Width, typ.Scale)
+	t := types.New(oid, typ.Width, typ.Scale)
+	t.Collation = uint8(typ.Collation)
+	return t
 }
 
 var MakeTypeByPlan2Expr = makeTypeByPlan2Expr
 
 func makeTypeByPlan2Expr(expr *plan.Expr) types.Type {
 	oid := types.T(expr.Typ.Id)
-	return types.New(oid, expr.Typ.Width, expr.Typ.Scale)
+	t := types.New(oid, expr.Typ.Width, expr.Typ.Scale)
+	t.Collation = uint8(expr.Typ.Collation)
+	return t
 }
 
 func makeHiddenColTyp() Type {

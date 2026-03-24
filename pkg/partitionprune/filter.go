@@ -641,14 +641,18 @@ func listFilterExpr(
 // Creates a new type based on the expression's type information.
 func makeTypeByPlan2Expr(expr *plan.Expr) types.Type {
 	oid := types.T(expr.Typ.Id)
-	return types.New(oid, expr.Typ.Width, expr.Typ.Scale)
+	t := types.New(oid, expr.Typ.Width, expr.Typ.Scale)
+	t.Collation = uint8(expr.Typ.Collation)
+	return t
 }
 
 // makeTypeByPlan2Type converts a plan type to a MatrixOne type.
 // Creates a new type based on the plan type information.
 func makeTypeByPlan2Type(typ plan.Type) types.Type {
 	oid := types.T(typ.Id)
-	return types.New(oid, typ.Width, typ.Scale)
+	t := types.New(oid, typ.Width, typ.Scale)
+	t.Collation = uint8(typ.Collation)
+	return t
 }
 
 // getFunctionObjRef creates a function object reference.

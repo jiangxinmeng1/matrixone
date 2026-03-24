@@ -204,6 +204,9 @@ func buildColumnAndConstraint(
 				return nil, err
 			}
 			newCol.OnUpdate = onUpdateExpr
+		case *tree.AttributeCollate:
+			colType.Collation = int32(types.CollationNameToID(attribute.Collate))
+			newCol.Typ = colType
 		default:
 			return nil, moerr.NewNotSupportedf(ctx.GetContext(), "unsupport column definition %v", attribute)
 		}

@@ -1108,6 +1108,8 @@ func buildTableDefs(stmt *tree.CreateTable, ctx CompilerContext, createTable *pl
 						Name:     colName,
 					})
 					indexs = append(indexs, colName)
+				case *tree.AttributeCollate:
+					colType.Collation = int32(types.CollationNameToID(attribute.Collate))
 				}
 			}
 			if len(pks) > 0 {

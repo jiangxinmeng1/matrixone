@@ -17,6 +17,7 @@ package hashmap
 import (
 	"bytes"
 	"io"
+	"unicode/utf8"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/common/util"
@@ -105,10 +106,38 @@ func (itr *strHashmapIterator) encodeHashKeys(vecs []*vector.Vector, start, coun
 	}
 }
 
+// collationNormalize returns the bytes normalized for collation comparison.
+// For case-insensitive collations, it returns the lowercased bytes.
+// For binary/case-sensitive collations, it returns the original bytes.
+func collationNormalize(data []byte, caseInsensitive bool) []byte {
+	if !caseInsensitive {
+		return data
+	}
+	// Fast path: check if any uppercase ASCII exists
+	hasUpper := false
+	for _, b := range data {
+		if b >= 'A' && b <= 'Z' {
+			hasUpper = true
+			break
+		}
+		if b >= utf8.RuneSelf {
+			// Non-ASCII: need full Unicode lowering
+			hasUpper = true
+			break
+		}
+	}
+	if !hasUpper {
+		return data
+	}
+	return bytes.ToLower(data)
+}
+
 func fillStringGroupStrForConstVec(itr *strHashmapIterator, vec *vector.Vector, n int, start int) {
 	keys := itr.keys
-	bytes := vec.GetBytesAt(start)
-	length := uint16(len(bytes))
+	rawBytes := vec.GetBytesAt(start)
+	ci := vec.GetType().IsCaseInsensitive()
+	normBytes := collationNormalize(rawBytes, ci)
+	length := uint16(len(normBytes))
 	// can't be const null
 	if itr.mp.hasNull {
 		gsp := vec.GetGrouping()
@@ -124,7 +153,7 @@ func fillStringGroupStrForConstVec(itr *strHashmapIterator, vec *vector.Vector, 
 			// give the length
 			keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
 			// append the pure value bytes
-			keys[i] = append(keys[i], bytes...)
+			keys[i] = append(keys[i], normBytes...)
 		}
 	} else {
 		for i := 0; i < n; i++ {
@@ -132,7 +161,7 @@ func fillStringGroupStrForConstVec(itr *strHashmapIterator, vec *vector.Vector, 
 			// give the length
 			keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
 			// append the pure value bytes
-			keys[i] = append(keys[i], bytes...)
+			keys[i] = append(keys[i], normBytes...)
 		}
 	}
 }
@@ -146,6 +175,7 @@ func fillStringGroupStrForConstVec(itr *strHashmapIterator, vec *vector.Vector, 
 // for one col, just give the value bytes
 func fillStringGroupStr(itr *strHashmapIterator, vec *vector.Vector, lenV int, start int, lenCols int) {
 	keys := itr.keys
+	ci := vec.GetType().IsCaseInsensitive()
 	if vec.IsGrouping() {
 		for i := 0; i < lenV; i++ {
 			keys[i] = append(keys[i], byte(2))
@@ -175,60 +205,46 @@ func fillStringGroupStr(itr *strHashmapIterator, vec *vector.Vector, lenV int, s
 			va, area := vector.MustVarlenaRawData(vec)
 			if area == nil {
 				for i := 0; i < lenV; i++ {
-					bytes := va[i+start].ByteSlice()
+					bs := collationNormalize(va[i+start].ByteSlice(), ci)
 					hasGrouping := gsp.Contains(uint64(i + start))
 					if hasGrouping {
 						keys[i] = append(keys[i], byte(2))
 						continue
 					}
-					// for "a"，"bc" and "ab","c", we need to distinct
-					// this is not null value
 					keys[i] = append(keys[i], 0)
-					// give the length
-					length := uint16(len(bytes))
+					length := uint16(len(bs))
 					keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
-					// append the pure value bytes
-					keys[i] = append(keys[i], bytes...)
+					keys[i] = append(keys[i], bs...)
 				}
 			} else {
 				for i := 0; i < lenV; i++ {
-					bytes := va[i+start].GetByteSlice(area)
+					bs := collationNormalize(va[i+start].GetByteSlice(area), ci)
 					hasGrouping := gsp.Contains(uint64(i + start))
 					if hasGrouping {
 						keys[i] = append(keys[i], byte(2))
 						continue
 					}
-					// for "a"，"bc" and "ab","c", we need to distinct
-					// this is not null value
 					keys[i] = append(keys[i], 0)
-					// give the length
-					length := uint16(len(bytes))
+					length := uint16(len(bs))
 					keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
-					// append the pure value bytes
-					keys[i] = append(keys[i], bytes...)
+					keys[i] = append(keys[i], bs...)
 				}
 			}
 		} else {
 			va, area := vector.MustVarlenaRawData(vec)
 			if area == nil {
 				for i := 0; i < lenV; i++ {
-					bytes := va[i+start].ByteSlice()
-					// for "a"，"bc" and "ab","c", we need to distinct
-					// give the length
-					length := uint16(len(bytes))
+					bs := collationNormalize(va[i+start].ByteSlice(), ci)
+					length := uint16(len(bs))
 					keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
-					// append the pure value bytes
-					keys[i] = append(keys[i], bytes...)
+					keys[i] = append(keys[i], bs...)
 				}
 			} else {
 				for i := 0; i < lenV; i++ {
-					bytes := va[i+start].GetByteSlice(area)
-					// for "a"，"bc" and "ab","c", we need to distinct
-					// give the length
-					length := uint16(len(bytes))
+					bs := collationNormalize(va[i+start].GetByteSlice(area), ci)
+					length := uint16(len(bs))
 					keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
-					// append the pure value bytes
-					keys[i] = append(keys[i], bytes...)
+					keys[i] = append(keys[i], bs...)
 				}
 			}
 		}
@@ -246,28 +262,21 @@ func fillStringGroupStr(itr *strHashmapIterator, vec *vector.Vector, lenV int, s
 					} else if hasNull {
 						keys[i] = append(keys[i], byte(1))
 					} else {
-						bytes := va[i+start].ByteSlice()
-						// for "a"，"bc" and "ab","c", we need to distinct
-						// this is not null value
+						bs := collationNormalize(va[i+start].ByteSlice(), ci)
 						keys[i] = append(keys[i], 0)
-						// give the length
-						length := uint16(len(bytes))
+						length := uint16(len(bs))
 						keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
-						// append the pure value bytes
-						keys[i] = append(keys[i], bytes...)
+						keys[i] = append(keys[i], bs...)
 					}
 				} else {
 					if hasNull {
 						itr.zValues[i] = 0
 						continue
 					}
-					bytes := va[i+start].ByteSlice()
-					// for "a"，"bc" and "ab","c", we need to distinct
-					// give the length
-					length := uint16(len(bytes))
+					bs := collationNormalize(va[i+start].ByteSlice(), ci)
+					length := uint16(len(bs))
 					keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
-					// append the pure value bytes
-					keys[i] = append(keys[i], bytes...)
+					keys[i] = append(keys[i], bs...)
 				}
 			}
 		} else {
@@ -280,28 +289,21 @@ func fillStringGroupStr(itr *strHashmapIterator, vec *vector.Vector, lenV int, s
 					} else if hasNull {
 						keys[i] = append(keys[i], byte(1))
 					} else {
-						bytes := va[i+start].GetByteSlice(area)
-						// for "a"，"bc" and "ab","c", we need to distinct
-						// this is not null value
+						bs := collationNormalize(va[i+start].GetByteSlice(area), ci)
 						keys[i] = append(keys[i], 0)
-						// give the length
-						length := uint16(len(bytes))
+						length := uint16(len(bs))
 						keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
-						// append the pure value bytes
-						keys[i] = append(keys[i], bytes...)
+						keys[i] = append(keys[i], bs...)
 					}
 				} else {
 					if hasNull {
 						itr.zValues[i] = 0
 						continue
 					}
-					bytes := va[i+start].GetByteSlice(area)
-					// for "a"，"bc" and "ab","c", we need to distinct
-					// give the length
-					length := uint16(len(bytes))
+					bs := collationNormalize(va[i+start].GetByteSlice(area), ci)
+					length := uint16(len(bs))
 					keys[i] = append(keys[i], util.UnsafeToBytes(&length)...)
-					// append the pure value bytes
-					keys[i] = append(keys[i], bytes...)
+					keys[i] = append(keys[i], bs...)
 				}
 			}
 		}
