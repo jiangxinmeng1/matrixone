@@ -170,11 +170,13 @@ func PlanColsToExeCols(planCols []*plan.ColDef) []TableDef {
 			alg = compress.Lz4
 		}
 		colTyp := col.GetTyp()
+		colType := types.New(types.T(colTyp.GetId()), colTyp.GetWidth(), colTyp.GetScale())
+		colType.Collation = uint8(colTyp.GetCollation())
 		exeCols[i] = &AttributeDef{
 			Attr: Attribute{
 				Name:          col.GetOriginCaseName(),
 				Alg:           alg,
-				Type:          types.New(types.T(colTyp.GetId()), colTyp.GetWidth(), colTyp.GetScale()),
+				Type:          colType,
 				Default:       planCols[i].GetDefault(),
 				OnUpdate:      planCols[i].GetOnUpdate(),
 				Primary:       col.GetPrimary(),

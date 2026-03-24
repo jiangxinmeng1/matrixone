@@ -591,6 +591,47 @@ ROLLBACK;
 SELECT * FROM t_transaction ORDER BY id;
 
 -- @case
+-- @desc: Test COUNT(DISTINCT) respects case-insensitive collation
+-- @label:bvt
+
+-- Table-level collation: utf8mb4_general_ci
+CREATE TABLE t_ci_count (
+    v VARCHAR(10)
+) COLLATE utf8mb4_general_ci;
+INSERT INTO t_ci_count VALUES ('ABC'), ('abc'), ('Abc');
+SELECT COUNT(DISTINCT v) FROM t_ci_count;
+
+-- Column-level collation: utf8mb4_general_ci
+CREATE TABLE t_ci_col_count (
+    v VARCHAR(10) COLLATE utf8mb4_general_ci
+);
+INSERT INTO t_ci_col_count VALUES ('ABC'), ('abc'), ('Abc');
+SELECT COUNT(DISTINCT v) FROM t_ci_col_count;
+
+-- Binary collation should remain case-sensitive
+CREATE TABLE t_bin_count (
+    v VARCHAR(10)
+) COLLATE utf8mb4_bin;
+INSERT INTO t_bin_count VALUES ('ABC'), ('abc'), ('Abc');
+SELECT COUNT(DISTINCT v) FROM t_bin_count;
+
+-- GROUP BY should also respect CI collation
+CREATE TABLE t_ci_group (
+    id INT,
+    v VARCHAR(10)
+) COLLATE utf8mb4_general_ci;
+INSERT INTO t_ci_group VALUES (1,'abc'),(2,'ABC'),(3,'Abc'),(4,'xyz'),(5,'XYZ');
+SELECT COUNT(*) as cnt FROM t_ci_group GROUP BY v ORDER BY cnt;
+
+-- Mixed: column-level overrides table-level
+CREATE TABLE t_mixed_collation (
+    ci_col VARCHAR(10) COLLATE utf8mb4_general_ci,
+    bin_col VARCHAR(10) COLLATE utf8mb4_bin
+);
+INSERT INTO t_mixed_collation VALUES ('ABC','ABC'), ('abc','abc');
+SELECT COUNT(DISTINCT ci_col) as ci_cnt, COUNT(DISTINCT bin_col) as bin_cnt FROM t_mixed_collation;
+
+-- @case
 -- @desc: Cleanup
 -- @label:bvt
 DROP DATABASE IF EXISTS charset_advanced_test;

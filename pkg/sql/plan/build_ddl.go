@@ -1033,6 +1033,16 @@ func buildTableDefs(stmt *tree.CreateTable, ctx CompilerContext, createTable *pl
 	secondaryIndexInfos := make([]*tree.Index, 0)
 	fkDatasOfFKSelfRefer := make([]*FkData, 0)
 	dedupFkName := make(UnorderedSet[string])
+
+	// Extract table-level collation from options
+	var tableCollation int32
+	for _, option := range stmt.Options {
+		if opt, ok := option.(*tree.TableOptionCollate); ok {
+			tableCollation = int32(types.CollationNameToID(opt.Collate))
+			break
+		}
+	}
+
 	for _, item := range stmt.Defs {
 		switch def := item.(type) {
 		case *tree.ColumnTableDef:
@@ -1112,6 +1122,15 @@ func buildTableDefs(stmt *tree.CreateTable, ctx CompilerContext, createTable *pl
 					colType.Collation = int32(types.CollationNameToID(attribute.Collate))
 				}
 			}
+
+			// Apply table-level collation as default for string columns without explicit collation
+			if colType.Collation == 0 && tableCollation != 0 {
+				oid := types.T(colType.GetId())
+				if oid == types.T_char || oid == types.T_varchar || oid == types.T_text {
+					colType.Collation = tableCollation
+				}
+			}
+
 			if len(pks) > 0 {
 				if len(primaryKeys) > 0 {
 					return moerr.NewInvalidInput(ctx.GetContext(), "more than one primary key defined")

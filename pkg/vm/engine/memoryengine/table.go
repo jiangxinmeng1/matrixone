@@ -280,6 +280,7 @@ func (t *Table) GetTableDef(ctx context.Context) *plan.TableDef {
 					Table:       t.tableName,
 					NotNullable: attr.Attr.Default != nil && !attr.Attr.Default.NullAbility,
 					Enumvalues:  attr.Attr.EnumVlaues,
+					Collation:   int32(attr.Attr.Type.Collation),
 				},
 				Primary:   attr.Attr.Primary,
 				Default:   attr.Attr.Default,

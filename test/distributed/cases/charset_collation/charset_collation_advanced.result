@@ -566,4 +566,42 @@ SELECT * FROM t_transaction ORDER BY id;
 id    data
 1    事务测试1
 2    Transaction test 2
+CREATE TABLE t_ci_count (
+v VARCHAR(10)
+) COLLATE utf8mb4_general_ci;
+INSERT INTO t_ci_count VALUES ('ABC'), ('abc'), ('Abc');
+SELECT COUNT(DISTINCT v) FROM t_ci_count;
+COUNT(distinct v)
+1
+CREATE TABLE t_ci_col_count (
+v VARCHAR(10) COLLATE utf8mb4_general_ci
+);
+INSERT INTO t_ci_col_count VALUES ('ABC'), ('abc'), ('Abc');
+SELECT COUNT(DISTINCT v) FROM t_ci_col_count;
+COUNT(distinct v)
+1
+CREATE TABLE t_bin_count (
+v VARCHAR(10)
+) COLLATE utf8mb4_bin;
+INSERT INTO t_bin_count VALUES ('ABC'), ('abc'), ('Abc');
+SELECT COUNT(DISTINCT v) FROM t_bin_count;
+COUNT(distinct v)
+3
+CREATE TABLE t_ci_group (
+id INT,
+v VARCHAR(10)
+) COLLATE utf8mb4_general_ci;
+INSERT INTO t_ci_group VALUES (1,'abc'),(2,'ABC'),(3,'Abc'),(4,'xyz'),(5,'XYZ');
+SELECT COUNT(*) as cnt FROM t_ci_group GROUP BY v ORDER BY cnt;
+cnt
+2
+3
+CREATE TABLE t_mixed_collation (
+ci_col VARCHAR(10) COLLATE utf8mb4_general_ci,
+bin_col VARCHAR(10) COLLATE utf8mb4_bin
+);
+INSERT INTO t_mixed_collation VALUES ('ABC','ABC'), ('abc','abc');
+SELECT COUNT(DISTINCT ci_col) as ci_cnt, COUNT(DISTINCT bin_col) as bin_cnt FROM t_mixed_collation;
+ci_cnt    bin_cnt
+1    2
 DROP DATABASE IF EXISTS charset_advanced_test;

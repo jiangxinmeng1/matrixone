@@ -17,6 +17,7 @@ package function
 import (
 	"bytes"
 	"math"
+	"strings"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/nulls"
@@ -211,6 +212,11 @@ func nullSafeEqualFn(parameters []*vector.Vector, result vector.FunctionResultWr
 			return a == b
 		}, selectList)
 	case types.T_char, types.T_varchar, types.T_blob, types.T_json, types.T_text, types.T_binary, types.T_varbinary, types.T_datalink:
+		if paramType.IsCaseInsensitive() {
+			return opBinaryBytesBytesToFixedNullSafe(parameters, rs, proc, length, func(a, b []byte) bool {
+				return bytes.EqualFold(a, b)
+			}, selectList)
+		}
 		return opBinaryBytesBytesToFixedNullSafe(parameters, rs, proc, length, func(a, b []byte) bool {
 			return bytes.Equal(a, b)
 		}, selectList)
@@ -334,6 +340,11 @@ func equalFn(parameters []*vector.Vector, result vector.FunctionResultWrapper, p
 			return a == b
 		}, selectList)
 	case types.T_char, types.T_varchar, types.T_blob, types.T_json, types.T_text, types.T_binary, types.T_varbinary, types.T_datalink:
+		if paramType.IsCaseInsensitive() {
+			return opBinaryStrStrToFixed[bool](parameters, rs, proc, length, func(v1, v2 string) bool {
+				return strings.EqualFold(v1, v2)
+			}, selectList)
+		}
 		if parameters[0].GetArea() == nil && parameters[1].GetArea() == nil && (selectList == nil) {
 			return compareVarlenaEqual(parameters, rs, proc, length, selectList)
 		}
@@ -1090,6 +1101,11 @@ func notEqualFn(parameters []*vector.Vector, result vector.FunctionResultWrapper
 			return a != b
 		}, selectList)
 	case types.T_char, types.T_varchar, types.T_blob, types.T_json, types.T_text, types.T_datalink:
+		if paramType.IsCaseInsensitive() {
+			return opBinaryStrStrToFixed[bool](parameters, rs, proc, length, func(a, b string) bool {
+				return !strings.EqualFold(a, b)
+			}, selectList)
+		}
 		return opBinaryStrStrToFixed[bool](parameters, rs, proc, length, func(a, b string) bool {
 			return a != b
 		}, selectList)

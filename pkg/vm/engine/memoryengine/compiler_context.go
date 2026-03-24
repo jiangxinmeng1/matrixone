@@ -342,6 +342,7 @@ func engineAttrToPlanColDef(idx int, attr *engine.Attribute) *plan.ColDef {
 			Width:       attr.Type.Width,
 			Scale:       attr.Type.Scale,
 			Enumvalues:  attr.EnumVlaues,
+			Collation:   int32(attr.Type.Collation),
 		},
 		Default:   attr.Default,
 		Primary:   attr.Primary,
