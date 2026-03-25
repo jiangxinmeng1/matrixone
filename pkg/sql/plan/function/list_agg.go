@@ -127,6 +127,9 @@ var supportedAggInNewFramework = []FuncNew{
 		class:      plan.Function_AGG,
 		layout:     STANDARD_FUNCTION,
 		checkFn: func(overloads []overload, inputs []types.Type) checkResult {
+			if len(inputs) == 1 && inputs[0].Oid == types.T_bool {
+				return newCheckResultWithCast(0, []types.Type{types.T_int64.ToType()})
+			}
 			return fixedUnaryAggTypeCheck(inputs, SumSupportedTypes)
 		},
 
@@ -148,6 +151,9 @@ var supportedAggInNewFramework = []FuncNew{
 		class:      plan.Function_AGG,
 		layout:     STANDARD_FUNCTION,
 		checkFn: func(overloads []overload, inputs []types.Type) checkResult {
+			if len(inputs) == 1 && inputs[0].Oid == types.T_bool {
+				return newCheckResultWithCast(0, []types.Type{types.T_int64.ToType()})
+			}
 			return fixedUnaryAggTypeCheck(inputs, SumSupportedTypes)
 		},
 
@@ -464,6 +470,9 @@ var supportedAggInNewFramework = []FuncNew{
 		class:      plan.Function_AGG,
 		layout:     STANDARD_FUNCTION,
 		checkFn: func(overloads []overload, inputs []types.Type) checkResult {
+			if len(inputs) == 1 && inputs[0].Oid == types.T_bool {
+				return newCheckResultWithCast(0, []types.Type{types.T_int64.ToType()})
+			}
 			return fixedUnaryAggTypeCheck(inputs, SumSupportedTypes)
 		},
 
@@ -485,6 +494,9 @@ var supportedAggInNewFramework = []FuncNew{
 		class:      plan.Function_AGG,
 		layout:     STANDARD_FUNCTION,
 		checkFn: func(overloads []overload, inputs []types.Type) checkResult {
+			if len(inputs) == 1 && inputs[0].Oid == types.T_bool {
+				return newCheckResultWithCast(0, []types.Type{types.T_int64.ToType()})
+			}
 			return fixedUnaryAggTypeCheck(inputs, SumSupportedTypes)
 		},
 
@@ -506,6 +518,9 @@ var supportedAggInNewFramework = []FuncNew{
 		class:      plan.Function_AGG,
 		layout:     STANDARD_FUNCTION,
 		checkFn: func(overloads []overload, inputs []types.Type) checkResult {
+			if len(inputs) == 1 && inputs[0].Oid == types.T_bool {
+				return newCheckResultWithCast(0, []types.Type{types.T_int64.ToType()})
+			}
 			return fixedUnaryAggTypeCheck(inputs, SumSupportedTypes)
 		},
 
@@ -527,6 +542,9 @@ var supportedAggInNewFramework = []FuncNew{
 		class:      plan.Function_AGG,
 		layout:     STANDARD_FUNCTION,
 		checkFn: func(overloads []overload, inputs []types.Type) checkResult {
+			if len(inputs) == 1 && inputs[0].Oid == types.T_bool {
+				return newCheckResultWithCast(0, []types.Type{types.T_int64.ToType()})
+			}
 			return fixedUnaryAggTypeCheck(inputs, SumSupportedTypes)
 		},
 

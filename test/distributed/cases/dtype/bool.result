@@ -162,3 +162,34 @@ delete from t1 where b=true;
 select * from t1;
 a	b
 1	0
+DROP TABLE IF EXISTS t3;
+CREATE TABLE t3 (id INT PRIMARY KEY, b BOOL);
+INSERT INTO t3 VALUES (1, TRUE), (2, FALSE), (3, TRUE), (4, NULL);
+SELECT SUM(b) FROM t3;
+sum(b)
+2
+SELECT AVG(b) FROM t3;
+avg(b)
+0.6666666666666666
+SELECT SUM(b), AVG(b), COUNT(b) FROM t3;
+sum(b)	avg(b)	count(b)
+2	0.6666666666666666	3
+SELECT CAST(b AS DECIMAL(10,2)) FROM t3 ORDER BY id;
+cast(b as decimal(10, 2))
+1.00
+0.00
+1.00
+null
+SELECT CAST(b AS FLOAT) FROM t3 ORDER BY id;
+cast(b as float)
+1.0
+0.0
+1.0
+null
+SELECT CAST(b AS DOUBLE) FROM t3 ORDER BY id;
+cast(b as double)
+1.0
+0.0
+1.0
+null
+DROP TABLE t3;

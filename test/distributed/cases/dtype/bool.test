@@ -54,3 +54,15 @@ delete from t1 where a=false;
 select * from t1;
 delete from t1 where b=true;
 select * from t1;
+
+#Test cases of bool with aggregate functions and cast to numeric types
+DROP TABLE IF EXISTS t3;
+CREATE TABLE t3 (id INT PRIMARY KEY, b BOOL);
+INSERT INTO t3 VALUES (1, TRUE), (2, FALSE), (3, TRUE), (4, NULL);
+SELECT SUM(b) FROM t3;
+SELECT AVG(b) FROM t3;
+SELECT SUM(b), AVG(b), COUNT(b) FROM t3;
+SELECT CAST(b AS DECIMAL(10,2)) FROM t3 ORDER BY id;
+SELECT CAST(b AS FLOAT) FROM t3 ORDER BY id;
+SELECT CAST(b AS DOUBLE) FROM t3 ORDER BY id;
+DROP TABLE t3;
