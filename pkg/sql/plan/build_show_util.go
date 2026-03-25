@@ -108,6 +108,14 @@ func ConstructCreateTableSQL(
 		}
 		fmt.Fprintf(buf, "  `%s` %s", formatStr(colNameOrigin), typeStr)
 
+		if col.Typ.Collation != 0 {
+			collID := uint8(col.Typ.Collation)
+			charsetName, collationName := CollationIDToCharsetAndName(collID)
+			if charsetName != "" {
+				fmt.Fprintf(buf, " CHARACTER SET %s COLLATE %s", charsetName, collationName)
+			}
+		}
+
 		//-------------------------------------------------------------------------------------------------------------
 		if col.Typ.AutoIncr {
 			buf.WriteString(" NOT NULL AUTO_INCREMENT")
@@ -615,6 +623,30 @@ func FormatColType(colType plan.Type) string {
 
 	}
 	return ts + suffix
+}
+
+// CollationIDToCharsetAndName returns the charset and collation name for a given collation ID.
+func CollationIDToCharsetAndName(id uint8) (string, string) {
+	switch id {
+	case types.CollationUtf8GeneralCI:
+		return "utf8", "utf8_general_ci"
+	case types.CollationUtf8mb4GeneralCI:
+		return "utf8mb4", "utf8mb4_general_ci"
+	case types.CollationUtf8Bin:
+		return "utf8", "utf8_bin"
+	case types.CollationUtf8mb4Bin:
+		return "utf8mb4", "utf8mb4_bin"
+	case types.CollationUtf8UnicodeCI:
+		return "utf8", "utf8_unicode_ci"
+	case types.CollationUtf8mb4UnicodeCI:
+		return "utf8mb4", "utf8mb4_unicode_ci"
+	case types.CollationUtf8mb40900AICI:
+		return "utf8mb4", "utf8mb4_0900_ai_ci"
+	case types.CollationBinary:
+		return "binary", "binary"
+	default:
+		return "", ""
+	}
 }
 
 // Character replace mapping maps certain special characters to their escape sequences.
