@@ -17,10 +17,17 @@ CN1_SQL_PORT=${CN1_SQL_PORT:-6010}
 CN2_SQL_PORT=${CN2_SQL_PORT:-6011}
 CN3_SQL_PORT=${CN3_SQL_PORT:-6012}
 LOG_PORT=${LOG_PORT:-32010}
-IMAGE_NAME=${IMAGE_NAME:-matrixorigin/matrixone:latest}
+
+# 项目根目录（start.sh 在 etc/launch-custom-docker/ 下）
+MO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+IMAGE_NAME=${IMAGE_NAME:-mo-custom:latest}
 
 case "${1:-up}" in
   up)
+    echo "=== Building MatrixOne from source ==="
+    docker build -t "$IMAGE_NAME" -f "$MO_ROOT/optools/images/Dockerfile" "$MO_ROOT"
+    echo "=== Build done ==="
+    echo ""
     echo "=== MatrixOne Custom Cluster (3 CN) ==="
     echo "  Image:    $IMAGE_NAME"
     echo "  CN1 port: $CN1_SQL_PORT"
