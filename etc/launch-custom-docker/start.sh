@@ -24,12 +24,22 @@ IMAGE_NAME=${IMAGE_NAME:-mo-custom:latest}
 
 case "${1:-up}" in
   up)
-    echo "=== Building MatrixOne from source ==="
-    DOCKER_BUILDKIT=1 docker build \
-      --build-arg GOPROXY="${GOPROXY:-https://goproxy.cn,direct}" \
-      -t "$IMAGE_NAME" \
-      -f "$MO_ROOT/optools/images/Dockerfile" \
-      "$MO_ROOT"
+    echo "=== Building MatrixOne from source (local build) ==="
+    # 本地编译，避免 Docker 构建时磁盘空间不足
+    make -C "$MO_ROOT" clean && make -C "$MO_ROOT" build
+    # 用轻量 Dockerfile 只打包二进制
+    cat > "$MO_ROOT/.Dockerfile.runtime" <<'DEOF'
+FROM matrixorigin/ubuntu:22.04
+COPY mo-service /mo-service
+COPY etc /etc
+COPY thirdparties/install/lib/*.so /usr/local/lib/
+RUN ldconfig && /mo-service -h
+WORKDIR /
+EXPOSE 6001
+ENTRYPOINT [ "/mo-service", "-debug-http=:12345", "-launch", "/etc/quickstart/launch.toml"]
+DEOF
+    docker build -t "$IMAGE_NAME" -f "$MO_ROOT/.Dockerfile.runtime" "$MO_ROOT"
+    rm -f "$MO_ROOT/.Dockerfile.runtime"
     echo "=== Build done ==="
     echo ""
     echo "=== MatrixOne Custom Cluster (3 CN) ==="
