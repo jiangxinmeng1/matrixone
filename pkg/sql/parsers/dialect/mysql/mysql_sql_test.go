@@ -103,6 +103,53 @@ func TestDataBranchDiffOutputModes(t *testing.T) {
 	require.True(t, diffStmt.OutputOpt.Count)
 }
 
+func TestDataBranchPick(t *testing.T) {
+	// Single PK value list
+	stmt, err := ParseOne(context.TODO(), "data branch pick db1.src into db2.dst keys (1, 2, 3)", 1)
+	require.NoError(t, err)
+	pickStmt, ok := stmt.(*tree.DataBranchPick)
+	require.True(t, ok)
+	require.Equal(t, "src", string(pickStmt.SrcTable.ObjectName))
+	require.Equal(t, "dst", string(pickStmt.DstTable.ObjectName))
+	require.NotNil(t, pickStmt.Keys)
+	require.Equal(t, tree.PickKeysValues, pickStmt.Keys.Type)
+	require.Len(t, pickStmt.Keys.KeyExprs, 3)
+	require.Nil(t, pickStmt.ConflictOpt)
+
+	// With conflict option
+	stmt, err = ParseOne(context.TODO(), "data branch pick src into dst keys (1, 2) when conflict skip", 1)
+	require.NoError(t, err)
+	pickStmt, ok = stmt.(*tree.DataBranchPick)
+	require.True(t, ok)
+	require.NotNil(t, pickStmt.ConflictOpt)
+	require.Equal(t, tree.CONFLICT_SKIP, pickStmt.ConflictOpt.Opt)
+
+	// Subquery keys
+	stmt, err = ParseOne(context.TODO(), "data branch pick src into dst keys (select pk from t1 where id > 10)", 1)
+	require.NoError(t, err)
+	pickStmt, ok = stmt.(*tree.DataBranchPick)
+	require.True(t, ok)
+	require.NotNil(t, pickStmt.Keys)
+	require.Equal(t, tree.PickKeysSubquery, pickStmt.Keys.Type)
+	require.NotNil(t, pickStmt.Keys.Select)
+
+	// WHEN CONFLICT ACCEPT
+	stmt, err = ParseOne(context.TODO(), "data branch pick src into dst keys (100) when conflict accept", 1)
+	require.NoError(t, err)
+	pickStmt, ok = stmt.(*tree.DataBranchPick)
+	require.True(t, ok)
+	require.NotNil(t, pickStmt.ConflictOpt)
+	require.Equal(t, tree.CONFLICT_ACCEPT, pickStmt.ConflictOpt.Opt)
+
+	// WHEN CONFLICT FAIL
+	stmt, err = ParseOne(context.TODO(), "data branch pick src into dst keys (100) when conflict fail", 1)
+	require.NoError(t, err)
+	pickStmt, ok = stmt.(*tree.DataBranchPick)
+	require.True(t, ok)
+	require.NotNil(t, pickStmt.ConflictOpt)
+	require.Equal(t, tree.CONFLICT_FAIL, pickStmt.ConflictOpt.Opt)
+}
+
 var (
 	partitionSQL = struct {
 		input  string
@@ -3437,6 +3484,18 @@ var (
 		input  string
 		output string
 	}{
+		{
+			input:  "select count(*) from t",
+			output: "select count(*) from t",
+		},
+		{
+			input:  "select count(*) as cnt, sum(a) from t group by b having count(*) > 1",
+			output: "select count(*) as cnt, sum(a) from t group by b having count(*) > 1",
+		},
+		{
+			input:  "select approx_count(*) from t",
+			output: "select approx_count(*) from t",
+		},
 		{
 			input:  "create table pt1 (id int, category varchar(50)) partition by list columns (category) (partition p1 values in ('A', 'B') comment 'Category A and B', partition p2 values in ('C', 'D') comment 'Category C and D')",
 			output: "create table pt1 (id int, category varchar(50)) partition by list columns (category) (partition p1 values in ('A', 'B') comment = 'Category A and B', partition p2 values in ('C', 'D') comment = 'Category C and D')",
