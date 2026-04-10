@@ -1,0 +1,147 @@
+version: "3.8"
+
+services:
+  mo-log:
+    image: ${IMAGE_NAME:-matrixorigin/matrixone:latest}
+    container_name: mo-log-custom
+    hostname: mo-log
+    entrypoint: ["/mo-service"]
+    command: ["-cfg", "/config/log.toml"]
+    ports:
+      - "${LOG_PORT:-32010}:32001"
+    volumes:
+      - ./mo-data:/mo-data
+      - ./logs:/logs
+      - ./log.toml:/config/log.toml:ro
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - mo-custom-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          cpus: "1"
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep mo-service || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  mo-tn:
+    image: ${IMAGE_NAME:-matrixorigin/matrixone:latest}
+    container_name: mo-tn-custom
+    hostname: mo-tn
+    entrypoint: ["/mo-service"]
+    command: ["-cfg", "/config/tn.toml"]
+    volumes:
+      - ./mo-data:/mo-data
+      - ./logs:/logs
+      - ./tn.toml:/config/tn.toml:ro
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - mo-custom-net
+    deploy:
+      resources:
+        limits:
+          cpus: "5"
+          memory: 15G
+        reservations:
+          cpus: "2"
+          memory: 8G
+    depends_on:
+      mo-log:
+        condition: service_healthy
+
+  mo-cn1:
+    image: ${IMAGE_NAME:-matrixorigin/matrixone:latest}
+    container_name: mo-cn1-custom
+    hostname: mo-cn1
+    entrypoint: ["/mo-service"]
+    command: ["-cfg", "/config/cn.toml"]
+    ports:
+      - "${CN1_SQL_PORT:-6010}:6001"
+    volumes:
+      - ./mo-data:/mo-data
+      - ./logs:/logs
+      - ./cn.toml:/config/cn.toml:ro
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - mo-custom-net
+    deploy:
+      resources:
+        limits:
+          cpus: "14"
+          memory: 25G
+        reservations:
+          cpus: "4"
+          memory: 10G
+    depends_on:
+      mo-log:
+        condition: service_healthy
+
+  mo-cn2:
+    image: ${IMAGE_NAME:-matrixorigin/matrixone:latest}
+    container_name: mo-cn2-custom
+    hostname: mo-cn2
+    entrypoint: ["/mo-service"]
+    command: ["-cfg", "/config/cn2.toml"]
+    ports:
+      - "${CN2_SQL_PORT:-6011}:6001"
+    volumes:
+      - ./mo-data:/mo-data
+      - ./logs:/logs
+      - ./cn2.toml:/config/cn2.toml:ro
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - mo-custom-net
+    deploy:
+      resources:
+        limits:
+          cpus: "14"
+          memory: 25G
+        reservations:
+          cpus: "4"
+          memory: 10G
+    depends_on:
+      mo-log:
+        condition: service_healthy
+
+  mo-cn3:
+    image: ${IMAGE_NAME:-matrixorigin/matrixone:latest}
+    container_name: mo-cn3-custom
+    hostname: mo-cn3
+    entrypoint: ["/mo-service"]
+    command: ["-cfg", "/config/cn3.toml"]
+    ports:
+      - "${CN3_SQL_PORT:-6012}:6001"
+    volumes:
+      - ./mo-data:/mo-data
+      - ./logs:/logs
+      - ./cn3.toml:/config/cn3.toml:ro
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - mo-custom-net
+    deploy:
+      resources:
+        limits:
+          cpus: "14"
+          memory: 25G
+        reservations:
+          cpus: "4"
+          memory: 10G
+    depends_on:
+      mo-log:
+        condition: service_healthy
+
+networks:
+  mo-custom-net:
+    driver: bridge

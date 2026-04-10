@@ -3,6 +3,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# 兼容 docker compose V2 插件和 V1 独立命令
+if docker compose version &>/dev/null; then
+  DC="docker compose"
+elif docker-compose version &>/dev/null; then
+  DC="docker-compose"
+else
+  echo "错误: 未找到 docker compose 或 docker-compose" >&2
+  exit 1
+fi
+
 CN1_SQL_PORT=${CN1_SQL_PORT:-6010}
 CN2_SQL_PORT=${CN2_SQL_PORT:-6011}
 CN3_SQL_PORT=${CN3_SQL_PORT:-6012}
@@ -23,7 +33,7 @@ case "${1:-up}" in
     echo "    CN x3:      14c / 25G each"
     echo "========================================="
     export CN1_SQL_PORT CN2_SQL_PORT CN3_SQL_PORT LOG_PORT IMAGE_NAME
-    docker compose up -d
+    $DC up -d
     echo ""
     echo "连接任意 CN:"
     echo "  mysql -h 127.0.0.1 -P ${CN1_SQL_PORT} -u root -p111"
@@ -31,19 +41,19 @@ case "${1:-up}" in
     echo "  mysql -h 127.0.0.1 -P ${CN3_SQL_PORT} -u root -p111"
     ;;
   down)
-    docker compose down
+    $DC down
     ;;
   logs)
-    docker compose logs -f ${2:-}
+    $DC logs -f ${2:-}
     ;;
   ps)
-    docker compose ps
+    $DC ps
     ;;
   restart)
-    docker compose restart ${2:-}
+    $DC restart ${2:-}
     ;;
   clean)
-    docker compose down
+    $DC down
     rm -rf mo-data logs
     echo "已清理所有数据"
     ;;
