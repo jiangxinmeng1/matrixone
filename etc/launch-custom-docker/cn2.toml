@@ -32,6 +32,7 @@ backend = "DISK-ETL"
 [cn]
 uuid = "dd2dccb4-4d3c-41f8-b482-5251dc7a41bf"
 port-base = 18100
+service-host = "mo-cn2"
 
 [cn.Engine]
 type = "distributed-tae"
