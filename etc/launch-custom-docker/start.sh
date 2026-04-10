@@ -25,7 +25,9 @@ IMAGE_NAME=${IMAGE_NAME:-mo-custom:latest}
 case "${1:-up}" in
   up)
     echo "=== Building MatrixOne from source (local build) ==="
-    # 本地编译，避免 Docker 构建时磁盘空间不足
+    # 用 /data3 的空间做编译临时目录，避免根分区空间不足
+    export TMPDIR="${TMPDIR:-/data3/tmp}"
+    mkdir -p "$TMPDIR"
     make -C "$MO_ROOT" clean && make -C "$MO_ROOT" build
     # 用轻量 Dockerfile 只打包二进制
     cat > "$MO_ROOT/.Dockerfile.runtime" <<'DEOF'
