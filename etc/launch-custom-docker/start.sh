@@ -25,12 +25,8 @@ IMAGE_NAME=${IMAGE_NAME:-mo-custom:latest}
 case "${1:-up}" in
   up)
     echo "=== Building MatrixOne from source ==="
-    CACHE_DIR="$(pwd)/.docker-cache"
-    mkdir -p "$CACHE_DIR"
     DOCKER_BUILDKIT=1 docker build \
       --build-arg GOPROXY="${GOPROXY:-https://goproxy.cn,direct}" \
-      --cache-from type=local,src="$CACHE_DIR" \
-      --cache-to type=local,dest="$CACHE_DIR",mode=max \
       -t "$IMAGE_NAME" \
       -f "$MO_ROOT/optools/images/Dockerfile" \
       "$MO_ROOT"
