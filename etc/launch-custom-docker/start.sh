@@ -19,7 +19,7 @@ CN3_SQL_PORT=${CN3_SQL_PORT:-6012}
 LOG_PORT=${LOG_PORT:-32010}
 
 # 项目根目录（start.sh 在 etc/launch-custom-docker/ 下）
-MO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+MO_ROOT="$(cd ../.. && pwd)"
 IMAGE_NAME=${IMAGE_NAME:-mo-custom:latest}
 
 case "${1:-up}" in
