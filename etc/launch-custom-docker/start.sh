@@ -25,7 +25,7 @@ IMAGE_NAME=${IMAGE_NAME:-mo-custom:latest}
 case "${1:-up}" in
   up)
     echo "=== Building MatrixOne from source ==="
-    docker build -t "$IMAGE_NAME" -f "$MO_ROOT/optools/images/Dockerfile" "$MO_ROOT"
+    docker build --build-arg GOPROXY="${GOPROXY:-https://goproxy.cn,direct}" -t "$IMAGE_NAME" -f "$MO_ROOT/optools/images/Dockerfile" "$MO_ROOT"
     echo "=== Build done ==="
     echo ""
     echo "=== MatrixOne Custom Cluster (3 CN) ==="
