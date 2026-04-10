@@ -5,7 +5,7 @@ services:
     image: ${IMAGE_NAME:-matrixorigin/matrixone:latest}
     container_name: mo-log-custom
     hostname: mo-log
-    entrypoint: ["/mo-service"]
+    entrypoint: ["bash", "-c", "exec -a jxm-mo /mo-service \"$@\"", "--"]
     command: ["-cfg", "/config/log.toml"]
     ports:
       - "${LOG_PORT:-32010}:32001"
@@ -26,7 +26,7 @@ services:
           cpus: "1"
           memory: 1G
     healthcheck:
-      test: ["CMD-SHELL", "pgrep mo-service || exit 1"]
+      test: ["CMD-SHELL", "pgrep -f jxm-mo || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -36,7 +36,7 @@ services:
     image: ${IMAGE_NAME:-matrixorigin/matrixone:latest}
     container_name: mo-tn-custom
     hostname: mo-tn
-    entrypoint: ["/mo-service"]
+    entrypoint: ["bash", "-c", "exec -a jxm-mo /mo-service \"$@\"", "--"]
     command: ["-cfg", "/config/tn.toml"]
     volumes:
       - ./mo-data:/mo-data
@@ -62,7 +62,7 @@ services:
     image: ${IMAGE_NAME:-matrixorigin/matrixone:latest}
     container_name: mo-cn1-custom
     hostname: mo-cn1
-    entrypoint: ["/mo-service"]
+    entrypoint: ["bash", "-c", "exec -a jxm-mo /mo-service \"$@\"", "--"]
     command: ["-cfg", "/config/cn.toml"]
     ports:
       - "${CN1_SQL_PORT:-6010}:6001"
@@ -90,7 +90,7 @@ services:
     image: ${IMAGE_NAME:-matrixorigin/matrixone:latest}
     container_name: mo-cn2-custom
     hostname: mo-cn2
-    entrypoint: ["/mo-service"]
+    entrypoint: ["bash", "-c", "exec -a jxm-mo /mo-service \"$@\"", "--"]
     command: ["-cfg", "/config/cn2.toml"]
     ports:
       - "${CN2_SQL_PORT:-6011}:6001"
@@ -118,7 +118,7 @@ services:
     image: ${IMAGE_NAME:-matrixorigin/matrixone:latest}
     container_name: mo-cn3-custom
     hostname: mo-cn3
-    entrypoint: ["/mo-service"]
+    entrypoint: ["bash", "-c", "exec -a jxm-mo /mo-service \"$@\"", "--"]
     command: ["-cfg", "/config/cn3.toml"]
     ports:
       - "${CN3_SQL_PORT:-6012}:6001"
