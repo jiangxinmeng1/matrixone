@@ -24,5 +24,23 @@ disk-path = "mo-data/file-service-cache"
 name = "ETL"
 backend = "DISK-ETL"
 
+[logservice]
+service-host = "mo-log"
+logservice-address = "0.0.0.0:32001"
+logservice-listen-address = "0.0.0.0:32001"
+gossip-address = "0.0.0.0:32002"
+gossip-listen-address = "0.0.0.0:32002"
+gossip-seed-addresses = ["mo-log:32002"]
+
+[logservice.BootstrapConfig]
+bootstrap-cluster = true
+num-of-log-shards = 1
+num-of-tn-shards = 1
+num-of-log-shard-replicas = 1
+init-hakeeper-members = ["131072:7c4dccb4-4d3c-41f8-b482-5251dc7a41bf"]
+
+[hakeeper-client]
+service-addresses = ["mo-log:32001"]
+
 [observability]
 status-port = 7001
