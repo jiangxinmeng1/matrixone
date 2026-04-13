@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -73,9 +74,17 @@ func WithBuffer(buffer *containers.OneSchemaBatchBuffer, isOwner bool) SinkerOpt
 	}
 }
 
-func WithAsyncFlush() SinkerOption {
+func WithPipelineFlush(sinkWorkers, maxPendingSync int) SinkerOption {
 	return func(sinker *Sinker) {
-		sinker.async.enabled = true
+		sinker.pipe.enabled = true
+		if sinkWorkers < 1 {
+			sinkWorkers = 1
+		}
+		sinker.pipe.sinkWorkers = sinkWorkers
+		if maxPendingSync < 1 {
+			maxPendingSync = 1
+		}
+		sinker.pipe.maxPending = maxPendingSync
 	}
 }
 
@@ -352,21 +361,30 @@ type Sinker struct {
 		buffers  *containers.OneSchemaBatchBuffer
 	}
 
-	async struct {
-		enabled bool
-		wg      sync.WaitGroup
-		err     error
+	pipe struct {
+		enabled     bool
+		sinkWorkers int
+		maxPending  int
+
+		started  bool
+		ctx      context.Context
+		cancel   context.CancelFunc
+		sinkChan chan *pipelineSinkJob
+		syncChan chan *pipelineSyncJob
+		wg       sync.WaitGroup
+
+		mu        sync.Mutex
+		persisted []objectio.ObjectStats
+		err       error
 	}
 
 	timing struct {
-		spillCount     int
-		spillTotal     time.Duration // total wall time in trySpill (main goroutine)
-		waitTotal      time.Duration // time blocked waiting for previous async IO
-		sortTotal      time.Duration // sort + merge sort + dedup
-		sinkTotal      time.Duration // fSinker.Sink() serialization + compression
-		syncTotal      time.Duration // fSinker.Sync() disk IO (sync path only)
-		asyncSyncTotal time.Duration // accumulated async Sync time (from goroutines)
-		lastAsyncSync  time.Duration // last goroutine's Sync duration (set by goroutine, read after Wait)
+		spillCount int64 // atomic
+		sortNs     int64 // atomic, nanoseconds
+		sinkNs     int64 // atomic, nanoseconds
+		syncNs     int64 // atomic, nanoseconds
+		waitNs     int64 // atomic, nanoseconds (main goroutine blocked on submit)
+		spillNs    int64 // atomic, nanoseconds (total wall time in trySpill)
 	}
 
 	mp *mpool.MPool
@@ -480,30 +498,152 @@ func (sinker *Sinker) trySortInMemoryStaged(ctx context.Context) error {
 	return nil
 }
 
-func (sinker *Sinker) waitPendingAsyncSpill() error {
-	sinker.async.wg.Wait()
-	sinker.timing.asyncSyncTotal += sinker.timing.lastAsyncSync
-	sinker.timing.lastAsyncSync = 0
-	err := sinker.async.err
-	sinker.async.err = nil
-	return err
+// pipeline job types
+
+type pipelineSinkJob struct {
+	data []*batch.Batch
+}
+
+type pipelineSyncJob struct {
+	fSinker FileSinker
+}
+
+func (sinker *Sinker) startPipeline(ctx context.Context) {
+	sinker.pipe.ctx, sinker.pipe.cancel = context.WithCancel(ctx)
+	sinker.pipe.sinkChan = make(chan *pipelineSinkJob, sinker.pipe.sinkWorkers)
+	sinker.pipe.syncChan = make(chan *pipelineSyncJob, sinker.pipe.maxPending)
+	sinker.pipe.started = true
+
+	for i := 0; i < sinker.pipe.sinkWorkers; i++ {
+		sinker.pipe.wg.Add(1)
+		go sinker.pipelineSinkWorker()
+	}
+	sinker.pipe.wg.Add(1)
+	go sinker.pipelineSyncWorker()
+}
+
+func (sinker *Sinker) pipelineSinkWorker() {
+	defer sinker.pipe.wg.Done()
+	for job := range sinker.pipe.sinkChan {
+		if sinker.pipelineHasError() {
+			sinker.freePipelineBatches(job.data)
+			continue
+		}
+
+		sinkStart := time.Now()
+		fSinker := sinker.fSinker.factory(sinker.mp, sinker.fs)
+		var sinkErr error
+		for _, bat := range job.data {
+			if err := fSinker.Sink(sinker.pipe.ctx, bat); err != nil {
+				sinkErr = err
+				break
+			}
+		}
+		atomic.AddInt64(&sinker.timing.sinkNs, int64(time.Since(sinkStart)))
+		sinker.freePipelineBatches(job.data)
+
+		if sinkErr != nil {
+			fSinker.Close()
+			sinker.setPipelineError(sinkErr)
+			continue
+		}
+
+		select {
+		case sinker.pipe.syncChan <- &pipelineSyncJob{fSinker: fSinker}:
+		case <-sinker.pipe.ctx.Done():
+			fSinker.Close()
+		}
+	}
+}
+
+func (sinker *Sinker) pipelineSyncWorker() {
+	defer sinker.pipe.wg.Done()
+	for job := range sinker.pipe.syncChan {
+		if sinker.pipelineHasError() {
+			job.fSinker.Close()
+			continue
+		}
+
+		syncStart := time.Now()
+		stats, err := job.fSinker.Sync(sinker.pipe.ctx)
+		atomic.AddInt64(&sinker.timing.syncNs, int64(time.Since(syncStart)))
+		job.fSinker.Close()
+
+		if err != nil {
+			sinker.setPipelineError(err)
+			continue
+		}
+
+		sinker.pipe.mu.Lock()
+		sinker.pipe.persisted = append(sinker.pipe.persisted, *stats)
+		sinker.pipe.mu.Unlock()
+	}
+}
+
+func (sinker *Sinker) pipelineHasError() bool {
+	sinker.pipe.mu.Lock()
+	defer sinker.pipe.mu.Unlock()
+	return sinker.pipe.err != nil
+}
+
+func (sinker *Sinker) pipelineError() error {
+	sinker.pipe.mu.Lock()
+	defer sinker.pipe.mu.Unlock()
+	return sinker.pipe.err
+}
+
+func (sinker *Sinker) setPipelineError(err error) {
+	sinker.pipe.mu.Lock()
+	if sinker.pipe.err == nil {
+		sinker.pipe.err = err
+	}
+	sinker.pipe.mu.Unlock()
+	sinker.pipe.cancel()
+}
+
+func (sinker *Sinker) drainPipeline() error {
+	if !sinker.pipe.started {
+		return nil
+	}
+	close(sinker.pipe.sinkChan)
+	sinker.pipe.wg.Wait()
+	close(sinker.pipe.syncChan)
+	return sinker.pipe.err
+}
+
+func (sinker *Sinker) freePipelineBatches(batches []*batch.Batch) {
+	for _, bat := range batches {
+		if bat != nil {
+			bat.Clean(sinker.mp)
+		}
+	}
+}
+
+func (sinker *Sinker) pipelineSubmit(ctx context.Context, data []*batch.Batch) error {
+	if err := sinker.pipelineError(); err != nil {
+		sinker.freePipelineBatches(data)
+		return err
+	}
+	waitStart := time.Now()
+	select {
+	case sinker.pipe.sinkChan <- &pipelineSinkJob{data: data}:
+		atomic.AddInt64(&sinker.timing.waitNs, int64(time.Since(waitStart)))
+		return nil
+	case <-sinker.pipe.ctx.Done():
+		sinker.freePipelineBatches(data)
+		return sinker.pipelineError()
+	case <-ctx.Done():
+		sinker.freePipelineBatches(data)
+		return context.Cause(ctx)
+	}
 }
 
 func (sinker *Sinker) trySpill(ctx context.Context) error {
 	spillStart := time.Now()
 	defer func() {
-		sinker.timing.spillCount++
-		sinker.timing.spillTotal += time.Since(spillStart)
+		atomic.AddInt64(&sinker.timing.spillCount, 1)
+		atomic.AddInt64(&sinker.timing.spillNs, int64(time.Since(spillStart)))
 	}()
-
-	// wait for any pending async spill to complete before starting a new one
-	if sinker.async.enabled {
-		waitStart := time.Now()
-		if err := sinker.waitPendingAsyncSpill(); err != nil {
-			return err
-		}
-		sinker.timing.waitTotal += time.Since(waitStart)
-	}
 
 	// sort all in memory data
 	sortStart := time.Now()
@@ -560,55 +700,58 @@ func (sinker *Sinker) trySpill(ctx context.Context) error {
 			return err
 		}
 	}
-	sinker.timing.sortTotal += time.Since(sortStart)
+	atomic.AddInt64(&sinker.timing.sortNs, int64(time.Since(sortStart)))
 
-	// 4. serialize data into FileSinker (CPU-bound: compress + encode)
-	sinkStart := time.Now()
-	var fSinker FileSinker
-	if sinker.async.enabled {
-		// create a dedicated FileSinker so the background goroutine
-		// writing the previous object does not race with us
-		fSinker = sinker.fSinker.factory(sinker.mp, sinker.fs)
-	} else {
-		fSinker = sinker.getStageFileSinker()
-		defer sinker.resetFileSinker()
+	// pipeline path: hand off serialization + IO to workers
+	if sinker.pipe.enabled {
+		if !sinker.pipe.started {
+			sinker.startPipeline(ctx)
+		}
+
+		// transfer batch ownership to pipeline workers
+		var jobData []*batch.Batch
+		if sinker.schema.sortKeyIdx != -1 {
+			// sorted[] contains copies from merge sort — steal them
+			jobData = make([]*batch.Batch, len(sorted))
+			copy(jobData, sorted)
+			// prevent the defer from freeing these batches
+			for i := range sorted {
+				sorted[i] = nil
+			}
+			sorted = sorted[:0]
+		} else {
+			// no sort key — steal in-memory staged batches directly
+			jobData = make([]*batch.Batch, len(sinker.staged.inMemory))
+			copy(jobData, sinker.staged.inMemory)
+			// prevent cleanupInMemoryStaged from freeing them
+			for i := range sinker.staged.inMemory {
+				sinker.staged.inMemory[i] = nil
+			}
+			sinker.staged.inMemory = sinker.staged.inMemory[:0]
+			sinker.staged.inMemorySize = 0
+		}
+
+		return sinker.pipelineSubmit(ctx, jobData)
 	}
+
+	// synchronous path: serialize + write in the current goroutine
+	sinkStart := time.Now()
+	fSinker := sinker.getStageFileSinker()
+	defer sinker.resetFileSinker()
 	for _, bat := range data {
 		if err := fSinker.Sink(ctx, bat); err != nil {
-			if sinker.async.enabled {
-				fSinker.Close()
-			}
 			return err
 		}
 	}
-	sinker.timing.sinkTotal += time.Since(sinkStart)
+	atomic.AddInt64(&sinker.timing.sinkNs, int64(time.Since(sinkStart)))
 
-	// 5. flush serialized data to fileservice
-	if sinker.async.enabled {
-		// async: the disk IO runs in a background goroutine so the caller
-		// can continue accumulating and sorting the next window of data
-		sinker.async.wg.Add(1)
-		go func() {
-			defer sinker.async.wg.Done()
-			syncStart := time.Now()
-			stats, err := fSinker.Sync(ctx)
-			sinker.timing.lastAsyncSync = time.Since(syncStart)
-			fSinker.Close()
-			if err != nil {
-				sinker.async.err = err
-			} else {
-				sinker.staged.persisted = append(sinker.staged.persisted, *stats)
-			}
-		}()
-	} else {
-		syncStart := time.Now()
-		stats, err := fSinker.Sync(ctx)
-		sinker.timing.syncTotal += time.Since(syncStart)
-		if err != nil {
-			return err
-		}
-		sinker.staged.persisted = append(sinker.staged.persisted, *stats)
+	syncStart := time.Now()
+	stats, err := fSinker.Sync(ctx)
+	atomic.AddInt64(&sinker.timing.syncNs, int64(time.Since(syncStart)))
+	if err != nil {
+		return err
 	}
+	sinker.staged.persisted = append(sinker.staged.persisted, *stats)
 
 	return nil
 }
@@ -681,13 +824,14 @@ func (sinker *Sinker) Sync(ctx context.Context) error {
 		return context.Cause(ctx)
 	default:
 	}
-	// drain any pending async spill before inspecting staged state
-	if sinker.async.enabled {
-		if err := sinker.waitPendingAsyncSpill(); err != nil {
+	if sinker.pipe.enabled && sinker.pipe.started {
+		// check pipeline error before proceeding
+		if err := sinker.pipelineError(); err != nil {
 			return err
 		}
 	}
-	if len(sinker.staged.persisted) == 0 && len(sinker.staged.inMemory) == 0 {
+	if len(sinker.staged.persisted) == 0 && len(sinker.staged.inMemory) == 0 &&
+		(!sinker.pipe.enabled || !sinker.pipe.started) {
 		return nil
 	}
 	// spill the remaining data
@@ -695,13 +839,6 @@ func (sinker *Sinker) Sync(ctx context.Context) error {
 		sinker.staged.inMemorySize >= sinker.config.tailSizeCap {
 		if err := sinker.trySpill(ctx); err != nil {
 			return err
-		}
-		// trySpill may have started an async goroutine;
-		// wait for it before examining staged.persisted
-		if sinker.async.enabled {
-			if err := sinker.waitPendingAsyncSpill(); err != nil {
-				return err
-			}
 		}
 	} else {
 		if err := sinker.trySortInMemoryStaged(ctx); err != nil {
@@ -719,19 +856,29 @@ func (sinker *Sinker) Sync(ctx context.Context) error {
 		sinker.clearInMemoryStaged()
 	}
 
+	// drain pipeline and collect results
+	if sinker.pipe.enabled && sinker.pipe.started {
+		if err := sinker.drainPipeline(); err != nil {
+			return err
+		}
+		sinker.staged.persisted = append(sinker.staged.persisted, sinker.pipe.persisted...)
+	}
+
 	defer func() {
 		sinker.staged.persisted = sinker.staged.persisted[:0]
 	}()
 
-	if sinker.timing.spillCount > 0 {
+	spillCount := atomic.LoadInt64(&sinker.timing.spillCount)
+	if spillCount > 0 {
 		logutil.Info("Sinker flush stats",
-			zap.Bool("async", sinker.async.enabled),
-			zap.Int("spills", sinker.timing.spillCount),
-			zap.Duration("sortTime", sinker.timing.sortTotal),
-			zap.Duration("serializeTime", sinker.timing.sinkTotal),
-			zap.Duration("ioTime", sinker.timing.syncTotal+sinker.timing.asyncSyncTotal),
-			zap.Duration("ioWaitTime", sinker.timing.waitTotal),
-			zap.Duration("totalSpillTime", sinker.timing.spillTotal),
+			zap.Bool("pipeline", sinker.pipe.enabled),
+			zap.Int("sinkWorkers", sinker.pipe.sinkWorkers),
+			zap.Int64("spills", spillCount),
+			zap.Duration("sortTime", time.Duration(atomic.LoadInt64(&sinker.timing.sortNs))),
+			zap.Duration("serializeTime", time.Duration(atomic.LoadInt64(&sinker.timing.sinkNs))),
+			zap.Duration("ioTime", time.Duration(atomic.LoadInt64(&sinker.timing.syncNs))),
+			zap.Duration("submitWaitTime", time.Duration(atomic.LoadInt64(&sinker.timing.waitNs))),
+			zap.Duration("totalSpillTime", time.Duration(atomic.LoadInt64(&sinker.timing.spillNs))),
 			zap.Int("objects", len(sinker.staged.persisted)),
 		)
 	}
@@ -757,8 +904,8 @@ func (sinker *Sinker) Sync(ctx context.Context) error {
 }
 
 func (sinker *Sinker) Close() error {
-	if sinker.async.enabled {
-		sinker.async.wg.Wait()
+	if sinker.pipe.enabled && sinker.pipe.started {
+		sinker.drainPipeline()
 	}
 	sinker.cleanupInMemoryStaged()
 	if sinker.buf.buffers != nil {
