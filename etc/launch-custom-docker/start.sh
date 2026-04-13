@@ -72,6 +72,10 @@ DEOF
   ps)
     $DC ps
     ;;
+  start)
+    export CN1_SQL_PORT CN2_SQL_PORT CN3_SQL_PORT LOG_PORT IMAGE_NAME
+    $DC up -d ${2:-}
+    ;;
   restart)
     $DC restart ${2:-}
     ;;
@@ -81,7 +85,7 @@ DEOF
     echo "已清理所有数据"
     ;;
   *)
-    echo "用法: $0 {up|down|logs|ps|restart|clean}"
+    echo "用法: $0 {up|start|down|logs|ps|restart|clean}"
     echo ""
     echo "环境变量:"
     echo "  CN1_SQL_PORT=6010   CN1端口"
