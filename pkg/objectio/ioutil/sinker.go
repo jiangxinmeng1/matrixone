@@ -17,11 +17,16 @@ package ioutil
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/objectio/mergeutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
@@ -65,6 +70,12 @@ func WithBuffer(buffer *containers.OneSchemaBatchBuffer, isOwner bool) SinkerOpt
 	return func(sinker *Sinker) {
 		sinker.buf.isOwner = isOwner
 		sinker.buf.buffers = buffer
+	}
+}
+
+func WithAsyncFlush() SinkerOption {
+	return func(sinker *Sinker) {
+		sinker.async.enabled = true
 	}
 }
 
@@ -341,6 +352,23 @@ type Sinker struct {
 		buffers  *containers.OneSchemaBatchBuffer
 	}
 
+	async struct {
+		enabled bool
+		wg      sync.WaitGroup
+		err     error
+	}
+
+	timing struct {
+		spillCount     int
+		spillTotal     time.Duration // total wall time in trySpill (main goroutine)
+		waitTotal      time.Duration // time blocked waiting for previous async IO
+		sortTotal      time.Duration // sort + merge sort + dedup
+		sinkTotal      time.Duration // fSinker.Sink() serialization + compression
+		syncTotal      time.Duration // fSinker.Sync() disk IO (sync path only)
+		asyncSyncTotal time.Duration // accumulated async Sync time (from goroutines)
+		lastAsyncSync  time.Duration // last goroutine's Sync duration (set by goroutine, read after Wait)
+	}
+
 	mp *mpool.MPool
 	fs fileservice.FileService
 }
@@ -452,8 +480,33 @@ func (sinker *Sinker) trySortInMemoryStaged(ctx context.Context) error {
 	return nil
 }
 
+func (sinker *Sinker) waitPendingAsyncSpill() error {
+	sinker.async.wg.Wait()
+	sinker.timing.asyncSyncTotal += sinker.timing.lastAsyncSync
+	sinker.timing.lastAsyncSync = 0
+	err := sinker.async.err
+	sinker.async.err = nil
+	return err
+}
+
 func (sinker *Sinker) trySpill(ctx context.Context) error {
+	spillStart := time.Now()
+	defer func() {
+		sinker.timing.spillCount++
+		sinker.timing.spillTotal += time.Since(spillStart)
+	}()
+
+	// wait for any pending async spill to complete before starting a new one
+	if sinker.async.enabled {
+		waitStart := time.Now()
+		if err := sinker.waitPendingAsyncSpill(); err != nil {
+			return err
+		}
+		sinker.timing.waitTotal += time.Since(waitStart)
+	}
+
 	// sort all in memory data
+	sortStart := time.Now()
 	if err := sinker.trySortInMemoryStaged(ctx); err != nil {
 		return err
 	}
@@ -507,21 +560,56 @@ func (sinker *Sinker) trySpill(ctx context.Context) error {
 			return err
 		}
 	}
+	sinker.timing.sortTotal += time.Since(sortStart)
 
-	// 4. spill
-	fSinker := sinker.getStageFileSinker()
-	defer sinker.resetFileSinker()
+	// 4. serialize data into FileSinker (CPU-bound: compress + encode)
+	sinkStart := time.Now()
+	var fSinker FileSinker
+	if sinker.async.enabled {
+		// create a dedicated FileSinker so the background goroutine
+		// writing the previous object does not race with us
+		fSinker = sinker.fSinker.factory(sinker.mp, sinker.fs)
+	} else {
+		fSinker = sinker.getStageFileSinker()
+		defer sinker.resetFileSinker()
+	}
 	for _, bat := range data {
 		if err := fSinker.Sink(ctx, bat); err != nil {
+			if sinker.async.enabled {
+				fSinker.Close()
+			}
 			return err
 		}
 	}
-	stats, err := fSinker.Sync(ctx)
-	if err != nil {
-		return err
+	sinker.timing.sinkTotal += time.Since(sinkStart)
+
+	// 5. flush serialized data to fileservice
+	if sinker.async.enabled {
+		// async: the disk IO runs in a background goroutine so the caller
+		// can continue accumulating and sorting the next window of data
+		sinker.async.wg.Add(1)
+		go func() {
+			defer sinker.async.wg.Done()
+			syncStart := time.Now()
+			stats, err := fSinker.Sync(ctx)
+			sinker.timing.lastAsyncSync = time.Since(syncStart)
+			fSinker.Close()
+			if err != nil {
+				sinker.async.err = err
+			} else {
+				sinker.staged.persisted = append(sinker.staged.persisted, *stats)
+			}
+		}()
+	} else {
+		syncStart := time.Now()
+		stats, err := fSinker.Sync(ctx)
+		sinker.timing.syncTotal += time.Since(syncStart)
+		if err != nil {
+			return err
+		}
+		sinker.staged.persisted = append(sinker.staged.persisted, *stats)
 	}
 
-	sinker.staged.persisted = append(sinker.staged.persisted, *stats)
 	return nil
 }
 
@@ -593,6 +681,12 @@ func (sinker *Sinker) Sync(ctx context.Context) error {
 		return context.Cause(ctx)
 	default:
 	}
+	// drain any pending async spill before inspecting staged state
+	if sinker.async.enabled {
+		if err := sinker.waitPendingAsyncSpill(); err != nil {
+			return err
+		}
+	}
 	if len(sinker.staged.persisted) == 0 && len(sinker.staged.inMemory) == 0 {
 		return nil
 	}
@@ -601,6 +695,13 @@ func (sinker *Sinker) Sync(ctx context.Context) error {
 		sinker.staged.inMemorySize >= sinker.config.tailSizeCap {
 		if err := sinker.trySpill(ctx); err != nil {
 			return err
+		}
+		// trySpill may have started an async goroutine;
+		// wait for it before examining staged.persisted
+		if sinker.async.enabled {
+			if err := sinker.waitPendingAsyncSpill(); err != nil {
+				return err
+			}
 		}
 	} else {
 		if err := sinker.trySortInMemoryStaged(ctx); err != nil {
@@ -621,6 +722,19 @@ func (sinker *Sinker) Sync(ctx context.Context) error {
 	defer func() {
 		sinker.staged.persisted = sinker.staged.persisted[:0]
 	}()
+
+	if sinker.timing.spillCount > 0 {
+		logutil.Info("Sinker flush stats",
+			zap.Bool("async", sinker.async.enabled),
+			zap.Int("spills", sinker.timing.spillCount),
+			zap.Duration("sortTime", sinker.timing.sortTotal),
+			zap.Duration("serializeTime", sinker.timing.sinkTotal),
+			zap.Duration("ioTime", sinker.timing.syncTotal+sinker.timing.asyncSyncTotal),
+			zap.Duration("ioWaitTime", sinker.timing.waitTotal),
+			zap.Duration("totalSpillTime", sinker.timing.spillTotal),
+			zap.Int("objects", len(sinker.staged.persisted)),
+		)
+	}
 
 	// if there is only one file, it is sorted an deduped
 	if len(sinker.staged.persisted) == 1 {
@@ -643,6 +757,9 @@ func (sinker *Sinker) Sync(ctx context.Context) error {
 }
 
 func (sinker *Sinker) Close() error {
+	if sinker.async.enabled {
+		sinker.async.wg.Wait()
+	}
 	sinker.cleanupInMemoryStaged()
 	if sinker.buf.buffers != nil {
 		if sinker.buf.isOwner {

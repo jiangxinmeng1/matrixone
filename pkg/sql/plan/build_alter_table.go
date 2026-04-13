@@ -203,6 +203,7 @@ func buildAlterInsertDataSQL(ctx CompilerContext, alterCtx *AlterTableContext) (
 	insertSQL := fmt.Sprintf("INSERT INTO `%s`.`%s` (%s) SELECT %s FROM `%s`.`%s`",
 		formatStr(schemaName), formatStr(copyTableName), insertBuffer.String(),
 		selectBuffer.String(), formatStr(schemaName), formatStr(originTableName))
+
 	return insertSQL, nil
 }
 

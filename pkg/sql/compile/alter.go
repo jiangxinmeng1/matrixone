@@ -17,6 +17,7 @@ package compile
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -120,6 +121,13 @@ func (s *Scope) AlterTableCopy(c *Compile) error {
 			zap.Error(err))
 		return err
 	}
+
+	// 3.5. If adding a primary key, pre-validate uniqueness for fast-fail
+	// before the expensive data copy operation.
+	// NOTE: disabled for now - GROUP BY on large tables causes OOM
+	// if err = preValidatePKUniqueness(c, qry); err != nil {
+	// 	return err
+	// }
 
 	// 4. copy the original table data to the temporary replica table
 	err = c.runSql(qry.InsertTmpDataSql)
@@ -429,4 +437,69 @@ func notifyParentTableFkTableIdChange(c *Compile, fkey *plan.ForeignKeyDef, oldT
 		}
 	}
 	return fatherRelation.UpdateConstraint(c.proc.Ctx, oldCt)
+}
+
+// preValidatePKUniqueness checks for duplicate PK values in the original table
+// before performing the expensive data copy. This provides fast-fail for the
+// ADD PRIMARY KEY case, avoiding wasted IO if duplicates exist.
+func preValidatePKUniqueness(c *Compile, qry *plan.AlterTable) error {
+	origPkey := qry.GetTableDef().GetPkey()
+	copyPkey := qry.GetCopyTableDef().GetPkey()
+
+	// Only validate when adding a primary key (original has fake PK, copy has real PK)
+	if origPkey == nil || origPkey.PkeyColName != catalog.FakePrimaryKeyColName {
+		return nil
+	}
+	if copyPkey == nil || copyPkey.PkeyColName == catalog.FakePrimaryKeyColName {
+		return nil
+	}
+
+	pkNames := copyPkey.GetNames()
+	if len(pkNames) == 0 {
+		return nil
+	}
+
+	dbName := qry.Database
+	if dbName == "" {
+		dbName = c.db
+	}
+	tblName := qry.GetTableDef().GetName()
+
+	// Build quoted column list for GROUP BY
+	quotedCols := make([]string, len(pkNames))
+	for i, name := range pkNames {
+		quotedCols[i] = "`" + strings.ReplaceAll(name, "`", "``") + "`"
+	}
+	colList := strings.Join(quotedCols, ", ")
+
+	checkSQL := fmt.Sprintf(
+		"SELECT %s FROM `%s`.`%s` GROUP BY %s HAVING count(*) > 1 LIMIT 1",
+		colList,
+		strings.ReplaceAll(dbName, "`", "``"),
+		strings.ReplaceAll(tblName, "`", "``"),
+		colList,
+	)
+
+	res, err := c.runSqlWithResult(checkSQL, NoAccountId)
+	if err != nil {
+		return err
+	}
+	defer res.Close()
+
+	for _, bat := range res.Batches {
+		if bat != nil && bat.RowCount() > 0 {
+			// Build a human-readable representation of the duplicate key value
+			dupVals := make([]string, 0, len(bat.Vecs))
+			for j := 0; j < len(bat.Vecs); j++ {
+				vec := bat.GetVector(int32(j))
+				if vec.Length() > 0 {
+					dupVals = append(dupVals, vec.RowToString(0))
+				}
+			}
+			entry := strings.Join(dupVals, "-")
+			keyName := strings.Join(pkNames, ",")
+			return moerr.NewDuplicateEntry(c.proc.Ctx, entry, keyName)
+		}
+	}
+	return nil
 }
