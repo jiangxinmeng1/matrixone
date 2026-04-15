@@ -42,6 +42,11 @@ type container struct {
 	topValueZM              objectio.ZoneMap
 	bat                     *batch.Batch
 	buildBat                *batch.Batch //temp batch, do not need free or reset
+
+	// hasVarlen is true if any column in the heap batch is a variable-length type.
+	hasVarlen bool
+	// replaceCount tracks heap replacements since the last area compaction.
+	replaceCount uint64
 }
 
 type Top struct {

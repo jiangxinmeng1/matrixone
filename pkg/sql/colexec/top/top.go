@@ -202,6 +202,9 @@ func (ctr *container) build(ap *Top, bat *batch.Batch, proc *process.Process) er
 			ctr.bat = batNew(len(bat.Vecs))
 			for i, vec := range bat.Vecs {
 				ctr.bat.Vecs[i] = vecNew(*vec.GetType())
+				if vec.GetType().IsVarlen() {
+					ctr.hasVarlen = true
+				}
 			}
 		}
 
@@ -274,7 +277,12 @@ func (ctr *container) processBatch(limit uint64, bat *batch.Batch, proc *process
 				}
 			}
 			heap.Fix(ctr, 0)
+			ctr.replaceCount++
 		}
+	}
+
+	if ctr.hasVarlen && ctr.replaceCount >= limit {
+		return ctr.compactHeap(limit, proc)
 	}
 	return nil
 }
@@ -307,6 +315,59 @@ func (ctr *container) sort() {
 		cmp.Set(0, ctr.bat.Vecs[i])
 	}
 	heap.Init(ctr)
+}
+
+// compactHeap rebuilds the heap batch to reclaim dead area space in
+// variable-length vectors. During heap replacements, each Copy appends
+// new data to the vector's area while the old data becomes garbage.
+// This method creates fresh vectors containing only the live rows.
+func (ctr *container) compactHeap(limit uint64, proc *process.Process) error {
+	n := len(ctr.sels)
+	if n == 0 {
+		return nil
+	}
+
+	mp := proc.Mp()
+	useOffHeap := limit > 10240
+	for i, oldVec := range ctr.bat.Vecs {
+		if !oldVec.GetType().IsVarlen() {
+			continue
+		}
+
+		newVec := vector.NewVec(*oldVec.GetType())
+		if useOffHeap {
+			newVec.SetOffHeap(true)
+		}
+		if err := newVec.Union(oldVec, ctr.sels, mp); err != nil {
+			newVec.Free(mp)
+			return err
+		}
+
+		oldVec.Free(mp)
+		ctr.bat.Vecs[i] = newVec
+	}
+
+	// For fixed-length vectors, use Shuffle to reorder in-place.
+	for _, vec := range ctr.bat.Vecs {
+		if vec.GetType().IsVarlen() {
+			continue
+		}
+		if err := vec.Shuffle(ctr.sels, mp); err != nil {
+			return err
+		}
+	}
+
+	// Reset sels to [0, 1, ..., n-1]
+	for i := range ctr.sels {
+		ctr.sels[i] = int64(i)
+	}
+	ctr.bat.SetRowCount(n)
+
+	// Re-set comparators and re-init heap
+	ctr.sort()
+
+	ctr.replaceCount = 0
+	return nil
 }
 
 func (top *Top) updateTopValueZM() bool {

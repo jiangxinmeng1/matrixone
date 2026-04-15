@@ -38,6 +38,11 @@ type container struct {
 	bat *batch.Batch // bat stores the final result of merge-top
 
 	executorsForOrderList []colexec.ExpressionExecutor
+
+	// hasVarlen is true if any column in the heap batch is a variable-length type.
+	hasVarlen bool
+	// replaceCount tracks heap replacements since the last area compaction.
+	replaceCount uint64
 }
 
 type MergeTop struct {
