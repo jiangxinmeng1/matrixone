@@ -17,6 +17,7 @@ package message
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -239,10 +240,42 @@ func (jm *JoinMap) IsSpilled() bool {
 // TakeSpillBuildFds transfers ownership of anonymous build-side file
 // descriptors from the JoinMap to the caller. After this call the JoinMap
 // no longer owns the fds; FreeMemory will not close them.
+// Use this for shuffle joins (1:1 build-to-probe relationship).
 func (jm *JoinMap) TakeSpillBuildFds() []*os.File {
 	fds := jm.SpillBuildFds
 	jm.SpillBuildFds = nil
 	return fds
+}
+
+// DupSpillBuildFds duplicates build-side spill file descriptors so that
+// multiple probe operators can independently read them. Each returned fd
+// has its own file position. The originals remain owned by the JoinMap
+// and will be closed by FreeMemory when the last reference is released.
+// Use this for broadcast joins (1:N build-to-probe relationship).
+func (jm *JoinMap) DupSpillBuildFds() ([]*os.File, error) {
+	if jm.SpillBuildFds == nil {
+		return nil, nil
+	}
+	dup := make([]*os.File, len(jm.SpillBuildFds))
+	for i, fd := range jm.SpillBuildFds {
+		if fd == nil {
+			continue
+		}
+		// Reopen via /proc/self/fd to get an independent file description
+		// (with its own file position), not just a dup'd descriptor.
+		f, err := os.Open(fmt.Sprintf("/proc/self/fd/%d", fd.Fd()))
+		if err != nil {
+			// Clean up already-opened fds on error.
+			for j := 0; j < i; j++ {
+				if dup[j] != nil {
+					dup[j].Close()
+				}
+			}
+			return nil, err
+		}
+		dup[i] = f
+	}
+	return dup, nil
 }
 
 func (jm *JoinMap) IsDeleted(row uint64) bool {

@@ -17,6 +17,7 @@ package hashjoin
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -272,7 +273,19 @@ func (hashJoin *HashJoin) build(analyzer process.Analyzer, proc *process.Process
 
 		// Handle spilled build side
 		if ctr.mp.IsSpilled() {
-			spilledBuildFds := ctr.mp.TakeSpillBuildFds()
+			var spilledBuildFds []*os.File
+			if hashJoin.IsShuffle {
+				// Shuffle: 1:1 build-to-probe, transfer ownership directly.
+				spilledBuildFds = ctr.mp.TakeSpillBuildFds()
+			} else {
+				// Broadcast: 1:N build-to-probe, duplicate fds so each
+				// probe gets independent file positions. Originals stay
+				// in JoinMap, closed when last probe calls Free().
+				spilledBuildFds, err = ctr.mp.DupSpillBuildFds()
+				if err != nil {
+					return err
+				}
+			}
 
 			// Register build fds in spillQueue immediately so cleanupSpillFiles
 			// can close them even if we return early (e.g. context cancelled).
