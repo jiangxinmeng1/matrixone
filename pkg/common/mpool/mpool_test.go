@@ -15,6 +15,7 @@
 package mpool
 
 import (
+	"runtime"
 	"sync"
 	"testing"
 
@@ -381,15 +382,60 @@ func TestShardDistribution(t *testing.T) {
 	DeleteMPool(mp)
 }
 
-func TestFixedPoolHeaderFromPtrSkipsEmptySlabs(t *testing.T) {
-	mp := MustNew("fixed-pool-empty-slab-test")
-	mp.pools[0].buf = append(mp.pools[0].buf, nil)
+func TestFixedPoolReleasesEmptySlabs(t *testing.T) {
+	mp := MustNew("fixed-pool-release-slab-test")
+	ptrs := make([][]byte, kStripeSize)
+
+	for i := range ptrs {
+		bs, err := mp.Alloc(64, true)
+		require.NoError(t, err)
+		ptrs[i] = bs
+	}
+	require.Len(t, mp.pools[0].slabs, 1)
+
+	for _, bs := range ptrs {
+		mp.Free(bs)
+	}
+	require.Len(t, mp.pools[0].slabs, 0)
+	require.Equal(t, int64(0), mp.CurrNB())
+
+	DeleteMPool(mp)
+}
+
+func TestFixedPoolFreeDoesNotWriteFreelistPointerToPayload(t *testing.T) {
+	mp := MustNew("fixed-pool-payload-test")
+	defer DeleteMPool(mp)
 
 	bs, err := mp.Alloc(64, true)
 	require.NoError(t, err)
-	mp.Free(bs)
+	keepSlab, err := mp.Alloc(64, true)
+	require.NoError(t, err)
+	for i := 0; i < 8; i++ {
+		bs[i] = 0xA5
+	}
 
-	DeleteMPool(mp)
+	mp.Free(bs)
+	require.Equal(t, []byte{0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5}, bs[:8])
+	mp.Free(keepSlab)
+}
+
+func TestFixedPoolGCDoesNotScanFreelistAsPointers(t *testing.T) {
+	mp := MustNew("fixed-pool-gc-test")
+	defer DeleteMPool(mp)
+
+	for round := 0; round < 100; round++ {
+		ptrs := make([][]byte, kStripeSize*2)
+		for i := range ptrs {
+			bs, err := mp.Alloc(64, true)
+			require.NoError(t, err)
+			ptrs[i] = bs
+		}
+		for _, bs := range ptrs {
+			mp.Free(bs)
+		}
+		runtime.GC()
+	}
+	require.Equal(t, int64(0), mp.CurrNB())
 }
 
 func TestPtrLenReplace(t *testing.T) {

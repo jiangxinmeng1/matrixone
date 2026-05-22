@@ -202,13 +202,18 @@ func (pHdr *memHdr) ToSlice(sz, cap int) []byte {
 }
 
 type fixedPool struct {
-	m      sync.Mutex
-	noLock bool
-	fpIdx  int8
-	poolId int64
-	eleSz  int32
-	buf    [][]byte
-	flist  unsafe.Pointer
+	m        sync.Mutex
+	noLock   bool
+	fpIdx    int8
+	poolId   int64
+	eleSz    int32
+	slabs    []fixedSlab
+	freeList []uint32
+}
+
+type fixedSlab struct {
+	buf  []byte
+	free int32
 }
 
 func (fp *fixedPool) initPool(poolid int64, idx int, noLock bool) {
@@ -218,53 +223,51 @@ func (fp *fixedPool) initPool(poolid int64, idx int, noLock bool) {
 	fp.eleSz = PoolElemSize[idx]
 }
 
-func (fp *fixedPool) nextPtr(ptr unsafe.Pointer) unsafe.Pointer {
-	return *(*unsafe.Pointer)(unsafe.Add(ptr, kMemHdrSz))
-}
-
-func (fp *fixedPool) setNextPtr(ptr unsafe.Pointer, next unsafe.Pointer) {
-	*(*unsafe.Pointer)(unsafe.Add(ptr, kMemHdrSz)) = next
-}
-
 func (fp *fixedPool) alloc() *memHdr {
 	if !fp.noLock {
 		fp.m.Lock()
 		defer fp.m.Unlock()
 	}
 
-	if fp.flist == nil {
+	if len(fp.freeList) == 0 {
 		slabSize := uint64(kStripeSize * (fp.eleSz + kMemHdrSz))
 		buf, err := simpleCAllocator().Malloc(slabSize)
 		if err != nil {
 			panic(err)
 		}
-		fp.buf = append(fp.buf, buf)
-		ret := unsafe.Pointer(&buf[0])
-		pHdr := (*memHdr)(ret)
-		pHdr.poolId = fp.poolId
-		pHdr.allocSz = fp.eleSz
-		pHdr.fixedPoolIdx = fp.fpIdx
-		pHdr.offHeap = true
-		pHdr.SetGuard()
-		clear(unsafe.Slice((*byte)(unsafe.Add(ret, kMemHdrSz)), fp.eleSz))
+		slabIdx := len(fp.slabs)
+		fp.slabs = append(fp.slabs, fixedSlab{
+			buf:  buf,
+			free: kStripeSize - 1,
+		})
 
-		ptr := unsafe.Add(ret, fp.eleSz+kMemHdrSz)
-		for i := 1; i < kStripeSize; i++ {
+		for i := 0; i < kStripeSize; i++ {
+			ptr := fp.slotPtr(slabIdx, i)
 			pHdr := (*memHdr)(ptr)
 			pHdr.poolId = fp.poolId
-			pHdr.allocSz = -1
+			pHdr.allocSz = fp.eleSz
+			if i > 0 {
+				pHdr.allocSz = -1
+				fp.freeList = append(fp.freeList, fp.slotID(slabIdx, i))
+			}
 			pHdr.fixedPoolIdx = fp.fpIdx
 			pHdr.offHeap = true
 			pHdr.SetGuard()
-			fp.setNextPtr(ptr, fp.flist)
-			fp.flist = ptr
-			ptr = unsafe.Add(ptr, fp.eleSz+kMemHdrSz)
 		}
+		ret := fp.slotPtr(slabIdx, 0)
+		clear(unsafe.Slice((*byte)(unsafe.Add(ret, kMemHdrSz)), fp.eleSz))
 		return (*memHdr)(ret)
 	}
 
-	ret := fp.flist
-	fp.flist = fp.nextPtr(fp.flist)
+	last := len(fp.freeList) - 1
+	slotID := fp.freeList[last]
+	fp.freeList = fp.freeList[:last]
+	slabIdx, slotIdx := fp.decodeSlotID(slotID)
+	if slabIdx < 0 || slabIdx >= len(fp.slabs) || fp.slabs[slabIdx].free <= 0 {
+		panic(moerr.NewInternalErrorNoCtx("mpool fixed pool slab corruption"))
+	}
+	fp.slabs[slabIdx].free--
+	ret := fp.slotPtr(slabIdx, slotIdx)
 	pHdr := (*memHdr)(ret)
 	pHdr.allocSz = fp.eleSz
 	pHdr.offHeap = true
@@ -285,9 +288,17 @@ func (fp *fixedPool) free(hdr *memHdr) {
 		defer fp.m.Unlock()
 	}
 	ptr := unsafe.Pointer(hdr)
+	slabIdx, slotIdx := fp.findSlotIdx(ptr)
+	if slabIdx < 0 {
+		panic(moerr.NewInternalErrorNoCtx("mpool fixed pool slab not found"))
+	}
 	hdr.allocSz = -1
-	fp.setNextPtr(ptr, fp.flist)
-	fp.flist = ptr
+	fp.slabs[slabIdx].free++
+	if fp.slabs[slabIdx].free == kStripeSize {
+		fp.releaseSlab(slabIdx)
+		return
+	}
+	fp.freeList = append(fp.freeList, fp.slotID(slabIdx, slotIdx))
 }
 
 func (fp *fixedPool) destroy() {
@@ -295,14 +306,96 @@ func (fp *fixedPool) destroy() {
 		fp.m.Lock()
 		defer fp.m.Unlock()
 	}
-	for _, buf := range fp.buf {
-		if len(buf) == 0 {
+	for _, slab := range fp.slabs {
+		if len(slab.buf) == 0 {
 			continue
 		}
-		simpleCAllocator().Deallocate(buf, uint64(cap(buf)))
+		simpleCAllocator().Deallocate(slab.buf, uint64(cap(slab.buf)))
 	}
-	fp.buf = nil
-	fp.flist = nil
+	fp.slabs = nil
+	fp.freeList = nil
+}
+
+func (fp *fixedPool) releaseSlab(idx int) {
+	slab := fp.slabs[idx]
+	last := len(fp.slabs) - 1
+	fp.rebuildFreelistForRelease(idx, last)
+	simpleCAllocator().Deallocate(slab.buf, uint64(cap(slab.buf)))
+	fp.slabs[idx] = fp.slabs[last]
+	fp.slabs = fp.slabs[:last]
+}
+
+func (fp *fixedPool) rebuildFreelistForRelease(releaseIdx, lastIdx int) {
+	newFreeList := fp.freeList[:0]
+	for _, slotID := range fp.freeList {
+		slabIdx, slotIdx := fp.decodeSlotID(slotID)
+		if slabIdx == releaseIdx {
+			continue
+		}
+		if releaseIdx != lastIdx && slabIdx == lastIdx {
+			slotID = fp.slotID(releaseIdx, slotIdx)
+		}
+		newFreeList = append(newFreeList, slotID)
+	}
+	fp.freeList = newFreeList
+}
+
+func (fp *fixedPool) findSlabIdx(ptr unsafe.Pointer) int {
+	for i := range fp.slabs {
+		if fp.slabs[i].contains(ptr) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (fp *fixedPool) findSlotIdx(ptr unsafe.Pointer) (int, int) {
+	for i := range fp.slabs {
+		if slotIdx, ok := fp.slabs[i].slotIdx(ptr, fp.eleSz); ok {
+			return i, slotIdx
+		}
+	}
+	return -1, -1
+}
+
+func (fp *fixedPool) slotID(slabIdx, slotIdx int) uint32 {
+	return uint32(slabIdx*kStripeSize + slotIdx)
+}
+
+func (fp *fixedPool) decodeSlotID(slotID uint32) (int, int) {
+	id := int(slotID)
+	return id / kStripeSize, id % kStripeSize
+}
+
+func (fp *fixedPool) slotPtr(slabIdx, slotIdx int) unsafe.Pointer {
+	return unsafe.Add(
+		unsafe.Pointer(&fp.slabs[slabIdx].buf[0]),
+		slotIdx*int(fp.eleSz+kMemHdrSz),
+	)
+}
+
+func (s fixedSlab) contains(ptr unsafe.Pointer) bool {
+	if len(s.buf) == 0 {
+		return false
+	}
+	uptr := uintptr(ptr)
+	base := uintptr(unsafe.Pointer(&s.buf[0]))
+	return uptr >= base && uptr < base+uintptr(len(s.buf))
+}
+
+func (s fixedSlab) slotIdx(ptr unsafe.Pointer, eleSz int32) (int, bool) {
+	if !s.contains(ptr) {
+		return 0, false
+	}
+	uptr := uintptr(ptr)
+	base := uintptr(unsafe.Pointer(&s.buf[0]))
+	stride := uintptr(eleSz + kMemHdrSz)
+	offset := uptr - base
+	if offset%stride != 0 {
+		return 0, false
+	}
+	slotIdx := int(offset / stride)
+	return slotIdx, slotIdx < kStripeSize
 }
 
 type detailInfo struct {
