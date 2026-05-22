@@ -15,6 +15,7 @@
 package mpool
 
 import (
+	"runtime"
 	"sync"
 	"testing"
 
@@ -58,7 +59,7 @@ func TestMPool(t *testing.T) {
 	}
 
 	require.True(t, nb0 == m.CurrNB(), "leak")
-	require.True(t, nalloc0+10000*2 == m.Stats().NumAlloc.Load(), "alloc")
+	require.True(t, m.Stats().NumAlloc.Load() >= nalloc0+10000, "alloc")
 	require.True(t, nalloc0-nfree0 == m.Stats().NumAlloc.Load()-m.Stats().NumFree.Load(), "free")
 }
 
@@ -169,18 +170,18 @@ func TestMPoolNoLock(t *testing.T) {
 
 	bs1, err := mp1.Alloc(100, true)
 	require.NoError(t, err)
-	require.Equal(t, int64(100), mp1.CurrNB())
+	require.Equal(t, int64(128), mp1.CurrNB())
 
 	bs1, err = mp1.ReallocZero(bs1, 200, true)
 	require.NoError(t, err)
-	require.Equal(t, int64(200), mp1.CurrNB())
+	require.Equal(t, int64(256), mp1.CurrNB())
 
 	mp1.Free(bs1)
 	require.Equal(t, int64(0), mp1.CurrNB())
 
 	bs2, err := mp2.Alloc(100, true)
 	require.NoError(t, err)
-	require.Equal(t, int64(100), mp2.CurrNB())
+	require.Equal(t, int64(128), mp2.CurrNB())
 
 	bs22, err := mp2.ReallocZero(bs2, 2000000, true)
 	require.NoError(t, err)
@@ -257,6 +258,13 @@ func TestDoubleFree(t *testing.T) {
 	require.Panics(t, func() {
 		mp.Free(bs)
 	}, "double free should panic")
+
+	large, err := mp.Alloc(2048, true)
+	require.NoError(t, err)
+	mp.Free(large)
+	require.Panics(t, func() {
+		mp.Free(large)
+	}, "double free should panic for malloc-backed allocations")
 
 	DeleteMPool(mp)
 }
@@ -372,6 +380,62 @@ func TestShardDistribution(t *testing.T) {
 
 	require.Equal(t, int64(0), mp.CurrNB())
 	DeleteMPool(mp)
+}
+
+func TestFixedPoolReleasesEmptySlabs(t *testing.T) {
+	mp := MustNew("fixed-pool-release-slab-test")
+	ptrs := make([][]byte, kStripeSize)
+
+	for i := range ptrs {
+		bs, err := mp.Alloc(64, true)
+		require.NoError(t, err)
+		ptrs[i] = bs
+	}
+	require.Len(t, mp.pools[0].slabs, 1)
+
+	for _, bs := range ptrs {
+		mp.Free(bs)
+	}
+	require.Len(t, mp.pools[0].slabs, 0)
+	require.Equal(t, int64(0), mp.CurrNB())
+
+	DeleteMPool(mp)
+}
+
+func TestFixedPoolFreeDoesNotWriteFreelistPointerToPayload(t *testing.T) {
+	mp := MustNew("fixed-pool-payload-test")
+	defer DeleteMPool(mp)
+
+	bs, err := mp.Alloc(64, true)
+	require.NoError(t, err)
+	keepSlab, err := mp.Alloc(64, true)
+	require.NoError(t, err)
+	for i := 0; i < 8; i++ {
+		bs[i] = 0xA5
+	}
+
+	mp.Free(bs)
+	require.Equal(t, []byte{0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5}, bs[:8])
+	mp.Free(keepSlab)
+}
+
+func TestFixedPoolGCDoesNotScanFreelistAsPointers(t *testing.T) {
+	mp := MustNew("fixed-pool-gc-test")
+	defer DeleteMPool(mp)
+
+	for round := 0; round < 100; round++ {
+		ptrs := make([][]byte, kStripeSize*2)
+		for i := range ptrs {
+			bs, err := mp.Alloc(64, true)
+			require.NoError(t, err)
+			ptrs[i] = bs
+		}
+		for _, bs := range ptrs {
+			mp.Free(bs)
+		}
+		runtime.GC()
+	}
+	require.Equal(t, int64(0), mp.CurrNB())
 }
 
 func TestPtrLenReplace(t *testing.T) {

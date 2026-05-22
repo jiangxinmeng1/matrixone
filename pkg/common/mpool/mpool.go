@@ -152,7 +152,9 @@ func (s *MPoolStats) RecordManyFrees(tag string, nfree, sz int64) int64 {
 }
 
 const (
-	kMemHdrSz = 16
+	NumFixedPool = 5
+	kMemHdrSz    = 24
+	kStripeSize  = 128
 )
 
 const (
@@ -164,12 +166,17 @@ const (
 	PB = 1024 * TB
 )
 
+var PoolElemSize = [NumFixedPool]int32{64, 128, 256, 512, 1024}
+
+const enableFixedPool = true
+
 // Memory header, kMemHdrSz bytes.
 type memHdr struct {
-	poolId  int64
-	allocSz int32
-	guard   [3]uint8
-	offHeap bool
+	poolId       int64
+	allocSz      int32
+	fixedPoolIdx int8
+	guard        [3]uint8
+	offHeap      bool
 }
 
 func init() {
@@ -186,6 +193,209 @@ func (pHdr *memHdr) SetGuard() {
 
 func (pHdr *memHdr) CheckGuard() bool {
 	return pHdr.guard[0] == 0xDE && pHdr.guard[1] == 0xAD && pHdr.guard[2] == 0xBF
+}
+
+func (pHdr *memHdr) ToSlice(sz, cap int) []byte {
+	ptr := unsafe.Add(unsafe.Pointer(pHdr), kMemHdrSz)
+	bs := unsafe.Slice((*byte)(ptr), cap)
+	return bs[:sz]
+}
+
+type fixedPool struct {
+	m        sync.Mutex
+	noLock   bool
+	fpIdx    int8
+	poolId   int64
+	eleSz    int32
+	slabs    []fixedSlab
+	freeList []uint32
+}
+
+type fixedSlab struct {
+	buf  []byte
+	free int32
+}
+
+func (fp *fixedPool) initPool(poolid int64, idx int, noLock bool) {
+	fp.poolId = poolid
+	fp.fpIdx = int8(idx)
+	fp.noLock = noLock
+	fp.eleSz = PoolElemSize[idx]
+}
+
+func (fp *fixedPool) alloc() *memHdr {
+	if !fp.noLock {
+		fp.m.Lock()
+		defer fp.m.Unlock()
+	}
+
+	if len(fp.freeList) == 0 {
+		slabSize := uint64(kStripeSize * (fp.eleSz + kMemHdrSz))
+		buf, err := simpleCAllocator().Malloc(slabSize)
+		if err != nil {
+			panic(err)
+		}
+		slabIdx := len(fp.slabs)
+		fp.slabs = append(fp.slabs, fixedSlab{
+			buf:  buf,
+			free: kStripeSize - 1,
+		})
+
+		for i := 0; i < kStripeSize; i++ {
+			ptr := fp.slotPtr(slabIdx, i)
+			pHdr := (*memHdr)(ptr)
+			pHdr.poolId = fp.poolId
+			pHdr.allocSz = fp.eleSz
+			if i > 0 {
+				pHdr.allocSz = -1
+				fp.freeList = append(fp.freeList, fp.slotID(slabIdx, i))
+			}
+			pHdr.fixedPoolIdx = fp.fpIdx
+			pHdr.offHeap = true
+			pHdr.SetGuard()
+		}
+		ret := fp.slotPtr(slabIdx, 0)
+		clear(unsafe.Slice((*byte)(unsafe.Add(ret, kMemHdrSz)), fp.eleSz))
+		return (*memHdr)(ret)
+	}
+
+	last := len(fp.freeList) - 1
+	slotID := fp.freeList[last]
+	fp.freeList = fp.freeList[:last]
+	slabIdx, slotIdx := fp.decodeSlotID(slotID)
+	if slabIdx < 0 || slabIdx >= len(fp.slabs) || fp.slabs[slabIdx].free <= 0 {
+		panic(moerr.NewInternalErrorNoCtx("mpool fixed pool slab corruption"))
+	}
+	fp.slabs[slabIdx].free--
+	ret := fp.slotPtr(slabIdx, slotIdx)
+	pHdr := (*memHdr)(ret)
+	pHdr.allocSz = fp.eleSz
+	pHdr.offHeap = true
+	bs := unsafe.Slice((*byte)(unsafe.Add(ret, kMemHdrSz)), fp.eleSz)
+	clear(bs)
+	return pHdr
+}
+
+func (fp *fixedPool) free(hdr *memHdr) {
+	if hdr.poolId != fp.poolId || hdr.fixedPoolIdx != fp.fpIdx ||
+		hdr.allocSz < 0 || hdr.allocSz > fp.eleSz ||
+		!hdr.offHeap || !hdr.CheckGuard() {
+		panic(moerr.NewInternalErrorNoCtx("mpool fixed pool hdr corruption. possible double free"))
+	}
+
+	if !fp.noLock {
+		fp.m.Lock()
+		defer fp.m.Unlock()
+	}
+	ptr := unsafe.Pointer(hdr)
+	slabIdx, slotIdx := fp.findSlotIdx(ptr)
+	if slabIdx < 0 {
+		panic(moerr.NewInternalErrorNoCtx("mpool fixed pool slab not found"))
+	}
+	hdr.allocSz = -1
+	fp.slabs[slabIdx].free++
+	if fp.slabs[slabIdx].free == kStripeSize {
+		fp.releaseSlab(slabIdx)
+		return
+	}
+	fp.freeList = append(fp.freeList, fp.slotID(slabIdx, slotIdx))
+}
+
+func (fp *fixedPool) destroy() {
+	if !fp.noLock {
+		fp.m.Lock()
+		defer fp.m.Unlock()
+	}
+	for _, slab := range fp.slabs {
+		if len(slab.buf) == 0 {
+			continue
+		}
+		simpleCAllocator().Deallocate(slab.buf, uint64(cap(slab.buf)))
+	}
+	fp.slabs = nil
+	fp.freeList = nil
+}
+
+func (fp *fixedPool) releaseSlab(idx int) {
+	slab := fp.slabs[idx]
+	last := len(fp.slabs) - 1
+	fp.rebuildFreelistForRelease(idx, last)
+	simpleCAllocator().Deallocate(slab.buf, uint64(cap(slab.buf)))
+	fp.slabs[idx] = fp.slabs[last]
+	fp.slabs = fp.slabs[:last]
+}
+
+func (fp *fixedPool) rebuildFreelistForRelease(releaseIdx, lastIdx int) {
+	newFreeList := fp.freeList[:0]
+	for _, slotID := range fp.freeList {
+		slabIdx, slotIdx := fp.decodeSlotID(slotID)
+		if slabIdx == releaseIdx {
+			continue
+		}
+		if releaseIdx != lastIdx && slabIdx == lastIdx {
+			slotID = fp.slotID(releaseIdx, slotIdx)
+		}
+		newFreeList = append(newFreeList, slotID)
+	}
+	fp.freeList = newFreeList
+}
+
+func (fp *fixedPool) findSlabIdx(ptr unsafe.Pointer) int {
+	for i := range fp.slabs {
+		if fp.slabs[i].contains(ptr) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (fp *fixedPool) findSlotIdx(ptr unsafe.Pointer) (int, int) {
+	for i := range fp.slabs {
+		if slotIdx, ok := fp.slabs[i].slotIdx(ptr, fp.eleSz); ok {
+			return i, slotIdx
+		}
+	}
+	return -1, -1
+}
+
+func (fp *fixedPool) slotID(slabIdx, slotIdx int) uint32 {
+	return uint32(slabIdx*kStripeSize + slotIdx)
+}
+
+func (fp *fixedPool) decodeSlotID(slotID uint32) (int, int) {
+	id := int(slotID)
+	return id / kStripeSize, id % kStripeSize
+}
+
+func (fp *fixedPool) slotPtr(slabIdx, slotIdx int) unsafe.Pointer {
+	return unsafe.Add(
+		unsafe.Pointer(&fp.slabs[slabIdx].buf[0]),
+		slotIdx*int(fp.eleSz+kMemHdrSz),
+	)
+}
+
+func (s fixedSlab) contains(ptr unsafe.Pointer) bool {
+	if len(s.buf) == 0 {
+		return false
+	}
+	uptr := uintptr(ptr)
+	base := uintptr(unsafe.Pointer(&s.buf[0]))
+	return uptr >= base && uptr < base+uintptr(len(s.buf))
+}
+
+func (s fixedSlab) slotIdx(ptr unsafe.Pointer, eleSz int32) (int, bool) {
+	if !s.contains(ptr) {
+		return 0, false
+	}
+	uptr := uintptr(ptr)
+	base := uintptr(unsafe.Pointer(&s.buf[0]))
+	stride := uintptr(eleSz + kMemHdrSz)
+	offset := uptr - base
+	if offset%stride != 0 {
+		return 0, false
+	}
+	slotIdx := int(offset / stride)
+	return slotIdx, slotIdx < kStripeSize
 }
 
 type detailInfo struct {
@@ -263,6 +473,7 @@ type MPool struct {
 
 	noLock bool
 	ptrs   map[unsafe.Pointer]memHdr
+	pools  [NumFixedPool]fixedPool
 }
 
 const (
@@ -297,10 +508,21 @@ func (mp *MPool) deallocateAllPtrs() {
 		if hdr.offHeap {
 			sz := int(hdr.allocSz)
 			profileRecordFree(uintptr(ptr), int64(sz))
-			simpleCAllocator().Deallocate(unsafe.Slice((*byte)(ptr), sz), uint64(sz))
+			if hdr.fixedPoolIdx >= NumFixedPool {
+				simpleCAllocator().Deallocate(unsafe.Slice((*byte)(ptr), sz), uint64(sz))
+			}
 		}
 	}
 	mp.ptrs = nil
+}
+
+func sizeToFixedPoolIdx(size int64) int {
+	for i, sz := range PoolElemSize {
+		if size <= int64(sz) {
+			return i
+		}
+	}
+	return NumFixedPool
 }
 
 func (mp *MPool) EnableDetailRecording() {
@@ -360,6 +582,9 @@ func (mp *MPool) destroy() {
 	globalStats.RecordManyFrees(mp.tag,
 		mp.stats.NumAlloc.Load()-mp.stats.NumFree.Load(),
 		mp.stats.NumCurrBytes.Load())
+	for i := range mp.pools {
+		mp.pools[i].destroy()
+	}
 }
 
 // New a MPool.   Tag is user supplied, used for debugging/diagnostics.
@@ -390,6 +615,9 @@ func NewMPool(tag string, cap int64, flag int) (*MPool, error) {
 
 	mp.stats.Init()
 	mp.ptrs = make(map[unsafe.Pointer]memHdr)
+	for i := 0; i < NumFixedPool; i++ {
+		mp.pools[i].initPool(mp.id, i, mp.noLock)
+	}
 	globalPools.Store(id, &mp)
 	return &mp, nil
 }
@@ -524,10 +752,39 @@ func (mp *MPool) alloc(detailk string, sz int64, offHeap bool) ([]byte, error) {
 	var bs []byte
 	var err error
 
+	if offHeap && enableFixedPool {
+		idx := sizeToFixedPoolIdx(sz)
+		if idx < NumFixedPool {
+			capacity := int64(mp.pools[idx].eleSz)
+			gcurr := globalStats.RecordAlloc("global", capacity)
+			if gcurr > GlobalCap() {
+				globalStats.RecordFree("global", capacity)
+				return nil, moerr.NewOOMNoCtx()
+			}
+			mycurr := mp.stats.RecordAlloc(mp.tag, capacity)
+			if mycurr > mp.Cap() {
+				mp.stats.RecordFree(mp.tag, capacity)
+				globalStats.RecordFree("global", capacity)
+				return nil, moerr.NewInternalErrorNoCtxf("mpool out of space, alloc %d bytes, cap %d", sz, mp.cap)
+			}
+			hdr := mp.pools[idx].alloc()
+			if mp.details != nil {
+				mp.details.recordAlloc(detailk, capacity)
+			}
+			ptr := unsafe.Add(unsafe.Pointer(hdr), kMemHdrSz)
+			if err := mp.recordPtrHdr(ptr, *hdr); err != nil {
+				panic(err)
+			}
+			profileRecordAlloc(3, uintptr(ptr), capacity)
+			return hdr.ToSlice(int(sz), int(capacity)), nil
+		}
+	}
+
 	hdr := memHdr{
-		poolId:  mp.id,
-		allocSz: int32(sz),
-		offHeap: offHeap,
+		poolId:       mp.id,
+		allocSz:      int32(sz),
+		fixedPoolIdx: NumFixedPool,
+		offHeap:      offHeap,
 	}
 	hdr.SetGuard()
 
@@ -600,7 +857,9 @@ func (mp *MPool) freePtr(detailk string, ptr unsafe.Pointer) {
 				sz := int64(hdr.allocSz)
 				profileRecordFree(uintptr(ptr), sz)
 				globalStats.RecordFree("global", sz)
-				simpleCAllocator().Deallocate(unsafe.Slice((*byte)(ptr), sz), uint64(sz))
+				if hdr.fixedPoolIdx >= NumFixedPool {
+					simpleCAllocator().Deallocate(unsafe.Slice((*byte)(ptr), sz), uint64(sz))
+				}
 			}
 		} else {
 			(otherPool.(*MPool)).freePtrInternal(detailk, ptr, hdr)
@@ -629,6 +888,10 @@ func (mp *MPool) freePtrInternal(detailk string, ptr unsafe.Pointer, hdr memHdr)
 		mp.details.recordFree(detailk, sz)
 	}
 
+	if hdr.fixedPoolIdx < NumFixedPool {
+		mp.pools[hdr.fixedPoolIdx].free((*memHdr)(unsafe.Add(ptr, -kMemHdrSz)))
+		return
+	}
 	simpleCAllocator().Deallocate(unsafe.Slice((*byte)(ptr), sz), uint64(sz))
 }
 
@@ -694,16 +957,30 @@ func (mp *MPool) ReallocZero(old []byte, sz int, offHeap bool) ([]byte, error) {
 	}
 
 	oldptr := unsafe.Pointer(&old[0])
+	oldHdr, ok := mp.removePtrHdr(oldptr)
+	if !ok {
+		panic(moerr.NewInternalErrorNoCtx("invalid ptr, double free"))
+	}
+	if oldHdr.fixedPoolIdx < NumFixedPool {
+		newbs, err := mp.allocWithDetailK(detailk, int64(sz), offHeap)
+		if err != nil {
+			return nil, err
+		}
+		copy(newbs, old)
+		mp.freePtrInternal(detailk, oldptr, oldHdr)
+		return newbs, nil
+	}
 	newbs, err := simpleCAllocator().ReallocZero(old, uint64(sz))
 	if err != nil {
+		mp.recordPtrHdr(oldptr, oldHdr)
 		return nil, err
 	}
 	newptr := unsafe.Pointer(&newbs[0])
-	mp.removePtrHdr(oldptr)
 	mp.recordPtrHdr(newptr, memHdr{
-		poolId:  mp.id,
-		allocSz: int32(sz),
-		offHeap: offHeap,
+		poolId:       mp.id,
+		allocSz:      int32(sz),
+		fixedPoolIdx: NumFixedPool,
+		offHeap:      offHeap,
 	})
 	profileRecordRealloc(3, uintptr(oldptr), uintptr(newptr), int64(oldcap), int64(sz))
 	globalStats.RecordFree("global", int64(oldcap))
@@ -868,8 +1145,7 @@ func calculateNewCap(oldCap int64, requiredSize int64) int64 {
 	if requiredSize > doublecap {
 		newcap = requiredSize
 	} else {
-		// performance: use a larger threshold (256 -> 4096)
-		const threshold = 4096
+		const threshold = 256
 		if newcap < threshold {
 			newcap = doublecap
 		} else {
