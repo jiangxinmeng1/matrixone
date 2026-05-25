@@ -171,6 +171,21 @@ func TestReadExtentReleasesPartialReadOnError(t *testing.T) {
 	require.Equal(t, int32(1), releases.Load())
 }
 
+func TestReadExtentReturnsErrorOnNilCachedData(t *testing.T) {
+	extent := NewExtent(1, 0, 1, 1)
+
+	_, err := ReadExtent(
+		context.Background(),
+		"test-object",
+		&extent,
+		fileservice.Policy(0),
+		&partialReadErrorFS{},
+		constructorFactory,
+	)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "CachedData is nil")
+}
+
 func TestConstructorFactoryReleasesDecompressionDataOnError(t *testing.T) {
 	var releases atomic.Int32
 	allocator := &trackingCacheDataAllocator{

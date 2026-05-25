@@ -334,7 +334,7 @@ func LoadBFWithMeta(
 // Uses mutex+map (not sync.Map) so the map shrinks naturally when keys are
 // deleted. Waiters read through metaCache after the load finishes so they do
 // not keep per-call copies of large metadata buffers.
-func dedupLoad(ctx context.Context, key mataCacheKey, load func() ([]byte, error)) ([]byte, error) {
+func dedupLoad(ctx context.Context, key mataCacheKey, load func() ([]byte, error)) (val []byte, err error) {
 	metaLoadMu.Lock()
 	if call, ok := metaLoadCalls[key]; ok {
 		metaLoadMu.Unlock()
@@ -352,22 +352,26 @@ func dedupLoad(ctx context.Context, key mataCacheKey, load func() ([]byte, error
 		}
 	}
 	call := &loadCall{done: make(chan struct{})}
-	call.err = moerr.NewInternalErrorNoCtx("dedup load did not complete")
 	metaLoadCalls[key] = call
 	metaLoadMu.Unlock()
 
 	defer func() {
+		if v := recover(); v != nil {
+			call.val = nil
+			call.err = moerr.ConvertPanicError(ctx, v)
+		}
+		if call.err == nil {
+			metaCache.Set(ctx, key, call.val, int64(len(call.val)))
+		}
 		metaLoadMu.Lock()
 		close(call.done)
 		delete(metaLoadCalls, key)
 		metaLoadMu.Unlock()
+		val, err = call.val, call.err
 	}()
 
 	call.val, call.err = load()
-	if call.err == nil {
-		metaCache.Set(ctx, key, call.val, int64(len(call.val)))
-	}
-	return call.val, call.err
+	return
 }
 
 func FastLoadObjectMeta(

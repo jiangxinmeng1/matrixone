@@ -166,6 +166,48 @@ func TestDiskCache(t *testing.T) {
 	assert.Nil(t, err)
 }
 
+func TestDiskCacheReadReusesOpenedIOEntryFile(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	cache, err := NewDiskCache(ctx, dir, fscache.ConstCapacity(1<<20), nil, false, nil, "")
+	require.NoError(t, err)
+	defer cache.Close(ctx)
+
+	err = cache.Update(ctx, &IOVector{
+		FilePath: "foo",
+		Entries: []IOEntry{
+			{
+				Offset: 0,
+				Size:   1,
+				Data:   []byte("a"),
+			},
+		},
+	}, false)
+	require.NoError(t, err)
+
+	vec := &IOVector{
+		FilePath: "foo",
+		Entries: []IOEntry{
+			{
+				Offset: 0,
+				Size:   1,
+			},
+			{
+				Offset: 0,
+				Size:   1,
+			},
+		},
+	}
+	require.NoError(t, cache.Read(ctx, vec))
+	defer vec.Release()
+
+	require.True(t, vec.Entries[0].done)
+	require.True(t, vec.Entries[1].done)
+	require.Equal(t, []byte("a"), vec.Entries[0].Data)
+	require.Equal(t, []byte("a"), vec.Entries[1].Data)
+}
+
 func TestDiskCacheWriteAgain(t *testing.T) {
 
 	dir := t.TempDir()
