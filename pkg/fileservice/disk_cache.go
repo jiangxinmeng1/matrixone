@@ -296,7 +296,7 @@ func (d *DiskCache) Read(
 		if f, ok := openedFiles[diskPath]; ok {
 			// use opened file
 			LogEvent(ctx, str_disk_cache_file_seek_begin)
-			_, err = file.Seek(entry.Offset, io.SeekStart)
+			_, err = f.Seek(entry.Offset, io.SeekStart)
 			LogEvent(ctx, str_disk_cache_file_seek_end)
 			if err == nil {
 				file = f

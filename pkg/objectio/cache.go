@@ -27,6 +27,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/shirou/gopsutil/v3/mem"
 
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
@@ -240,7 +241,7 @@ func LoadBFWithMeta(
 // dedupLoad ensures that for a given cache key, only one goroutine performs
 // the actual I/O load. Other concurrent callers for the same key wait and
 // share the result. This prevents cache stampede under high concurrency.
-func dedupLoad(ctx context.Context, key mataCacheKey, load func() ([]byte, error)) ([]byte, error) {
+func dedupLoad(ctx context.Context, key mataCacheKey, load func() ([]byte, error)) (val []byte, err error) {
 	call := &loadCall{done: make(chan struct{})}
 	if actual, loaded := metaLoadGroup.LoadOrStore(key, call); loaded {
 		existing := actual.(*loadCall)
@@ -252,12 +253,19 @@ func dedupLoad(ctx context.Context, key mataCacheKey, load func() ([]byte, error
 		}
 	}
 	defer metaLoadGroup.Delete(key)
+	defer func() {
+		if v := recover(); v != nil {
+			call.val = nil
+			call.err = moerr.ConvertPanicError(ctx, v)
+		}
+		if call.err == nil {
+			metaCache.Set(ctx, key, call.val, int64(len(call.val)))
+		}
+		close(call.done)
+		val, err = call.val, call.err
+	}()
 	call.val, call.err = load()
-	if call.err == nil {
-		metaCache.Set(ctx, key, call.val, int64(len(call.val)))
-	}
-	close(call.done)
-	return call.val, call.err
+	return
 }
 
 func FastLoadObjectMeta(

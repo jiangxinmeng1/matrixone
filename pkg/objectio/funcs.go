@@ -20,15 +20,13 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/matrixorigin/matrixone/pkg/util"
-
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
-	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/perfcounter"
 )
 
@@ -60,10 +58,8 @@ func ReadExtent(
 		return
 	}
 	if ioVec.Entries[0].CachedData == nil {
-		logutil.Errorf("ReadExtent: ioVec.Entries[0].CachedData is nil, name: %s, extent: %v",
-			name, extent.String())
-		util.EnableCoreDump()
-		util.CoreDump()
+		ioVec.ReleaseReadResultOnError()
+		return nil, moerr.NewInternalErrorf(ctx, "ReadExtent: CachedData is nil after successful Read, name: %s, extent: %v", name, extent.String())
 	}
 	//TODO when to call ioVec.Release?
 	v := ioVec.Entries[0].CachedData.Bytes()
