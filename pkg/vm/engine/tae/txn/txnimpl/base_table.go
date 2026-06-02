@@ -286,6 +286,10 @@ func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers
 			common.WorkspaceAllocator,
 		)
 		if err != nil {
+			if !obj.IsAppendable() && obj.CreatedAt.GT(&from) {
+				logutil.Infof("incrementalGetRowsByPK: ERROR from GetDuplicatedRows for CreatedAt > from non-appendable: obj=%s, err=%v, CreatedAt=%s, from=%s, to=%s, txn=%s",
+					obj.ID().String(), err, obj.CreatedAt.ToString(), from.ToString(), to.ToString(), tbl.txnTable.store.txn.Repr())
+			}
 			return
 		}
 	}

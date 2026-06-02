@@ -1138,7 +1138,12 @@ func (tbl *txnTable) findDeletes(
 	if err = index.BatchUpdateZM(keysZM, rowIDs.GetDownstreamVector()); err != nil {
 		return
 	}
-	tbl.contains(ctx, rowIDs, keysZM, common.WorkspaceAllocator)
+	err = tbl.contains(ctx, rowIDs, keysZM, common.WorkspaceAllocator)
+	if err != nil {
+		logutil.Infof("findDeletes: tbl.contains returned error: err=%v, from=%s, to=%s, txn=%s",
+			err, from.ToString(), to.ToString(), tbl.store.txn.Repr())
+		return
+	}
 
 	tbl.entry.WaitTombstoneObjectCommitted(to)
 	it := tbl.entry.MakeTombstoneObjectIt()
@@ -1167,7 +1172,12 @@ func (tbl *txnTable) findDeletes(
 			continue
 		}
 
-		if !obj.VisibleByTS(to) {
+		visible := obj.VisibleByTS(to)
+		if !obj.IsAppendable() && obj.CreatedAt.GT(&from) {
+			logutil.Infof("findDeletes: non-appendable CreatedAt > from: obj=%s, CreatedAt=%s, from=%s, to=%s, VisibleByTS(to)=%v, txn=%s",
+				obj.ID().String(), obj.CreatedAt.ToString(), from.ToString(), to.ToString(), visible, tbl.store.txn.Repr())
+		}
+		if !visible {
 			continue
 		}
 		objData := obj.GetObjectData()
@@ -1185,6 +1195,16 @@ func (tbl *txnTable) findDeletes(
 			}
 		}
 
+		if !obj.IsAppendable() && obj.CreatedAt.GT(&from) {
+			rowIDCountBefore := 0
+			for i := 0; i < rowIDs.Length(); i++ {
+				if !rowIDs.IsNull(i) {
+					rowIDCountBefore++
+				}
+			}
+			logutil.Infof("findDeletes: non-appendable CreatedAt > from, calling Contains: obj=%s, CreatedAt=%s, from=%s, to=%s, rowIDCountBefore=%d, txn=%s",
+				obj.ID().String(), obj.CreatedAt.ToString(), from.ToString(), to.ToString(), rowIDCountBefore, tbl.store.txn.Repr())
+		}
 		if err = objData.Contains(
 			ctx,
 			tbl.store.txn,
@@ -1192,8 +1212,20 @@ func (tbl *txnTable) findDeletes(
 			keysZM,
 			common.WorkspaceAllocator,
 		); err != nil {
+			logutil.Infof("findDeletes: ERROR from Contains: obj=%s, err=%v, IsAppendable=%v, CreatedAt=%s, from=%s, to=%s, txn=%s",
+				obj.ID().String(), err, obj.IsAppendable(), obj.CreatedAt.ToString(), from.ToString(), to.ToString(), tbl.store.txn.Repr())
 			// logutil.Infof("%s, %s, %v", obj.String(), rowmask, err)
 			return
+		}
+		if !obj.IsAppendable() && obj.CreatedAt.GT(&from) {
+			rowIDCountAfter := 0
+			for i := 0; i < rowIDs.Length(); i++ {
+				if !rowIDs.IsNull(i) {
+					rowIDCountAfter++
+				}
+			}
+			logutil.Infof("findDeletes: non-appendable CreatedAt > from, after Contains: obj=%s, CreatedAt=%s, from=%s, to=%s, rowIDCountAfter=%d, txn=%s",
+				obj.ID().String(), obj.CreatedAt.ToString(), from.ToString(), to.ToString(), rowIDCountAfter, tbl.store.txn.Repr())
 		}
 	}
 	return
@@ -1222,12 +1254,30 @@ func (tbl *txnTable) DoPrecommitDedupByPK(
 			return
 		}
 		defer rowIDs.Close()
+		rowIDCountBeforeFindDeletes := 0
+		for i := 0; i < rowIDs.Length(); i++ {
+			if !rowIDs.IsNull(i) {
+				rowIDCountBeforeFindDeletes++
+			}
+		}
+		logutil.Infof("DoPrecommitDedupByPK: before findDeletes, rowIDCount=%d, from=%s, to=%s, txn=%s",
+			rowIDCountBeforeFindDeletes, tbl.dedupTS.Next().ToString(), now.ToString(), tbl.store.txn.Repr())
 		if !isTombstone {
 			err = tbl.findDeletes(tbl.store.ctx, rowIDs, tbl.dedupTS.Next(), now)
 			if err != nil {
+				logutil.Infof("DoPrecommitDedupByPK: findDeletes returned error: err=%v, rowIDCount=%d, from=%s, to=%s, txn=%s",
+					err, rowIDCountBeforeFindDeletes, tbl.dedupTS.Next().ToString(), now.ToString(), tbl.store.txn.Repr())
 				return
 			}
 		}
+		rowIDCountAfterFindDeletes := 0
+		for i := 0; i < rowIDs.Length(); i++ {
+			if !rowIDs.IsNull(i) {
+				rowIDCountAfterFindDeletes++
+			}
+		}
+		logutil.Infof("DoPrecommitDedupByPK: after findDeletes, rowIDCount=%d, from=%s, to=%s, txn=%s",
+			rowIDCountAfterFindDeletes, tbl.dedupTS.Next().ToString(), now.ToString(), tbl.store.txn.Repr())
 		for i := 0; i < rowIDs.Length(); i++ {
 			var colName string
 			if isTombstone {
