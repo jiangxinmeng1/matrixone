@@ -1188,6 +1188,11 @@ func (tbl *txnTable) findDeletes(
 				continue
 			}
 		} else if obj.IsAppendable() {
+			// D entry with old aobj stats (between DropObjectByID and UpdateObjectInfo)
+			// still has IsAppendable=true but should be handled as a delete entry.
+			if obj.IsDEntry() {
+				continue
+			}
 			if !obj.VisibleByTS(to) {
 				continue
 			}
