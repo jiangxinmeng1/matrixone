@@ -519,44 +519,43 @@ func (entry *ObjectEntry) Less(b *ObjectEntry) bool {
 func (entry *ObjectEntry) Less2(b *ObjectEntry) bool {
 	aInMem := entry.IsInMemory()
 	bInMem := b.IsInMemory()
-	aUncommitted := entry.IsLocal && !aInMem
-	bUncommitted := b.IsLocal && !bInMem
+	aUncommitted := (entry.IsLocal || !entry.IsCommitted()) && !aInMem
+	bUncommitted := (b.IsLocal || !b.IsCommitted()) && !bInMem
 	aAppendable := entry.IsAppendable()
 	bAppendable := b.IsAppendable()
 
-	// 1. Uncommitted non-in-memory goes last
 	if aUncommitted != bUncommitted {
 		return !aUncommitted
 	}
 
-	// 2. Appendable objects (both committed and in-memory) should come before
-	//    non-appendable committed objects so they are visited first in ascending
-	//    iteration (tests rely on this order), while they still stay contiguous
-	//    for early-break correctness when iterating in reverse.
 	if aAppendable != bAppendable {
 		return aAppendable
 	}
 
-	// 3. Within appendable objects: sort by CreatedAt (monotonic for early break)
 	if aAppendable && bAppendable {
+		aMin := entry.GetMinCommitTS()
+		bMin := b.GetMinCommitTS()
+		if !aMin.EQ(&bMin) {
+			return aMin.LT(&bMin)
+		}
+		return bytes.Compare(entry.ObjectShortName()[:], b.ObjectShortName()[:]) < 0
+	}
+
+	aIsCreate := entry.IsCEntry()
+	bIsCreate := b.IsCEntry()
+	if aIsCreate != bIsCreate {
+		return aIsCreate
+	}
+
+	if aIsCreate {
 		if !entry.CreatedAt.EQ(&b.CreatedAt) {
 			return entry.CreatedAt.LT(&b.CreatedAt)
 		}
 		return bytes.Compare(entry.ObjectShortName()[:], b.ObjectShortName()[:]) < 0
 	}
 
-	// 4. Within non-appendable committed objects: sort by max(CreatedAt, DeletedAt)
-	t1 := entry.CreatedAt
-	if t1.LT(&entry.DeletedAt) {
-		t1 = entry.DeletedAt
-	}
-	t2 := b.CreatedAt
-	if t2.LT(&b.DeletedAt) {
-		t2 = b.DeletedAt
-	}
-
-	if !t1.EQ(&t2) {
-		return t1.LT(&t2)
+	if !entry.DeletedAt.EQ(&b.DeletedAt) {
+		return entry.DeletedAt.LT(&b.DeletedAt)
 	}
 
 	return bytes.Compare(entry.ObjectShortName()[:], b.ObjectShortName()[:]) < 0

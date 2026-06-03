@@ -1125,8 +1125,9 @@ func (tbl *txnTable) DedupSnapByPK(
 findDeletes set the rowIDs to null if the row is deleted, and committed in time range [from, to]
 
 candidates:
-1. NAppendable where from <= createdAt <= to
-2. Appendable where x <= createdAt <= to,  where x is the first appendable entry with CreatedAt < from
+1. Non-appendable D entries until DeletedAt < from.
+2. Serving non-appendable C entries with CreatedAt <= to.
+3. Appendable entries until maxCommitTS < from.
 */
 func (tbl *txnTable) findDeletes(
 	ctx context.Context,
@@ -1155,37 +1156,59 @@ func (tbl *txnTable) findDeletes(
 		}
 		obj := it.Item()
 
-		if obj.CreatedAt.GT(&to) {
-			continue
-		}
-
-		if obj.IsAppendable() {
-			if !obj.HasDropIntent() && obj.CreatedAt.LT(&from) {
-				earlybreak = true
+		if (obj.IsLocal || !obj.IsCommitted()) && !obj.IsInMemory() {
+			if !obj.VisibleByTS(to) {
+				continue
 			}
-		} else if obj.CreatedAt.LT(&from) {
 			continue
 		}
 
-		// only keep the category-a + category-c for candidates.
-		if obj.GetPrevVersion() == nil && obj.GetNextVersion() != nil {
+		if !obj.IsAppendable() && obj.IsDEntry() {
+			if obj.DeletedAt.LT(&from) {
+				earlybreak = true
+				continue
+			}
+			if obj.CreatedAt.GT(&to) {
+				continue
+			}
+			if !obj.VisibleByTS(to) {
+				continue
+			}
+			if obj.GetPrevVersion() == nil && obj.GetNextVersion() != nil {
+				continue
+			}
+		} else if !obj.IsAppendable() && obj.IsCEntry() {
+			if obj.CreatedAt.GT(&to) {
+				continue
+			}
+			if obj.HasDCounterpart() {
+				continue
+			}
+			if !obj.VisibleByTS(to) {
+				continue
+			}
+		} else if obj.IsAppendable() {
+			if !obj.VisibleByTS(to) {
+				continue
+			}
+			if obj.GetPrevVersion() == nil && obj.GetNextVersion() != nil {
+				continue
+			}
+			objData := obj.GetObjectData()
+			if objData != nil {
+				maxCommitTS := objData.GetMaxCommitTS()
+				if !maxCommitTS.IsEmpty() && maxCommitTS.LT(&from) && !obj.HasDropIntent() {
+					earlybreak = true
+				}
+			}
+		} else {
 			continue
 		}
 
-		visible := obj.VisibleByTS(to)
-		if !obj.IsAppendable() && obj.CreatedAt.GT(&from) {
-			logutil.Infof("findDeletes: non-appendable CreatedAt > from: obj=%s, CreatedAt=%s, from=%s, to=%s, VisibleByTS(to)=%v, txn=%s",
-				obj.ID().String(), obj.CreatedAt.ToString(), from.ToString(), to.ToString(), visible, tbl.store.txn.Repr())
-		}
-		if !visible {
-			continue
-		}
 		objData := obj.GetObjectData()
 		if objData == nil {
 			panic(fmt.Sprintf("logic error, object %v", obj.StringWithLevel(3)))
 		}
-		// PXU TODO: jxm need to double check this logic
-		// if !obj.ObjectLocation().IsEmpty() {
 		if obj.Rows() != 0 {
 			var skip bool
 			if skip, err = quickSkipThisObject(ctx, keysZM, obj); err != nil {
@@ -1195,16 +1218,6 @@ func (tbl *txnTable) findDeletes(
 			}
 		}
 
-		if !obj.IsAppendable() && obj.CreatedAt.GT(&from) {
-			rowIDCountBefore := 0
-			for i := 0; i < rowIDs.Length(); i++ {
-				if !rowIDs.IsNull(i) {
-					rowIDCountBefore++
-				}
-			}
-			logutil.Infof("findDeletes: non-appendable CreatedAt > from, calling Contains: obj=%s, CreatedAt=%s, from=%s, to=%s, rowIDCountBefore=%d, txn=%s",
-				obj.ID().String(), obj.CreatedAt.ToString(), from.ToString(), to.ToString(), rowIDCountBefore, tbl.store.txn.Repr())
-		}
 		if err = objData.Contains(
 			ctx,
 			tbl.store.txn,
@@ -1212,20 +1225,7 @@ func (tbl *txnTable) findDeletes(
 			keysZM,
 			common.WorkspaceAllocator,
 		); err != nil {
-			logutil.Infof("findDeletes: ERROR from Contains: obj=%s, err=%v, IsAppendable=%v, CreatedAt=%s, from=%s, to=%s, txn=%s",
-				obj.ID().String(), err, obj.IsAppendable(), obj.CreatedAt.ToString(), from.ToString(), to.ToString(), tbl.store.txn.Repr())
-			// logutil.Infof("%s, %s, %v", obj.String(), rowmask, err)
 			return
-		}
-		if !obj.IsAppendable() && obj.CreatedAt.GT(&from) {
-			rowIDCountAfter := 0
-			for i := 0; i < rowIDs.Length(); i++ {
-				if !rowIDs.IsNull(i) {
-					rowIDCountAfter++
-				}
-			}
-			logutil.Infof("findDeletes: non-appendable CreatedAt > from, after Contains: obj=%s, CreatedAt=%s, from=%s, to=%s, rowIDCountAfter=%d, txn=%s",
-				obj.ID().String(), obj.CreatedAt.ToString(), from.ToString(), to.ToString(), rowIDCountAfter, tbl.store.txn.Repr())
 		}
 	}
 	return

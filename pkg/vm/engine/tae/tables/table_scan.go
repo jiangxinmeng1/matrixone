@@ -79,9 +79,10 @@ TombstoneRangeScanByObject scans the an object's tombstones committed in the ran
 
 Since the returned batch must have accruate ts for each row, we need collect the data from appendable objects.
 
-Targets:
-1. CNCreated entries where start <= CreatedAt <= end
-2. Appendable entries where x <= CreatedAt <= end, where x is the first appendable entry with CreatedAt < start
+Targets follow ObjectEntry.Less2 tiers:
+1. Delete entries whose DeletedAt is in range.
+2. Serving create entries whose CreatedAt is at or before end.
+3. Appendable entries whose max commit timestamp reaches start.
 */
 func TombstoneRangeScanByObject(
 	ctx context.Context,
@@ -101,39 +102,57 @@ func TombstoneRangeScanByObject(
 		}
 
 		tombstone := it.Item()
-		// we only check the created version of the object.
-		if tombstone.HasDropIntent() {
+
+		if (tombstone.IsLocal || !tombstone.IsCommitted()) && !tombstone.IsInMemory() {
+			if !tombstone.VisibleByTS(end) {
+				continue
+			}
 			continue
 		}
 
-		if tombstone.IsAppendable() {
-			if tombstone.CreatedAt.GT(&end) {
-				// committing create object is excluded here
+		if !tombstone.IsAppendable() && tombstone.IsDEntry() {
+			if tombstone.DeletedAt.LT(&start) {
+				earlybreak = true
 				continue
 			}
-			// For appendable objects (especially shared aobj), we cannot use CreatedAt
-			// alone to determine early break, because data may be committed after CreatedAt.
-			// Use maxCommitTS from appendMVCC if available.
+			if tombstone.CreatedAt.GT(&end) {
+				continue
+			}
+			if !tombstone.VisibleByTS(end) {
+				continue
+			}
+			if tombstone.GetPrevVersion() == nil && tombstone.GetNextVersion() != nil {
+				continue
+			}
+		} else if !tombstone.IsAppendable() && tombstone.IsCEntry() {
+			if tombstone.CreatedAt.GT(&end) {
+				continue
+			}
+			if tombstone.HasDCounterpart() {
+				continue
+			}
+			if !tombstone.VisibleByTS(end) {
+				continue
+			}
+			if !tombstone.ObjectStats.GetCNCreated() {
+				continue
+			}
+		} else if tombstone.IsAppendable() {
+			if !tombstone.VisibleByTS(end) {
+				continue
+			}
+			if tombstone.GetPrevVersion() == nil && tombstone.GetNextVersion() != nil {
+				continue
+			}
 			objData := tombstone.GetObjectData()
 			if objData != nil {
 				maxCommitTS := objData.GetMaxCommitTS()
-				// Only set earlybreak if all committed data is before 'start'
-				if !maxCommitTS.IsEmpty() && maxCommitTS.LT(&start) {
-					earlybreak = true
-				}
-			} else {
-				// Fallback to CreatedAt if objData is nil
-				if tombstone.CreatedAt.LT(&start) {
+				if !maxCommitTS.IsEmpty() && maxCommitTS.LT(&start) && !tombstone.HasDropIntent() {
 					earlybreak = true
 				}
 			}
 		} else {
-			if !tombstone.ObjectStats.GetCNCreated() {
-				continue
-			}
-			if tombstone.CreatedAt.GT(&end) || tombstone.CreatedAt.LT(&start) {
-				continue
-			}
+			continue
 		}
 
 		if tombstone.HasCommittedPersistedData() {

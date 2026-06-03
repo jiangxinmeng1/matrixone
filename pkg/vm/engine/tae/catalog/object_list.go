@@ -62,7 +62,9 @@ nd - non-appendable D entry
                                  +-----------------+
 
 ObjectList properties:
-0. Entries are sorted by max(CreatedAt, DeletedAt). For txn active entries, sorted by objectName further.
+0. Entries are sorted by ObjectEntry.Less2:
+   appendable objects by minCommitTS, non-appendable C entries by CreatedAt,
+   non-appendable D entries by DeletedAt, and txn active entries last.
 1. Elements are splitted into two groups by `IsCommitted`: [committed entries...] [txn active entries]
 2. Category-a + Category-c produce the same result as the ObjectList under the previous implementation(modified inplace & sorted by called time of CreateObject), that's what we want in RecurLoop.
 
@@ -92,8 +94,7 @@ func NewObjectList(isTombstone bool) *ObjectList {
 		Degree:  64,
 		NoLocks: true,
 	}
-	// Use timestamp-based ordering to keep btree search semantics (pivot by TS)
-	tree := btree.NewBTreeGOptions((*ObjectEntry).Less, opts)
+	tree := btree.NewBTreeGOptions((*ObjectEntry).Less2, opts)
 	list := &ObjectList{
 		maxTs_objectID: make(map[types.Objectid]types.TS),
 		isTombstone:    isTombstone,

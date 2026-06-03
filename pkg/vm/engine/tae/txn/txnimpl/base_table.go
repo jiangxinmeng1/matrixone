@@ -234,44 +234,55 @@ func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers
 		}
 		obj := objIt.Item()
 
-		if obj.CreatedAt.GT(&to) {
+		if (obj.IsLocal || !obj.IsCommitted()) && !obj.IsInMemory() {
+			if !obj.VisibleByTS(to) {
+				continue
+			}
 			continue
 		}
 
-		if obj.IsAppendable() {
-			// For appendable objects (especially shared aobj), we cannot use CreatedAt
-			// alone to determine early break, because data may be committed after CreatedAt.
-			// Use maxCommitTS from appendMVCC if available.
+		if !obj.IsAppendable() && obj.IsDEntry() {
+			if obj.DeletedAt.LT(&from) {
+				earlybreak = true
+				continue
+			}
+			if obj.CreatedAt.GT(&to) {
+				continue
+			}
+			if !obj.VisibleByTS(to) {
+				continue
+			}
+			if obj.GetPrevVersion() == nil && obj.GetNextVersion() != nil {
+				continue
+			}
+		} else if !obj.IsAppendable() && obj.IsCEntry() {
+			if obj.CreatedAt.GT(&to) {
+				continue
+			}
+			if obj.HasDCounterpart() {
+				continue
+			}
+			if !obj.VisibleByTS(to) {
+				continue
+			}
+		} else if obj.IsAppendable() {
+			if !obj.VisibleByTS(to) {
+				continue
+			}
+			if obj.GetPrevVersion() == nil && obj.GetNextVersion() != nil {
+				continue
+			}
 			objData := obj.GetObjectData()
 			if objData != nil {
 				maxCommitTS := objData.GetMaxCommitTS()
-				// Only set earlybreak if all committed data is before 'from'
 				if !maxCommitTS.IsEmpty() && maxCommitTS.LT(&from) && !obj.HasDropIntent() {
 					earlybreak = true
 				}
 			}
-			// Note: we still check the current appendable object, just set earlybreak for next iteration
 		} else {
-			// For non-appendable objects, use CreatedAt
-			if obj.CreatedAt.LT(&from) {
-				continue
-			}
-			// Skip non-appendable objects created after transaction started.
-			// These are typically flush-generated objects that shouldn't cause w-w conflicts
-			// for transactions that started before the flush committed.
-			if obj.CreatedAt.GT(&from) {
-				continue
-			}
-		}
-
-		// only keep the category-a + category-c for candidates.
-		if obj.GetPrevVersion() == nil && obj.GetNextVersion() != nil {
 			continue
 		}
 
-		if !obj.VisibleByTS(to) {
-			continue
-		}
 		objData := obj.GetObjectData()
 		if objData == nil {
 			panic(moerr.NewInternalErrorf(ctx, "objData should not be nil: obj=%s", obj.ID().String()))
@@ -286,10 +297,6 @@ func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers
 			common.WorkspaceAllocator,
 		)
 		if err != nil {
-			if !obj.IsAppendable() && obj.CreatedAt.GT(&from) {
-				logutil.Infof("incrementalGetRowsByPK: ERROR from GetDuplicatedRows for CreatedAt > from non-appendable: obj=%s, err=%v, CreatedAt=%s, from=%s, to=%s, txn=%s",
-					obj.ID().String(), err, obj.CreatedAt.ToString(), from.ToString(), to.ToString(), tbl.txnTable.store.txn.Repr())
-			}
 			return
 		}
 	}

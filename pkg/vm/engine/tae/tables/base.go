@@ -253,11 +253,6 @@ func (obj *baseObject) getDuplicateRowsWithLoad(
 ) (err error) {
 	schema := obj.meta.Load().GetSchema()
 	def := schema.GetSingleSortKey()
-	objCreatedAt := obj.meta.Load().GetCreatedAt()
-	if !isAblk && objCreatedAt.GT(&from) {
-		logutil.Infof("getDuplicateRowsWithLoad[MAIN]: non-appendable CreatedAt > from, calling ResolvePersistedColumnData: obj=%s, blk=%d, CreatedAt=%s, from=%s, to=%s, txn=%s",
-			obj.meta.Load().ID().String(), blkOffset, objCreatedAt.ToString(), from.ToString(), to.ToString(), txn.Repr())
-	}
 	data, err := obj.ResolvePersistedColumnData(
 		ctx,
 		txn,
@@ -284,10 +279,6 @@ func (obj *baseObject) getDuplicateRowsWithLoad(
 			from, to,
 		)
 	} else {
-		if objCreatedAt.GT(&from) {
-			logutil.Infof("getDuplicateRowsWithLoad[MAIN]: non-appendable CreatedAt > from, using getDuplicatedRowIDNABlkFunctions (no row visibility check): obj=%s, blk=%d, CreatedAt=%s, from=%s, to=%s, data.Vecs[0].Length()=%d, txn=%s",
-				obj.meta.Load().ID().String(), blkOffset, objCreatedAt.ToString(), from.ToString(), to.ToString(), data.Vecs[0].Length(), txn.Repr())
-		}
 		dedupFn = containers.MakeForeachVectorOp(
 			keys.GetType().Oid,
 			getDuplicatedRowIDNABlkFunctions,
@@ -298,26 +289,11 @@ func (obj *baseObject) getDuplicateRowsWithLoad(
 	}
 	err = containers.ForeachVector(keys, dedupFn, sels)
 	if err != nil {
-		if !isAblk && objCreatedAt.GT(&from) {
-			logutil.Infof("getDuplicateRowsWithLoad[MAIN]: ERROR for non-appendable CreatedAt > from: err=%v, obj=%s, blk=%d, CreatedAt=%s, from=%s, to=%s, txn=%s",
-				err, obj.meta.Load().ID().String(), blkOffset, objCreatedAt.ToString(), from.ToString(), to.ToString(), txn.Repr())
-		}
 		logutil.Info("Dedup-Err",
 			zap.Any("err", err),
 			zap.String("txn", txn.Repr()),
 			zap.String("obj", obj.meta.Load().ID().String()),
 			zap.Uint16("blk offset", blkOffset))
-	} else {
-		if !isAblk && objCreatedAt.GT(&from) {
-			rowIDCount := 0
-			for i := 0; i < rowIDs.Length(); i++ {
-				if !rowIDs.IsNull(i) {
-					rowIDCount++
-				}
-			}
-			logutil.Infof("getDuplicateRowsWithLoad[MAIN]: non-appendable CreatedAt > from, found rowIDs: obj=%s, blk=%d, CreatedAt=%s, from=%s, to=%s, rowIDCount=%d, txn=%s",
-				obj.meta.Load().ID().String(), blkOffset, objCreatedAt.ToString(), from.ToString(), to.ToString(), rowIDCount, txn.Repr())
-		}
 	}
 	return
 }
@@ -467,19 +443,9 @@ func (obj *baseObject) persistedContains(
 		if err == nil || !moerr.IsMoErrCode(err, moerr.OkExpectedPossibleDup) {
 			continue
 		}
-		objCreatedAt := obj.meta.Load().GetCreatedAt()
-		startTS := txn.GetStartTS()
-		if !isAblk && objCreatedAt.GT(&startTS) {
-			logutil.Infof("persistedContains: calling containsWithLoad for non-appendable CreatedAt > startTS: obj=%s, blk=%d, CreatedAt=%s, startTS=%s, isAblk=%v, txn=%s",
-				obj.meta.Load().ID().String(), i, objCreatedAt.ToString(), startTS.ToString(), isAblk, txn.Repr())
-		}
 		err = obj.containsWithLoad(
 			ctx, txn, keys, sels, uint16(i), isAblk, mp)
 		if err != nil {
-			if !isAblk && objCreatedAt.GT(&startTS) {
-				logutil.Infof("persistedContains: ERROR from containsWithLoad for non-appendable CreatedAt > startTS: obj=%s, blk=%d, err=%v, CreatedAt=%s, startTS=%s, isAblk=%v, txn=%s",
-					obj.meta.Load().ID().String(), i, err, objCreatedAt.ToString(), startTS.ToString(), isAblk, txn.Repr())
-			}
 			return err
 		}
 	}

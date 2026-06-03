@@ -21,35 +21,37 @@ import (
 	"github.com/google/uuid"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
-	"github.com/stretchr/testify/assert"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
+	"github.com/stretchr/testify/require"
 )
 
-// Helper to create test ObjectEntry
-// isInMemory: appendable=true, no extent (simulates in-memory aobj)
-// isCommitted: appendable=false, has extent (simulates committed nobj)
-// isUncommitted: appendable=false, no extent, IsLocal=true (simulates uncommitted nobj)
-func makeTestObject(createdAt, deletedAt int64, isInMemory, isCommitted, isUncommitted bool) *ObjectEntry {
+type sortTestObjectData struct {
+	data.Object
+	minCommitTS types.TS
+	maxCommitTS types.TS
+}
+
+func (d *sortTestObjectData) GetMinCommitTS() types.TS { return d.minCommitTS }
+func (d *sortTestObjectData) GetMaxCommitTS() types.TS { return d.maxCommitTS }
+
+func makeSortTestObject(createdAt, deletedAt int64, appendable, persisted, local bool) *ObjectEntry {
 	var objectID objectio.ObjectId
-	if isInMemory {
-		// Use UUID v7 for in-memory
+	if appendable {
 		id := uuid.Must(uuid.NewV7())
 		copy(objectID[:], id[:])
 	} else {
 		objectID = objectio.NewObjectid()
 	}
 
-	appendable := isInMemory
 	stats := objectio.NewObjectStatsWithObjectID(&objectID, appendable, false, false)
-
-	// Committed objects have extent
-	if isCommitted {
-		extent := objectio.NewRandomExtent()
-		objectio.SetObjectStatsExtent(stats, extent)
+	if persisted {
+		objectio.SetObjectStatsExtent(stats, objectio.NewRandomExtent())
 	}
 
-	entry := &ObjectEntry{
+	return &ObjectEntry{
 		ObjectNode: ObjectNode{
-			IsLocal: isUncommitted,
+			IsLocal:    local,
+			forcePNode: persisted,
 		},
 		EntryMVCCNode: EntryMVCCNode{
 			CreatedAt: types.BuildTS(createdAt, 0),
@@ -59,441 +61,93 @@ func makeTestObject(createdAt, deletedAt int64, isInMemory, isCommitted, isUncom
 			ObjectStats: *stats,
 		},
 	}
-	return entry
 }
 
-func TestLess2Sorting(t *testing.T) {
-	// Create test objects
-	committed1 := makeTestObject(100, 0, false, true, false)   // committed nobj, CreatedAt=100
-	committed2 := makeTestObject(200, 250, false, true, false) // committed nobj, DeletedAt=250
-	inMemory1 := makeTestObject(150, 0, true, false, false)    // in-memory aobj, CreatedAt=150
-	inMemory2 := makeTestObject(180, 0, true, false, false)    // in-memory aobj, CreatedAt=180
-	uncommitted1 := makeTestObject(300, 0, false, false, true) // uncommitted nobj, CreatedAt=300
-	uncommitted2 := makeTestObject(350, 0, false, false, true) // uncommitted nobj, CreatedAt=350
-
-	// Verify IsInMemory works
-	assert.True(t, inMemory1.IsInMemory(), "inMemory1 should be in-memory")
-	assert.True(t, inMemory2.IsInMemory(), "inMemory2 should be in-memory")
-	assert.False(t, committed1.IsInMemory(), "committed1 should not be in-memory")
-	assert.False(t, uncommitted1.IsInMemory(), "uncommitted1 should not be in-memory")
-
-	objects := []*ObjectEntry{
-		uncommitted2, committed2, inMemory2, uncommitted1, committed1, inMemory1,
+func makeSortTestAobj(createdAt, minCommitAt, maxCommitAt int64) *ObjectEntry {
+	obj := makeSortTestObject(createdAt, 0, true, false, false)
+	obj.objData = &sortTestObjectData{
+		minCommitTS: types.BuildTS(minCommitAt, 0),
+		maxCommitTS: types.BuildTS(maxCommitAt, 0),
 	}
+	return obj
+}
 
-	// Sort using Less2
+func makeSortTestDeleteEntry(createdAt, deletedAt int64) (*ObjectEntry, *ObjectEntry) {
+	created := makeSortTestObject(createdAt, 0, false, true, false)
+	deleted := created.Clone()
+	deleted.DeletedAt = types.BuildTS(deletedAt, 0)
+	deleted.ObjectState = ObjectState_Delete_ApplyCommit
+	created.nextVersion = deleted
+	deleted.prevVersion = created
+	return created, deleted
+}
+
+func sortByLess2(objects []*ObjectEntry) {
 	sort.Slice(objects, func(i, j int) bool {
 		return objects[i].Less2(objects[j])
 	})
-
-	// Expected order (Less2 logic):
-	// 1. Appendable objects first (sorted by CreatedAt)
-	// 2. Non-appendable committed objects (sorted by max(CreatedAt, DeletedAt))
-	// 3. Uncommitted objects last (sorted by CreatedAt)
-	//
-	// So: inMemory1(150), inMemory2(180), committed1(100), committed2(250), uncommitted1(300), uncommitted2(350)
-
-	assert.Equal(t, inMemory1, objects[0], "inMemory1 should be first (appendable, CreatedAt=150)")
-	assert.Equal(t, inMemory2, objects[1], "inMemory2 should be second (appendable, CreatedAt=180)")
-	assert.Equal(t, committed1, objects[2], "committed1 should be third (non-appendable, CreatedAt=100)")
-	assert.Equal(t, committed2, objects[3], "committed2 should be fourth (non-appendable, DeletedAt=250)")
-	assert.Equal(t, uncommitted1, objects[4], "uncommitted1 should be fifth")
-	assert.Equal(t, uncommitted2, objects[5], "uncommitted2 should be sixth")
 }
 
-func TestEarlyBreakScenario(t *testing.T) {
-	// Scenario: Query range [from=200, to=300]
-	// With Less2: appendable objects come first, sorted by CreatedAt
-	// Early break should happen when iterating backwards through appendable objects
-
-	from := types.BuildTS(200, 0)
-
-	// Create objects (no uncommitted, only committed + in-memory)
-	inMemory1 := makeTestObject(250, 0, true, false, false)  // in-memory aobj, in range
-	inMemory2 := makeTestObject(180, 0, true, false, false)  // in-memory aobj, CreatedAt < from, EARLY BREAK
-	committed1 := makeTestObject(220, 0, false, true, false) // committed nobj
-	committed2 := makeTestObject(100, 0, false, true, false) // committed nobj
+func TestLess2TierOrdering(t *testing.T) {
+	aobj2 := makeSortTestAobj(10, 200, 260)
+	aobj1 := makeSortTestAobj(300, 100, 180)
+	create2 := makeSortTestObject(220, 0, false, true, false)
+	create1 := makeSortTestObject(120, 0, false, true, false)
+	_, delete2 := makeSortTestDeleteEntry(80, 240)
+	_, delete1 := makeSortTestDeleteEntry(90, 140)
+	uncommitted := makeSortTestObject(50, 0, false, false, true)
 
 	objects := []*ObjectEntry{
-		inMemory1, inMemory2, committed1, committed2,
+		uncommitted, delete2, create2, aobj2, delete1, create1, aobj1,
 	}
+	sortByLess2(objects)
 
-	// Sort using Less2
-	sort.Slice(objects, func(i, j int) bool {
-		return objects[i].Less2(objects[j])
-	})
+	require.Equal(t, []*ObjectEntry{
+		aobj1,
+		aobj2,
+		create1,
+		create2,
+		delete1,
+		delete2,
+		uncommitted,
+	}, objects)
+}
 
-	t.Logf("Sorted order:")
-	for i, obj := range objects {
-		t.Logf("  [%d] CreatedAt=%d, IsAppendable=%v, IsInMemory=%v",
-			i, obj.CreatedAt.Physical(), obj.IsAppendable(), obj.IsInMemory())
-	}
+func TestLess2SplitsCreateAndDeleteEntries(t *testing.T) {
+	createLate := makeSortTestObject(300, 0, false, true, false)
+	_, deleteEarly := makeSortTestDeleteEntry(10, 100)
+	createEarly := makeSortTestObject(200, 0, false, true, false)
+	_, deleteLate := makeSortTestDeleteEntry(20, 400)
 
-	// Less2 order: inMemory2(180), inMemory1(250), committed2(100), committed1(220)
-	// Appendable objects first (sorted by CreatedAt), then non-appendable (sorted by max timestamp)
+	objects := []*ObjectEntry{deleteLate, createLate, deleteEarly, createEarly}
+	sortByLess2(objects)
 
-	// Simulate iteration (Last -> Prev, newest to oldest)
-	var visited []*ObjectEntry
-	earlyBreak := false
+	require.Equal(t, []*ObjectEntry{
+		createEarly,
+		createLate,
+		deleteEarly,
+		deleteLate,
+	}, objects)
+}
 
+func TestLess2ReverseIterationOrder(t *testing.T) {
+	aobj := makeSortTestAobj(100, 100, 160)
+	create := makeSortTestObject(200, 0, false, true, false)
+	_, deleteEntry := makeSortTestDeleteEntry(50, 300)
+	uncommitted := makeSortTestObject(400, 0, false, false, true)
+
+	objects := []*ObjectEntry{create, aobj, uncommitted, deleteEntry}
+	sortByLess2(objects)
+
+	var reverse []*ObjectEntry
 	for i := len(objects) - 1; i >= 0; i-- {
-		obj := objects[i]
-
-		t.Logf("Visiting [%d]: CreatedAt=%d, IsAppendable=%v",
-			i, obj.CreatedAt.Physical(), obj.IsAppendable())
-
-		// Early break logic: if appendable && CreatedAt < from
-		if obj.IsAppendable() && obj.CreatedAt.LT(&from) {
-			t.Logf("  -> Early break!")
-			earlyBreak = true
-			break
-		}
-
-		visited = append(visited, obj)
+		reverse = append(reverse, objects[i])
 	}
 
-	assert.True(t, earlyBreak, "Should trigger early break")
-	t.Logf("Visited %d objects", len(visited))
-
-	// After sorting with Less2: inMemory2(180), inMemory1(250), committed2(100), committed1(220)
-	// Iterate backwards: committed1(220), committed2(100), inMemory1(250), inMemory2(180 < from, break)
-	assert.Equal(t, 3, len(visited), "Should visit 3 objects before early break")
-	assert.Equal(t, committed1, visited[0])
-	assert.Equal(t, committed2, visited[1])
-	assert.Equal(t, inMemory1, visited[2])
-}
-
-func TestEarlyBreakWithCommittedAobj(t *testing.T) {
-	// Test early break with committed appendable objects (persisted aobj)
-	from := types.BuildTS(200, 0)
-
-	// Create committed appendable objects (simulating flushed aobj)
-	committedAobj1 := makeTestObject(250, 0, true, false, false)
-	committedAobj1.ObjectNode.forcePNode = true // Mark as persisted
-
-	committedAobj2 := makeTestObject(180, 0, true, false, false)
-	committedAobj2.ObjectNode.forcePNode = true // Mark as persisted, CreatedAt < from
-
-	inMemory1 := makeTestObject(220, 0, true, false, false)  // in-memory aobj
-	committed1 := makeTestObject(150, 0, false, true, false) // committed nobj
-
-	objects := []*ObjectEntry{
-		committedAobj1, committedAobj2, inMemory1, committed1,
-	}
-
-	// Sort using Less2
-	sort.Slice(objects, func(i, j int) bool {
-		return objects[i].Less2(objects[j])
-	})
-
-	t.Logf("Sorted order:")
-	for i, obj := range objects {
-		t.Logf("  [%d] CreatedAt=%d, IsAppendable=%v, forcePNode=%v",
-			i, obj.CreatedAt.Physical(), obj.IsAppendable(), obj.ObjectNode.forcePNode)
-	}
-
-	// Less2 order: appendable first (by CreatedAt), then non-appendable
-	// committedAobj2(180), inMemory1(220), committedAobj1(250), committed1(150)
-	assert.Equal(t, committedAobj2, objects[0], "committedAobj2 (180, appendable)")
-	assert.Equal(t, inMemory1, objects[1], "inMemory1 (220, appendable)")
-	assert.Equal(t, committedAobj1, objects[2], "committedAobj1 (250, appendable)")
-	assert.Equal(t, committed1, objects[3], "committed1 (150, non-appendable)")
-
-	// Simulate early break (iterate backwards)
-	var visited []*ObjectEntry
-	earlyBreak := false
-
-	for i := len(objects) - 1; i >= 0; i-- {
-		obj := objects[i]
-
-		if obj.IsAppendable() && obj.CreatedAt.LT(&from) {
-			earlyBreak = true
-			break
-		}
-
-		visited = append(visited, obj)
-	}
-
-	assert.True(t, earlyBreak, "Should trigger early break")
-	// Iterate backwards: committed1(150), committedAobj1(250), inMemory1(220), committedAobj2(180 < from, break)
-	assert.Equal(t, 3, len(visited), "Should visit 3 objects")
-}
-
-func TestEarlyBreakMonotonicCreatedAt(t *testing.T) {
-	// Critical test: Verify appendable objects are monotonic by CreatedAt
-	// This is required for early break correctness
-
-	from := types.BuildTS(200, 0)
-
-	// Mix of committed and in-memory appendable objects
-	inMemory1 := makeTestObject(300, 0, true, false, false)
-	inMemory2 := makeTestObject(250, 0, true, false, false)
-	inMemory3 := makeTestObject(150, 0, true, false, false) // < from
-
-	committedAobj1 := makeTestObject(280, 0, true, false, false)
-	committedAobj1.ObjectNode.forcePNode = true
-
-	committedAobj2 := makeTestObject(220, 0, true, false, false)
-	committedAobj2.ObjectNode.forcePNode = true
-
-	committedAobj3 := makeTestObject(180, 0, true, false, false) // < from
-	committedAobj3.ObjectNode.forcePNode = true
-
-	objects := []*ObjectEntry{
-		inMemory1, inMemory2, inMemory3, committedAobj1, committedAobj2, committedAobj3,
-	}
-
-	// Sort using Less2
-	sort.Slice(objects, func(i, j int) bool {
-		return objects[i].Less2(objects[j])
-	})
-
-	// Verify all appendable objects are sorted by CreatedAt (monotonic)
-	var appendableObjects []*ObjectEntry
-	for _, obj := range objects {
-		if obj.IsAppendable() {
-			appendableObjects = append(appendableObjects, obj)
-		}
-	}
-
-	// Check monotonic CreatedAt
-	for i := 1; i < len(appendableObjects); i++ {
-		prev := appendableObjects[i-1]
-		curr := appendableObjects[i]
-		assert.True(t, prev.CreatedAt.LE(&curr.CreatedAt),
-			"Appendable objects must be monotonic by CreatedAt: prev=%d, curr=%d",
-			prev.CreatedAt.Physical(), curr.CreatedAt.Physical())
-	}
-
-	// Verify early break works correctly
-	var visited []*ObjectEntry
-	earlyBreak := false
-
-	for i := len(objects) - 1; i >= 0; i-- {
-		obj := objects[i]
-
-		if obj.IsAppendable() && obj.CreatedAt.LT(&from) {
-			earlyBreak = true
-			break
-		}
-
-		visited = append(visited, obj)
-	}
-
-	assert.True(t, earlyBreak, "Should trigger early break")
-
-	// Verify we didn't visit any appendable object with CreatedAt < from
-	for _, obj := range visited {
-		if obj.IsAppendable() {
-			assert.True(t, obj.CreatedAt.GE(&from),
-				"Should not visit appendable object with CreatedAt < from")
-		}
-	}
-}
-
-func TestEarlyBreakAllCombinations(t *testing.T) {
-	// Comprehensive test: all object types mixed together
-	from := types.BuildTS(200, 0)
-
-	// Create all types of objects
-	// 1. Committed non-appendable (nobj)
-	committedNobj1 := makeTestObject(100, 150, false, true, false) // DeletedAt=150 < from
-	committedNobj2 := makeTestObject(180, 250, false, true, false) // DeletedAt=250, in range
-	committedNobj3 := makeTestObject(220, 0, false, true, false)   // CreatedAt=220, in range
-
-	// 2. Committed appendable (persisted aobj)
-	committedAobj1 := makeTestObject(170, 0, true, false, false) // < from
-	committedAobj1.ObjectNode.forcePNode = true
-
-	committedAobj2 := makeTestObject(210, 0, true, false, false) // in range
-	committedAobj2.ObjectNode.forcePNode = true
-
-	committedAobj3 := makeTestObject(280, 0, true, false, false) // in range
-	committedAobj3.ObjectNode.forcePNode = true
-
-	// 3. In-memory appendable (in-memory aobj)
-	inMemory1 := makeTestObject(190, 0, true, false, false) // < from
-	inMemory2 := makeTestObject(230, 0, true, false, false) // in range
-	inMemory3 := makeTestObject(270, 0, true, false, false) // in range
-
-	// 4. Uncommitted non-appendable
-	uncommitted1 := makeTestObject(350, 0, false, false, true)
-	uncommitted2 := makeTestObject(400, 0, false, false, true)
-
-	objects := []*ObjectEntry{
-		committedNobj1, committedNobj2, committedNobj3,
-		committedAobj1, committedAobj2, committedAobj3,
-		inMemory1, inMemory2, inMemory3,
-		uncommitted1, uncommitted2,
-	}
-
-	// Sort using Less2
-	sort.Slice(objects, func(i, j int) bool {
-		return objects[i].Less2(objects[j])
-	})
-
-	t.Logf("Sorted order:")
-	for i, obj := range objects {
-		t.Logf("  [%d] CreatedAt=%d, DeletedAt=%d, IsAppendable=%v, IsLocal=%v, IsInMemory=%v",
-			i, obj.CreatedAt.Physical(), obj.DeletedAt.Physical(),
-			obj.IsAppendable(), obj.IsLocal, obj.IsInMemory())
-	}
-
-	// Verify sorting order:
-	// 1. Non-appendable committed (by max(CreatedAt, DeletedAt))
-	// 2. All appendable (by CreatedAt, monotonic)
-	// 3. Uncommitted non-appendable (by CreatedAt)
-
-	// Find boundaries
-	var nonAppendableCommitted, appendable, uncommitted []*ObjectEntry
-	for _, obj := range objects {
-		if obj.IsLocal && !obj.IsInMemory() {
-			uncommitted = append(uncommitted, obj)
-		} else if obj.IsAppendable() {
-			appendable = append(appendable, obj)
-		} else {
-			nonAppendableCommitted = append(nonAppendableCommitted, obj)
-		}
-	}
-
-	t.Logf("Non-appendable committed: %d, Appendable: %d, Uncommitted: %d",
-		len(nonAppendableCommitted), len(appendable), len(uncommitted))
-
-	// Verify appendable objects are monotonic by CreatedAt
-	for i := 1; i < len(appendable); i++ {
-		prev := appendable[i-1]
-		curr := appendable[i]
-		assert.True(t, prev.CreatedAt.LE(&curr.CreatedAt),
-			"Appendable objects must be monotonic: prev=%d, curr=%d",
-			prev.CreatedAt.Physical(), curr.CreatedAt.Physical())
-	}
-
-	// Simulate early break
-	var visited []*ObjectEntry
-	earlyBreak := false
-
-	for i := len(objects) - 1; i >= 0; i-- {
-		obj := objects[i]
-
-		// Early break logic: if appendable && CreatedAt < from
-		if obj.IsAppendable() && obj.CreatedAt.LT(&from) {
-			t.Logf("Early break at object: CreatedAt=%d", obj.CreatedAt.Physical())
-			earlyBreak = true
-			break
-		}
-
-		visited = append(visited, obj)
-	}
-
-	assert.True(t, earlyBreak, "Should trigger early break")
-
-	// Verify correctness: no appendable object with CreatedAt < from should be visited
-	for _, obj := range visited {
-		if obj.IsAppendable() {
-			assert.True(t, obj.CreatedAt.GE(&from),
-				"Visited appendable object with CreatedAt=%d < from=%d",
-				obj.CreatedAt.Physical(), from.Physical())
-		}
-	}
-
-	// Verify we visited all appendable objects with CreatedAt >= from
-	visitedAppendable := 0
-	for _, obj := range visited {
-		if obj.IsAppendable() {
-			visitedAppendable++
-		}
-	}
-
-	expectedAppendable := 0
-	for _, obj := range appendable {
-		if obj.CreatedAt.GE(&from) {
-			expectedAppendable++
-		}
-	}
-
-	assert.Equal(t, expectedAppendable, visitedAppendable,
-		"Should visit all appendable objects with CreatedAt >= from")
-}
-
-func TestEarlyBreakEdgeCases(t *testing.T) {
-	// Test edge cases
-
-	t.Run("No appendable objects", func(t *testing.T) {
-		from := types.BuildTS(200, 0)
-
-		committed1 := makeTestObject(100, 0, false, true, false)
-		committed2 := makeTestObject(250, 0, false, true, false)
-		uncommitted := makeTestObject(300, 0, false, false, true)
-
-		objects := []*ObjectEntry{committed1, committed2, uncommitted}
-		sort.Slice(objects, func(i, j int) bool {
-			return objects[i].Less2(objects[j])
-		})
-
-		earlyBreak := false
-		for i := len(objects) - 1; i >= 0; i-- {
-			obj := objects[i]
-			if obj.IsAppendable() && obj.CreatedAt.LT(&from) {
-				earlyBreak = true
-				break
-			}
-		}
-
-		assert.False(t, earlyBreak, "Should not trigger early break without appendable objects")
-	})
-
-	t.Run("All appendable objects above from", func(t *testing.T) {
-		from := types.BuildTS(100, 0)
-
-		inMemory1 := makeTestObject(200, 0, true, false, false)
-		inMemory2 := makeTestObject(300, 0, true, false, false)
-
-		objects := []*ObjectEntry{inMemory1, inMemory2}
-		sort.Slice(objects, func(i, j int) bool {
-			return objects[i].Less2(objects[j])
-		})
-
-		earlyBreak := false
-		visitedCount := 0
-		for i := len(objects) - 1; i >= 0; i-- {
-			obj := objects[i]
-			if obj.IsAppendable() && obj.CreatedAt.LT(&from) {
-				earlyBreak = true
-				break
-			}
-			visitedCount++
-		}
-
-		assert.False(t, earlyBreak, "Should not trigger early break")
-		assert.Equal(t, 2, visitedCount, "Should visit all objects")
-	})
-
-	t.Run("First appendable object triggers early break", func(t *testing.T) {
-		from := types.BuildTS(200, 0)
-
-		inMemory1 := makeTestObject(150, 0, true, false, false) // < from
-		committed1 := makeTestObject(250, 0, false, true, false)
-
-		objects := []*ObjectEntry{inMemory1, committed1}
-		sort.Slice(objects, func(i, j int) bool {
-			return objects[i].Less2(objects[j])
-		})
-
-		// After sorting with Less2: inMemory1(150, appendable), committed1(250, non-appendable)
-		// Iterate backwards: committed1(250), then inMemory1(150 < from, break)
-
-		earlyBreak := false
-		visitedCount := 0
-		for i := len(objects) - 1; i >= 0; i-- {
-			obj := objects[i]
-			if obj.IsAppendable() && obj.CreatedAt.LT(&from) {
-				earlyBreak = true
-				break
-			}
-			visitedCount++
-		}
-
-		assert.True(t, earlyBreak, "Should trigger early break")
-		assert.Equal(t, 1, visitedCount, "Should visit committed1 before early break on inMemory1")
-	})
+	require.Equal(t, []*ObjectEntry{
+		uncommitted,
+		deleteEntry,
+		create,
+		aobj,
+	}, reverse)
 }
