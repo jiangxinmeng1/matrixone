@@ -20,7 +20,10 @@ import (
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func Test_RestartFlusher(t *testing.T) {
@@ -58,4 +61,50 @@ func Test_RestartFlusher(t *testing.T) {
 	assert.False(t, f.IsNoop())
 	fCfg = f.GetCfg()
 	assert.Equal(t, cfg, fCfg)
+}
+
+func TestForeachAobjBeforeSkipsOldPersistedCEntry(t *testing.T) {
+	c := catalog.MockCatalog(nil)
+	defer c.Close()
+
+	txnMgr := txnbase.NewTxnManager(catalog.MockTxnStoreFactory(c), catalog.MockTxnFactory(c), types.NewMockHLCClock(1))
+	txnMgr.Start(context.Background())
+	defer txnMgr.Stop()
+
+	txn, err := txnMgr.StartTxn(nil)
+	require.NoError(t, err)
+	db, err := c.CreateDBEntry("db", "", "", txn)
+	require.NoError(t, err)
+	table, err := db.CreateTableEntry(catalog.MockSchema(2, 0), txn, nil)
+	require.NoError(t, err)
+	require.NoError(t, txn.Commit(context.Background()))
+
+	dataAobj := catalog.NewInMemoryObject(table, types.BuildTS(100, 0), false)
+	tombAobj := catalog.NewInMemoryObject(table, types.BuildTS(100, 0), true)
+	table.Lock()
+	table.AddEntryLocked(dataAobj)
+	table.AddEntryLocked(tombAobj)
+	table.Unlock()
+
+	catalog.MockCreatedObjectEntry2List(table, c, false, types.BuildTS(120, 0))
+	catalog.MockCreatedObjectEntry2List(table, c, true, types.BuildTS(120, 0))
+
+	ts := types.BuildTS(300, 0)
+	lastCkp := types.BuildTS(150, 0)
+	var dataSeen, tombSeen []*catalog.ObjectEntry
+	foreachAobjBefore(
+		context.Background(),
+		table,
+		ts,
+		lastCkp,
+		func(entry *catalog.ObjectEntry) {
+			dataSeen = append(dataSeen, entry)
+		},
+		func(entry *catalog.ObjectEntry) {
+			tombSeen = append(tombSeen, entry)
+		},
+	)
+
+	require.Equal(t, []*catalog.ObjectEntry{dataAobj}, dataSeen)
+	require.Equal(t, []*catalog.ObjectEntry{tombAobj}, tombSeen)
 }

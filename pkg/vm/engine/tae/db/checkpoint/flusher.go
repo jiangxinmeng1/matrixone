@@ -453,18 +453,20 @@ func foreachAobjBefore(_ context.Context,
 	}
 	for ; ok; ok = data.Prev() {
 		item := data.Item()
-		// Any C entry created before the last checkpoint end time, break
-		// BUT: if it's an appendable object without D counterpart, we still need to flush it
-		if item.IsCEntry() && item.CreatedAt.LT(&lastCkp) {
-			// Check if this appendable object still needs flushing (has no D entry)
-			if item.IsAppendable() && !item.HasDCounterpart() && item.CreatedAt.LE(&ts) {
-				df(item)
-				continue
-			}
-			break
+		if !item.IsAppendable() {
+			continue
 		}
-		if item.IsAppendable() && item.IsCEntry() && !item.HasDCounterpart() && item.CreatedAt.LE(&ts) {
-			df(item)
+		if !item.IsCEntry() {
+			continue
+		}
+		if !item.HasDCounterpart() {
+			if item.CreatedAt.LE(&ts) {
+				df(item)
+			}
+			continue
+		}
+		if item.CreatedAt.LT(&lastCkp) {
+			break
 		}
 	}
 
@@ -475,18 +477,20 @@ func foreachAobjBefore(_ context.Context,
 	}
 	for ; ok; ok = tomb.Prev() {
 		item := tomb.Item()
-		// Any C entry created before the last checkpoint end time, break
-		// BUT: if it's an appendable object without D counterpart, we still need to flush it
-		if item.IsCEntry() && item.CreatedAt.LT(&lastCkp) {
-			// Check if this appendable object still needs flushing (has no D entry)
-			if item.IsAppendable() && !item.HasDCounterpart() && item.CreatedAt.LE(&ts) {
-				tf(item)
-				continue
-			}
-			break
+		if !item.IsAppendable() {
+			continue
 		}
-		if item.IsAppendable() && item.IsCEntry() && !item.HasDCounterpart() && item.CreatedAt.LE(&ts) {
-			tf(item)
+		if !item.IsCEntry() {
+			continue
+		}
+		if !item.HasDCounterpart() {
+			if item.CreatedAt.LE(&ts) {
+				tf(item)
+			}
+			continue
+		}
+		if item.CreatedAt.LT(&lastCkp) {
+			break
 		}
 	}
 }
