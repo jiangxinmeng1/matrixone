@@ -87,6 +87,20 @@ func createMockNode(schema *catalog.Schema, rows int) *mockAppendableNode {
 	}
 }
 
+func createMockNodeWithOffset(schema *catalog.Schema, rows, offset int) *mockAppendableNode {
+	node := createMockNode(schema, rows)
+	for _, colDef := range schema.ColDefs {
+		if colDef.IsPhyAddr() || colDef.Type.Oid != types.T_int32 {
+			continue
+		}
+		vec := node.data.Vecs[colDef.Idx]
+		for i := 0; i < rows; i++ {
+			vec.Update(i, int32(offset+i), false)
+		}
+	}
+	return node
+}
+
 // Helper function to create test environment
 func setupTest(t *testing.T) (*catalog.Catalog, *catalog.TableEntry, txnif.AsyncTxn, *txnbase.TxnManager, *dbutils.Runtime) {
 	schema := catalog.MockSchema(2, 0)
@@ -212,6 +226,77 @@ func TestSharedAppender_NewAPI_Concurrent(t *testing.T) {
 	for _, node := range nodes {
 		node.data.Close()
 	}
+}
+
+func TestSharedAppender_NewAPI_OutOfOrderApplyUsesAllocatedRows(t *testing.T) {
+	defer testutils.AfterTest(t)()
+
+	c, table, _, txnMgr, rt := setupTest(t)
+	defer c.Close()
+	defer txnMgr.Stop()
+
+	txn1, err := txnMgr.StartTxn(nil)
+	require.NoError(t, err)
+	txn2, err := txnMgr.StartTxn(nil)
+	require.NoError(t, err)
+
+	appender1 := table.GetTxnAppender(txn1, rt, false)
+	defer appender1.Close()
+	appender2 := table.GetTxnAppender(txn2, rt, false)
+	defer appender2.Close()
+
+	schema := table.GetLastestSchema(false)
+	node1 := createMockNodeWithOffset(schema, 3, 0)
+	defer node1.data.Close()
+	node2 := createMockNodeWithOffset(schema, 3, 100)
+	defer node2.data.Close()
+
+	_, err = appender1.PrepareAppend(node1)
+	require.NoError(t, err)
+	_, err = appender2.PrepareAppend(node2)
+	require.NoError(t, err)
+
+	require.Equal(t, uint32(0), node1.appends[0].destOff)
+	require.Equal(t, uint32(3), node2.appends[0].destOff)
+
+	sharedAppender := appender1.(SharedAppender)
+	aobjs := sharedAppender.GetRefedAobjs()
+	require.Len(t, aobjs, 1)
+	aobj := aobjs[0]
+
+	aobj.RLock()
+	pinned := aobj.PinNode()
+	mnode := pinned.MustMNode()
+	require.Equal(t, 6, mnode.data.Length())
+	pkVec := mnode.data.GetVectorByName(schema.GetPrimaryKey().Name)
+	for i := 0; i < 6; i++ {
+		require.True(t, pkVec.IsNull(i), "row %d should be reserved as NULL before apply", i)
+	}
+	pinned.Unref()
+	aobj.RUnlock()
+
+	require.NoError(t, appender2.ApplyAppend())
+	require.NoError(t, appender1.ApplyAppend())
+
+	aobj.RLock()
+	pinned = aobj.PinNode()
+	mnode = pinned.MustMNode()
+	defer pinned.Unref()
+	defer aobj.RUnlock()
+
+	pkVec = mnode.data.GetVectorByName(schema.GetPrimaryKey().Name)
+	expected := []int32{0, 1, 2, 100, 101, 102}
+	for i, v := range expected {
+		require.False(t, pkVec.IsNull(i), "row %d should be overwritten", i)
+		require.Equal(t, v, pkVec.Get(i))
+	}
+
+	rows, err := mnode.pkIndex.GetActiveRow(int32(0))
+	require.NoError(t, err)
+	require.Equal(t, []uint32{0}, rows)
+	rows, err = mnode.pkIndex.GetActiveRow(int32(100))
+	require.NoError(t, err)
+	require.Equal(t, []uint32{3}, rows)
 }
 
 // Test: Cross aobj append

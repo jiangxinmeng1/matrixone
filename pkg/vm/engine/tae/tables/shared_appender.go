@@ -251,20 +251,18 @@ func (txnApp *txnAppender) writeDataToAobj(data *containers.Batch, ctx *appendCo
 
 	if !n.IsPersisted() {
 		mnode := n.MustMNode()
-		from, err := mnode.ApplyAppendLocked(bat)
-		if err != nil {
+		if err := mnode.OverwriteAtLocked(bat, ctx.destRow); err != nil {
 			return err
 		}
 
-		// Update PK index (critical fix: was missing in original implementation)
 		schema := mnode.writeSchema
 		for _, colDef := range schema.ColDefs {
 			if colDef.IsPhyAddr() {
 				continue
 			}
 			if colDef.IsRealPrimary() && !schema.IsSecondaryIndexTable() {
-				if err = mnode.pkIndex.BatchUpsert(
-					bat.Vecs[colDef.Idx].GetDownstreamVector(), from); err != nil {
+				if err := mnode.pkIndex.BatchUpsert(
+					bat.GetVectorByName(colDef.Name).GetDownstreamVector(), int(ctx.destRow)); err != nil {
 					return err
 				}
 			}
@@ -332,6 +330,7 @@ func (txnApp *txnAppender) allocateSpace(count uint32) (*catalog.ObjectEntry, *a
 
 					// Create AppendNode (safe: we hold node ref, appends won't be released)
 					shared.currentAobj.Lock()
+					node.MustMNode().EnsureLength(startRow + allocated)
 					appendNode, _ := shared.currentAobj.appendMVCC.AddAppendNodeLocked(
 						txnApp.txn, startRow, startRow+allocated)
 					shared.currentAobj.Unlock()
@@ -408,6 +407,9 @@ func (txnApp *txnAppender) allocateSpace(count uint32) (*catalog.ObjectEntry, *a
 
 	// Create AppendNode for new aobj
 	aobj.Lock()
+	node := aobj.PinNode()
+	node.MustMNode().EnsureLength(allocated)
+	node.Unref()
 	appendNode, _ := aobj.appendMVCC.AddAppendNodeLocked(
 		txnApp.txn, startRow, startRow+allocated)
 	aobj.Unlock()

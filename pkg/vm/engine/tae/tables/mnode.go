@@ -156,21 +156,46 @@ func (node *memoryNode) getDataWindowOnWriteSchema(
 	if node.data == nil {
 		return nil
 	}
-	from, to, commitTSVec, abort, _ :=
+	from, to, commitTSVec, abortVec, aborts :=
 		node.object.appendMVCC.CollectAppendLocked(start, end, mp)
-	if abort != nil {
-		abort.Close()
+	if abortVec != nil {
+		abortVec.Close()
 	}
 	if commitTSVec == nil {
 		return nil
 	}
+	var deletes *nulls.Bitmap
+	if aborts != nil && !aborts.IsEmpty() {
+		deletes = nulls.NewWithSize(int(to - from))
+		nulls.Range(aborts, uint64(from), uint64(to), uint64(from), deletes)
+		if !deletes.IsEmpty() {
+			commitTSVec.CompactByBitmap(deletes)
+		}
+	}
+	if commitTSVec.Length() == 0 {
+		commitTSVec.Close()
+		return nil
+	}
 	dest, ok := batches[node.writeSchema.Version]
 	if ok {
-		dest.Extend(node.data.Window(int(from), int(to-from)))
+		var window *containers.Batch
+		if deletes != nil && !deletes.IsEmpty() {
+			window = node.data.CloneWindowWithPool(int(from), int(to-from), node.object.rt.VectorPool.Transient)
+			window.Deletes = deletes
+			window.Compact()
+		} else {
+			window = node.data.Window(int(from), int(to-from))
+		}
+		dest.Extend(window)
+		window.Close()
 		dest.GetVectorByName(objectio.TombstoneAttr_CommitTs_Attr).Extend(commitTSVec)
 		commitTSVec.Close() // TODO no copy
 	} else {
 		inner := node.data.CloneWindowWithPool(int(from), int(to-from), node.object.rt.VectorPool.Transient)
+		if deletes != nil && !deletes.IsEmpty() {
+			inner.Deletes = deletes
+			inner.Compact()
+		}
 		batWithVer := &containers.BatchWithVersion{
 			Version:    node.writeSchema.Version,
 			NextSeqnum: uint16(node.writeSchema.Extra.NextColSeqnum),
@@ -240,6 +265,23 @@ func (node *memoryNode) getDataWindowLocked(
 	return
 }
 
+// EnsureLength extends node.data to targetLen rows with NULL placeholders.
+// Caller must hold the object lock.
+func (node *memoryNode) EnsureLength(targetLen uint32) {
+	data := node.mustData()
+	current := uint32(data.Length())
+	if targetLen <= current {
+		return
+	}
+	gap := int(targetLen - current)
+	for _, colDef := range node.writeSchema.ColDefs {
+		vec := data.Vecs[colDef.Idx]
+		nullVec := containers.NewConstNullVector(*vec.GetType(), gap, vec.GetAllocator())
+		vec.Extend(nullVec)
+		nullVec.Close()
+	}
+}
+
 func (node *memoryNode) ApplyAppendLocked(
 	bat *containers.Batch,
 ) (from int, err error) {
@@ -250,15 +292,51 @@ func (node *memoryNode) ApplyAppendLocked(
 		destVec := node.data.Vecs[def.Idx]
 		destVec.Extend(bat.Vecs[srcPos])
 	}
-	// RelLogicalID COMPAT
-	if node.object.meta.Load().GetTable().ID == 2 && len(node.data.Vecs) > 10 /*not tombstone*/ {
-		in_logical_idx := slices.Index(bat.Attrs, pkgcatalog.SystemRelAttr_LogicalID)
-		if in_logical_idx == -1 {
-			desc := node.data.GetVectorByName(pkgcatalog.SystemRelAttr_LogicalID)
-			desc.Extend(bat.GetVectorByName(pkgcatalog.SystemRelAttr_ID))
+	node.applyRelLogicalIDCompatLocked(bat, uint32(from), true)
+	return
+}
+
+// OverwriteAtLocked writes batch data into node.data at destRow, replacing
+// placeholders created by EnsureLength. Caller must hold the object lock.
+func (node *memoryNode) OverwriteAtLocked(bat *containers.Batch, destRow uint32) error {
+	schema := node.writeSchema
+	data := node.mustData()
+	if uint32(data.Length()) < destRow+uint32(bat.Length()) {
+		node.EnsureLength(destRow + uint32(bat.Length()))
+	}
+	for srcPos, attr := range bat.Attrs {
+		def := schema.ColDefs[schema.GetColIdx(attr)]
+		destVec := data.Vecs[def.Idx]
+		srcVec := bat.Vecs[srcPos]
+		for i := 0; i < srcVec.Length(); i++ {
+			destVec.Update(int(destRow)+i, srcVec.Get(i), srcVec.IsNull(i))
 		}
 	}
-	return
+	node.applyRelLogicalIDCompatLocked(bat, destRow, false)
+	return nil
+}
+
+func (node *memoryNode) applyRelLogicalIDCompatLocked(
+	bat *containers.Batch,
+	destRow uint32,
+	append bool,
+) {
+	if node.object.meta.Load().GetTable().ID != 2 || len(node.data.Vecs) <= 10 /*not tombstone*/ {
+		return
+	}
+	inLogicalIdx := slices.Index(bat.Attrs, pkgcatalog.SystemRelAttr_LogicalID)
+	if inLogicalIdx != -1 {
+		return
+	}
+	desc := node.data.GetVectorByName(pkgcatalog.SystemRelAttr_LogicalID)
+	src := bat.GetVectorByName(pkgcatalog.SystemRelAttr_ID)
+	if append {
+		desc.Extend(src)
+		return
+	}
+	for i := 0; i < src.Length(); i++ {
+		desc.Update(int(destRow)+i, src.Get(i), src.IsNull(i))
+	}
 }
 
 func (node *memoryNode) GetDuplicatedRows(

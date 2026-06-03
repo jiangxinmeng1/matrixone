@@ -377,6 +377,36 @@ func (obj *aobject) OnReplayAppendPayload(bat *containers.Batch) (err error) {
 	return
 }
 
+func (obj *aobject) OnReplayAppendPayloadAt(bat *containers.Batch, destOff uint32) (err error) {
+	node := obj.PinNode()
+	defer node.Unref()
+	if node.IsPersisted() {
+		return moerr.NewInternalErrorNoCtx("cannot replay append to persisted node")
+	}
+
+	obj.Lock()
+	defer obj.Unlock()
+
+	mnode := node.MustMNode()
+	if err = mnode.OverwriteAtLocked(bat, destOff); err != nil {
+		return
+	}
+	schema := mnode.writeSchema
+	for _, colDef := range schema.ColDefs {
+		if colDef.IsPhyAddr() {
+			continue
+		}
+		if colDef.IsRealPrimary() && !schema.IsSecondaryIndexTable() {
+			if err = mnode.pkIndex.BatchUpsert(
+				bat.GetVectorByName(colDef.Name).GetDownstreamVector(), int(destOff)); err != nil {
+				return
+			}
+		}
+	}
+	obj.meta.Load().GetTable().AddRows(uint64(bat.Length()))
+	return
+}
+
 func (obj *aobject) MakeAppender() (appender data.ObjectAppender, err error) {
 	if obj == nil {
 		err = moerr.GetOkExpectedEOB()

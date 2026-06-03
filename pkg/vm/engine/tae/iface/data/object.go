@@ -55,6 +55,7 @@ type ObjectAppender interface {
 type ObjectReplayer interface {
 	OnReplayAppend(node txnif.AppendNode) (err error)
 	OnReplayAppendPayload(bat *containers.Batch) (err error)
+	OnReplayAppendPayloadAt(bat *containers.Batch, destOff uint32) (err error)
 }
 
 type Object interface {
