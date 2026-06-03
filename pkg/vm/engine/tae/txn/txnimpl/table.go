@@ -1181,9 +1181,6 @@ func (tbl *txnTable) findDeletes(
 			if obj.CreatedAt.GT(&to) {
 				continue
 			}
-			if obj.CreatedAt.LT(&from) {
-				continue
-			}
 			if obj.HasDCounterpart() {
 				continue
 			}

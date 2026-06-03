@@ -259,9 +259,6 @@ func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers
 			if obj.CreatedAt.GT(&to) {
 				continue
 			}
-			if obj.CreatedAt.LT(&from) {
-				continue
-			}
 			if obj.HasDCounterpart() {
 				continue
 			}
