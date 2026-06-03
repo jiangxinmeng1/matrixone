@@ -28,9 +28,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestGetUpdateEntry_SetCreatedAtToMinCommitTS tests that GetUpdateEntry sets
-// CreatedAt to GetMinCommitTS() for in-memory aobj
-func TestGetUpdateEntry_SetCreatedAtToMinCommitTS(t *testing.T) {
+// TestGetUpdateEntry_SetCreatedAtToMaxCommitTS tests that GetUpdateEntry sets
+// CreatedAt to GetMaxCommitTS() for in-memory aobj.
+func TestGetUpdateEntry_SetCreatedAtToMaxCommitTS(t *testing.T) {
 	defer testutils.AfterTest(t)()
 
 	schema := catalog.MockSchema(2, 0)
@@ -96,18 +96,15 @@ func TestGetUpdateEntry_SetCreatedAtToMinCommitTS(t *testing.T) {
 	require.NoError(t, txn2.Commit(context.Background()))
 	commitTS2 := node2.GetEnd()
 
-	// Calculate expected minCommitTS
-	expectedMinTS := commitTS1
-	if commitTS2.LT(&commitTS1) {
-		expectedMinTS = commitTS2
+	expectedMaxTS := commitTS1
+	if commitTS2.GT(&commitTS1) {
+		expectedMaxTS = commitTS2
 	}
 
-	// Verify aobj.GetMinCommitTS() returns min(commitTS1, commitTS2)
-	// Note: objData and aobj are the same instance, so they should have the same appendMVCC
-	minCommitTS := aobj.GetMinCommitTS()
-	require.True(t, minCommitTS.EQ(&expectedMinTS),
-		"aobj.GetMinCommitTS() should return min(commitTS1, commitTS2), got %v, expected %v",
-		minCommitTS.ToString(), expectedMinTS.ToString())
+	maxCommitTS := aobj.GetMaxCommitTS()
+	require.True(t, maxCommitTS.EQ(&expectedMaxTS),
+		"aobj.GetMaxCommitTS() should return max(commitTS1, commitTS2), got %v, expected %v",
+		maxCommitTS.ToString(), expectedMaxTS.ToString())
 
 	// Call GetUpdateEntry for in-memory update (stats has no location)
 	flushTxn, err := txnMgr.StartTxn(nil)
@@ -120,17 +117,16 @@ func TestGetUpdateEntry_SetCreatedAtToMinCommitTS(t *testing.T) {
 	persistedObj, _, _ := sharedAobj.GetUpdateEntry(flushTxn, statsNoLocation)
 	require.NotNil(t, persistedObj, "Persisted object should not be nil")
 
-	// Key assertion: CreatedAt should be set to GetMinCommitTS() if conditions are met
+	// Key assertion: CreatedAt should be set to GetMaxCommitTS() if conditions are met
 	// GetUpdateEntry checks: entry.IsAppendable() && entry.ObjectStats.ObjectLocation().IsEmpty()
-	// If both conditions are true and objData.GetMinCommitTS() returns a valid value, CreatedAt will be updated
+	// If both conditions are true and objData.GetMaxCommitTS() returns a valid value, CreatedAt will be updated
 	// Note: NewInMemoryObject may create objects with location, so the condition might not be met
 	// But we can verify the logic by checking if CreatedAt was updated when conditions are met
 	locationEmpty := sharedAobj.ObjectStats.ObjectLocation().IsEmpty()
 	if locationEmpty && sharedAobj.IsAppendable() {
-		// Conditions are met, so CreatedAt should be set to GetMinCommitTS()
-		require.True(t, persistedObj.CreatedAt.EQ(&minCommitTS),
-			"Persisted object CreatedAt should equal GetMinCommitTS(), got %v, expected %v",
-			persistedObj.CreatedAt.ToString(), minCommitTS.ToString())
+		require.True(t, persistedObj.CreatedAt.EQ(&maxCommitTS),
+			"Persisted object CreatedAt should equal GetMaxCommitTS(), got %v, expected %v",
+			persistedObj.CreatedAt.ToString(), maxCommitTS.ToString())
 		require.False(t, persistedObj.CreatedAt.EQ(&originalCreatedAt),
 			"Persisted object CreatedAt should be different from original CreatedAt")
 	} else {
@@ -176,8 +172,11 @@ func TestGetUpdateEntry_NoRaceCondition(t *testing.T) {
 	factory := NewDataFactory(rt, "")
 	sharedAobj.InitData(factory)
 
-	// Create aobj and add AppendNodes
-	aobj := newAObject(sharedAobj, rt, false)
+	objData := sharedAobj.GetObjectData()
+	require.NotNil(t, objData)
+	defer objData.Close()
+	aobj, ok := objData.(*aobject)
+	require.True(t, ok, "objData should be *aobject")
 	aobj.Ref()
 	defer aobj.Unref()
 
@@ -194,19 +193,17 @@ func TestGetUpdateEntry_NoRaceCondition(t *testing.T) {
 		commitTSs = append(commitTSs, node.GetEnd())
 	}
 
-	// Find minimum commitTS
-	minCommitTS := commitTSs[0]
+	maxCommitTS := commitTSs[0]
 	for _, ts := range commitTSs {
-		if ts.LT(&minCommitTS) {
-			minCommitTS = ts
+		if ts.GT(&maxCommitTS) {
+			maxCommitTS = ts
 		}
 	}
 
-	// Verify GetMinCommitTS
-	actualMinTS := aobj.GetMinCommitTS()
-	require.True(t, actualMinTS.EQ(&minCommitTS),
-		"GetMinCommitTS should return minimum commitTS, got %v, expected %v",
-		actualMinTS.ToString(), minCommitTS.ToString())
+	actualMaxTS := aobj.GetMaxCommitTS()
+	require.True(t, actualMaxTS.EQ(&maxCommitTS),
+		"GetMaxCommitTS should return maximum commitTS, got %v, expected %v",
+		actualMaxTS.ToString(), maxCommitTS.ToString())
 
 	// Test concurrent GetUpdateEntry calls
 	const numGoroutines = 10
@@ -233,15 +230,14 @@ func TestGetUpdateEntry_NoRaceCondition(t *testing.T) {
 
 	// Verify all results have consistent CreatedAt
 	// Note: GetUpdateEntry only sets CreatedAt if entry.IsAppendable() && entry.ObjectStats.ObjectLocation().IsEmpty()
-	// If conditions are met and objData.GetMinCommitTS() returns a valid value, CreatedAt will be updated
+	// If conditions are met and objData.GetMaxCommitTS() returns a valid value, CreatedAt will be updated
 	locationEmpty := sharedAobj.ObjectStats.ObjectLocation().IsEmpty()
 	for i, result := range results {
 		require.NotNil(t, result, "Result %d should not be nil", i)
 		if locationEmpty && sharedAobj.IsAppendable() {
-			// Conditions are met, so CreatedAt should be set to GetMinCommitTS()
-			require.True(t, result.CreatedAt.EQ(&minCommitTS),
-				"Result %d CreatedAt should equal minCommitTS, got %v, expected %v",
-				i, result.CreatedAt.ToString(), minCommitTS.ToString())
+			require.True(t, result.CreatedAt.EQ(&maxCommitTS),
+				"Result %d CreatedAt should equal maxCommitTS, got %v, expected %v",
+				i, result.CreatedAt.ToString(), maxCommitTS.ToString())
 		} else {
 			// Conditions not met, so CreatedAt won't be updated
 			require.NotNil(t, result.CreatedAt, "Result %d CreatedAt should not be nil", i)

@@ -168,7 +168,11 @@ func incrementalGetRowsByPK(pks, from, to) (rowIDs, err) {
             if obj.CreatedAt.GT(&to) {
                 continue
             }
-            // 从 CreatedAt <= to 开始 → 后面的都 <= to（升序排列，倒序降序）
+            // Skip: CreatedAt < from → flushed object 的 CreatedAt=maxCommitTS，
+            // 说明全部数据都在窗口之前，跳过
+            if obj.CreatedAt.LT(&from) {
+                continue
+            }
 
             // Skip: 已有 D counterpart → 已 flush/已 drop，数据在 D entry 里
             if obj.HasDCounterpart() {
@@ -267,6 +271,7 @@ func findDeletes(rowIDs, from, to) error {
         // ═══════════════════════════════════════════════
         if !obj.IsAppendable() && obj.IsCEntry() {
             if obj.CreatedAt.GT(&to) { continue }
+            if obj.CreatedAt.LT(&from) { continue }
             if obj.HasDCounterpart() { continue }
             if !obj.VisibleByTS(to) { continue }
 
@@ -306,11 +311,16 @@ Flusher 只关心 aobj（需要 flush 的 appendable 对象），变化最小：
 
 ```go
 func foreachAobjBefore(table, ts, lastCkp, df, tf) {
+    key := NewObjectEntryDEntrySeekKey(ts.Next())
+
     data := table.MakeDataObjectIt()
     defer data.Release()
 
-    // 从 Last 开始倒序遍历：Tier 4 → Tier 3 → Tier 2 → Tier 1
-    for ok := data.Last(); ok; ok = data.Prev() {
+    var ok bool
+    if ok = data.Seek(key); !ok {
+        ok = data.Last()
+    }
+    for ; ok; ok = data.Prev() {
         item := data.Item()
 
         // Tier 3: delete entries → 不处理（不是 aobj）
@@ -385,6 +395,7 @@ Tier 1: aobj (按 minCommitTS 升序)
 | `txn/txnimpl/table.go` | `findDeletes` 改为按 Tier 的分支逻辑 |
 | `tables/table_scan.go` | `TombstoneRangeScanByObject` 相应调整 |
 | `db/checkpoint/flusher.go` | `foreachAobjBefore` 调整 break 条件适配新 Tier 顺序 |
+| `catalog/object.go` | flush 后对象 `CreatedAt` 使用 `maxCommitTS` |
 
 ## 5. 注意事项
 

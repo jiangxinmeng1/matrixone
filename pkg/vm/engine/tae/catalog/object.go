@@ -206,15 +206,15 @@ func (entry *ObjectEntry) GetUpdateEntry(
 	node := dropped.GetLastMVCCNode()
 	objectio.SetObjectStats(&dropped.ObjectStats, stats)
 
-	// For in-memory aobj (appendable and no location), set CreatedAt to GetMinCommitTS()
-	// Check if entry is appendable and has no persisted location (in-memory)
+	// For in-memory aobj, use the latest committed append timestamp as the
+	// persisted object's CreatedAt. Then CreatedAt < from means all rows are
+	// before the incremental dedup window.
 	if entry.IsAppendable() && entry.ObjectStats.ObjectLocation().IsEmpty() {
 		objData := entry.GetObjectData()
 		if objData != nil {
-			minCommitTS := objData.GetMinCommitTS()
-			maxTS := types.MaxTs()
-			if !minCommitTS.IsEmpty() && !minCommitTS.EQ(&maxTS) {
-				dropped.CreatedAt = minCommitTS
+			maxCommitTS := objData.GetMaxCommitTS()
+			if !maxCommitTS.IsEmpty() {
+				dropped.CreatedAt = maxCommitTS
 			}
 		}
 	}
@@ -232,6 +232,23 @@ func (entry *ObjectEntry) GetUpdateEntry(
 	dropped.DeleteNode = txnbase.NewTxnMVCCNodeWithTxn(txn)
 	return
 }
+
+// NewObjectEntryDEntrySeekKey builds a synthetic ObjectEntry that sorts in the D-entry tier.
+func NewObjectEntryDEntrySeekKey(deletedAt types.TS) *ObjectEntry {
+	objID := objectio.NewObjectid()
+	stats := objectio.NewObjectStatsWithObjectID(&objID, false, false, false)
+	return &ObjectEntry{
+		EntryMVCCNode: EntryMVCCNode{DeletedAt: deletedAt},
+		ObjectMVCCNode: ObjectMVCCNode{
+			ObjectStats: *stats,
+		},
+		ObjectNode: ObjectNode{
+			prevVersion: &ObjectEntry{},
+			forcePNode:  true,
+		},
+	}
+}
+
 func (entry *ObjectEntry) VisibleByTS(ts types.TS) bool {
 	// visible by end
 	if entry.CreatedAt.GT(&ts) {

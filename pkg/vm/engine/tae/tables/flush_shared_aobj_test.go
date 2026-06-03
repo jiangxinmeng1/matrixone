@@ -93,7 +93,7 @@ func TestFlushSharedAobj_ObjectListSorting(t *testing.T) {
 
 	err = txn2.Commit(context.Background())
 	require.NoError(t, err)
-	_ = node2 // For future GetMinCommitTS validation
+	_ = node2
 
 	// 3. 创建其他 non-appendable objects (用于测试排序)
 	// Object A: CreatedAt = T1 + 1000 (应该排在 persisted obj 后面)
@@ -546,15 +546,15 @@ func TestFlushSharedAobj_SimulateFlush(t *testing.T) {
 	require.NoError(t, err)
 	commitTS2 := node2.GetEnd()
 
-	// 3. Calculate minCommitTS (key step in flush)
-	minCommitTS := aobj.GetMinCommitTS()
-	expectedMinTS := commitTS1
-	if commitTS2.LT(&commitTS1) {
-		expectedMinTS = commitTS2
+	// 3. Calculate maxCommitTS (key step in flush)
+	maxCommitTS := aobj.GetMaxCommitTS()
+	expectedMaxTS := commitTS1
+	if commitTS2.GT(&commitTS1) {
+		expectedMaxTS = commitTS2
 	}
 
-	assert.True(t, minCommitTS.EQ(&expectedMinTS),
-		"minCommitTS should equal min(commitTS1, commitTS2)")
+	assert.True(t, maxCommitTS.EQ(&expectedMaxTS),
+		"maxCommitTS should equal max(commitTS1, commitTS2)")
 
 	// 4. Simulate flush: Create persistedObj with same ObjectID
 	flushTxn, err := txnMgr.StartTxn(nil)
@@ -569,7 +569,7 @@ func TestFlushSharedAobj_SimulateFlush(t *testing.T) {
 
 	// Create persistedObj (simulating UpdateObjectInfo result)
 	persistedObj := catalog.NewObjectEntry(table, flushTxn, *stats, nil, false)
-	persistedObj.CreatedAt = minCommitTS // Key: Use minCommitTS
+	persistedObj.CreatedAt = maxCommitTS // Key: Use maxCommitTS
 	persistedObj.ObjectState = catalog.ObjectState_Create_Active
 
 	table.Lock()
@@ -586,11 +586,11 @@ func TestFlushSharedAobj_SimulateFlush(t *testing.T) {
 	assert.Equal(t, sharedAobj.ID(), persistedObj.ID(),
 		"ObjectID should be preserved after flush")
 
-	assert.True(t, persistedObj.CreatedAt.EQ(&minCommitTS),
-		"persistedObj.CreatedAt should equal minCommitTS")
+	assert.True(t, persistedObj.CreatedAt.EQ(&maxCommitTS),
+		"persistedObj.CreatedAt should equal maxCommitTS")
 
 	t.Logf("Flush shared aobj simulation verified:")
 	t.Logf("  ObjectID preserved: %v", sharedAobj.ID())
-	t.Logf("  minCommitTS: %v", minCommitTS)
+	t.Logf("  maxCommitTS: %v", maxCommitTS)
 	t.Logf("  persistedObj.CreatedAt: %v", persistedObj.CreatedAt)
 }

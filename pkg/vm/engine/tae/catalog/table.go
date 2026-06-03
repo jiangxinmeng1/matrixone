@@ -287,7 +287,7 @@ func IsTableTailFlushed(table *TableEntry, start, end types.TS, isTombstone bool
 	}
 	earlybreak := false
 	// some entries shared the same timestamp with end, so we need to seek to the next one
-	key := &ObjectEntry{EntryMVCCNode: EntryMVCCNode{DeletedAt: end.Next()}}
+	key := NewObjectEntryDEntrySeekKey(end.Next())
 	var ok bool
 	if ok = it.Seek(key); !ok {
 		ok = it.Last()

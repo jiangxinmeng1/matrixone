@@ -443,9 +443,15 @@ func foreachAobjBefore(_ context.Context,
 	// 2. the ts is lagged, lowering the possibility of missing aobj. In contrast, we have to wait when checkpoint pending checkpoint tasks
 	// table.WaitDataObjectCommitted(ts)
 	// table.WaitTombstoneObjectCommitted(ts)
+	var ok bool
+	key := catalog.NewObjectEntryDEntrySeekKey(ts.Next())
+
 	data := table.MakeDataObjectIt()
 	defer data.Release()
-	for ok := data.Last(); ok; ok = data.Prev() {
+	if ok = data.Seek(key); !ok {
+		ok = data.Last()
+	}
+	for ; ok; ok = data.Prev() {
 		item := data.Item()
 		// Any C entry created before the last checkpoint end time, break
 		// BUT: if it's an appendable object without D counterpart, we still need to flush it
@@ -464,7 +470,10 @@ func foreachAobjBefore(_ context.Context,
 
 	tomb := table.MakeTombstoneObjectIt()
 	defer tomb.Release()
-	for ok := tomb.Last(); ok; ok = tomb.Prev() {
+	if ok = tomb.Seek(key); !ok {
+		ok = tomb.Last()
+	}
+	for ; ok; ok = tomb.Prev() {
 		item := tomb.Item()
 		// Any C entry created before the last checkpoint end time, break
 		// BUT: if it's an appendable object without D counterpart, we still need to flush it

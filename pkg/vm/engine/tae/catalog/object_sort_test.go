@@ -23,6 +23,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/btree"
 )
 
 type sortTestObjectData struct {
@@ -150,4 +151,22 @@ func TestLess2ReverseIterationOrder(t *testing.T) {
 		create,
 		aobj,
 	}, reverse)
+}
+
+func TestDEntrySeekKeyTargetsDeleteTier(t *testing.T) {
+	create := makeSortTestObject(400, 0, false, true, false)
+	_, deleteEarly := makeSortTestDeleteEntry(100, 200)
+	_, deleteLate := makeSortTestDeleteEntry(100, 300)
+
+	tree := btree.NewBTreeG[*ObjectEntry]((*ObjectEntry).Less2)
+	tree.Set(create)
+	tree.Set(deleteEarly)
+	tree.Set(deleteLate)
+
+	it := tree.Iter()
+	defer it.Release()
+
+	require.True(t, it.Seek(NewObjectEntryDEntrySeekKey(types.BuildTS(250, 0))))
+	require.Equal(t, deleteLate, it.Item())
+	require.True(t, it.Item().IsDEntry())
 }
