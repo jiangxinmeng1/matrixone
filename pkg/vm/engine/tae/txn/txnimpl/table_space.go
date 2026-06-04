@@ -21,12 +21,9 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
-	"go.uber.org/zap"
 
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
@@ -115,9 +112,10 @@ func (space *tableSpace) ApplyAppend() (err error) {
 	for _, ctx := range space.appends {
 		bat, _ := ctx.node.Window(ctx.start, ctx.start+ctx.count)
 		defer bat.Close()
-		if destOff, err = ctx.driver.ApplyAppend(
+		if destOff, err = ctx.driver.ApplyAppendAt(
 			bat,
-			space.table.store.txn); err != nil {
+			space.table.store.txn,
+			ctx.dest); err != nil {
 			return
 		}
 		id := ctx.driver.GetID()
@@ -155,10 +153,6 @@ func (space *tableSpace) PrepareApply() (err error) {
 
 func (space *tableSpace) prepareApplyANode(node *anode, startOffset uint32) error {
 	node.Compact()
-	tableData := space.table.entry.GetTableData()
-	if space.tableHandle == nil {
-		space.tableHandle = tableData.GetHandle(space.isTombstone)
-	}
 	appended := startOffset
 	var vec containers.Vector
 	if startOffset == 0 {
@@ -167,45 +161,15 @@ func (space *tableSpace) prepareApplyANode(node *anode, startOffset uint32) erro
 		vec = node.data.Vecs[space.table.GetLocalSchema(space.isTombstone).PhyAddrKey.Idx]
 	}
 	for appended < node.Rows() {
-		appender, err := space.tableHandle.GetAppender()
-		if moerr.IsMoErrCode(err, moerr.ErrAppendableObjectNotFound) {
-			objH, err2 := space.table.CreateObject(space.isTombstone)
-			if err2 != nil {
-				return err2
-			}
-			appender = space.tableHandle.SetAppender(objH.Fingerprint())
-			// logutil.Info("CreateObject", zap.String("objH", appender.GetID().ObjectString()), zap.String("txn", node.GetTxn().String()))
-			objH.Close()
-		}
-		if !appender.IsSameColumns(space.table.GetLocalSchema(space.isTombstone)) {
-			return moerr.NewInternalErrorNoCtx("schema changed, please rollback and retry")
-		}
-
-		// see more notes in flushtabletail.go
-		/// ----------- Choose a ablock ---------
-		appender.LockFreeze()
-		// no one can touch freeze for now, check it
-		if appender.CheckFreeze() {
-			// freezed, try to find another ablock
-			appender.UnlockFreeze()
-			// Unref the appender, otherwise it can't be PrepareCompact(ed) successfully
-			appender.Close()
-			logutil.Info("LockFreeze", zap.String("appender", appender.PPString()))
-			continue
-		}
-
-		// hold freezelock to attach AppendNode
-		//PrepareAppend: It is very important that appending a AppendNode into
-		// block's MVCCHandle before applying data into block.
-		anode, created, toAppend, err := appender.PrepareAppend(
-			node.isMergeCompact,
+		appender, anode, startRow, toAppend, created, err := space.table.entry.GetTableData().PrepareSharedAppend(
+			space.isTombstone,
+			space.table.GetLocalSchema(space.isTombstone),
+			space.table.store.txn,
 			node.Rows()-appended,
-			space.table.store.txn)
+			node.isMergeCompact)
 		if err != nil {
-			appender.UnlockFreeze()
 			return err
 		}
-		appender.UnlockFreeze()
 		/// ------- Attach AppendNode Successfully -----
 
 		objID := appender.GetMeta().(*catalog.ObjectEntry).ID()
@@ -215,7 +179,7 @@ func (space *tableSpace) prepareApplyANode(node *anode, startOffset uint32) erro
 		if err = objectio.ConstructRowidColumnTo(
 			col.GetDownstreamVector(),
 			&blkID,
-			anode.GetMaxRow()-toAppend,
+			startRow,
 			toAppend,
 			col.GetAllocator(),
 		); err != nil {
@@ -230,6 +194,7 @@ func (space *tableSpace) prepareApplyANode(node *anode, startOffset uint32) erro
 			anode:  anode,
 			start:  appended,
 			count:  toAppend,
+			dest:   startRow,
 		}
 		if created {
 			if err = space.table.store.IncreateWriteCnt("prepare apply anode"); err != nil {

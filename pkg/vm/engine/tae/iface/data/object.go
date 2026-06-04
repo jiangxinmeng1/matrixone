@@ -45,6 +45,10 @@ type ObjectAppender interface {
 	ApplyAppend(bat *containers.Batch,
 		txn txnif.AsyncTxn,
 	) (int, error)
+	ApplyAppendAt(bat *containers.Batch,
+		txn txnif.AsyncTxn,
+		destRow uint32,
+	) (int, error)
 	IsAppendable() bool
 	ReplayAppend(bat *containers.Batch,
 		txn txnif.AsyncTxn) (int, error)
@@ -55,6 +59,7 @@ type ObjectAppender interface {
 type ObjectReplayer interface {
 	OnReplayAppend(node txnif.AppendNode) (err error)
 	OnReplayAppendPayload(bat *containers.Batch) (err error)
+	OnReplayAppendPayloadAt(bat *containers.Batch, destRow uint32) (err error)
 }
 
 type Object interface {

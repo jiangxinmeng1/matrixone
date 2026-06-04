@@ -17,6 +17,7 @@ package data
 import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 )
 
 var (
@@ -31,4 +32,11 @@ type TableHandle interface {
 type Table interface {
 	GetHandle(bool) TableHandle
 	ApplyHandle(TableHandle, bool)
+	PrepareSharedAppend(
+		isTombstone bool,
+		schema any,
+		txn txnif.AsyncTxn,
+		rows uint32,
+		isMergeCompact bool,
+	) (ObjectAppender, txnif.AppendNode, uint32, uint32, bool, error)
 }

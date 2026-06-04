@@ -200,8 +200,17 @@ func (obj *aobject) GetDuplicatedRows(
 		fn := func() (minv, maxv int32, err error) {
 			obj.RUnlock()
 			defer obj.RLock()
-			if maxv, err = obj.GetMaxRowByTS(to); err != nil {
-				return
+			startTS := txn.GetStartTS()
+			if to.EQ(&startTS) {
+				var maxRow uint32
+				if maxRow, err = obj.appendMVCC.GetMaxVisibleRowLocked(ctx, txn); err != nil {
+					return
+				}
+				maxv = int32(maxRow)
+			} else {
+				if maxv, err = obj.GetMaxRowByTS(to); err != nil {
+					return
+				}
 			}
 			minv, err = obj.GetMaxRowByTS(from)
 			return
@@ -337,11 +346,19 @@ func (obj *aobject) OnReplayAppend(node txnif.AppendNode) (err error) {
 }
 
 func (obj *aobject) OnReplayAppendPayload(bat *containers.Batch) (err error) {
+	return obj.OnReplayAppendPayloadAt(bat, math.MaxUint32)
+}
+
+func (obj *aobject) OnReplayAppendPayloadAt(bat *containers.Batch, destRow uint32) (err error) {
 	appender, err := obj.MakeAppender()
 	if err != nil {
 		return
 	}
-	_, err = appender.ReplayAppend(bat, nil)
+	if destRow == math.MaxUint32 {
+		_, err = appender.ReplayAppend(bat, nil)
+	} else {
+		_, err = appender.ApplyAppendAt(bat, nil, destRow)
+	}
 	return
 }
 
@@ -374,4 +391,16 @@ func (obj *aobject) GetRowsOnReplay() uint64 {
 			ObjectStats.Rows())
 	}
 	return uint64(obj.appendMVCC.GetTotalRow())
+}
+
+func (obj *aobject) GetMinCommitTS() types.TS {
+	obj.RLock()
+	defer obj.RUnlock()
+	return obj.appendMVCC.GetMinCommitTSLocked()
+}
+
+func (obj *aobject) GetMaxCommitTS() types.TS {
+	obj.RLock()
+	defer obj.RUnlock()
+	return obj.appendMVCC.GetMaxCommitTSLocked()
 }

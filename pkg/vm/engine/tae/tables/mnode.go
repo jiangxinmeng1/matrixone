@@ -271,6 +271,44 @@ func (node *memoryNode) ApplyAppendLocked(
 	return
 }
 
+func (node *memoryNode) EnsureLengthLocked(targetLen uint32) {
+	data := node.mustData()
+	for _, vec := range data.Vecs {
+		for vec.Length() < int(targetLen) {
+			vec.Append(nil, true)
+		}
+	}
+}
+
+func (node *memoryNode) OverwriteAtLocked(
+	bat *containers.Batch,
+	destRow uint32,
+) (from int, err error) {
+	schema := node.writeSchema
+	from = int(destRow)
+	rows := bat.Length()
+	node.EnsureLengthLocked(destRow + uint32(rows))
+	for srcPos, attr := range bat.Attrs {
+		def := schema.ColDefs[schema.GetColIdx(attr)]
+		destVec := node.data.Vecs[def.Idx]
+		for i := 0; i < rows; i++ {
+			destVec.Update(from+i, bat.Vecs[srcPos].Get(i), bat.Vecs[srcPos].IsNull(i))
+		}
+	}
+	// RelLogicalID COMPAT
+	if node.object.meta.Load().GetTable().ID == 2 && len(node.data.Vecs) > 10 /*not tombstone*/ {
+		inLogicalIdx := slices.Index(bat.Attrs, pkgcatalog.SystemRelAttr_LogicalID)
+		if inLogicalIdx == -1 {
+			desc := node.data.GetVectorByName(pkgcatalog.SystemRelAttr_LogicalID)
+			src := bat.GetVectorByName(pkgcatalog.SystemRelAttr_ID)
+			for i := 0; i < rows; i++ {
+				desc.Update(from+i, src.Get(i), src.IsNull(i))
+			}
+		}
+	}
+	return
+}
+
 func (node *memoryNode) GetDuplicatedRows(
 	ctx context.Context,
 	txn txnif.TxnReader,
@@ -324,7 +362,11 @@ func (node *memoryNode) Scan(
 	}
 	node.object.RLock()
 	defer node.object.RUnlock()
-	maxRow, visible, _, err := node.object.appendMVCC.GetVisibleRowLocked(ctx, txn)
+	baseLen := 0
+	if *bat != nil {
+		baseLen = (*bat).Length()
+	}
+	maxRow, visible, holes, err := node.object.appendMVCC.GetVisibleRowLocked(ctx, txn)
 	if !visible || err != nil {
 		// blk.RUnlock()
 		return
@@ -337,6 +379,17 @@ func (node *memoryNode) Scan(
 		maxRow,
 		mp,
 	)
+	if holes != nil && !holes.IsEmpty() {
+		if (*bat).Deletes == nil {
+			(*bat).Deletes = nulls.NewWithSize(baseLen + int(maxRow))
+		}
+		holes.Foreach(func(row uint64) bool {
+			if row < uint64(maxRow) {
+				(*bat).Deletes.Add(uint64(baseLen) + row)
+			}
+			return true
+		})
+	}
 	for _, idx := range colIdxes {
 		if idx == objectio.SEQNUM_COMMITTS {
 			node.object.appendMVCC.FillInCommitTSVecLocked(
@@ -389,7 +442,7 @@ func (node *memoryNode) FillBlockTombstones(
 	mp *mpool.MPool) error {
 	node.object.RLock()
 	defer node.object.RUnlock()
-	maxRow, visible, _, err := node.object.appendMVCC.GetVisibleRowLocked(ctx, txn)
+	maxRow, visible, holes, err := node.object.appendMVCC.GetVisibleRowLocked(ctx, txn)
 	if !visible || err != nil {
 		// blk.RUnlock()
 		return err
@@ -397,6 +450,9 @@ func (node *memoryNode) FillBlockTombstones(
 	rowIDVec := node.data.GetVectorByName(objectio.TombstoneAttr_Rowid_Attr)
 	rowIDs := vector.MustFixedColWithTypeCheck[types.Rowid](rowIDVec.GetDownstreamVector())
 	for i := 0; i < int(maxRow); i++ {
+		if holes != nil && holes.Contains(uint64(i)) {
+			continue
+		}
 		rowID := rowIDs[i]
 		if types.PrefixCompare(rowID[:], blkID[:]) == 0 {
 			if *deletes == nil {

@@ -412,6 +412,31 @@ func NewStandaloneObject(table *TableEntry, ts types.TS, isTombstone bool) *Obje
 	return e
 }
 
+func NewInMemoryObject(table *TableEntry, ts types.TS, isTombstone bool) *ObjectEntry {
+	nobjid := objectio.NewObjectid()
+	return NewInMemoryObjectWithID(table, ts, isTombstone, &nobjid)
+}
+
+func NewInMemoryObjectWithID(table *TableEntry, ts types.TS, isTombstone bool, id *objectio.ObjectId) *ObjectEntry {
+	stats := objectio.NewObjectStatsWithObjectID(id, true, isTombstone, false)
+	e := &ObjectEntry{
+		table: table,
+		ObjectNode: ObjectNode{
+			SortHint:    table.GetDB().catalog.NextObject(),
+			IsTombstone: isTombstone,
+		},
+		EntryMVCCNode: EntryMVCCNode{
+			CreatedAt: ts,
+		},
+		CreateNode:  txnbase.NewTxnMVCCNodeWithTS(ts),
+		ObjectState: ObjectState_Create_ApplyCommit,
+		ObjectMVCCNode: ObjectMVCCNode{
+			ObjectStats: *stats,
+		},
+	}
+	return e
+}
+
 func (entry *ObjectEntry) GetLocation() objectio.Location {
 	location := entry.ObjectStats.ObjectLocation()
 	return location
@@ -627,6 +652,38 @@ func (entry *ObjectEntry) ObjectPersisted() bool {
 	} else {
 		return true
 	}
+}
+
+func (entry *ObjectEntry) IsInMemory() bool {
+	return entry.IsAppendable() && !entry.ObjectPersisted()
+}
+
+func (entry *ObjectEntry) GetMinCommitTS() types.TS {
+	if entry.objData == nil || !entry.IsInMemory() {
+		return types.TS{}
+	}
+	type minCommitTSGetter interface {
+		GetMinCommitTS() types.TS
+	}
+	getter, ok := entry.objData.(minCommitTSGetter)
+	if !ok {
+		return types.TS{}
+	}
+	return getter.GetMinCommitTS()
+}
+
+func (entry *ObjectEntry) GetMaxCommitTS() types.TS {
+	if entry.objData == nil || !entry.IsInMemory() {
+		return types.TS{}
+	}
+	type maxCommitTSGetter interface {
+		GetMaxCommitTS() types.TS
+	}
+	getter, ok := entry.objData.(maxCommitTSGetter)
+	if !ok {
+		return types.TS{}
+	}
+	return getter.GetMaxCommitTS()
 }
 
 // PXU TODO: I can't understand this code

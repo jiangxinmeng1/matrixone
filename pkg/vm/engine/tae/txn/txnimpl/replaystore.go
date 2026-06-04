@@ -18,6 +18,7 @@ import (
 	"context"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/util/fault"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
@@ -139,6 +140,9 @@ func (store *replayTxnStore) replayAppendData(cmd *AppendCmd, observer wal.Repla
 			}
 		}
 		blk, err := database.GetObjectEntryByID(id, cmd.IsTombstone)
+		if moerr.IsMoErrCode(err, moerr.OkExpectedEOB) {
+			blk, err = store.replayCreateInMemoryObject(database, id, cmd.IsTombstone, cmd.Ts)
+		}
 		if sarg != "" {
 			err = ErrDebugReplay
 		}
@@ -179,6 +183,9 @@ func (store *replayTxnStore) replayAppendData(cmd *AppendCmd, observer wal.Repla
 			}
 		}
 		blk, err := database.GetObjectEntryByID(id, cmd.IsTombstone)
+		if moerr.IsMoErrCode(err, moerr.OkExpectedEOB) {
+			blk, err = store.replayCreateInMemoryObject(database, id, cmd.IsTombstone, cmd.Ts)
+		}
 		if sarg != "" {
 			err = ErrDebugReplay
 		}
@@ -198,7 +205,7 @@ func (store *replayTxnStore) replayAppendData(cmd *AppendCmd, observer wal.Repla
 		bat := data.CloneWindow(int(start), int(info.GetSrcLen()))
 		bat.Compact()
 		defer bat.Close()
-		if err = blk.GetObjectData().OnReplayAppendPayload(bat); err != nil || sarg != "" {
+		if err = blk.GetObjectData().OnReplayAppendPayloadAt(bat, info.GetDestOff()); err != nil || sarg != "" {
 			logutil.Infof("cmd %v\ncatalog: %v", cmd.String(), store.catalog.SimplePPString(3))
 			if sarg == "" {
 				panic(err)
@@ -231,6 +238,9 @@ func (store *replayTxnStore) replayAppend(cmd *updates.UpdateCmd, observer wal.R
 		}
 	}
 	obj, err := database.GetObjectEntryByID(id, cmd.GetAppendNode().IsTombstone())
+	if moerr.IsMoErrCode(err, moerr.OkExpectedEOB) {
+		obj, err = store.replayCreateInMemoryObject(database, id, cmd.GetAppendNode().IsTombstone(), appendNode.GetStart())
+	}
 	if sarg != "" {
 		err = ErrDebugReplay
 	}
@@ -252,4 +262,22 @@ func (store *replayTxnStore) replayAppend(cmd *updates.UpdateCmd, observer wal.R
 			panic(err)
 		}
 	}
+}
+
+func (store *replayTxnStore) replayCreateInMemoryObject(
+	db *catalog.DBEntry,
+	id *common.ID,
+	isTombstone bool,
+	createTS types.TS,
+) (*catalog.ObjectEntry, error) {
+	table, err := db.GetTableEntryByID(id.TableID)
+	if err != nil {
+		return nil, err
+	}
+	obj := catalog.NewInMemoryObjectWithID(table, createTS, isTombstone, id.ObjectID())
+	obj.InitData(store.catalog.DataFactory)
+	table.Lock()
+	table.AddEntryLocked(obj)
+	table.Unlock()
+	return obj, nil
 }

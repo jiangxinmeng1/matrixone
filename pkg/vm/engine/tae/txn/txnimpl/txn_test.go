@@ -38,6 +38,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"github.com/panjf2000/ants/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -523,6 +524,128 @@ func TestNodeCommand(t *testing.T) {
 		t.Log(cmd.String())
 	}
 	assert.NoError(t, txn.Commit(context.Background()))
+}
+
+func TestSharedAppendPrepareDoesNotLogObjectCreateEntry(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	ctx := context.Background()
+	testutils.EnsureNoLeak(t)
+	dir := testutils.InitTestEnv(ModuleName, t)
+	c, mgr, driver := initTestContext(ctx, t, dir)
+	defer driver.Close()
+	defer c.Close()
+	defer mgr.Stop()
+
+	schema := catalog.MockSchemaAll(3, 2)
+	schema.Extra.BlockMaxRows = 100
+	createTxn, _ := mgr.StartTxn(nil)
+	db, _ := createTxn.CreateDatabase("db", "", "")
+	rel, _ := db.CreateRelation(schema)
+	dbID := db.GetID()
+	relID := rel.ID()
+	assert.NoError(t, createTxn.Commit(ctx))
+
+	txn, _ := mgr.StartTxn(nil)
+	tDB, _ := txn.GetStore().(*txnStore).getOrSetDB(dbID)
+	tbl, _ := tDB.getOrSetTable(relID)
+	bat := catalog.MockBatch(tbl.GetLocalSchema(false), 10)
+	defer bat.Close()
+
+	assert.NoError(t, tbl.Append(ctx, bat))
+	assert.NoError(t, tbl.PrePrepare())
+
+	var objectEntries, appendNodes int
+	for _, entry := range tbl.txnEntries.entries {
+		switch entry.(type) {
+		case *catalog.ObjectEntry:
+			objectEntries++
+		case txnif.AppendNode:
+			appendNodes++
+		}
+	}
+	assert.Zero(t, objectEntries)
+	assert.Positive(t, appendNodes)
+	assert.NoError(t, txn.Commit(ctx))
+}
+
+func TestReplayAppendDataCreatesAndReusesSharedAObject(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	ctx := context.Background()
+	testutils.EnsureNoLeak(t)
+	dir := testutils.InitTestEnv(ModuleName, t)
+	c, mgr, driver := initTestContext(ctx, t, dir)
+	defer driver.Close()
+	defer c.Close()
+	defer mgr.Stop()
+
+	schema := catalog.MockSchemaAll(3, 2)
+	schema.Extra.BlockMaxRows = 10
+	createTxn, _ := mgr.StartTxn(nil)
+	db, err := createTxn.CreateDatabase("db", "", "")
+	require.NoError(t, err)
+	rel, err := db.CreateRelation(schema)
+	require.NoError(t, err)
+	dbID := db.GetID()
+	tableID := rel.ID()
+	require.NoError(t, createTxn.Commit(ctx))
+
+	objID := objectio.NewObjectid()
+	dest := common.ID{DbID: dbID, TableID: tableID}
+	dest.SetObjectID(&objID)
+	store := &replayTxnStore{catalog: c}
+
+	cmd1 := newReplayAppendCmdForTest(schema, dest, 0, 2, 10)
+	store.replayAppendData(cmd1, nil)
+
+	database, err := c.GetDatabaseByID(dbID)
+	require.NoError(t, err)
+	obj, err := database.GetObjectEntryByID(&dest, false)
+	require.NoError(t, err)
+	require.True(t, obj.IsInMemory())
+	rows, err := obj.GetObjectData().Rows()
+	require.NoError(t, err)
+	require.Equal(t, 2, rows)
+
+	cmd2 := newReplayAppendCmdForTest(schema, dest, 2, 2, 20)
+	store.replayAppendData(cmd2, nil)
+	obj2, err := database.GetObjectEntryByID(&dest, false)
+	require.NoError(t, err)
+	require.True(t, obj == obj2)
+	rows, err = obj2.GetObjectData().Rows()
+	require.NoError(t, err)
+	require.Equal(t, 4, rows)
+}
+
+func newReplayAppendCmdForTest(
+	schema *catalog.Schema,
+	dest common.ID,
+	destOff uint32,
+	rows int,
+	base int32,
+) *AppendCmd {
+	bat := catalog.MockBatch(schema, rows)
+	for _, vec := range bat.Vecs {
+		if vec.GetType().Oid != types.T_int32 {
+			continue
+		}
+		for i := 0; i < rows; i++ {
+			vec.Update(i, base+int32(i), false)
+		}
+	}
+	return &AppendCmd{
+		Data: bat,
+		Infos: []*appendInfo{
+			{
+				srcOff:  0,
+				srcLen:  uint32(rows),
+				dest:    dest,
+				destOff: destOff,
+				destLen: uint32(rows),
+			},
+		},
+		Ts:          types.BuildTS(1, 0),
+		IsTombstone: false,
+	}
 }
 
 func TestTxnManager1(t *testing.T) {

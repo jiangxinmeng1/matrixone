@@ -176,6 +176,9 @@ func (tbl *baseTable) getRowsByPK(ctx context.Context, pks containers.Vector) (r
 	}
 	for it.Next() {
 		obj := it.Item()
+		if !obj.IsVisible(tbl.txnTable.store.txn) {
+			continue
+		}
 		objData := obj.GetObjectData()
 		if objData == nil {
 			continue
@@ -193,7 +196,7 @@ func (tbl *baseTable) getRowsByPK(ctx context.Context, pks containers.Vector) (r
 			tbl.txnTable.store.txn,
 			pks,
 			nil,
-			types.TS{}, types.MaxTs(),
+			types.TS{}, tbl.txnTable.store.txn.GetStartTS(),
 			rowIDs,
 			common.WorkspaceAllocator,
 		)

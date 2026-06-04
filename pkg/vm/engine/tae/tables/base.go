@@ -460,6 +460,10 @@ func (obj *baseObject) OnReplayAppendPayload(_ *containers.Batch) (err error) {
 	panic("not supported")
 }
 
+func (obj *baseObject) OnReplayAppendPayloadAt(_ *containers.Batch, _ uint32) (err error) {
+	panic("not supported")
+}
+
 func (obj *baseObject) MakeAppender() (appender data.ObjectAppender, err error) {
 	panic("not supported")
 }

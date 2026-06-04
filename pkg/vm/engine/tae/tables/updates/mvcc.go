@@ -100,6 +100,50 @@ func (n *AppendMVCCHandle) GetMaxRowByTSLocked(ts types.TS) uint32 {
 	return node.maxRow
 }
 
+func (n *AppendMVCCHandle) GetMaxVisibleRowLocked(
+	ctx context.Context,
+	txn txnif.TxnReader,
+) (maxRow uint32, err error) {
+	startTS := txn.GetStartTS()
+	n.appends.ForEach(func(an *AppendNode) bool {
+		if an.IsVisible(txn) {
+			maxRow = an.maxRow
+		}
+		return !an.Prepare.GT(&startTS)
+	}, true)
+	return
+}
+
+func (n *AppendMVCCHandle) GetMinCommitTSLocked() types.TS {
+	var min types.TS
+	n.appends.ForEach(func(an *AppendNode) bool {
+		if !an.IsCommitted() {
+			return true
+		}
+		ts := an.GetCommitTS()
+		if min.IsEmpty() || ts.LT(&min) {
+			min = ts
+		}
+		return true
+	}, true)
+	return min
+}
+
+func (n *AppendMVCCHandle) GetMaxCommitTSLocked() types.TS {
+	var max types.TS
+	n.appends.ForEach(func(an *AppendNode) bool {
+		if !an.IsCommitted() {
+			return true
+		}
+		ts := an.GetCommitTS()
+		if max.IsEmpty() || ts.GT(&max) {
+			max = ts
+		}
+		return true
+	}, true)
+	return max
+}
+
 // it collects all append nodes in the range [start, end]
 // minRow: is the min row
 // maxRow: is the max row

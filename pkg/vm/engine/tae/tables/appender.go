@@ -110,12 +110,32 @@ func (appender *objectAppender) ReplayAppend(
 func (appender *objectAppender) ApplyAppend(
 	bat *containers.Batch,
 	txn txnif.AsyncTxn) (from int, err error) {
+	return appender.applyAppendAt(bat, txn, nil)
+}
+
+func (appender *objectAppender) ApplyAppendAt(
+	bat *containers.Batch,
+	txn txnif.AsyncTxn,
+	destRow uint32,
+) (from int, err error) {
+	return appender.applyAppendAt(bat, txn, &destRow)
+}
+
+func (appender *objectAppender) applyAppendAt(
+	bat *containers.Batch,
+	txn txnif.AsyncTxn,
+	destRow *uint32,
+) (from int, err error) {
 	n := appender.obj.PinNode()
 	defer n.Unref()
 	node := n.MustMNode()
 	appender.obj.Lock()
 	defer appender.obj.Unlock()
-	from, err = node.ApplyAppendLocked(bat)
+	if destRow == nil {
+		from, err = node.ApplyAppendLocked(bat)
+	} else {
+		from, err = node.OverwriteAtLocked(bat, *destRow)
+	}
 
 	schema := node.writeSchema
 	for _, colDef := range schema.ColDefs {

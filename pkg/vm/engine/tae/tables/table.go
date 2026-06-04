@@ -15,23 +15,31 @@
 package tables
 
 import (
+	"sync"
+
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 )
 
 type dataTable struct {
 	meta       *catalog.TableEntry
 	aObj       *aobject
 	aTombstone *aobject
+	shared     *sharedAppender
+	sharedTomb *sharedAppender
 	rt         *dbutils.Runtime
 }
 
 func newTable(meta *catalog.TableEntry, rt *dbutils.Runtime) *dataTable {
-	return &dataTable{
+	t := &dataTable{
 		meta: meta,
 		rt:   rt,
 	}
+	t.shared = &sharedAppender{table: t}
+	t.sharedTomb = &sharedAppender{table: t, isTombstone: true}
+	return t
 }
 
 func (table *dataTable) GetHandle(isTombstone bool) data.TableHandle {
@@ -50,4 +58,25 @@ func (table *dataTable) ApplyHandle(h data.TableHandle, isTombstone bool) {
 		table.aObj = handle.object
 	}
 
+}
+
+func (table *dataTable) PrepareSharedAppend(
+	isTombstone bool,
+	schema any,
+	txn txnif.AsyncTxn,
+	rows uint32,
+	isMergeCompact bool,
+) (data.ObjectAppender, txnif.AppendNode, uint32, uint32, bool, error) {
+	if isTombstone {
+		return table.sharedTomb.PrepareAppend(schema.(*catalog.Schema), txn, rows, isMergeCompact)
+	}
+	return table.shared.PrepareAppend(schema.(*catalog.Schema), txn, rows, isMergeCompact)
+}
+
+type sharedAppender struct {
+	sync.Mutex
+	table       *dataTable
+	isTombstone bool
+	current     *aobject
+	nextRow     uint32
 }
