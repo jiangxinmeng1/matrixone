@@ -1528,6 +1528,63 @@ func TestFlushTabletail(t *testing.T) {
 	}
 }
 
+func TestFlushSharedAObjScanRestartTombstoneAndDedup(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	testutils.EnsureNoLeak(t)
+	ctx := context.Background()
+
+	opts := config.WithLongScanAndCKPOpts(nil)
+	tae := testutil.NewTestEngine(ctx, ModuleName, t, opts)
+	defer tae.Close()
+
+	schema := catalog.MockSchemaAll(13, 2)
+	schema.Name = "flush_shared_aobj"
+	schema.Extra.BlockMaxRows = 20
+	schema.Extra.ObjectMaxBlocks = 1
+	bat := catalog.MockBatch(schema, 100)
+	defer bat.Close()
+
+	testutil.CreateRelationAndAppend(t, 0, tae.DB, "db", schema, bat, true)
+	testutil.CompactBlocks(t, 0, tae.DB, "db", schema, false)
+	{
+		txn, rel := testutil.GetDefaultRelation(t, tae.DB, schema.Name)
+		testutil.CheckAllColRowsByScan(t, rel, 100, true)
+		assert.NoError(t, txn.Commit(ctx))
+	}
+
+	tae.Restart(ctx)
+	{
+		txn, rel := testutil.GetDefaultRelation(t, tae.DB, schema.Name)
+		testutil.CheckAllColRowsByScan(t, rel, 100, true)
+		assert.NoError(t, txn.Commit(ctx))
+	}
+
+	{
+		txn, rel := testutil.GetDefaultRelation(t, tae.DB, schema.Name)
+		assert.NoError(t, rel.DeleteByFilter(ctx, handle.NewEQFilter(bat.Vecs[2].Get(0))))
+		assert.NoError(t, txn.Commit(ctx))
+	}
+	testutil.CompactBlocks(t, 0, tae.DB, "db", schema, false)
+
+	tae.Restart(ctx)
+	{
+		txn, rel := testutil.GetDefaultRelation(t, tae.DB, schema.Name)
+		_, _, err := rel.GetByFilter(ctx, handle.NewEQFilter(bat.Vecs[2].Get(0)))
+		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrNotFound))
+		testutil.CheckAllColRowsByScan(t, rel, 99, true)
+		assert.NoError(t, txn.Commit(ctx))
+	}
+
+	dup := bat.CloneWindow(1, 1)
+	defer dup.Close()
+	{
+		txn, rel := testutil.GetDefaultRelation(t, tae.DB, schema.Name)
+		err := rel.Append(ctx, dup)
+		assert.Error(t, err)
+		assert.NoError(t, txn.Rollback(ctx))
+	}
+}
+
 func TestRollback1(t *testing.T) {
 	defer testutils.AfterTest(t)()
 	testutils.EnsureNoLeak(t)

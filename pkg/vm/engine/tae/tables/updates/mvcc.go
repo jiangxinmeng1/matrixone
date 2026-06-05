@@ -116,6 +116,9 @@ func (n *AppendMVCCHandle) GetMaxVisibleRowLocked(
 
 func (n *AppendMVCCHandle) GetMinCommitTSLocked() types.TS {
 	var min types.TS
+	if n == nil || n.appends == nil {
+		return min
+	}
 	n.appends.ForEach(func(an *AppendNode) bool {
 		if !an.IsCommitted() {
 			return true
@@ -131,6 +134,9 @@ func (n *AppendMVCCHandle) GetMinCommitTSLocked() types.TS {
 
 func (n *AppendMVCCHandle) GetMaxCommitTSLocked() types.TS {
 	var max types.TS
+	if n == nil || n.appends == nil {
+		return max
+	}
 	n.appends.ForEach(func(an *AppendNode) bool {
 		if !an.IsCommitted() {
 			return true

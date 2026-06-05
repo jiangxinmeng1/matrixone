@@ -444,36 +444,52 @@ func foreachAobjBefore(_ context.Context,
 	// table.WaitDataObjectCommitted(ts)
 	// table.WaitTombstoneObjectCommitted(ts)
 	var ok bool
-	// some entries shared the same timestamp with end, so we need to seek to the next one
-	key := &catalog.ObjectEntry{EntryMVCCNode: catalog.EntryMVCCNode{DeletedAt: ts.Next()}}
-
 	data := table.MakeDataObjectIt()
 	defer data.Release()
-	if ok = data.Seek(key); !ok {
-		ok = data.Last()
-	}
+	ok = data.Last()
 	for ; ok; ok = data.Prev() {
 		item := data.Item()
-		// Any C entry created before the last checkpoint end time, break
-		if item.IsCEntry() && item.CreatedAt.LT(&lastCkp) {
+		if !item.IsAppendable() {
+			continue
+		}
+		if item.IsDEntry() {
+			continue
+		}
+		if item.HasDCounterpart() {
+			if item.CreatedAt.LT(&lastCkp) {
+				break
+			}
+			continue
+		}
+		if item.CreatedAt.LT(&lastCkp) {
 			break
 		}
-		if item.IsAppendable() && item.IsCEntry() && !item.HasDCounterpart() && item.CreatedAt.LE(&ts) {
+		if item.CreatedAt.LE(&ts) {
 			df(item)
 		}
 	}
 
 	tomb := table.MakeTombstoneObjectIt()
 	defer tomb.Release()
-	if ok = tomb.Seek(key); !ok {
-		ok = tomb.Last()
-	}
+	ok = tomb.Last()
 	for ; ok; ok = tomb.Prev() {
 		item := tomb.Item()
-		if item.IsCEntry() && item.CreatedAt.LT(&lastCkp) {
+		if !item.IsAppendable() {
+			continue
+		}
+		if item.IsDEntry() {
+			continue
+		}
+		if item.HasDCounterpart() {
+			if item.CreatedAt.LT(&lastCkp) {
+				break
+			}
+			continue
+		}
+		if item.CreatedAt.LT(&lastCkp) {
 			break
 		}
-		if item.IsAppendable() && item.IsCEntry() && !item.HasDCounterpart() && item.CreatedAt.LE(&ts) {
+		if item.CreatedAt.LE(&ts) {
 			tf(item)
 		}
 	}

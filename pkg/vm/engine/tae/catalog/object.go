@@ -207,8 +207,13 @@ func (entry *ObjectEntry) GetUpdateEntry(
 	dropped.GetObjectData().UpdateMeta(dropped)
 	if dropped.IsDEntry() { // Only in UT it can not be a D Entry
 		updatedCEntry = entry.prevVersion.Clone()
+		if minCommitTS := entry.prevVersion.GetMinCommitTS(); !minCommitTS.IsEmpty() {
+			dropped.CreatedAt = minCommitTS
+			updatedCEntry.CreatedAt = minCommitTS
+		}
 		updatedCEntry.nextVersion = dropped
 		dropped.prevVersion = updatedCEntry
+		dropped.GetObjectData().UpdateMeta(dropped)
 	}
 	if node.Txn != nil && txn.GetID() == node.Txn.GetID() {
 		return
@@ -457,19 +462,62 @@ func (entry *ObjectEntry) GetObjectStats() (stats *objectio.ObjectStats) {
 }
 
 func (entry *ObjectEntry) Less(b *ObjectEntry) bool {
-	t1 := entry.CreatedAt
-	if t1.LT(&entry.DeletedAt) {
-		t1 = entry.DeletedAt
-	}
-	t2 := b.CreatedAt
-	if t2.LT(&b.DeletedAt) {
-		t2 = b.DeletedAt
+	r1, t1 := entry.objectListRankAndTS()
+	r2, t2 := b.objectListRankAndTS()
+	if r1 != r2 {
+		return r1 < r2
 	}
 	if !t1.EQ(&t2) {
 		return t1.LT(&t2)
 	}
 
 	return bytes.Compare(entry.ObjectShortName()[:], b.ObjectShortName()[:]) < 0
+}
+
+func (entry *ObjectEntry) objectListRankAndTS() (rank int, ts types.TS) {
+	if !entry.IsCommitted() {
+		return 6, txnif.UncommitTS
+	}
+
+	if entry.IsAppendable() {
+		switch {
+		case entry.IsCEntry() && !entry.HasDCounterpart():
+			if !entry.DeletedAt.IsEmpty() {
+				return 2, entry.DeletedAt
+			}
+			ts = entry.GetMinCommitTS()
+			if ts.IsEmpty() {
+				ts = entry.CreatedAt
+			}
+			return 0, ts
+		case entry.IsCEntry():
+			if !entry.DeletedAt.IsEmpty() {
+				return 2, entry.DeletedAt
+			}
+			ts = entry.GetMinCommitTS()
+			if ts.IsEmpty() {
+				ts = entry.CreatedAt
+			}
+			return 1, ts
+		default:
+			return 2, entry.DeletedAt
+		}
+	}
+
+	switch {
+	case entry.IsCEntry() && !entry.HasDCounterpart():
+		if !entry.DeletedAt.IsEmpty() {
+			return 5, entry.DeletedAt
+		}
+		return 3, entry.CreatedAt
+	case entry.IsCEntry():
+		if !entry.DeletedAt.IsEmpty() {
+			return 5, entry.DeletedAt
+		}
+		return 4, entry.CreatedAt
+	default:
+		return 5, entry.DeletedAt
+	}
 }
 
 func (entry *ObjectEntry) UpdateObjectInfo(txn txnif.TxnReader, stats *objectio.ObjectStats) (isNewNode bool, err error) {

@@ -169,6 +169,10 @@ func NewFlushTableTailTask(
 	task.BaseTask = tasks.NewBaseTask(task, tasks.FlushTableTailTask, ctx)
 
 	for _, obj := range objs {
+		latest := obj.GetLatestNode()
+		if latest != obj || latest.HasDropIntent() || !latest.IsCEntry() || latest.HasDCounterpart() {
+			continue
+		}
 		task.scopes = append(task.scopes, *obj.AsCommonID())
 		var hdl handle.Object
 		hdl, err = rel.GetObject(obj.ID(), false)
@@ -199,6 +203,10 @@ func NewFlushTableTailTask(
 	task.tombstoneSchema = rel.Schema(true).(*catalog.Schema)
 
 	for _, obj := range tombStones {
+		latest := obj.GetLatestNode()
+		if latest != obj || latest.HasDropIntent() || !latest.IsCEntry() || latest.HasDCounterpart() {
+			continue
+		}
 		task.scopes = append(task.scopes, *obj.AsCommonID())
 		var hdl handle.Object
 		hdl, err = rel.GetObject(obj.ID(), true)
@@ -821,18 +829,22 @@ func (task *flushTableTailTask) flushAObjsForSnapshot(ctx context.Context, isTom
 		); err != nil {
 			return
 		}
-		if len(dataVers) == 0 {
-			// the new appendable block might has no data when we flush the table, just skip it
-			// In previous impl, runner will only pass non-empty obj to NewCompactBlackTask
-			continue
-		}
 		if len(dataVers) != 1 {
-			panic("logic err")
+			if len(dataVers) != 0 {
+				panic("logic err")
+			}
 		}
 		var dataVer *containers.BatchWithVersion
 		for _, data := range dataVers {
 			dataVer = data
 			break
+		}
+		if dataVer == nil {
+			schema := task.schema
+			if isTombstone {
+				schema = task.tombstoneSchema
+			}
+			dataVer = buildEmptyAObjBatchWithVersion(schema)
 		}
 
 		// do not close data, leave that to wait phase
@@ -865,6 +877,30 @@ func (task *flushTableTailTask) flushAObjsForSnapshot(ctx context.Context, isTom
 		}
 	}
 	return
+}
+
+func buildEmptyAObjBatchWithVersion(schema *catalog.Schema) *containers.BatchWithVersion {
+	attrs := schema.Attrs()
+	typs := schema.Types()
+	bat := containers.BuildBatch(attrs, typs, containers.Options{Allocator: common.MergeAllocator})
+	bat.AddVector(
+		objectio.TombstoneAttr_CommitTs_Attr,
+		containers.MakeVector(objectio.TSType, common.MergeAllocator),
+	)
+	seqnums := make([]uint16, 0, len(schema.ColDefs)+1)
+	for _, def := range schema.ColDefs {
+		if def.IsPhyAddr() {
+			continue
+		}
+		seqnums = append(seqnums, def.SeqNum)
+	}
+	seqnums = append(seqnums, objectio.SEQNUM_COMMITTS)
+	return &containers.BatchWithVersion{
+		Version:    schema.Version,
+		NextSeqnum: uint16(schema.Extra.NextColSeqnum),
+		Seqnums:    seqnums,
+		Batch:      bat,
+	}
 }
 
 // waitFlushAObjForSnapshot waits all io tasks about flushing aobject for snapshot read, update locations

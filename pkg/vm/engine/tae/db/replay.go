@@ -192,6 +192,11 @@ func (replayer *WalReplayer) postReplayWal() error {
 		if entry.IsAppendable() && entry.HasDropCommitted() {
 			err = entry.GetObjectData().TryUpgrade()
 		}
+		if entry.IsAppendable() && entry.IsCEntry() && !entry.HasDCounterpart() {
+			if minCommitTS := entry.GetMinCommitTS(); !minCommitTS.IsEmpty() {
+				entry.GetTable().UpdateObjectEntryCreatedAt(entry, minCommitTS)
+			}
+		}
 		return
 	}
 	return replayer.db.Catalog.RecurLoop(processor)

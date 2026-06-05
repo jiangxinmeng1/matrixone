@@ -253,18 +253,16 @@ func IsTableTailFlushed(table *TableEntry, start, end types.TS, isTombstone bool
 		it = table.MakeDataObjectIt()
 	}
 	earlybreak := false
-	// some entries shared the same timestamp with end, so we need to seek to the next one
-	key := &ObjectEntry{EntryMVCCNode: EntryMVCCNode{DeletedAt: end.Next()}}
-	var ok bool
-	if ok = it.Seek(key); !ok {
-		ok = it.Last()
-	}
+	ok := it.Last()
 	for ; ok; ok = it.Prev() {
 		if earlybreak {
 			break
 		}
 		obj := it.Item()
-		if !obj.IsAppendable() || obj.IsDEntry() || obj.CreatedAt.GT(&end) {
+		if !obj.IsAppendable() || obj.IsDEntry() {
+			continue
+		}
+		if obj.CreatedAt.GT(&end) {
 			continue
 		}
 		// check only appendable C entries
@@ -314,6 +312,14 @@ func (entry *TableEntry) UpdateReplayEntryTs(objectEntry *ObjectEntry, ts types.
 		entry.tombstoneObjects.UpdateReplayTs(objectEntry.ID(), ts)
 	} else {
 		entry.dataObjects.UpdateReplayTs(objectEntry.ID(), ts)
+	}
+}
+
+func (entry *TableEntry) UpdateObjectEntryCreatedAt(objectEntry *ObjectEntry, ts types.TS) {
+	if objectEntry.IsTombstone {
+		entry.tombstoneObjects.UpdateEntryCreatedAt(objectEntry, ts)
+	} else {
+		entry.dataObjects.UpdateEntryCreatedAt(objectEntry, ts)
 	}
 }
 

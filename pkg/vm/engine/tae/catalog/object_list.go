@@ -83,8 +83,8 @@ Committed Object ( LastestNode.Txn == nil ) && ( 0 < CreatedAt < MaxU64, 0 <= De
 type ObjectList struct {
 	isTombstone bool
 	sync.RWMutex
-	maxTs_objectID map[objectio.ObjectId]types.TS
-	tree           atomic.Pointer[btree.BTreeG[*ObjectEntry]]
+	latest_objectID map[objectio.ObjectId]*ObjectEntry
+	tree            atomic.Pointer[btree.BTreeG[*ObjectEntry]]
 }
 
 func NewObjectList(isTombstone bool) *ObjectList {
@@ -94,8 +94,8 @@ func NewObjectList(isTombstone bool) *ObjectList {
 	}
 	tree := btree.NewBTreeGOptions((*ObjectEntry).Less, opts)
 	list := &ObjectList{
-		maxTs_objectID: make(map[types.Objectid]types.TS),
-		isTombstone:    isTombstone,
+		latest_objectID: make(map[types.Objectid]*ObjectEntry),
+		isTombstone:     isTombstone,
 	}
 	list.tree.Store(tree)
 	return list
@@ -119,13 +119,9 @@ func getObjectEntry(it btree.IterG[*ObjectEntry], pivot *ObjectEntry) *ObjectEnt
 
 func (l *ObjectList) getNodes(id *objectio.ObjectId, latestOnly bool) []*ObjectEntry {
 	l.RLock()
-	ts, ok := l.maxTs_objectID[*id]
-	tree := l.tree.Load()
+	obj := l.latest_objectID[*id]
 	l.RUnlock()
-	if !ok {
-		return nil
-	}
-	return l.getNodesSnap(tree, ts, id, latestOnly)
+	return getNodesFromLatest(obj, latestOnly)
 }
 
 // getNodes returns the create and delete (if exists) entries of the object with the given objectID
@@ -160,6 +156,17 @@ func (l *ObjectList) getNodesSnap(
 	return ret
 }
 
+func getNodesFromLatest(obj *ObjectEntry, latestOnly bool) []*ObjectEntry {
+	if obj == nil {
+		return nil
+	}
+	ret := []*ObjectEntry{obj}
+	if !latestOnly && obj.prevVersion != nil {
+		ret = append(ret, obj.prevVersion)
+	}
+	return ret
+}
+
 func (l *ObjectList) GetLastestNode(id *objectio.ObjectId) *ObjectEntry {
 	nodes := l.getNodes(id, true)
 	if len(nodes) == 0 {
@@ -186,7 +193,8 @@ func (l *ObjectList) GetObjectByID(objectID *objectio.ObjectId) (obj *ObjectEntr
 func (l *ObjectList) UpdateReplayTs(id *objectio.ObjectId, ts types.TS) {
 	l.Lock()
 	defer l.Unlock()
-	l.maxTs_objectID[*id] = ts
+	_ = id
+	_ = ts
 }
 
 // 1. del\ins\updated should all belong to the same object
@@ -194,17 +202,13 @@ func (l *ObjectList) UpdateReplayTs(id *objectio.ObjectId, ts types.TS) {
 // 3. updated will be inserted into the tree, and the index map WON'T be updated. The Caller make sure the updated entry has the same sort key as the target entry.
 // 4. all operations are atomic from the view of the caller of modify
 func (l *ObjectList) modify(del, ins, updated *ObjectEntry) (deleted, replaced1, replaced2 bool) {
-	maxTs := ins.CreatedAt
-	if maxTs.LT(&ins.DeletedAt) {
-		maxTs = ins.DeletedAt
-	}
 	l.Lock()
 	defer l.Unlock()
-	l.maxTs_objectID[*ins.ID()] = maxTs
 
 	oldTree := l.tree.Load()
 	newTree := oldTree.Copy()
 
+	oldLatest := l.latest_objectID[*ins.ID()]
 	if del != nil {
 		if del.IsTombstone != l.isTombstone {
 			panic("logic error")
@@ -212,6 +216,13 @@ func (l *ObjectList) modify(del, ins, updated *ObjectEntry) (deleted, replaced1,
 		_, deleted = newTree.Delete(del)
 	}
 	if updated != nil {
+		if oldLatest != nil {
+			if oldLatest.IsCEntry() {
+				newTree.Delete(oldLatest)
+			} else if oldLatest.prevVersion != nil {
+				newTree.Delete(oldLatest.prevVersion)
+			}
+		}
 		_, replaced2 = newTree.Set(updated)
 	}
 	_, replaced1 = newTree.Set(ins)
@@ -219,7 +230,38 @@ func (l *ObjectList) modify(del, ins, updated *ObjectEntry) (deleted, replaced1,
 	if !ok {
 		panic("concurrent mutation")
 	}
+	l.latest_objectID[*ins.ID()] = ins
 	return
+}
+
+func (l *ObjectList) UpdateEntryCreatedAt(obj *ObjectEntry, createdAt types.TS) {
+	if obj == nil || obj.CreatedAt.EQ(&createdAt) {
+		return
+	}
+	l.Lock()
+	defer l.Unlock()
+
+	oldTree := l.tree.Load()
+	newTree := oldTree.Copy()
+	newTree.Delete(obj)
+
+	updated := obj.Clone()
+	updated.CreatedAt = createdAt
+	if updated.IsDEntry() {
+		updated.prevVersion = obj.prevVersion
+	} else if updated.HasDCounterpart() {
+		updated.nextVersion = obj.nextVersion
+	}
+	newTree.Set(updated)
+	l.latest_objectID[*updated.ID()] = updated
+
+	ok := l.tree.CompareAndSwap(oldTree, newTree)
+	if !ok {
+		panic("concurrent mutation")
+	}
+	if updated.GetObjectData() != nil {
+		updated.GetObjectData().UpdateMeta(updated)
+	}
 }
 
 // Set inserts a brand the objectstate, used in CreateObject
@@ -296,18 +338,18 @@ func (l *ObjectList) UpdateObjectInfo(
 func (l *ObjectList) DeleteAllEntries(id *objectio.ObjectId) error {
 	l.Lock()
 	defer l.Unlock()
-	ts, ok := l.maxTs_objectID[*id]
-	if !ok {
+	obj := l.latest_objectID[*id]
+	if obj == nil {
 		return nil
 	}
 	oldTree := l.tree.Load()
 	newTree := oldTree.Copy()
-	objs := l.getNodesSnap(newTree, ts, id, false)
+	objs := getNodesFromLatest(obj, false)
 	for _, obj := range objs {
 		newTree.Delete(obj)
-		delete(l.maxTs_objectID, *obj.ID())
 	}
-	ok = l.tree.CompareAndSwap(oldTree, newTree)
+	delete(l.latest_objectID, *id)
+	ok := l.tree.CompareAndSwap(oldTree, newTree)
 	if !ok {
 		panic("concurrent mutation")
 	}
@@ -428,9 +470,9 @@ func (l *ObjectList) Show() string {
 	for it.Next() {
 		ret += " " + it.Item().StringWithLevel(common.PPL2) + "\n"
 	}
-	ret += "maxTs_objectID:\n"
-	for id, ts := range l.maxTs_objectID {
-		ret += fmt.Sprintf(" %s: %s\n", id.ShortStringEx(), ts.ToString())
+	ret += "latest_objectID:\n"
+	for id, obj := range l.latest_objectID {
+		ret += fmt.Sprintf(" %s: %s\n", id.ShortStringEx(), obj.StringWithLevel(common.PPL1))
 	}
 	return ret
 }

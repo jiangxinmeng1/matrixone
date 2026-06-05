@@ -396,11 +396,17 @@ func (obj *aobject) GetRowsOnReplay() uint64 {
 func (obj *aobject) GetMinCommitTS() types.TS {
 	obj.RLock()
 	defer obj.RUnlock()
+	if obj.appendMVCC == nil {
+		return types.TS{}
+	}
 	return obj.appendMVCC.GetMinCommitTSLocked()
 }
 
 func (obj *aobject) GetMaxCommitTS() types.TS {
 	obj.RLock()
 	defer obj.RUnlock()
+	if obj.appendMVCC == nil {
+		return types.TS{}
+	}
 	return obj.appendMVCC.GetMaxCommitTSLocked()
 }
