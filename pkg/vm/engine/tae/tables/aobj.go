@@ -197,31 +197,22 @@ func (obj *aobject) GetDuplicatedRows(
 	node := obj.PinNode()
 	defer node.Unref()
 	if !node.IsPersisted() {
-		fn := func() (minv, maxv int32, err error) {
-			obj.RUnlock()
-			defer obj.RLock()
-			startTS := txn.GetStartTS()
-			if to.EQ(&startTS) {
-				var maxRow uint32
-				if maxRow, err = obj.appendMVCC.GetMaxVisibleRowLocked(ctx, txn); err != nil {
-					return
-				}
-				maxv = int32(maxRow)
-			} else {
-				if maxv, err = obj.GetMaxRowByTS(to); err != nil {
-					return
-				}
-			}
-			minv, err = obj.GetMaxRowByTS(from)
-			return
+		obj.RLock()
+		neededRows, commitTSVec, err := obj.appendMVCC.BuildDedupRowBitmapLocked(from, to, txn.GetStartTS())
+		obj.RUnlock()
+		if commitTSVec != nil {
+			defer commitTSVec.Close()
 		}
-		return node.GetDuplicatedRows(
+		if err != nil {
+			return err
+		}
+		return node.MustMNode().GetDuplicatedRowsWithBitmap(
 			ctx,
 			txn,
-			fn,
 			keys,
 			keysZM,
 			rowIDs,
+			neededRows,
 			mp,
 		)
 	} else {

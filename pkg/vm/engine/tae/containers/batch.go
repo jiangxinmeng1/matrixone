@@ -223,6 +223,27 @@ func (bat *Batch) CloneWindow(offset, length int, allocator ...*mpool.MPool) (cl
 	return
 }
 
+func (bat *Batch) CloneWindowWithBitmap(mask *nulls.Bitmap, allocator *mpool.MPool) (cloned *Batch) {
+	cloned = new(Batch)
+	cloned.Attrs = make([]string, len(bat.Attrs))
+	copy(cloned.Attrs, bat.Attrs)
+	cloned.Nameidx = make(map[string]int, len(bat.Nameidx))
+	for k, v := range bat.Nameidx {
+		cloned.Nameidx[k] = v
+	}
+	cloned.Vecs = make([]Vector, len(bat.Vecs))
+	for i, vec := range bat.Vecs {
+		cloned.Vecs[i] = MakeVector(*vec.GetType(), allocator)
+	}
+	mask.Foreach(func(row uint64) bool {
+		for i, vec := range bat.Vecs {
+			cloned.Vecs[i].Append(vec.Get(int(row)), vec.IsNull(int(row)))
+		}
+		return true
+	})
+	return
+}
+
 func (bat *Batch) String() string {
 	return bat.PPString(10)
 }

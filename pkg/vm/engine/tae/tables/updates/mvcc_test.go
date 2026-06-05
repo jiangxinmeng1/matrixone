@@ -23,6 +23,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
 	"github.com/stretchr/testify/assert"
 )
@@ -136,4 +137,78 @@ func TestGetVisibleRow(t *testing.T) {
 	assert.True(t, visible)
 	assert.Equal(t, 0, holes.GetCardinality())
 
+}
+
+func TestAppendMVCCReorderByPrepareTSAfterPrepareCommit(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	schema := catalog.MockSchema(1, 0)
+	c := catalog.MockCatalog(nil)
+	defer c.Close()
+	db, _ := c.CreateDBEntry("db", "", "", nil)
+	table, _ := db.CreateTableEntry(schema, nil, nil)
+	noid := objectio.NewObjectid()
+	stats := objectio.NewObjectStatsWithObjectID(&noid, true, false, false)
+	obj, _ := table.CreateObject(nil, &objectio.CreateObjOpt{Stats: stats}, nil)
+	n := NewAppendMVCCHandle(obj)
+
+	txn1 := MockTxnWithStartTS(types.BuildTS(10, 0))
+	txn2 := MockTxnWithStartTS(types.BuildTS(20, 0))
+	an1, created := n.AddAppendNodeLocked(txn1, 0, 1)
+	assert.True(t, created)
+	an2, created := n.AddAppendNodeLocked(txn2, 1, 2)
+	assert.True(t, created)
+	assert.Equal(t, an1, n.appends.MVCC[0])
+	assert.Equal(t, an2, n.appends.MVCC[1])
+
+	txn1.PrepareTS = types.BuildTS(200, 0)
+	txn2.PrepareTS = types.BuildTS(100, 0)
+	assert.NoError(t, an1.PrepareCommit())
+	assert.NoError(t, an2.PrepareCommit())
+
+	assert.Equal(t, an2, n.appends.MVCC[0])
+	assert.Equal(t, an1, n.appends.MVCC[1])
+	_, node := n.appends.GetNodeToReadByPrepareTS(types.BuildTS(150, 0))
+	assert.Equal(t, an2, node)
+	_, node = n.appends.GetNodeToReadByPrepareTS(types.BuildTS(250, 0))
+	assert.Equal(t, an1, node)
+}
+
+func TestCollectAppendLockedMarksAbortRowsForSkip(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	schema := catalog.MockSchema(1, 0)
+	c := catalog.MockCatalog(nil)
+	defer c.Close()
+	db, _ := c.CreateDBEntry("db", "", "", nil)
+	table, _ := db.CreateTableEntry(schema, nil, nil)
+	noid := objectio.NewObjectid()
+	stats := objectio.NewObjectStatsWithObjectID(&noid, true, false, false)
+	obj, _ := table.CreateObject(nil, &objectio.CreateObjOpt{Stats: stats}, nil)
+	n := NewAppendMVCCHandle(obj)
+
+	an1, _ := n.AddAppendNodeLocked(nil, 0, 1)
+	an1.Start = types.BuildTS(1, 0)
+	an1.Prepare = types.BuildTS(10, 0)
+	an1.End = types.BuildTS(10, 0)
+	an2, _ := n.AddAppendNodeLocked(nil, 1, 2)
+	an2.Start = types.BuildTS(2, 0)
+	an2.Prepare = types.BuildTS(20, 0)
+	an2.End = types.BuildTS(20, 0)
+	an2.Aborted = true
+
+	n.RLock()
+	rowMask, commitTSVec, abortVec := n.CollectAppendLocked(
+		types.BuildTS(1, 0),
+		types.BuildTS(30, 0),
+		common.DebugAllocator,
+	)
+	n.RUnlock()
+	defer commitTSVec.Close()
+	defer abortVec.Close()
+
+	assert.True(t, rowMask.Contains(0))
+	assert.True(t, rowMask.Contains(1))
+	assert.Equal(t, 2, commitTSVec.Length())
+	assert.Equal(t, 2, abortVec.Length())
+	assert.False(t, abortVec.Get(0).(bool))
+	assert.True(t, abortVec.Get(1).(bool))
 }

@@ -138,6 +138,7 @@ func parseNAContainsArgs(args ...any) (vec *vector.Vector, rowIDs containers.Vec
 func parseAGetDuplicateRowIDsArgs(args ...any) (
 	vec containers.Vector, rowIDs containers.Vector, blkID types.Blockid,
 	scanFn func(uint16) (vec containers.Vector, err error), txn txnif.TxnReader, from, to types.TS,
+	neededRows *nulls.Bitmap,
 ) {
 	vec = args[0].(containers.Vector)
 	if args[1] != nil {
@@ -157,6 +158,9 @@ func parseAGetDuplicateRowIDsArgs(args ...any) (
 	}
 	if args[6] != nil {
 		to = args[6].(types.TS)
+	}
+	if len(args) > 7 && args[7] != nil {
+		neededRows = args[7].(*nulls.Bitmap)
 	}
 	return
 }
@@ -266,7 +270,7 @@ func getDuplicatedRowIDNABlkOrderedFunc[T types.OrderedT](args ...any) func(T, b
 }
 
 func getDuplicatedRowIDABlkBytesFunc(args ...any) func([]byte, bool, int) error {
-	vec, rowIDs, blkID, scanFn, txn, from, to := parseAGetDuplicateRowIDsArgs(args...)
+	vec, rowIDs, blkID, scanFn, txn, from, to, neededRows := parseAGetDuplicateRowIDsArgs(args...)
 	return func(v1 []byte, _ bool, rowOffset int) error {
 		if !rowIDs.IsNull(rowOffset) {
 			return nil
@@ -286,6 +290,9 @@ func getDuplicatedRowIDABlkBytesFunc(args ...any) func([]byte, bool, int) error 
 			func(v2 []byte, _ bool, row int) (err error) {
 				// logutil.Infof("row=%d,v1=%v,v2=%v", row, v1, v2)
 				if !rowIDs.IsNull(rowOffset) {
+					return nil
+				}
+				if neededRows != nil && !neededRows.Contains(uint64(row)) {
 					return nil
 				}
 				if compute.CompareBytes(v1, v2) != 0 {
@@ -322,7 +329,7 @@ func getDuplicatedRowIDABlkBytesFunc(args ...any) func([]byte, bool, int) error 
 
 func getDuplicatedRowIDABlkFuncFactory[T types.FixedSizeT](comp func(T, T) int) func(args ...any) func(T, bool, int) error {
 	return func(args ...any) func(T, bool, int) error {
-		vec, rowIDs, blkID, scanFn, txn, from, to := parseAGetDuplicateRowIDsArgs(args...)
+		vec, rowIDs, blkID, scanFn, txn, from, to, neededRows := parseAGetDuplicateRowIDsArgs(args...)
 		return func(v1 T, _ bool, rowOffset int) error {
 			if !rowIDs.IsNull(rowOffset) {
 				return nil
@@ -341,6 +348,9 @@ func getDuplicatedRowIDABlkFuncFactory[T types.FixedSizeT](comp func(T, T) int) 
 				true,
 				func(v2 T, _ bool, row int) (err error) {
 					if !rowIDs.IsNull(rowOffset) {
+						return nil
+					}
+					if neededRows != nil && !neededRows.Contains(uint64(row)) {
 						return nil
 					}
 					if comp(v1, v2) != 0 {

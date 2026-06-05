@@ -193,6 +193,37 @@ func (obj *baseObject) LoadPersistedCommitTS(bid uint16) (vec containers.Vector,
 	return
 }
 
+func (obj *baseObject) LoadPersistedAbortVec(bid uint16) (vec containers.Vector, err error) {
+	if !obj.meta.Load().IsAppendable() {
+		panic("not support")
+	}
+	location, err := obj.buildMetalocation(bid)
+	if err != nil {
+		return
+	}
+	if location.IsEmpty() {
+		return
+	}
+	vectors, _, err := ioutil.LoadColumns2(
+		context.Background(),
+		[]uint16{objectio.SEQNUM_ABORT},
+		nil,
+		obj.rt.Fs,
+		location,
+		fileservice.Policy(0),
+		true,
+		obj.rt.VectorPool.Transient,
+	)
+	if err != nil {
+		return nil, nil
+	}
+	if vectors[0].GetType().Oid != types.T_bool {
+		panic(fmt.Sprintf("%s: bad abort layout", obj.meta.Load().ID().String()))
+	}
+	vec = vectors[0]
+	return
+}
+
 // func (obj *baseObject) LoadPersistedColumnData(
 // 	ctx context.Context, schema *catalog.Schema, colIdx int, mp *mpool.MPool, blkID uint16,
 // ) (vec containers.Vector, err error) {
@@ -240,6 +271,53 @@ func (obj *baseObject) ResolvePersistedColumnData(
 	return
 }
 
+func (obj *baseObject) buildPersistedDedupRowBitmap(
+	blkOffset uint16,
+	txn txnif.TxnReader,
+	from, to types.TS,
+) (neededRows *nulls.Bitmap, err error) {
+	commitTSVec, err := obj.LoadPersistedCommitTS(blkOffset)
+	if err != nil {
+		return
+	}
+	if commitTSVec == nil {
+		return nulls.NewWithSize(0), nil
+	}
+	defer commitTSVec.Close()
+
+	abortVec, err := obj.LoadPersistedAbortVec(blkOffset)
+	if err != nil {
+		return
+	}
+	if abortVec != nil {
+		defer abortVec.Close()
+	}
+
+	neededRows = nulls.NewWithSize(commitTSVec.Length())
+	startTS := txn.GetStartTS()
+	for row := 0; row < commitTSVec.Length(); row++ {
+		if abortVec != nil && abortVec.Get(row).(bool) {
+			continue
+		}
+		commitTS, ok := commitTSVec.Get(row).(types.TS)
+		if !ok || commitTS.IsEmpty() {
+			continue
+		}
+		if !from.IsEmpty() && commitTS.LE(&from) {
+			continue
+		}
+		if commitTS.GT(&to) {
+			continue
+		}
+		if commitTS.GT(&startTS) {
+			err = txnif.ErrTxnWWConflict
+			return
+		}
+		neededRows.Add(uint64(row))
+	}
+	return
+}
+
 func (obj *baseObject) getDuplicateRowsWithLoad(
 	ctx context.Context,
 	txn txnif.TxnReader,
@@ -249,6 +327,7 @@ func (obj *baseObject) getDuplicateRowsWithLoad(
 	blkOffset uint16,
 	isAblk bool,
 	from, to types.TS,
+	neededRows *nulls.Bitmap,
 	mp *mpool.MPool,
 ) (err error) {
 	schema := obj.meta.Load().GetSchema()
@@ -277,6 +356,7 @@ func (obj *baseObject) getDuplicateRowsWithLoad(
 			obj.LoadPersistedCommitTS,
 			txn,
 			from, to,
+			neededRows,
 		)
 	} else {
 		dedupFn = containers.MakeForeachVectorOp(
@@ -405,8 +485,18 @@ func (obj *baseObject) persistedGetDuplicatedRows(
 		if err == nil || !moerr.IsMoErrCode(err, moerr.OkExpectedPossibleDup) {
 			continue
 		}
+		var neededRows *nulls.Bitmap
+		if isAblk {
+			neededRows, err = obj.buildPersistedDedupRowBitmap(uint16(i), txn, from, to)
+			if err != nil {
+				return err
+			}
+			if neededRows != nil && neededRows.IsEmpty() {
+				continue
+			}
+		}
 		err = obj.getDuplicateRowsWithLoad(
-			ctx, txn, keys, sels, rowIDs, uint16(i), isAblk, from, to, mp)
+			ctx, txn, keys, sels, rowIDs, uint16(i), isAblk, from, to, neededRows, mp)
 		if err != nil {
 			return err
 		}

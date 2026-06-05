@@ -128,6 +128,9 @@ func (node *AppendNode) PrepareCommit() error {
 	node.mvcc.Lock()
 	defer node.mvcc.Unlock()
 	_, err := node.TxnMVCCNode.PrepareCommit()
+	if err == nil {
+		node.mvcc.ReorderAppendsByPrepareTSLocked()
+	}
 	return err
 }
 
@@ -213,7 +216,7 @@ func (node *AppendNode) ReadFrom(r io.Reader) (n int64, err error) {
 func (node *AppendNode) PrepareRollback() (err error) {
 	node.mvcc.Lock()
 	defer node.mvcc.Unlock()
-	node.mvcc.DeleteAppendNodeLocked(node)
+	err = node.TxnMVCCNode.PrepareRollback()
 	return
 }
 func (node *AppendNode) MakeCommand(id uint32) (cmd txnif.TxnCmd, err error) {

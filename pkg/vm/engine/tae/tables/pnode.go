@@ -141,6 +141,8 @@ func (node *persistedNode) Scan(
 					replaceCommitts(vecs, i)
 				}
 				/// TODO: Read old version of nonappendable block?
+			} else if idx == objectio.SEQNUM_ABORT {
+				attr = objectio.TombstoneAttr_Abort_Attr
 			} else {
 				attr = readSchema.ColDefs[idx].Name
 			}
@@ -175,6 +177,8 @@ func (node *persistedNode) Scan(
 				if vecs[i].IsConstNull() {
 					replaceCommitts(vecs, i)
 				}
+			} else if idx == objectio.SEQNUM_ABORT {
+				attr = objectio.TombstoneAttr_Abort_Attr
 			} else {
 				attr = readSchema.ColDefs[idx].Name
 			}

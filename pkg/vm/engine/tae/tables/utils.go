@@ -72,6 +72,11 @@ func LoadPersistedColumnData(
 			assignedCommitts = true
 			continue
 		}
+		if colIdx == objectio.SEQNUM_ABORT {
+			cols = append(cols, objectio.SEQNUM_ABORT)
+			typs = append(typs, types.T_bool.ToType())
+			continue
+		}
 		def := schema.ColDefs[colIdx]
 		if def.IsPhyAddr() {
 			vec, err := PreparePhyAddrData(&id.BlockID, 0, location.Rows(), rt.VectorPool.Transient)

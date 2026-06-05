@@ -230,31 +230,34 @@ func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers
 		common.WorkspaceAllocator,
 	)
 
-	var earlybreak bool
-	for ok := objIt.Last(); ok; ok = objIt.Prev() {
-		if earlybreak {
-			break
-		}
+	for ok := objIt.Last(); ok; {
 		obj := objIt.Item()
+		rank, entryTS := obj.ObjectListRankAndTS()
 
-		if obj.CreatedAt.GT(&to) {
-			continue
-		}
-
-		if obj.IsAppendable() {
-			if !obj.HasDropIntent() && obj.CreatedAt.LT(&from) {
-				earlybreak = true
+		if rank == 2 || rank == 5 {
+			if entryTS.LT(&from) {
+				ok = objIt.Prev()
+				continue
 			}
-		} else if obj.CreatedAt.LT(&from) {
+		}
+
+		if rank == 1 || rank == 4 {
+			for ok = objIt.Prev(); ok; ok = objIt.Prev() {
+				nextRank, _ := objIt.Item().ObjectListRankAndTS()
+				if nextRank != rank {
+					break
+				}
+			}
 			continue
 		}
 
-		// only keep the category-a + category-c for candidates.
-		if obj.GetPrevVersion() == nil && obj.GetNextVersion() != nil {
+		if (rank == 0 || rank == 3) && entryTS.GT(&to) {
+			ok = objIt.Prev()
 			continue
 		}
 
 		if !obj.VisibleByTS(to) {
+			ok = objIt.Prev()
 			continue
 		}
 		objData := obj.GetObjectData()
@@ -270,6 +273,7 @@ func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers
 		if err != nil {
 			return
 		}
+		ok = objIt.Prev()
 	}
 	// s := ""
 	// for _, v := range candidates {

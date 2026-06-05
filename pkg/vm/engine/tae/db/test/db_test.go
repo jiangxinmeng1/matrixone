@@ -10652,6 +10652,43 @@ func TestTransferDeletes(t *testing.T) {
 	})
 	assert.NoError(t, txn.Commit(ctx))
 	wg.Wait()
+
+	txn3, rel := tae.GetRelation()
+	testutil.CheckAllColRowsByScan(t, rel, 1, true)
+	assert.NoError(t, txn3.Commit(ctx))
+}
+
+func TestTransferDeletesPersistedTombstoneUsesStatsPath(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	testutils.EnsureNoLeak(t)
+	ctx := context.Background()
+
+	opts := config.WithLongScanAndCKPOpts(nil)
+	tae := testutil.NewTestEngine(ctx, ModuleName, t, opts)
+	defer tae.Close()
+
+	schema := catalog.MockSchema(2, 0)
+	schema.Extra.BlockMaxRows = 10
+	schema.Extra.ObjectMaxBlocks = 10
+	tae.BindSchema(schema)
+	bat := catalog.MockBatch(schema, 2)
+	defer bat.Close()
+	tae.CreateRelAndAppend(bat, true)
+	tae.CompactBlocks(true)
+
+	txn, rel := tae.GetRelation()
+	v := bat.Vecs[schema.GetSingleSortKeyIdx()].Get(0)
+	ok, err := tae.TryDeleteByDeltalocWithTxn([]any{v}, txn)
+	assert.True(t, ok)
+	assert.NoError(t, err)
+	assert.NoError(t, txn.Commit(ctx))
+
+	txn, rel = tae.GetRelation()
+	testutil.CheckAllColRowsByScan(t, rel, 1, true)
+	filter := handle.NewEQFilter(v)
+	_, _, err = rel.GetByFilter(ctx, filter)
+	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrNotFound))
+	assert.NoError(t, txn.Commit(ctx))
 }
 
 // TestTransferDeleteVectorRealloc verifies that TransferDeletes Part 2

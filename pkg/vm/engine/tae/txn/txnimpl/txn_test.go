@@ -29,7 +29,9 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/wal"
@@ -566,6 +568,197 @@ func TestSharedAppendPrepareDoesNotLogObjectCreateEntry(t *testing.T) {
 	assert.Zero(t, objectEntries)
 	assert.Positive(t, appendNodes)
 	assert.NoError(t, txn.Commit(ctx))
+}
+
+func TestConcurrentFreezeAllocatesDisjointAppendRanges(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	ctx := context.Background()
+	testutils.EnsureNoLeak(t)
+	dir := testutils.InitTestEnv(ModuleName, t)
+	c, mgr, driver := initTestContext(ctx, t, dir)
+	defer driver.Close()
+	defer c.Close()
+	defer mgr.Stop()
+
+	schema := catalog.MockSchema(2, -1)
+	schema.Extra.BlockMaxRows = 1000
+	createTxn, _ := mgr.StartTxn(nil)
+	db, _ := createTxn.CreateDatabase("db", "", "")
+	rel, _ := db.CreateRelation(schema)
+	dbID := db.GetID()
+	relID := rel.ID()
+	require.NoError(t, createTxn.Commit(ctx))
+
+	const txnCnt = 8
+	const rowsPerTxn = 10
+	txns := make([]txnif.AsyncTxn, txnCnt)
+	tables := make([]*txnTable, txnCnt)
+	for i := range txns {
+		txn, _ := mgr.StartTxn(nil)
+		database, _ := txn.GetDatabase("db")
+		relation, _ := database.GetRelationByID(relID)
+		bat := catalog.MockBatch(schema, rowsPerTxn)
+		defer bat.Close()
+		require.NoError(t, relation.Append(ctx, bat))
+		txnDB, _ := txn.GetStore().(*txnStore).getOrSetDB(dbID)
+		tbl, _ := txnDB.getOrSetTable(relID)
+		txns[i] = txn
+		tables[i] = tbl
+	}
+
+	var wg sync.WaitGroup
+	for _, txn := range txns {
+		wg.Add(1)
+		go func(txn txnif.AsyncTxn) {
+			defer wg.Done()
+			require.NoError(t, txn.Freeze(ctx))
+		}(txn)
+	}
+	wg.Wait()
+
+	seenRows := make(map[uint32]struct{})
+	for _, tbl := range tables {
+		for _, entry := range tbl.txnEntries.entries {
+			anode, ok := entry.(txnif.AppendNode)
+			if !ok || anode.IsTombstone() {
+				continue
+			}
+			require.Equal(t, uint32(rowsPerTxn), anode.GetMaxRow()-anode.GetStartRow())
+			for row := anode.GetStartRow(); row < anode.GetMaxRow(); row++ {
+				require.NotContains(t, seenRows, row)
+				seenRows[row] = struct{}{}
+			}
+		}
+	}
+	require.Len(t, seenRows, txnCnt*rowsPerTxn)
+
+	for _, txn := range txns {
+		require.NoError(t, txn.Rollback(ctx))
+	}
+}
+
+func TestFreezeAllocatedAppendNodeRollbackAfterPrePrepareConflict(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	ctx := context.Background()
+	testutils.EnsureNoLeak(t)
+	dir := testutils.InitTestEnv(ModuleName, t)
+	c, mgr, driver := initTestContext(ctx, t, dir)
+	defer driver.Close()
+	defer c.Close()
+	defer mgr.Stop()
+
+	schema := catalog.MockSchema(2, 0)
+	schema.Extra.BlockMaxRows = 100
+	createTxn, _ := mgr.StartTxn(nil)
+	db, _ := createTxn.CreateDatabase("db", "", "")
+	rel, _ := db.CreateRelation(schema)
+	dbID := db.GetID()
+	relID := rel.ID()
+	require.NoError(t, createTxn.Commit(ctx))
+
+	bat := catalog.MockBatch(schema, 1)
+	defer bat.Close()
+
+	txnA, _ := mgr.StartTxn(nil)
+	dbA, _ := txnA.GetDatabase("db")
+	relA, _ := dbA.GetRelationByID(relID)
+	require.NoError(t, relA.Append(ctx, bat))
+	require.NoError(t, txnA.Freeze(ctx))
+	txnDBA, _ := txnA.GetStore().(*txnStore).getOrSetDB(dbID)
+	tblA, _ := txnDBA.getOrSetTable(relID)
+	require.Len(t, collectAppendNodes(tblA, false), 1)
+
+	txnB, _ := mgr.StartTxn(nil)
+	dbB, _ := txnB.GetDatabase("db")
+	relB, _ := dbB.GetRelationByID(relID)
+	require.NoError(t, relB.Append(ctx, bat))
+	require.NoError(t, txnB.Commit(ctx))
+
+	anodes := collectAppendNodes(tblA, false)
+	require.Error(t, txnA.PrePrepare(ctx))
+	require.NoError(t, txnA.PrepareRollback())
+	for _, anode := range anodes {
+		require.True(t, anode.IsAborted())
+	}
+	require.NoError(t, txnA.ApplyRollback())
+
+	txnRead, _ := mgr.StartTxn(nil)
+	dbRead, _ := txnRead.GetDatabase("db")
+	relRead, _ := dbRead.GetRelationByID(relID)
+	checkAllColRowsByScanInTxnImpl(t, relRead, 1, true)
+	require.NoError(t, txnRead.Commit(ctx))
+}
+
+func TestCommitFlowWithFreezePrepareApplyWritesData(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	ctx := context.Background()
+	testutils.EnsureNoLeak(t)
+	dir := testutils.InitTestEnv(ModuleName, t)
+	c, mgr, driver := initTestContext(ctx, t, dir)
+	defer driver.Close()
+	defer c.Close()
+	defer mgr.Stop()
+
+	schema := catalog.MockSchema(2, 0)
+	schema.Extra.BlockMaxRows = 100
+	createTxn, _ := mgr.StartTxn(nil)
+	db, _ := createTxn.CreateDatabase("db", "", "")
+	rel, _ := db.CreateRelation(schema)
+	relID := rel.ID()
+	require.NoError(t, createTxn.Commit(ctx))
+
+	txn, _ := mgr.StartTxn(nil)
+	database, _ := txn.GetDatabase("db")
+	relation, _ := database.GetRelationByID(relID)
+	bat := catalog.MockBatch(schema, 10)
+	defer bat.Close()
+	require.NoError(t, relation.Append(ctx, bat))
+	require.NoError(t, txn.Commit(ctx))
+
+	readTxn, _ := mgr.StartTxn(nil)
+	readDB, _ := readTxn.GetDatabase("db")
+	readRel, _ := readDB.GetRelationByID(relID)
+	checkAllColRowsByScanInTxnImpl(t, readRel, 10, true)
+	require.NoError(t, readTxn.Commit(ctx))
+}
+
+func checkAllColRowsByScanInTxnImpl(t *testing.T, rel handle.Relation, expectRows int, applyDelete bool) {
+	schema := rel.Schema(false).(*catalog.Schema)
+	for _, def := range schema.ColDefs {
+		rows := 0
+		it := rel.MakeObjectIt(false)
+		for it.Next() {
+			obj := it.GetObject()
+			meta := obj.GetMeta().(*catalog.ObjectEntry)
+			for blk := uint16(0); blk < uint16(meta.BlockCnt()); blk++ {
+				var view *containers.Batch
+				require.NoError(t, obj.HybridScan(context.Background(), &view, blk, []int{def.Idx}, common.DebugAllocator))
+				if view == nil {
+					continue
+				}
+				if applyDelete {
+					view.Compact()
+				}
+				rows += view.Length()
+				view.Close()
+			}
+		}
+		require.Equal(t, expectRows, rows)
+	}
+}
+
+func collectAppendNodes(tbl *txnTable, isTombstone bool) []txnif.AppendNode {
+	nodes := make([]txnif.AppendNode, 0)
+	if tbl == nil || tbl.txnEntries == nil {
+		return nodes
+	}
+	for _, entry := range tbl.txnEntries.entries {
+		anode, ok := entry.(txnif.AppendNode)
+		if ok && anode.IsTombstone() == isTombstone {
+			nodes = append(nodes, anode)
+		}
+	}
+	return nodes
 }
 
 func TestReplayAppendDataCreatesAndReusesSharedAObject(t *testing.T) {

@@ -20,6 +20,7 @@ import (
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
@@ -194,6 +195,58 @@ func (idx *MutIndex) GetDuplicatedRows(
 		}
 		rowID := objectio.NewRowid(blkID, maxRow)
 		containers.UpdateValue(rowIDs, uint32(offset), rowID, false, mp)
+		return nil
+	}
+	if err = containers.ForeachWindowBytes(keys, 0, keys.Length(), op, nil); err != nil {
+		return
+	}
+	return
+}
+
+func (idx *MutIndex) GetDuplicatedRowsWithBitmap(
+	ctx context.Context,
+	keys *vector.Vector,
+	keysZM index.ZM,
+	blkID *types.Blockid,
+	rowIDs *vector.Vector,
+	neededRows *nulls.Bitmap,
+	skipFn func(row uint32) error,
+	mp *mpool.MPool,
+) (err error) {
+	if neededRows == nil || neededRows.IsEmpty() {
+		return nil
+	}
+	if keysZM.Valid() {
+		if exist := idx.zonemap.FastIntersect(keysZM); !exist {
+			return
+		}
+	} else {
+		if exist := idx.zonemap.FastContainsAny(keys); !exist {
+			return
+		}
+	}
+	op := func(v []byte, _ bool, offset int) error {
+		if !rowIDs.IsNull(uint64(offset)) {
+			return nil
+		}
+		rows, err := idx.art.Search(v)
+		if err == index.ErrNotFound {
+			return nil
+		}
+		for i := len(rows) - 1; i >= 0; i-- {
+			row := rows[i]
+			if !neededRows.Contains(uint64(row)) {
+				continue
+			}
+			if skipFn != nil {
+				if err = skipFn(row); err != nil {
+					return err
+				}
+			}
+			rowID := objectio.NewRowid(blkID, row)
+			containers.UpdateValue(rowIDs, uint32(offset), rowID, false, mp)
+			return nil
+		}
 		return nil
 	}
 	if err = containers.ForeachWindowBytes(keys, 0, keys.Length(), op, nil); err != nil {

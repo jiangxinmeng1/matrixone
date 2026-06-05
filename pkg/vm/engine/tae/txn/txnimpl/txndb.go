@@ -487,6 +487,11 @@ func (db *txnDB) Freeze(ctx context.Context) (err error) {
 		}
 		v2.TxnTNAppendDeduplicateDurationHistogram.Observe(time.Since(now).Seconds())
 	}
+	for _, table := range db.tables {
+		if err = table.PrePrepare(); err != nil {
+			return
+		}
+	}
 	return
 }
 
@@ -530,11 +535,6 @@ func (db *txnDB) PrePrepare(ctx context.Context) (err error) {
 		)
 	}
 
-	for _, table := range db.tables {
-		if err = table.PrePrepare(); err != nil {
-			return
-		}
-	}
 	return
 }
 

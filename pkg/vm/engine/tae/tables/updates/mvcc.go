@@ -16,6 +16,7 @@ package updates
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"unsafe"
 
@@ -151,18 +152,13 @@ func (n *AppendMVCCHandle) GetMaxCommitTSLocked() types.TS {
 }
 
 // it collects all append nodes in the range [start, end]
-// minRow: is the min row
-// maxRow: is the max row
-// commitTSVec: is the commit ts vector
-// abortVec: is the abort vector
-// aborts: is the aborted bitmap
-// If checkCommit, it ignore all uncommitted nodes
+// rowMask contains rows from all collected nodes, including aborted rows.
+// commitTSVec and abortVec are aligned with rowMask iteration order.
 func (n *AppendMVCCHandle) CollectAppendLocked(
 	start, end types.TS, mp *mpool.MPool,
 ) (
-	minRow, maxRow uint32,
+	rowMask *nulls.Bitmap,
 	commitTSVec, abortVec containers.Vector,
-	aborts *nulls.Bitmap,
 ) {
 	startOffset, node := n.appends.GetNodeToReadByPrepareTS(start)
 	if node != nil {
@@ -175,10 +171,19 @@ func (n *AppendMVCCHandle) CollectAppendLocked(
 	if node == nil || startOffset > endOffset {
 		return
 	}
-	minRow = n.appends.GetNodeByOffset(startOffset).startRow
-	maxRow = node.maxRow
 
-	aborts = &nulls.Bitmap{}
+	maxRow := uint32(0)
+	n.appends.LoopOffsetRange(
+		startOffset,
+		endOffset,
+		func(node *AppendNode) bool {
+			if node.maxRow > maxRow {
+				maxRow = node.maxRow
+			}
+			return true
+		})
+
+	rowMask = nulls.NewWithSize(int(maxRow))
 	commitTSVec = containers.MakeVector(types.T_TS.ToType(), mp)
 	abortVec = containers.MakeVector(types.T_bool.ToType(), mp)
 	n.appends.LoopOffsetRange(
@@ -191,9 +196,7 @@ func (n *AppendMVCCHandle) CollectAppendLocked(
 				txn.GetTxnState(true)
 				n.RLock()
 			}
-			if node.IsAborted() {
-				aborts.AddRange(uint64(node.startRow), uint64(node.maxRow))
-			}
+			rowMask.AddRange(uint64(node.startRow), uint64(node.maxRow))
 			for i := 0; i < int(node.maxRow-node.startRow); i++ {
 				commitTSVec.Append(node.GetCommitTS(), false)
 				abortVec.Append(node.IsAborted(), false)
@@ -235,6 +238,70 @@ func (n *AppendMVCCHandle) GetCommitTSVecInRange(start, end types.TS, mp *mpool.
 		},
 		true)
 	return commitTSVec
+}
+
+func (n *AppendMVCCHandle) BuildDedupRowBitmapLocked(
+	from, to, startTS types.TS,
+) (neededRows *nulls.Bitmap, commitTSVec containers.Vector, err error) {
+	neededRows = &nulls.Bitmap{}
+	if n == nil || n.appends == nil || n.appends.IsEmpty() {
+		return
+	}
+
+	anToWait := make([]*AppendNode, 0)
+	txnToWait := make([]txnif.TxnReader, 0)
+	n.appends.ForEach(func(an *AppendNode) bool {
+		needWait, waitTxn := an.NeedWaitCommitting(startTS)
+		if needWait {
+			anToWait = append(anToWait, an)
+			txnToWait = append(txnToWait, waitTxn)
+		}
+		return true
+	}, true)
+
+	if len(anToWait) != 0 {
+		n.RUnlock()
+		for _, txn := range txnToWait {
+			txn.GetTxnState(true)
+		}
+		n.RLock()
+	}
+
+	maxRow := uint32(0)
+	n.appends.ForEach(func(an *AppendNode) bool {
+		if an.maxRow > maxRow {
+			maxRow = an.maxRow
+		}
+		return true
+	}, true)
+	neededRows = nulls.NewWithSize(int(maxRow))
+	commitTSVec = containers.MakeVector(types.T_TS.ToType(), common.WorkspaceAllocator)
+
+	n.appends.ForEach(func(an *AppendNode) bool {
+		if an.IsAborted() || !an.IsCommitted() {
+			return true
+		}
+		commitTS := an.GetCommitTS()
+		if !from.IsEmpty() && commitTS.LE(&from) {
+			return true
+		}
+		if commitTS.GT(&to) {
+			return true
+		}
+		if commitTS.GT(&startTS) {
+			err = txnif.ErrTxnWWConflict
+			return false
+		}
+		neededRows.AddRange(uint64(an.startRow), uint64(an.maxRow))
+		for i := an.startRow; i < an.maxRow; i++ {
+			for commitTSVec.Length() <= int(i) {
+				commitTSVec.Append(types.TS{}, true)
+			}
+			commitTSVec.Update(int(i), commitTS, false)
+		}
+		return true
+	}, true)
+	return
 }
 
 // it is used to get the visible max row for a txn
@@ -330,6 +397,15 @@ func (n *AppendMVCCHandle) CollectUncommittedANodesPreparedBeforeLocked(
 func (n *AppendMVCCHandle) OnReplayAppendNode(an *AppendNode) {
 	an.mvcc = n
 	n.appends.InsertNode(an)
+}
+
+func (n *AppendMVCCHandle) ReorderAppendsByPrepareTSLocked() {
+	if n.appends == nil || len(n.appends.MVCC) < 2 {
+		return
+	}
+	sort.SliceStable(n.appends.MVCC, func(i, j int) bool {
+		return n.appends.MVCC[i].TxnMVCCNode.Compare2(n.appends.MVCC[j].TxnMVCCNode) < 0
+	})
 }
 
 // AddAppendNodeLocked add a new appendnode to the list.

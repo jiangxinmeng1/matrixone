@@ -474,6 +474,10 @@ func (entry *ObjectEntry) Less(b *ObjectEntry) bool {
 	return bytes.Compare(entry.ObjectShortName()[:], b.ObjectShortName()[:]) < 0
 }
 
+func (entry *ObjectEntry) ObjectListRankAndTS() (rank int, ts types.TS) {
+	return entry.objectListRankAndTS()
+}
+
 func (entry *ObjectEntry) objectListRankAndTS() (rank int, ts types.TS) {
 	if !entry.IsCommitted() {
 		return 6, txnif.UncommitTS

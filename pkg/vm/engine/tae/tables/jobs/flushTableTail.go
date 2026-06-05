@@ -887,14 +887,18 @@ func buildEmptyAObjBatchWithVersion(schema *catalog.Schema) *containers.BatchWit
 		objectio.TombstoneAttr_CommitTs_Attr,
 		containers.MakeVector(objectio.TSType, common.MergeAllocator),
 	)
-	seqnums := make([]uint16, 0, len(schema.ColDefs)+1)
+	bat.AddVector(
+		objectio.TombstoneAttr_Abort_Attr,
+		containers.MakeVector(types.T_bool.ToType(), common.MergeAllocator),
+	)
+	seqnums := make([]uint16, 0, len(schema.ColDefs)+2)
 	for _, def := range schema.ColDefs {
 		if def.IsPhyAddr() {
 			continue
 		}
 		seqnums = append(seqnums, def.SeqNum)
 	}
-	seqnums = append(seqnums, objectio.SEQNUM_COMMITTS)
+	seqnums = append(seqnums, objectio.SEQNUM_COMMITTS, objectio.SEQNUM_ABORT)
 	return &containers.BatchWithVersion{
 		Version:    schema.Version,
 		NextSeqnum: uint16(schema.Extra.NextColSeqnum),
