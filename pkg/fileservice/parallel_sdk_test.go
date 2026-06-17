@@ -495,17 +495,14 @@ func TestAwsDeleteMultiDoesNotFallbackOnOtherErrors(t *testing.T) {
 func newMockCOSServer(t *testing.T, failPart int) (*httptest.Server, *cosServerState) {
 	t.Helper()
 	state := &cosServerState{
-		failPart:           failPart,
-		failPartStatus:     http.StatusBadRequest,
-		failCompleteStatus: http.StatusBadRequest,
-		failCreateStatus:   http.StatusBadRequest,
-		parts:              make(map[int][]byte),
+		failPart: failPart,
+		parts:    make(map[int][]byte),
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && strings.Contains(r.URL.RawQuery, "uploads"):
 			if state.failCreate {
-				w.WriteHeader(state.failCreateStatus)
+				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 			_, _ = io.ReadAll(r.Body)
@@ -523,7 +520,7 @@ func newMockCOSServer(t *testing.T, failPart int) (*httptest.Server, *cosServerS
 			pn, _ := strconv.Atoi(partStr)
 			body, _ := io.ReadAll(r.Body)
 			if state.failPart > 0 && pn == state.failPart {
-				w.WriteHeader(state.failPartStatus)
+				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 			state.mu.Lock()
@@ -532,7 +529,7 @@ func newMockCOSServer(t *testing.T, failPart int) (*httptest.Server, *cosServerS
 		case r.Method == http.MethodPost && strings.Contains(r.URL.RawQuery, "uploadId"):
 			body, _ := io.ReadAll(r.Body)
 			if state.failComplete {
-				w.WriteHeader(state.failCompleteStatus)
+				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 			state.mu.Lock()
@@ -553,21 +550,18 @@ func newMockCOSServer(t *testing.T, failPart int) (*httptest.Server, *cosServerS
 }
 
 type cosServerState struct {
-	mu                 sync.Mutex
-	parts              map[int][]byte
-	completeBody       []byte
-	failPart           int
-	failPartStatus     int
-	failComplete       bool
-	failCompleteStatus int
-	failCreate         bool
-	failCreateStatus   int
-	uploadID           string
-	aborted            atomic.Bool
-	completed          atomic.Bool
-	respBody           string
-	putCount           int
-	putBody            []byte
+	mu           sync.Mutex
+	parts        map[int][]byte
+	completeBody []byte
+	failPart     int
+	failComplete bool
+	failCreate   bool
+	uploadID     string
+	aborted      atomic.Bool
+	completed    atomic.Bool
+	respBody     string
+	putCount     int
+	putBody      []byte
 }
 
 func newTestCOSClient(t *testing.T, srv *httptest.Server) *QCloudSDK {
