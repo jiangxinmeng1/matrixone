@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"strings"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
@@ -58,6 +59,9 @@ type ApplyTableDataArg struct {
 	tableID      uint64
 	databaseName string
 	databaseID   uint64
+	output       string
+	s3           string
+	backend      string
 }
 
 func NewApplyTableDataArg(
@@ -98,6 +102,8 @@ func (a *ApplyTableDataArg) PrepareCommand() *cobra.Command {
 	applyTableDataCmd.Flags().StringP("tname", "t", "", "set table name")
 	applyTableDataCmd.Flags().StringP("dname", "d", "", "set database name")
 	applyTableDataCmd.Flags().StringP("dir", "o", "", "set output directory")
+	applyTableDataCmd.Flags().String("s3", "", "set s3 options")
+	applyTableDataCmd.Flags().String("backend", "S3", "set s3 backend")
 	return applyTableDataCmd
 }
 
@@ -105,16 +111,30 @@ func (a *ApplyTableDataArg) FromCommand(cmd *cobra.Command) (err error) {
 	a.tableName, _ = cmd.Flags().GetString("tname")
 	a.databaseName, _ = cmd.Flags().GetString("dname")
 	a.dir, _ = cmd.Flags().GetString("dir")
+	a.output = a.dir
+	a.s3, _ = cmd.Flags().GetString("s3")
+	a.backend, _ = cmd.Flags().GetString("backend")
 	if cmd.Flag("ictx") != nil {
 		a.inspectContext = cmd.Flag("ictx").Value.(*inspectContext)
 		a.mp = common.DefaultAllocator
-		if a.srcFS, err = a.inspectContext.db.Opts.TmpFs.GetOrCreateApp(
-			&fileservice.AppConfig{
-				Name: DumpTableDir,
-				GCFn: GCDumpTableFiles,
-			},
-		); err != nil {
-			return err
+		if a.s3 != "" || strings.HasPrefix(a.output, "/") {
+			if a.srcFS, err = newDumpTableFileService(context.Background(), dumpTableFSOptions{
+				output:  a.output,
+				s3:      a.s3,
+				backend: a.backend,
+			}); err != nil {
+				return err
+			}
+			a.dir = ""
+		} else {
+			if a.srcFS, err = a.inspectContext.db.Opts.TmpFs.GetOrCreateApp(
+				&fileservice.AppConfig{
+					Name: DumpTableDir,
+					GCFn: GCDumpTableFiles,
+				},
+			); err != nil {
+				return err
+			}
 		}
 		a.dstFS = a.inspectContext.db.Opts.Fs
 		a.ctx = context.Background()
@@ -184,6 +204,38 @@ func (a *ApplyTableDataArg) Run() (err error) {
 			zap.Any("error", err),
 		)
 	}()
+	var tableDirs []string
+	if tableDirs, err = a.discoverTableDumpDirs(a.dir); err != nil {
+		return
+	}
+	for _, tableDir := range tableDirs {
+		if err = a.applyOneTable(tableDir); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func (a *ApplyTableDataArg) applyOneTable(dir string) (err error) {
+	oldDir := a.dir
+	oldDatabaseName := a.databaseName
+	oldTableName := a.tableName
+	a.dir = dir
+	defer func() {
+		a.dir = oldDir
+		a.databaseName = oldDatabaseName
+		a.tableName = oldTableName
+	}()
+	databaseName, tableName, err := a.readDumpTableNames(dir)
+	if err != nil {
+		return err
+	}
+	if a.databaseName == "" {
+		a.databaseName = databaseName
+	}
+	if a.tableName == "" {
+		a.tableName = tableName
+	}
 	if err = a.createDatabase(); err != nil {
 		return
 	}
@@ -268,6 +320,51 @@ func (a *ApplyTableDataArg) Run() (err error) {
 	}
 	return
 
+}
+
+func (a *ApplyTableDataArg) discoverTableDumpDirs(root string) ([]string, error) {
+	if a.isTableDumpDir(root) {
+		return []string{root}, nil
+	}
+	var tableDirs []string
+	for entry, err := range a.srcFS.List(a.ctx, root) {
+		if err != nil {
+			return nil, err
+		}
+		if entry == nil || !entry.IsDir {
+			continue
+		}
+		child := dumpTablePath(root, strings.TrimSuffix(entry.Name, "/"))
+		if a.isTableDumpDir(child) {
+			tableDirs = append(tableDirs, child)
+			continue
+		}
+		for subEntry, err := range a.srcFS.List(a.ctx, child) {
+			if err != nil {
+				return nil, err
+			}
+			if subEntry == nil || !subEntry.IsDir {
+				continue
+			}
+			grandChild := dumpTablePath(child, strings.TrimSuffix(subEntry.Name, "/"))
+			if a.isTableDumpDir(grandChild) {
+				tableDirs = append(tableDirs, grandChild)
+			}
+		}
+	}
+	if len(tableDirs) == 0 {
+		return nil, moerr.NewInternalErrorNoCtx("invalid dump table directory")
+	}
+	return tableDirs, nil
+}
+
+func (a *ApplyTableDataArg) isTableDumpDir(dir string) bool {
+	for _, name := range []string{DumpTableSchema, DumpTableTable, DumpTableObjectList} {
+		if _, err := a.srcFS.StatFile(a.ctx, dumpTablePath(dir, name)); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *ApplyTableDataArg) createDatabase() (err error) {
@@ -409,13 +506,32 @@ func (a *ApplyTableDataArg) createTable() (err error) {
 	return
 }
 
+func (a *ApplyTableDataArg) readDumpTableNames(dir string) (databaseName, tableName string, err error) {
+	tableBatch, release, err := a.readBatchAt(dir, DumpTableTable, catalog.SystemTableSchema.AllNames())
+	if err != nil {
+		return "", "", err
+	}
+	defer release()
+	defer tableBatch.Clean(a.mp)
+	if tableBatch.RowCount() != 1 {
+		return "", "", moerr.NewInternalErrorNoCtx(fmt.Sprintf("invalid table batch, %d", tableBatch.RowCount()))
+	}
+	return tableBatch.GetVectorByName(pkgcatalog.SystemRelAttr_DBName).GetStringAt(0),
+		tableBatch.GetVectorByName(pkgcatalog.SystemRelAttr_Name).GetStringAt(0),
+		nil
+}
+
 func (a *ApplyTableDataArg) readBatch(name string, attrs []string) (bat *batch.Batch, release func(), err error) {
+	return a.readBatchAt(a.dir, name, attrs)
+}
+
+func (a *ApplyTableDataArg) readBatchAt(dir string, name string, attrs []string) (bat *batch.Batch, release func(), err error) {
 	logutil.Info(
 		"APPLY-TABLE-DATA-READ-BATCH",
-		zap.String("dir", a.dir),
+		zap.String("dir", dir),
 		zap.String("name", name),
 	)
-	fname := path.Join(a.dir, name)
+	fname := dumpTablePath(dir, name)
 	var reader *ioutil.BlockReader
 	if reader, err = ioutil.NewFileReader(
 		a.srcFS,

@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	pkgcatalog "github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
@@ -161,6 +162,11 @@ type DumpTableArg struct {
 	objectListBatch *batch.Batch
 	mp              *mpool.MPool
 	srcfs, dstfs    fileservice.FileService
+	did, tid        uint64
+	accountID       uint32
+	output          string
+	s3              string
+	backend         string
 }
 
 // for UT
@@ -193,35 +199,46 @@ func (c *DumpTableArg) PrepareCommand() *cobra.Command {
 
 	dumpTableCmd.Flags().IntP("tid", "t", 0, "set table id")
 	dumpTableCmd.Flags().IntP("did", "d", 0, "set database id")
+	dumpTableCmd.Flags().Uint32P("account-id", "a", 0, "set account id")
+	dumpTableCmd.Flags().StringP("output", "o", "", "set output directory")
+	dumpTableCmd.Flags().String("s3", "", "set s3 options")
+	dumpTableCmd.Flags().String("backend", "S3", "set s3 backend")
 	return dumpTableCmd
 }
 
 func (c *DumpTableArg) FromCommand(cmd *cobra.Command) (err error) {
 	tid, _ := cmd.Flags().GetInt("tid")
 	did, _ := cmd.Flags().GetInt("did")
+	c.tid = uint64(tid)
+	c.did = uint64(did)
+	c.accountID, _ = cmd.Flags().GetUint32("account-id")
+	c.output, _ = cmd.Flags().GetString("output")
+	c.s3, _ = cmd.Flags().GetString("s3")
+	c.backend, _ = cmd.Flags().GetString("backend")
 	if cmd.Flag("ictx") != nil {
 		c.inspectContext = cmd.Flag("ictx").Value.(*inspectContext)
 		c.mp = common.DefaultAllocator
-		if c.dstfs, err = c.inspectContext.db.Opts.TmpFs.GetOrCreateApp(
-			&fileservice.AppConfig{
-				Name: DumpTableDir,
-				GCFn: GCDumpTableFiles,
-			},
-		); err != nil {
-			return
+		if c.output != "" || c.s3 != "" {
+			if c.dstfs, err = newDumpTableFileService(context.Background(), dumpTableFSOptions{
+				output:  c.output,
+				s3:      c.s3,
+				backend: c.backend,
+			}); err != nil {
+				return
+			}
+			c.dir = ""
+		} else {
+			if c.dstfs, err = c.inspectContext.db.Opts.TmpFs.GetOrCreateApp(
+				&fileservice.AppConfig{
+					Name: DumpTableDir,
+					GCFn: GCDumpTableFiles,
+				},
+			); err != nil {
+				return
+			}
 		}
 		c.srcfs = c.inspectContext.db.Opts.Fs
 		c.ctx = context.Background()
-		database, err := c.inspectContext.db.Catalog.GetDatabaseByID(uint64(did))
-		if err != nil {
-			err = moerr.NewInternalErrorNoCtx(fmt.Sprintf("get database by id %d failed", did))
-			return err
-		}
-		c.table, err = database.GetTableEntryByID(uint64(tid))
-		if err != nil {
-			err = moerr.NewInternalErrorNoCtx(fmt.Sprintf("get table by id %d-%d failed", did, tid))
-			return err
-		}
 		c.objectListBatch = NewObjectListBatch()
 	} else {
 		return moerr.NewInternalErrorNoCtx("inspect context not found")
@@ -250,10 +267,83 @@ func (c *DumpTableArg) Run() (err error) {
 	if c.txn, err = c.inspectContext.db.StartTxn(nil); err != nil {
 		return
 	}
-	if c.dir == "" {
-		c.dir = GetDumpTableDir(c.table.ID, c.txn.GetStartTS())
-	}
 	defer c.txn.Commit(c.ctx)
+	if c.table != nil {
+		dir := c.dir
+		if dir == "" {
+			dir = GetDumpTableDir(c.table.ID, c.txn.GetStartTS())
+		}
+		return c.dumpOneTable(c.table, dir)
+	}
+	if c.tid != 0 {
+		database, err := c.inspectContext.db.Catalog.GetDatabaseByID(c.did)
+		if err != nil {
+			return moerr.NewInternalErrorNoCtx(fmt.Sprintf("get database by id %d failed", c.did))
+		}
+		table, err := database.GetTableEntryByID(c.tid)
+		if err != nil {
+			return moerr.NewInternalErrorNoCtx(fmt.Sprintf("get table by id %d-%d failed", c.did, c.tid))
+		}
+		dir := c.dir
+		if dir == "" && c.output == "" && c.s3 == "" {
+			dir = GetDumpTableDir(table.ID, c.txn.GetStartTS())
+		}
+		return c.dumpOneTable(table, dir)
+	}
+	if c.did != 0 {
+		if c.output == "" && c.s3 == "" {
+			return moerr.NewInvalidInputNoCtx("dump database requires output directory")
+		}
+		database, err := c.inspectContext.db.Catalog.GetDatabaseByID(c.did)
+		if err != nil {
+			return moerr.NewInternalErrorNoCtx(fmt.Sprintf("get database by id %d failed", c.did))
+		}
+		return c.dumpDatabase(database, c.dir)
+	}
+	if c.accountID != 0 {
+		if c.output == "" && c.s3 == "" {
+			return moerr.NewInvalidInputNoCtx("dump account requires output directory")
+		}
+		return c.dumpAccount(c.accountID, c.dir)
+	}
+	return moerr.NewInvalidInputNoCtx("dump table requires table id, database id, or account id")
+}
+
+func (c *DumpTableArg) dumpDatabase(database *catalog.DBEntry, root string) error {
+	p := &catalog.LoopProcessor{}
+	p.TableFn = func(table *catalog.TableEntry) error {
+		if table.GetLastestSchema(false).Relkind == pkgcatalog.SystemViewRel {
+			return nil
+		}
+		tableDir := dumpTablePath(root, dumpTableEntryDir(table.GetLastestSchema(false).Name, table.ID))
+		return c.dumpOneTable(table, tableDir)
+	}
+	return database.RecurLoop(p)
+}
+
+func (c *DumpTableArg) dumpAccount(accountID uint32, root string) error {
+	p := &catalog.LoopProcessor{}
+	p.DatabaseFn = func(database *catalog.DBEntry) error {
+		if database.GetTenantID() != accountID {
+			return nil
+		}
+		dbRoot := dumpTablePath(root, dumpTableEntryDir(database.GetName(), database.ID))
+		return c.dumpDatabase(database, dbRoot)
+	}
+	return c.inspectContext.db.Catalog.RecurLoop(p)
+}
+
+func (c *DumpTableArg) dumpOneTable(table *catalog.TableEntry, dir string) (err error) {
+	c.table = table
+	c.dir = dir
+	if c.objectListBatch != nil {
+		c.objectListBatch.Clean(c.mp)
+	}
+	c.objectListBatch = NewObjectListBatch()
+	defer func() {
+		c.objectListBatch.Clean(c.mp)
+		c.objectListBatch = nil
+	}()
 	logutil.Info(
 		"DUMP-TABLE-START",
 		zap.String(
@@ -268,12 +358,6 @@ func (c *DumpTableArg) Run() (err error) {
 		),
 		zap.String("dir", c.dir),
 	)
-	defer c.objectListBatch.Clean(c.mp)
-	txn, err := c.inspectContext.db.StartTxn(nil)
-	if err != nil {
-		return err
-	}
-	defer txn.Commit(c.ctx)
 
 	if err := c.flushTableSchema(); err != nil {
 		return err
@@ -453,7 +537,7 @@ func copyFile(
 }
 
 func (c *DumpTableArg) flush(name string, bat *batch.Batch) (err error) {
-	nameWithDir := fmt.Sprintf("%s/%s", c.dir, name)
+	nameWithDir := dumpTablePath(c.dir, name)
 	writer, err := objectio.NewObjectWriterSpecial(objectio.WriterDumpTable, nameWithDir, c.dstfs)
 	if err != nil {
 		return
