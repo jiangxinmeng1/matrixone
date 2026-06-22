@@ -338,7 +338,6 @@ func TestApplyTableData(t *testing.T) {
 	ctx := context.Background()
 
 	opts := config.WithLongScanAndCKPOpts(nil)
-	opts.EnableApplyTableData = true
 	tae := testutil.NewTestEngine(ctx, ModuleName, t, opts)
 	defer tae.Close()
 
@@ -456,16 +455,11 @@ func TestApplyTableDataError(t *testing.T) {
 	applyTableCmd := fmt.Sprintf("apply-table-data -d %v -t %v -o %s", "db2", "table2", dir)
 
 	resp, err = mh.runInspectCmd(applyTableCmd)
-	assert.True(t, strings.Contains(resp.Message, "apply table data is not enabled"))
-	require.NoError(t, err)
-
-	tae.Opts.EnableApplyTableData = true
-	resp, err = mh.runInspectCmd(applyTableCmd)
 	t.Log(resp.Message)
 	require.NoError(t, err)
 
 	resp, err = mh.runInspectCmd(applyTableCmd)
-	assert.True(t, strings.Contains(resp.Message, "table already exists"))
+	assert.True(t, strings.Contains(resp.Message, "database \"db2\" already exists"))
 	require.NoError(t, err)
 }
 

@@ -61,6 +61,7 @@ func LoadPersistedColumnData(
 	typs := make([]types.Type, 0, len(colIdxs))
 	vectors := make([]containers.Vector, len(colIdxs))
 	phyAddIdx := -1
+	rowidIdx := -1
 	committsIdx := -1
 	assignedCommitts := false
 	var deletes *nulls.Nulls
@@ -70,6 +71,15 @@ func LoadPersistedColumnData(
 			typs = append(typs, objectio.TSType)
 			committsIdx = len(cols) - 1
 			assignedCommitts = true
+			continue
+		}
+		if colIdx == objectio.SEQNUM_ROWID {
+			vec, err := PreparePhyAddrData(&id.BlockID, 0, location.Rows(), rt.VectorPool.Transient)
+			if err != nil {
+				return nil, deletes, nil, err
+			}
+			rowidIdx = i
+			vectors[i] = vec
 			continue
 		}
 		def := schema.ColDefs[colIdx]
@@ -131,6 +141,9 @@ func LoadPersistedColumnData(
 	for i, vec := range vecs {
 		idx := i
 		if idx >= phyAddIdx && phyAddIdx > -1 {
+			idx++
+		}
+		if idx >= rowidIdx && rowidIdx > -1 {
 			idx++
 		}
 		vectors[idx] = vec

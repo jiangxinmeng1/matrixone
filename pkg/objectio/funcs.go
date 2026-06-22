@@ -166,6 +166,9 @@ func ReadOneBlockWithMeta(
 			switch seqnum {
 			case SEQNUM_COMMITTS:
 				seqnum = metaColCnt - 1
+			case SEQNUM_ROWID:
+				putFillHolder(i, seqnum)
+				continue
 			case SEQNUM_ABORT:
 				panic("not support")
 			default:

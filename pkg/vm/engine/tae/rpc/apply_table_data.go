@@ -146,13 +146,6 @@ func (a *ApplyTableDataArg) Usage() (res string) {
 	return
 }
 func (a *ApplyTableDataArg) Run() (err error) {
-	if !a.inspectContext.db.Opts.EnableApplyTableData {
-		err2 := a.txn.Rollback(a.ctx)
-		if err2 != nil {
-			logutil.Error("APPLY-TABLE-DATA-ROLLBACK-ERROR", zap.Error(err2))
-		}
-		return moerr.NewInternalErrorNoCtx("apply table data is not enabled")
-	}
 	logutil.Info(
 		"APPLY-TABLE-DATA-START",
 		zap.String("dir", a.dir),
@@ -199,97 +192,119 @@ func (a *ApplyTableDataArg) Run() (err error) {
 	defer objectlistBatch.Clean(a.mp)
 	objTypes := vector.MustFixedColNoTypeCheck[int8](objectlistBatch.Vecs[ObjectListAttr_ObjectType_Idx])
 	idVec := objectlistBatch.Vecs[ObjectListAttr_ID_Idx]
-	isPersisted := vector.MustFixedColNoTypeCheck[bool](objectlistBatch.Vecs[ObjectListAttr_IsPersisted_Idx])
 
+	statsVec := containers.MakeVector(types.T_varchar.ToType(), a.mp)
+	defer statsVec.Close()
 	for i := 0; i < objectlistBatch.RowCount(); i++ {
-		var isTombstone bool
 		if objTypes[i] == ckputil.ObjectType_Data {
-			isTombstone = false
+			if err = a.applyDataObject(idVec.GetBytesAt(i), statsVec); err != nil {
+				return
+			}
 		} else if objTypes[i] == ckputil.ObjectType_Tombstone {
-			isTombstone = true
+			return moerr.NewInternalErrorNoCtx("invalid dump table object list: tombstone object is not supported")
 		} else {
 			panic(fmt.Sprintf("invalid object type: %d", objTypes[i]))
 		}
-		if isTombstone {
-			logutil.Info(
-				"APPLY-TABLE-DATA-SKIP-TOMBSTONE",
-				zap.String("dir", a.dir),
-				zap.Int("object-index", i),
-			)
-			continue
-		}
-		stats := objectio.ObjectStats(idVec.GetBytesAt(i))
-		sourceName := stats.ObjectName().String()
-		newID := objectio.NewObjectid()
-		newName := objectio.BuildObjectNameWithObjectID(&newID)
-		newNameStr := newName.String()
-		var obj handle.Object
-		if isPersisted[i] {
-			src := path.Join(a.dir, sourceName)
-			if _, err = fileservice.DoWithRetry(
-				"CopyFile",
-				func() ([]byte, error) {
-					return copyFile(a.ctx, a.srcFS, a.dstFS, src, newNameStr)
-				},
-				64,
-				fileservice.IsRetryableError,
-			); err != nil {
-				return
-			}
-			if err = objectio.SetObjectStatsObjectName(&stats, newName); err != nil {
-				return
-			}
-			logutil.Info(
-				"APPLY-TABLE-DATA-RENAME-OBJECT",
-				zap.String("dir", a.dir),
-				zap.String("source-name", sourceName),
-				zap.String("target-name", newNameStr),
-			)
-		} else {
-			if err = objectio.SetObjectStatsObjectName(&stats, newName); err != nil {
-				return
-			}
-		}
-		if obj, err = a.rel.CreateNonAppendableObject(
-			isTombstone,
-			&objectio.CreateObjOpt{
-				Stats:       &stats,
-				IsTombstone: isTombstone,
-			},
-		); err != nil {
-			return
-		}
-
-		schema := a.rel.GetMeta().(*catalog.TableEntry).GetLastestSchema(isTombstone)
-
-		attrs := schema.AllNames()
-		attrs = append(attrs, objectio.TombstoneAttr_CommitTs_Attr)
-		if !isPersisted[i] {
-			var bat *batch.Batch
-			var objectRelease func()
-			if bat, objectRelease, err = a.readBatch(sourceName, attrs); err != nil {
-				return
-			}
-			defer objectRelease()
-			tnBat := containers.ToTNBatch(bat, a.mp)
-			meta := obj.GetMeta().(*catalog.ObjectEntry)
-			var anodes []txnif.TxnEntry
-			if anodes, err = meta.GetObjectData().ApplyDebugBatch(tnBat, a.txn); err != nil {
-				return
-			}
-			for _, anode := range anodes {
-				a.txn.GetStore().LogTxnEntry(
-					a.databaseID,
-					a.tableID,
-					anode,
-					nil,
-					nil,
-				)
-			}
-		}
+	}
+	if statsVec.Length() > 0 {
+		err = a.rel.AddDataFiles(a.ctx, statsVec)
 	}
 	return
 
+}
+
+func (a *ApplyTableDataArg) applyDataObject(
+	rawStats []byte,
+	statsVec containers.Vector,
+) (err error) {
+	sourceStats := objectio.ObjectStats(rawStats)
+	sourceName := sourceStats.ObjectName().String()
+	schema := a.rel.GetMeta().(*catalog.TableEntry).GetLastestSchema(false)
+	attrs := append(append([]string{}, schema.AllNames()...), objectio.PhysicalAddr_Attr, objectio.TombstoneAttr_CommitTs_Attr)
+	bats, release, err := a.readBatches(sourceName, nil, attrs)
+	if err != nil {
+		return err
+	}
+	defer releaseBatches(release, bats, a.mp)
+	if len(bats) == 0 {
+		return nil
+	}
+
+	arena := objectio.GetArena(objectio.ArenaSmall)
+	defer func() {
+		arena.Reset()
+		objectio.PutArena(arena)
+	}()
+
+	objID := objectio.NewObjectid()
+	name := objectio.BuildObjectNameWithObjectID(&objID)
+	writer, err := ioutil.NewBlockWriterWithArena(
+		a.dstFS,
+		name,
+		schema.Version,
+		schema.AllSeqnums(),
+		false,
+		arena,
+	)
+	if err != nil {
+		return err
+	}
+	if schema.HasPK() {
+		writer.SetPrimaryKey(uint16(schema.GetSingleSortKeyIdx()))
+	} else if schema.HasSortKey() {
+		writer.SetSortKey(uint16(schema.GetSingleSortKeyIdx()))
+	}
+	if schema.HasFakePK() {
+		writer.SetFakePK(uint16(schema.GetPrimaryKey().Idx))
+	}
+
+	userColCnt := len(schema.AllNames())
+	totalRows := 0
+	for _, bat := range bats {
+		if bat.RowCount() == 0 {
+			continue
+		}
+		writeBat := batch.NewWithSize(userColCnt)
+		writeBat.Vecs = bat.Vecs[:userColCnt]
+		writeBat.Attrs = attrs[:userColCnt]
+		writeBat.SetRowCount(bat.RowCount())
+		totalRows += bat.RowCount()
+		if _, err = writer.WriteBatch(writeBat); err != nil {
+			return err
+		}
+	}
+	if totalRows == 0 {
+		logutil.Info(
+			"APPLY-TABLE-DATA-SKIP-FULLY-DELETED-OBJECT",
+			zap.String("dir", a.dir),
+			zap.String("source-name", sourceName),
+		)
+		return nil
+	}
+	if _, _, err = writer.Sync(a.ctx); err != nil {
+		return err
+	}
+	stats := writer.GetObjectStats(objectio.WithCNCreated())
+	statsVec.Append(stats[:], false)
+	logutil.Info(
+		"APPLY-TABLE-DATA-WRITE-OBJECT",
+		zap.String("dir", a.dir),
+		zap.String("source-name", sourceName),
+		zap.String("target-name", name.String()),
+		zap.Int("rows", totalRows),
+	)
+	return nil
+}
+
+func releaseBatches(release func(), bats []*batch.Batch, mp *mpool.MPool) {
+	if release != nil {
+		release()
+	}
+	for _, bat := range bats {
+		if bat != nil {
+			bat.Clean(mp)
+		}
+	}
 }
 
 func (a *ApplyTableDataArg) createDatabase() (err error) {
@@ -298,12 +313,7 @@ func (a *ApplyTableDataArg) createDatabase() (err error) {
 
 	if database, err = a.txn.CreateDatabase(a.databaseName, "", ""); err != nil {
 		if moerr.IsMoErrCode(err, moerr.OkExpectedDup) {
-			database, err = a.txn.GetDatabase(a.databaseName)
-			if err != nil {
-				return
-			}
-			a.databaseID = database.GetID()
-			return nil
+			return moerr.NewInternalErrorNoCtx(fmt.Sprintf("database %q already exists", a.databaseName))
 		}
 		return
 	}
@@ -369,7 +379,7 @@ func (a *ApplyTableDataArg) createTable() (err error) {
 
 	if a.rel, err = db.CreateRelation(a.schema); err != nil {
 		if moerr.IsMoErrCode(err, moerr.OkExpectedDup) {
-			return moerr.NewInternalErrorNoCtx("table already exists")
+			return moerr.NewInternalErrorNoCtx(fmt.Sprintf("table %q.%q already exists", a.databaseName, a.tableName))
 		}
 		return
 	}
@@ -432,6 +442,20 @@ func (a *ApplyTableDataArg) createTable() (err error) {
 }
 
 func (a *ApplyTableDataArg) readBatch(name string, attrs []string) (bat *batch.Batch, release func(), err error) {
+	var bats []*batch.Batch
+	if bats, release, err = a.readBatches(name, nil, attrs); err != nil {
+		return
+	}
+	_, injected := objectio.GCDumpTableInjected()
+	if len(bats) != 1 || injected {
+		releaseBatches(release, bats, a.mp)
+		return nil, nil, moerr.NewInternalErrorNoCtx(fmt.Sprintf("invalid object list batch, %d", len(bats)))
+	}
+	bat = bats[0]
+	return
+}
+
+func (a *ApplyTableDataArg) readBatches(name string, idxs []uint16, attrs []string) (bats []*batch.Batch, release func(), err error) {
 	logutil.Info(
 		"APPLY-TABLE-DATA-READ-BATCH",
 		zap.String("dir", a.dir),
@@ -445,22 +469,14 @@ func (a *ApplyTableDataArg) readBatch(name string, attrs []string) (bat *batch.B
 	); err != nil {
 		return
 	}
-	var bats []*batch.Batch
 	if bats, release, err = reader.LoadAllColumns(
-		a.ctx, nil, a.mp,
+		a.ctx, idxs, a.mp,
 	); err != nil {
 		return
 	}
-	_, injected := objectio.GCDumpTableInjected()
-	if len(bats) != 1 || injected {
-		release()
-		for _, bat := range bats {
-			bat.Clean(a.mp)
-		}
-		return nil, nil, moerr.NewInternalErrorNoCtx(fmt.Sprintf("invalid object list batch, %d", len(bats)))
+	for _, bat := range bats {
+		bat.Attrs = attrs
 	}
-	bat = bats[0]
-	bat.Attrs = attrs
 	return
 }
 

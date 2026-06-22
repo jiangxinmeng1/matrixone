@@ -208,6 +208,16 @@ func (node *memoryNode) getDataWindowLocked(
 				(*bat).AddVector(objectio.TombstoneAttr_CommitTs_Attr, vec)
 				continue
 			}
+			if colIdx == objectio.SEQNUM_ROWID {
+				typ := types.T_Rowid.ToType()
+				vec := node.object.rt.VectorPool.Transient.GetVector(&typ)
+				blkID := node.object.meta.Load().AsCommonID().BlockID
+				if err := objectio.ConstructRowidColumnTo(vec.GetDownstreamVector(), &blkID, from, to-from, mp); err != nil {
+					return err
+				}
+				(*bat).AddVector(objectio.TombstoneAttr_Rowid_Attr, vec)
+				continue
+			}
 			colDef := readSchema.ColDefs[colIdx]
 			idx, ok := node.writeSchema.SeqnumMap[colDef.SeqNum]
 			var vec containers.Vector
@@ -225,6 +235,9 @@ func (node *memoryNode) getDataWindowLocked(
 		for _, colIdx := range colIdxes {
 			if colIdx == objectio.SEQNUM_COMMITTS {
 				continue
+			}
+			if colIdx == objectio.SEQNUM_ROWID {
+				continue  // rowid was populated when bat was created
 			}
 			colDef := readSchema.ColDefs[colIdx]
 			idx, ok := node.writeSchema.SeqnumMap[colDef.SeqNum]

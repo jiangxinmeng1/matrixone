@@ -16,9 +16,7 @@ package rpc
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
-	"io"
 	"path"
 	"strconv"
 	"strings"
@@ -32,6 +30,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/ckputil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
@@ -159,6 +158,7 @@ type DumpTableArg struct {
 	dir             string
 	inspectContext  *inspectContext
 	objectListBatch *batch.Batch
+	tombstones      []*catalog.ObjectEntry
 	mp              *mpool.MPool
 	srcfs, dstfs    fileservice.FileService
 }
@@ -285,8 +285,13 @@ func (c *DumpTableArg) Run() (err error) {
 	}
 
 	p := &catalog.LoopProcessor{}
+	p.TombstoneFn = c.collectTombstoneObject
+	if err = c.table.RecurLoop(p); err != nil {
+		return err
+	}
+
+	p = &catalog.LoopProcessor{}
 	p.ObjectFn = c.onObject
-	p.TombstoneFn = c.onObject
 	if err = c.table.RecurLoop(p); err != nil {
 		return err
 	}
@@ -358,6 +363,9 @@ func (c *DumpTableArg) flushTableEntry() (err error) {
 }
 
 func (c *DumpTableArg) onObject(e *catalog.ObjectEntry) error {
+	if e.IsTombstone {
+		return nil
+	}
 	startTS := c.txn.GetStartTS()
 	if e.CreatedAt.EQ(&txnif.UncommitTS) || e.DeleteBefore(startTS) {
 		return nil
@@ -367,91 +375,30 @@ func (c *DumpTableArg) onObject(e *catalog.ObjectEntry) error {
 		return err
 	}
 	defer bat.Close()
-	var isPersisted bool
-	if isPersisted, err = c.collectObjectList(e); err != nil {
+	if err = c.filterDeletedRows(bat); err != nil {
+		return err
+	}
+	if bat.Length() == 0 {
+		logutil.Info(
+			"DUMP-TABLE-SKIP-FULLY-DELETED-OBJECT",
+			zap.String("dir", c.dir),
+			zap.String("name", objectio.BuildObjectNameWithObjectID(e.ID()).String()),
+		)
+		return nil
+	}
+	isPersisted, err := c.collectObjectList(e)
+	if err != nil {
 		return err
 	}
 	cnBatch := containers.ToCNBatch(bat)
+	objectName := objectio.BuildObjectNameWithObjectID(e.ID())
 	if isPersisted {
-		name := e.ObjectStats.ObjectName().String()
-		dstName := path.Join(c.dir, name)
-		if _, err = fileservice.DoWithRetry(
-			"CopyFile",
-			func() ([]byte, error) {
-				return copyFile(c.ctx, c.srcfs, c.dstfs, name, dstName)
-			},
-			64,
-			fileservice.IsRetryableError,
-		); err != nil {
-			return err
-		}
-		logutil.Info(
-			"DUMP-TABLE-FLUSH",
-			zap.String(
-				"table",
-				fmt.Sprintf(
-					"%d-%v, %d-%s",
-					c.table.GetDB().ID,
-					c.table.GetDB().GetFullName(),
-					c.table.ID,
-					c.table.GetFullName(),
-				),
-			),
-			zap.String("dir", c.dir),
-			zap.String("name", name),
-		)
-	} else {
-		objectName := objectio.BuildObjectNameWithObjectID(e.ID())
-		if err := c.flush(objectName.String(), cnBatch); err != nil {
-			return err
-		}
+		objectName = e.ObjectStats.ObjectName()
+	}
+	if err := c.flush(objectName.String(), cnBatch); err != nil {
+		return err
 	}
 	return nil
-}
-
-func copyFile(
-	ctx context.Context,
-	srcFS, dstFS fileservice.FileService,
-	srcName, dstName string,
-) ([]byte, error) {
-	var reader io.ReadCloser
-	ioVec := &fileservice.IOVector{
-		FilePath: srcName,
-		Entries: []fileservice.IOEntry{
-			{
-				ReadCloserForRead: &reader,
-				Offset:            0,
-				Size:              -1,
-			},
-		},
-		Policy: fileservice.SkipAllCache,
-	}
-
-	err := srcFS.Read(ctx, ioVec)
-	if err != nil {
-		return nil, err
-	}
-	defer reader.Close()
-	// hash
-	hasher := sha256.New()
-	hashingReader := io.TeeReader(reader, hasher)
-	dstIoVec := fileservice.IOVector{
-		FilePath: dstName,
-		Entries: []fileservice.IOEntry{
-			{
-				ReaderForWrite: hashingReader,
-				Offset:         0,
-				Size:           -1,
-			},
-		},
-		Policy: fileservice.SkipAllCache,
-	}
-
-	err = dstFS.Write(ctx, dstIoVec)
-	if err != nil {
-		return nil, err
-	}
-	return hasher.Sum(nil), nil
 }
 
 func (c *DumpTableArg) flush(name string, bat *batch.Batch) (err error) {
@@ -487,11 +434,21 @@ func (c *DumpTableArg) flush(name string, bat *batch.Batch) (err error) {
 
 func (c *DumpTableArg) collectObjectList(e *catalog.ObjectEntry) (isPersisted bool, err error) {
 	startTS := c.txn.GetStartTS()
-	var objectType int8
-	if e.IsTombstone {
-		objectType = ckputil.ObjectType_Tombstone
+	objectType := int8(ckputil.ObjectType_Data)
+	var deleteTS types.TS
+	if e.DeletedAt.EQ(&txnif.UncommitTS) || e.DeletedAt.LT(&startTS) {
+		deleteTS = types.TS{}
 	} else {
-		objectType = ckputil.ObjectType_Data
+		deleteTS = e.DeletedAt
+	}
+	if isPersisted, err = c.isObjectPersisted(e); err != nil {
+		return false, err
+	}
+	stats := e.ObjectStats
+	if !isPersisted {
+		if err = objectio.SetObjectStatsObjectName(&stats, objectio.BuildObjectNameWithObjectID(e.ID())); err != nil {
+			return false, err
+		}
 	}
 	if err := vector.AppendFixed(
 		c.objectListBatch.Vecs[ObjectListAttr_ObjectType_Idx], objectType, false, c.mp,
@@ -499,7 +456,7 @@ func (c *DumpTableArg) collectObjectList(e *catalog.ObjectEntry) (isPersisted bo
 		return false, err
 	}
 	if err := vector.AppendBytes(
-		c.objectListBatch.Vecs[ObjectListAttr_ID_Idx], []byte(e.ObjectStats[:]), false, c.mp,
+		c.objectListBatch.Vecs[ObjectListAttr_ID_Idx], []byte(stats[:]), false, c.mp,
 	); err != nil {
 		return false, err
 	}
@@ -507,17 +464,6 @@ func (c *DumpTableArg) collectObjectList(e *catalog.ObjectEntry) (isPersisted bo
 		c.objectListBatch.Vecs[ObjectListAttr_CreateTS_Idx], e.CreatedAt, false, c.mp,
 	); err != nil {
 		return false, err
-	}
-	var deleteTS types.TS
-	if e.DeletedAt.EQ(&txnif.UncommitTS) || e.DeletedAt.LT(&startTS) {
-		deleteTS = types.TS{}
-	} else {
-		deleteTS = e.DeletedAt
-	}
-	if e.GetAppendable() && deleteTS.IsEmpty() {
-		isPersisted = false
-	} else {
-		isPersisted = true
 	}
 	if err := vector.AppendFixed(
 		c.objectListBatch.Vecs[ObjectListAttr_DeleteTS_Idx], deleteTS, false, c.mp,
@@ -534,15 +480,146 @@ func (c *DumpTableArg) collectObjectList(e *catalog.ObjectEntry) (isPersisted bo
 }
 
 func (c *DumpTableArg) visitObjectData(e *catalog.ObjectEntry) (bat *containers.Batch, err error) {
-	schema := e.GetTable().GetLastestSchema(e.IsTombstone)
+	schema := e.GetTable().GetLastestSchema(false)
 	colIdxes := make([]int, 0)
 	// user rows, rowID, commitTS
 	for i := range schema.ColDefs {
 		colIdxes = append(colIdxes, i)
 	}
+	colIdxes = append(colIdxes, objectio.SEQNUM_ROWID)
 	colIdxes = append(colIdxes, objectio.SEQNUM_COMMITTS)
 	if err = e.GetObjectData().Scan(c.ctx, &bat, c.txn, schema, 0, colIdxes, c.mp); err != nil {
 		return
 	}
 	return
+}
+
+func (c *DumpTableArg) collectTombstoneObject(e *catalog.ObjectEntry) error {
+	startTS := c.txn.GetStartTS()
+	if !e.IsTombstone || e.CreatedAt.EQ(&txnif.UncommitTS) || e.DeleteBefore(startTS) {
+		return nil
+	}
+	c.tombstones = append(c.tombstones, e)
+	return nil
+}
+
+func (c *DumpTableArg) filterDeletedRows(bat *containers.Batch) error {
+	if len(c.tombstones) == 0 || bat.Length() == 0 {
+		return nil
+	}
+	rowIDVec := bat.Vecs[len(bat.Vecs)-2]
+	deletedByBlock := make(map[types.Blockid]objectio.Bitmap)
+	defer func() {
+		for _, deletedRows := range deletedByBlock {
+			deletedRows.Release()
+		}
+	}()
+
+	hasDelete := false
+	for rowIdx := 0; rowIdx < bat.Length(); rowIdx++ {
+		rowID := rowIDVec.Get(rowIdx).(types.Rowid)
+		blockID := rowID.CloneBlockID()
+		deletedRows, ok := deletedByBlock[blockID]
+		if !ok {
+			var err error
+			if deletedRows, err = c.getDeletedMaskForBlock(&blockID); err != nil {
+				return err
+			}
+			deletedByBlock[blockID] = deletedRows
+		}
+		if deletedRows.Contains(uint64(rowID.GetRowOffset())) {
+			bat.Delete(rowIdx)
+			hasDelete = true
+		}
+	}
+	if hasDelete {
+		bat.Compact()
+	}
+	return nil
+}
+
+func (c *DumpTableArg) getDeletedMaskForBlock(blockID *types.Blockid) (objectio.Bitmap, error) {
+	deletedRows := objectio.GetReusableBitmap()
+	startTS := c.txn.GetStartTS()
+	for _, tombstone := range c.tombstones {
+		stats := tombstone.ObjectStats
+		if !stats.ZMIsEmpty() && !stats.SortKeyZoneMap().RowidPrefixEq(blockID[:]) {
+			continue
+		}
+		isPersisted, err := c.isObjectPersisted(tombstone)
+		if err != nil {
+			deletedRows.Release()
+			return deletedRows, err
+		}
+		if isPersisted {
+			used := false
+			getTombstone := func() (*objectio.ObjectStats, error) {
+				if used {
+					return nil, nil
+				}
+				used = true
+				return &stats, nil
+			}
+			if err := ioutil.GetTombstonesByBlockId(
+				c.ctx,
+				&startTS,
+				blockID,
+				getTombstone,
+				&deletedRows,
+				c.srcfs,
+			); err != nil {
+				deletedRows.Release()
+				return deletedRows, err
+			}
+			continue
+		}
+		if err := c.applyAppendableTombstoneForBlock(tombstone, blockID, &deletedRows); err != nil {
+			deletedRows.Release()
+			return deletedRows, err
+		}
+	}
+	return deletedRows, nil
+}
+
+func (c *DumpTableArg) applyAppendableTombstoneForBlock(
+	tombstone *catalog.ObjectEntry,
+	blockID *types.Blockid,
+	deletedRows *objectio.Bitmap,
+) error {
+	schema := tombstone.GetTable().GetLastestSchema(true)
+	var bat *containers.Batch
+	if err := tombstone.GetObjectData().Scan(
+		c.ctx,
+		&bat,
+		c.txn,
+		schema,
+		0,
+		[]int{objectio.TombstoneAttr_Rowid_SeqNum},
+		c.mp,
+	); err != nil {
+		return err
+	}
+	defer bat.Close()
+	if bat.Length() == 0 {
+		return nil
+	}
+	rowIDVec := bat.Vecs[0]
+	for rowIdx := 0; rowIdx < bat.Length(); rowIdx++ {
+		rowID := rowIDVec.Get(rowIdx).(types.Rowid)
+		if rowID.BorrowBlockID().EQ(blockID) {
+			deletedRows.Add(uint64(rowID.GetRowOffset()))
+		}
+	}
+	return nil
+}
+
+func (c *DumpTableArg) isObjectPersisted(e *catalog.ObjectEntry) (bool, error) {
+	startTS := c.txn.GetStartTS()
+	var deleteTS types.TS
+	if e.DeletedAt.EQ(&txnif.UncommitTS) || e.DeletedAt.LT(&startTS) {
+		deleteTS = types.TS{}
+	} else {
+		deleteTS = e.DeletedAt
+	}
+	return !e.GetAppendable() || !deleteTS.IsEmpty(), nil
 }
