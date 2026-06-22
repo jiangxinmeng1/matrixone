@@ -193,12 +193,14 @@ func (c *DumpTableArg) PrepareCommand() *cobra.Command {
 
 	dumpTableCmd.Flags().IntP("tid", "t", 0, "set table id")
 	dumpTableCmd.Flags().IntP("did", "d", 0, "set database id")
+	dumpTableCmd.Flags().StringP("dir", "o", "", "set dump directory")
 	return dumpTableCmd
 }
 
 func (c *DumpTableArg) FromCommand(cmd *cobra.Command) (err error) {
 	tid, _ := cmd.Flags().GetInt("tid")
 	did, _ := cmd.Flags().GetInt("did")
+	c.dir, _ = cmd.Flags().GetString("dir")
 	if cmd.Flag("ictx") != nil {
 		c.inspectContext = cmd.Flag("ictx").Value.(*inspectContext)
 		c.mp = common.DefaultAllocator

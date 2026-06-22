@@ -210,8 +210,46 @@ func (a *ApplyTableDataArg) Run() (err error) {
 		} else {
 			panic(fmt.Sprintf("invalid object type: %d", objTypes[i]))
 		}
+		if isTombstone {
+			logutil.Info(
+				"APPLY-TABLE-DATA-SKIP-TOMBSTONE",
+				zap.String("dir", a.dir),
+				zap.Int("object-index", i),
+			)
+			continue
+		}
 		stats := objectio.ObjectStats(idVec.GetBytesAt(i))
+		sourceName := stats.ObjectName().String()
+		newID := objectio.NewObjectid()
+		newName := objectio.BuildObjectNameWithObjectID(&newID)
+		newNameStr := newName.String()
 		var obj handle.Object
+		if isPersisted[i] {
+			src := path.Join(a.dir, sourceName)
+			if _, err = fileservice.DoWithRetry(
+				"CopyFile",
+				func() ([]byte, error) {
+					return copyFile(a.ctx, a.srcFS, a.dstFS, src, newNameStr)
+				},
+				64,
+				fileservice.IsRetryableError,
+			); err != nil {
+				return
+			}
+			if err = objectio.SetObjectStatsObjectName(&stats, newName); err != nil {
+				return
+			}
+			logutil.Info(
+				"APPLY-TABLE-DATA-RENAME-OBJECT",
+				zap.String("dir", a.dir),
+				zap.String("source-name", sourceName),
+				zap.String("target-name", newNameStr),
+			)
+		} else {
+			if err = objectio.SetObjectStatsObjectName(&stats, newName); err != nil {
+				return
+			}
+		}
 		if obj, err = a.rel.CreateNonAppendableObject(
 			isTombstone,
 			&objectio.CreateObjOpt{
@@ -226,11 +264,10 @@ func (a *ApplyTableDataArg) Run() (err error) {
 
 		attrs := schema.AllNames()
 		attrs = append(attrs, objectio.TombstoneAttr_CommitTs_Attr)
-		name := stats.ObjectName().String()
 		if !isPersisted[i] {
 			var bat *batch.Batch
 			var objectRelease func()
-			if bat, objectRelease, err = a.readBatch(name, attrs); err != nil {
+			if bat, objectRelease, err = a.readBatch(sourceName, attrs); err != nil {
 				return
 			}
 			defer objectRelease()
@@ -249,21 +286,6 @@ func (a *ApplyTableDataArg) Run() (err error) {
 					nil,
 				)
 			}
-		} else {
-
-			a.dstFS.Delete(a.ctx, name)
-			src := path.Join(a.dir, name)
-			if _, err = fileservice.DoWithRetry(
-				"CopyFile",
-				func() ([]byte, error) {
-					return copyFile(a.ctx, a.srcFS, a.dstFS, src, name)
-				},
-				64,
-				fileservice.IsRetryableError,
-			); err != nil {
-				return
-			}
-
 		}
 	}
 	return
