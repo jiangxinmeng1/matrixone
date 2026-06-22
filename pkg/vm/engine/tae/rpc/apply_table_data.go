@@ -313,7 +313,12 @@ func (a *ApplyTableDataArg) createDatabase() (err error) {
 
 	if database, err = a.txn.CreateDatabase(a.databaseName, "", ""); err != nil {
 		if moerr.IsMoErrCode(err, moerr.OkExpectedDup) {
-			return moerr.NewInternalErrorNoCtx(fmt.Sprintf("database %q already exists", a.databaseName))
+			database, err = a.txn.GetDatabase(a.databaseName)
+			if err != nil {
+				return
+			}
+			a.databaseID = database.GetID()
+			return nil
 		}
 		return
 	}
@@ -369,6 +374,11 @@ func (a *ApplyTableDataArg) createTable() (err error) {
 	defer tableRelease()
 	defer tableBatch.Clean(a.mp)
 	tnTableBatch := containers.ToTNBatch(tableBatch, a.mp)
+
+	// If no target table name provided, use the original name from the dump.
+	if a.tableName == "" {
+		a.tableName = string(tnTableBatch.GetVectorByName(pkgcatalog.SystemRelAttr_Name).Get(0).([]byte))
+	}
 
 	var db handle.Database
 	if db, err = a.txn.GetDatabase(a.databaseName); err != nil {
