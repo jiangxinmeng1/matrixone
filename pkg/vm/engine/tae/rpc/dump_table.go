@@ -318,6 +318,14 @@ func (c *DumpTableArg) onObject(e *catalog.ObjectEntry) error {
 	if err != nil {
 		return err
 	}
+	if bat == nil {
+		logutil.Info(
+			"DUMP-TABLE-SKIP-EMPTY-OBJECT",
+			zap.String("dir", c.dir),
+			zap.String("name", objectio.BuildObjectNameWithObjectID(e.ID()).String()),
+		)
+		return nil
+	}
 	defer bat.Close()
 	if err = c.filterDeletedRows(bat); err != nil {
 		return err
@@ -450,6 +458,9 @@ func (c *DumpTableArg) collectTombstoneObject(e *catalog.ObjectEntry) error {
 }
 
 func (c *DumpTableArg) filterDeletedRows(bat *containers.Batch) error {
+	if bat == nil {
+		return nil
+	}
 	if len(c.tombstones) == 0 || bat.Length() == 0 {
 		return nil
 	}
