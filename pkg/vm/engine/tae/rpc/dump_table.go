@@ -156,6 +156,7 @@ type DumpTableArg struct {
 	txn             txnif.AsyncTxn
 	table           *catalog.TableEntry
 	dir             string
+	snapshotTSStr   string
 	inspectContext  *inspectContext
 	objectListBatch *batch.Batch
 	tombstones      []*catalog.ObjectEntry
@@ -194,6 +195,7 @@ func (c *DumpTableArg) PrepareCommand() *cobra.Command {
 	dumpTableCmd.Flags().IntP("tid", "t", 0, "set table id")
 	dumpTableCmd.Flags().IntP("did", "d", 0, "set database id")
 	dumpTableCmd.Flags().StringP("dir", "o", "", "set dump directory")
+	dumpTableCmd.Flags().StringP("snapshot-ts", "s", "", "snapshot timestamp for consistent cross-table dump")
 	return dumpTableCmd
 }
 
@@ -201,6 +203,7 @@ func (c *DumpTableArg) FromCommand(cmd *cobra.Command) (err error) {
 	tid, _ := cmd.Flags().GetInt("tid")
 	did, _ := cmd.Flags().GetInt("did")
 	c.dir, _ = cmd.Flags().GetString("dir")
+	c.snapshotTSStr, _ = cmd.Flags().GetString("snapshot-ts")
 	if cmd.Flag("ictx") != nil {
 		c.inspectContext = cmd.Flag("ictx").Value.(*inspectContext)
 		c.mp = common.DefaultAllocator
@@ -249,8 +252,15 @@ func (c *DumpTableArg) Usage() (res string) {
 	return
 }
 func (c *DumpTableArg) Run() (err error) {
-	if c.txn, err = c.inspectContext.db.StartTxn(nil); err != nil {
-		return
+	if c.snapshotTSStr != "" {
+		snapshotTS := types.StringToTS(c.snapshotTSStr)
+		if c.txn, err = c.inspectContext.db.StartTxnWithStartTSAndSnapshotTS(nil, snapshotTS); err != nil {
+			return
+		}
+	} else {
+		if c.txn, err = c.inspectContext.db.StartTxn(nil); err != nil {
+			return
+		}
 	}
 	if c.dir == "" {
 		c.dir = GetDumpTableDir(c.table.ID, c.txn.GetStartTS())
@@ -271,7 +281,13 @@ func (c *DumpTableArg) Run() (err error) {
 		zap.String("dir", c.dir),
 	)
 	defer c.objectListBatch.Clean(c.mp)
-	txn, err := c.inspectContext.db.StartTxn(nil)
+	var txn txnif.AsyncTxn
+	if c.snapshotTSStr != "" {
+		snapshotTS := types.StringToTS(c.snapshotTSStr)
+		txn, err = c.inspectContext.db.StartTxnWithStartTSAndSnapshotTS(nil, snapshotTS)
+	} else {
+		txn, err = c.inspectContext.db.StartTxn(nil)
+	}
 	if err != nil {
 		return err
 	}
@@ -488,8 +504,10 @@ func (c *DumpTableArg) visitObjectData(e *catalog.ObjectEntry) (bat *containers.
 	}
 	colIdxes = append(colIdxes, objectio.SEQNUM_ROWID)
 	colIdxes = append(colIdxes, objectio.SEQNUM_COMMITTS)
-	if err = e.GetObjectData().Scan(c.ctx, &bat, c.txn, schema, 0, colIdxes, c.mp); err != nil {
-		return
+	for blkID := 0; blkID < e.BlockCnt(); blkID++ {
+		if err = e.GetObjectData().Scan(c.ctx, &bat, c.txn, schema, uint16(blkID), colIdxes, c.mp); err != nil {
+			return
+		}
 	}
 	return
 }

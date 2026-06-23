@@ -117,6 +117,9 @@ func initCommand(_ context.Context, inspectCtx *inspectContext) *cobra.Command {
 
 	applyTable := &ApplyTableDataArg{}
 	rootCmd.AddCommand(applyTable.PrepareCommand())
+
+	getTS := &GetTSArg{}
+	rootCmd.AddCommand(getTS.PrepareCommand())
 	return rootCmd
 }
 

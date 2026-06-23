@@ -12549,7 +12549,7 @@ func Test_ApplyTableData(t *testing.T) {
 	schema.Extra.BlockMaxRows = 10
 	schema.Extra.ObjectMaxBlocks = 2
 	tae.BindSchema(schema)
-	bat := catalog.MockBatch(schema, 2)
+	bat := catalog.MockBatch(schema, 25)
 
 	tae.CreateRelAndAppend2(bat, true)
 	tae.CompactBlocks(true)
@@ -12589,7 +12589,7 @@ func Test_ApplyTableData(t *testing.T) {
 	assert.NoError(t, txn.Commit(ctx))
 	for i := 0; i < colCount; i++ {
 		rows := testutil.GetColumnRowsByScan(t, rel, i, true)
-		assert.Equal(t, 2, rows)
+		assert.Equal(t, 25, rows)
 	}
 
 	t.Log(tae.Catalog.SimplePPString(3))
