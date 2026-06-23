@@ -18,9 +18,6 @@ import (
 	"context"
 	"fmt"
 	"path"
-	"strconv"
-	"strings"
-	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
@@ -42,73 +39,8 @@ import (
 	"go.uber.org/zap"
 )
 
-func init() {
-	fileservice.RegisterAppConfig(&fileservice.AppConfig{
-		Name: DumpTableDir,
-		GCFn: GCDumpTableFiles,
-	})
-}
-
 const (
-	DumpTableDir = "dumpTable"
-)
-
-const (
-	DumpTableFileTTL = time.Hour * 24 * 30
-)
-
-func DecodeDumpTableDir(dir string) (tid uint64, createTime time.Time, snapshotTS types.TS, err error) {
-	parts := strings.Split(dir, "_")
-	if len(parts) != 3 {
-		return 0, time.Time{}, types.TS{}, moerr.NewInternalErrorNoCtx("invalid dump table directory")
-	}
-	tid, err = strconv.ParseUint(parts[0], 10, 64)
-	if err != nil {
-		return 0, time.Time{}, types.TS{}, err
-	}
-	createTime, err = time.Parse("2006-01-02.15.04.05.MST", parts[1])
-	if err != nil {
-		return 0, time.Time{}, types.TS{}, err
-	}
-	snapshotTS = types.StringToTS(parts[2])
-	return
-}
-
-func GCDumpTableFiles(filePath string, fs fileservice.FileService) (neesGC bool, err error) {
-	_, createTime, _, err := DecodeDumpTableDir(filePath)
-	if err != nil {
-		return
-	}
-	_, injected := objectio.GCDumpTableInjected()
-	if createTime.Add(time.Hour*24).Before(time.Now()) || injected {
-		neesGC = true
-		ctx := context.Background()
-		ctx, cancel := context.WithTimeoutCause(ctx, 5*time.Second, moerr.CauseClearPersistTable)
-		defer cancel()
-		entrys := fs.List(ctx, filePath)
-		var entry *fileservice.DirEntry
-		for entry, err = range entrys {
-			if err != nil {
-				continue
-			}
-			if err = fs.Delete(ctx, path.Join(filePath, entry.Name)); err != nil {
-				return
-			}
-		}
-		if err = fs.Delete(ctx, filePath); err != nil {
-			return
-		}
-		return
-	}
-	return
-}
-
-func GetDumpTableDir(tid uint64, snapshotTS types.TS) string {
-	dir := fmt.Sprintf("%d_%v_%s", tid, time.Now().Format("2006-01-02.15.04.05.MST"), snapshotTS.ToString())
-	return dir
-}
-
-const (
+	DumpTableFSName     = "live-dump"
 	DumpTableObjectList = "object_list"
 	DumpTableSchema     = "schema"
 	DumpTableTable      = "table"
@@ -205,16 +137,15 @@ func (c *DumpTableArg) FromCommand(cmd *cobra.Command) (err error) {
 	c.dir, _ = cmd.Flags().GetString("dir")
 	c.snapshotTSStr, _ = cmd.Flags().GetString("snapshot-ts")
 	if cmd.Flag("ictx") != nil {
+		if c.dir == "" {
+			return moerr.NewInternalErrorNoCtx("dump directory is required")
+		}
 		c.inspectContext = cmd.Flag("ictx").Value.(*inspectContext)
 		c.mp = common.DefaultAllocator
-		if c.dstfs, err = c.inspectContext.db.Opts.TmpFs.GetOrCreateApp(
-			&fileservice.AppConfig{
-				Name: DumpTableDir,
-				GCFn: GCDumpTableFiles,
-			},
-		); err != nil {
+		if c.dstfs, err = fileservice.NewLocalETLFS(DumpTableFSName, c.dir); err != nil {
 			return
 		}
+		c.dir = ""
 		c.srcfs = c.inspectContext.db.Opts.Fs
 		c.ctx = context.Background()
 		database, err := c.inspectContext.db.Catalog.GetDatabaseByID(uint64(did))
@@ -261,9 +192,6 @@ func (c *DumpTableArg) Run() (err error) {
 		if c.txn, err = c.inspectContext.db.StartTxn(nil); err != nil {
 			return
 		}
-	}
-	if c.dir == "" {
-		c.dir = GetDumpTableDir(c.table.ID, c.txn.GetStartTS())
 	}
 	defer c.txn.Commit(c.ctx)
 	logutil.Info(
@@ -418,7 +346,7 @@ func (c *DumpTableArg) onObject(e *catalog.ObjectEntry) error {
 }
 
 func (c *DumpTableArg) flush(name string, bat *batch.Batch) (err error) {
-	nameWithDir := fmt.Sprintf("%s/%s", c.dir, name)
+	nameWithDir := path.Join(c.dir, name)
 	writer, err := objectio.NewObjectWriterSpecial(objectio.WriterDumpTable, nameWithDir, c.dstfs)
 	if err != nil {
 		return

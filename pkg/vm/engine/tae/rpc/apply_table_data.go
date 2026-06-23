@@ -25,6 +25,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/incrservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
@@ -58,6 +59,9 @@ type ApplyTableDataArg struct {
 	tableID      uint64
 	databaseName string
 	databaseID   uint64
+
+	autoIncrementCols []incrservice.AutoColumn
+	autoIncrementMaxs []uint64
 }
 
 func NewApplyTableDataArg(
@@ -106,16 +110,15 @@ func (a *ApplyTableDataArg) FromCommand(cmd *cobra.Command) (err error) {
 	a.databaseName, _ = cmd.Flags().GetString("dname")
 	a.dir, _ = cmd.Flags().GetString("dir")
 	if cmd.Flag("ictx") != nil {
+		if a.dir == "" {
+			return moerr.NewInternalErrorNoCtx("dump directory is required")
+		}
 		a.inspectContext = cmd.Flag("ictx").Value.(*inspectContext)
 		a.mp = common.DefaultAllocator
-		if a.srcFS, err = a.inspectContext.db.Opts.TmpFs.GetOrCreateApp(
-			&fileservice.AppConfig{
-				Name: DumpTableDir,
-				GCFn: GCDumpTableFiles,
-			},
-		); err != nil {
+		if a.srcFS, err = fileservice.NewLocalETLFS(DumpTableFSName, a.dir); err != nil {
 			return err
 		}
+		a.dir = ""
 		a.dstFS = a.inspectContext.db.Opts.Fs
 		a.ctx = context.Background()
 		if a.txn, err = a.inspectContext.db.StartTxn(nil); err != nil {
@@ -207,7 +210,13 @@ func (a *ApplyTableDataArg) Run() (err error) {
 		}
 	}
 	if statsVec.Length() > 0 {
-		err = a.rel.AddDataFiles(a.ctx, statsVec)
+		if err = a.rel.AddDataFiles(a.ctx, statsVec); err != nil {
+			return
+		}
+	}
+	err = a.createAutoIncrementMetadata()
+	if err != nil {
+		return
 	}
 	return
 
@@ -264,6 +273,7 @@ func (a *ApplyTableDataArg) applyDataObject(
 		if bat.RowCount() == 0 {
 			continue
 		}
+		a.collectAutoIncrementMax(bat)
 		writeBat := batch.NewWithSize(userColCnt)
 		writeBat.Vecs = bat.Vecs[:userColCnt]
 		writeBat.Attrs = attrs[:userColCnt]
@@ -395,6 +405,7 @@ func (a *ApplyTableDataArg) createTable() (err error) {
 	}
 
 	a.tableID = a.rel.ID()
+	a.initAutoIncrementMetadata()
 
 	packer := types.NewPacker()
 	tnTableBatch.GetVectorByName(pkgcatalog.SystemRelAttr_ID).Update(0, a.tableID, false)
@@ -449,6 +460,132 @@ func (a *ApplyTableDataArg) createTable() (err error) {
 		return
 	}
 	return
+}
+
+func (a *ApplyTableDataArg) initAutoIncrementMetadata() {
+	a.autoIncrementCols = a.autoIncrementCols[:0]
+	a.autoIncrementMaxs = a.autoIncrementMaxs[:0]
+	for _, def := range a.schema.ColDefs {
+		if !def.AutoIncrement || def.Hidden || def.FakePK || def.PhyAddr {
+			continue
+		}
+		a.autoIncrementCols = append(a.autoIncrementCols, incrservice.AutoColumn{
+			TableID:  a.tableID,
+			ColName:  def.Name,
+			ColIndex: def.Idx,
+			Offset:   0,
+			Step:     1,
+		})
+		a.autoIncrementMaxs = append(a.autoIncrementMaxs, 0)
+	}
+}
+
+func (a *ApplyTableDataArg) collectAutoIncrementMax(bat *batch.Batch) {
+	for i, col := range a.autoIncrementCols {
+		if col.ColIndex < 0 || col.ColIndex >= len(bat.Vecs) {
+			continue
+		}
+		vec := bat.Vecs[col.ColIndex]
+		for row := 0; row < bat.RowCount(); row++ {
+			if vec.IsNull(uint64(row)) {
+				continue
+			}
+			if v, ok := autoIncrementValueToUint64(vec, row); ok && v > a.autoIncrementMaxs[i] {
+				a.autoIncrementMaxs[i] = v
+			}
+		}
+	}
+}
+
+func autoIncrementValueToUint64(vec *vector.Vector, row int) (uint64, bool) {
+	switch vec.GetType().Oid {
+	case types.T_int8:
+		return signedAutoIncrementValueToUint64(int64(vector.GetFixedAtNoTypeCheck[int8](vec, row)))
+	case types.T_int16:
+		return signedAutoIncrementValueToUint64(int64(vector.GetFixedAtNoTypeCheck[int16](vec, row)))
+	case types.T_int32:
+		return signedAutoIncrementValueToUint64(int64(vector.GetFixedAtNoTypeCheck[int32](vec, row)))
+	case types.T_int64:
+		return signedAutoIncrementValueToUint64(vector.GetFixedAtNoTypeCheck[int64](vec, row))
+	case types.T_uint8:
+		return uint64(vector.GetFixedAtNoTypeCheck[uint8](vec, row)), true
+	case types.T_uint16:
+		return uint64(vector.GetFixedAtNoTypeCheck[uint16](vec, row)), true
+	case types.T_uint32:
+		return uint64(vector.GetFixedAtNoTypeCheck[uint32](vec, row)), true
+	case types.T_uint64:
+		return vector.GetFixedAtNoTypeCheck[uint64](vec, row), true
+	default:
+		return 0, false
+	}
+}
+
+func signedAutoIncrementValueToUint64(v int64) (uint64, bool) {
+	if v <= 0 {
+		return 0, false
+	}
+	return uint64(v), true
+}
+
+func (a *ApplyTableDataArg) createAutoIncrementMetadata() (err error) {
+	if len(a.autoIncrementCols) == 0 {
+		return nil
+	}
+
+	var db handle.Database
+	if db, err = a.txn.GetDatabase(pkgcatalog.MO_CATALOG); err != nil {
+		return
+	}
+	var table handle.Relation
+	if table, err = db.GetRelationByName(pkgcatalog.MOAutoIncrTable); err != nil {
+		return
+	}
+	tableEntry, ok := table.GetMeta().(*catalog.TableEntry)
+	if !ok {
+		return moerr.NewInternalErrorNoCtx(fmt.Sprintf("invalid %s metadata", pkgcatalog.MOAutoIncrTable))
+	}
+	schema := tableEntry.GetLastestSchema(false)
+	bat := containers.NewBatch()
+	defer bat.Close()
+
+	for _, def := range schema.ColDefs {
+		if def.IsPhyAddr() {
+			continue
+		}
+		bat.AddVector(def.Name, containers.MakeVector(def.Type, a.mp))
+	}
+
+	packer := types.NewPacker()
+	defer packer.Close()
+	for i, col := range a.autoIncrementCols {
+		col.Offset = a.autoIncrementMaxs[i]
+		for _, def := range schema.ColDefs {
+			if def.IsPhyAddr() {
+				continue
+			}
+			vec := bat.GetVectorByName(def.Name)
+			switch def.Name {
+			case "table_id":
+				vec.Append(col.TableID, false)
+			case "col_name":
+				vec.Append([]byte(col.ColName), false)
+			case "col_index":
+				vec.Append(int32(col.ColIndex), false)
+			case "offset":
+				vec.Append(col.Offset, false)
+			case "step":
+				vec.Append(col.Step, false)
+			case pkgcatalog.CPrimaryKeyColName:
+				packer.Reset()
+				packer.EncodeUint64(col.TableID)
+				packer.EncodeStringType([]byte(col.ColName))
+				vec.Append(packer.Bytes(), false)
+			default:
+				return moerr.NewInternalErrorNoCtx(fmt.Sprintf("unexpected %s column %q", pkgcatalog.MOAutoIncrTable, def.Name))
+			}
+		}
+	}
+	return table.Append(a.ctx, bat)
 }
 
 func (a *ApplyTableDataArg) readBatch(name string, attrs []string) (bat *batch.Batch, release func(), err error) {

@@ -18,10 +18,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -146,6 +146,10 @@ func dumpCommand() *cobra.Command {
 			if root == "" {
 				return errors.New("--output/-o or --output-dir is required")
 			}
+			root, err = filepath.Abs(root)
+			if err != nil {
+				return err
+			}
 			_ = jobs // v1 runs serially; keep the flag for CLI compatibility.
 			// Obtain a single snapshot timestamp for consistent cross-table dump.
 			getTSSQL := fmt.Sprintf("select mo_ctl('dn', 'inspect', %s)", sqlString("get-ts"))
@@ -171,8 +175,8 @@ func dumpCommand() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("dump %s.%s(%d): %w", tbl.dbName, tbl.tableName, tbl.tableID, err)
 				}
-				if err := copyDumpOutput(dir); err != nil {
-					return fmt.Errorf("dump %s.%s(%d): copy output: %w", tbl.dbName, tbl.tableName, tbl.tableID, err)
+				if err = inspectResponseError(resp); err != nil {
+					return fmt.Errorf("dump %s.%s(%d): %w", tbl.dbName, tbl.tableName, tbl.tableID, err)
 				}
 				cmd.Printf("Table %d %s.%s dumped to %s\n%s\n", tbl.tableID, tbl.dbName, tbl.tableName, dir, strings.TrimSpace(resp))
 			}
@@ -206,6 +210,10 @@ func applyCommand() *cobra.Command {
 			if targetDatabase == "" {
 				return errors.New("--target-database is required")
 			}
+			from, err := filepath.Abs(from)
+			if err != nil {
+				return err
+			}
 			db, err := openDB(opts)
 			if err != nil {
 				return err
@@ -217,7 +225,6 @@ func applyCommand() *cobra.Command {
 			// one with its original name.
 			var tasks []applyTableTask
 
-			tmpRoot := filepath.Join("mo-data", "tmp", DumpTableDir)
 			if targetTable != "" {
 				// Single table apply
 				tasks = append(tasks, applyTableTask{dir: from, tableName: targetTable})
@@ -233,12 +240,6 @@ func applyCommand() *cobra.Command {
 			}
 
 			for _, t := range tasks {
-				// Copy dump files to tmpfs so the TN handler can read them.
-				tmpDir := filepath.Join(tmpRoot, t.dir)
-				if err := copyDir(t.dir, tmpDir); err != nil {
-					return fmt.Errorf("copy to tmpfs %s: %w", t.dir, err)
-				}
-
 				// Allow empty table name → TN reads original name from dump.
 				operation := fmt.Sprintf(
 					"apply-table-data -d %s -t %s -o %s",
@@ -249,6 +250,9 @@ func applyCommand() *cobra.Command {
 				sqlText := fmt.Sprintf("select mo_ctl('dn', 'inspect', %s)", sqlString(operation))
 				resp, err := querySingleString(db, sqlText)
 				if err != nil {
+					return fmt.Errorf("apply %s: %w", t.dir, err)
+				}
+				if err = inspectResponseError(resp); err != nil {
 					return fmt.Errorf("apply %s: %w", t.dir, err)
 				}
 				cmd.Println(strings.TrimSpace(resp))
@@ -410,10 +414,6 @@ func sqlString(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-// DumpTableDir matches the tmp fileservice app name used by dump-table and
-// apply-table-data on the TN side.
-const DumpTableDir = "dumpTable"
-
 // resolveApplyTables scans the dump root directory for table subdirectories
 // and returns a list of apply tasks. The directory structure is expected to be:
 //
@@ -450,38 +450,6 @@ func resolveApplyTables(root string) ([]applyTableTask, error) {
 	return tasks, nil
 }
 
-// copyDumpOutput copies dump output from the TN-side tmp fileservice
-// (mo-data/tmp/dumpTable/) to the user-requested local directory.
-// The dump-table inspect command writes to the dumpTable tmpfs app;
-// this function makes the output visible at the path the user specified.
-func copyDumpOutput(userPath string) error {
-	tmpRoot := filepath.Join("mo-data", "tmp", "dumpTable")
-	// Normalize userPath: strip leading ./ if present
-	srcPath := filepath.Join(tmpRoot, userPath)
-	// Ensure destination parent directories exist
-	if err := os.MkdirAll(filepath.Dir(userPath), 0755); err != nil {
-		return err
-	}
-	return copyDir(srcPath, userPath)
-}
-
-func copyDir(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		relPath, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		dstPath := filepath.Join(dst, relPath)
-		if info.IsDir() {
-			return os.MkdirAll(dstPath, info.Mode())
-		}
-		return copyFile(path, dstPath)
-	})
-}
-
 // parseSnapshotTS extracts the timestamp string from a get-ts inspect command
 // response. The InspectResp.ConsoleString() format is "\nmsg: <Message>\n\n<Payload>".
 func parseSnapshotTS(resp string) (string, error) {
@@ -490,27 +458,18 @@ func parseSnapshotTS(resp string) (string, error) {
 	if !strings.HasPrefix(s, prefix) {
 		return "", fmt.Errorf("unexpected get-ts response: %q", resp)
 	}
-	return strings.TrimSpace(strings.TrimPrefix(s, prefix)), nil
+	msg := strings.TrimSpace(strings.TrimPrefix(s, prefix))
+	ts := regexp.MustCompile(`\d+-\d+`).FindString(msg)
+	if ts == "" {
+		return "", fmt.Errorf("unexpected get-ts response: %q", resp)
+	}
+	return ts, nil
 }
 
-func copyFile(src, dst string) (err error) {
-	s, err := os.Open(src)
-	if err != nil {
-		return err
+func inspectResponseError(resp string) error {
+	s := strings.TrimSpace(resp)
+	if !strings.HasPrefix(s, "msg: Failed") {
+		return nil
 	}
-	defer s.Close()
-	if err = os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-		return err
-	}
-	d, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if cerr := d.Close(); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
-	_, err = io.Copy(d, s)
-	return err
+	return fmt.Errorf("%s", s)
 }

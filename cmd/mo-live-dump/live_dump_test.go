@@ -14,7 +14,10 @@
 
 package live_dump
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestSQLString(t *testing.T) {
 	got := sqlString(`dump-table -o "a'b"`)
@@ -34,5 +37,54 @@ func TestTableDumpDir(t *testing.T) {
 	want := "./dump_out/tables/account_7/db_9001/table_272535"
 	if got != want {
 		t.Fatalf("tableDumpDir() = %q, want %q", got, want)
+	}
+}
+
+func TestParseSnapshotTS(t *testing.T) {
+	tests := []struct {
+		name string
+		resp string
+		want string
+	}{
+		{
+			name: "message only",
+			resp: "msg: 1782184172426822147-0",
+			want: "1782184172426822147-0",
+		},
+		{
+			name: "run factory suffix",
+			resp: "msg: 1782184172426822147-0get-ts",
+			want: "1782184172426822147-0",
+		},
+		{
+			name: "console string",
+			resp: "\nmsg: 1782184172426822147-0get-ts\n\n",
+			want: "1782184172426822147-0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseSnapshotTS(tt.resp)
+			if err != nil {
+				t.Fatalf("parseSnapshotTS() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseSnapshotTS() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInspectResponseError(t *testing.T) {
+	if err := inspectResponseError("\nmsg: apply-table-data\n\n"); err != nil {
+		t.Fatalf("inspectResponseError() unexpected error = %v", err)
+	}
+	resp := "\nmsg: Failed\n\npanic in inspect dn"
+	err := inspectResponseError(resp)
+	if err == nil {
+		t.Fatalf("inspectResponseError() expected error")
+	}
+	if got := err.Error(); got != strings.TrimSpace(resp) {
+		t.Fatalf("inspectResponseError() = %q, want %q", got, strings.TrimSpace(resp))
 	}
 }

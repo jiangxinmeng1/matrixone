@@ -12683,59 +12683,6 @@ func Test_ApplyTableData2(t *testing.T) {
 	close()
 }
 
-func TestDumpTableFileNameDecode(t *testing.T) {
-	ctx := context.Background()
-
-	opts := config.WithLongScanAndCKPOpts(nil)
-	opts.EnableApplyTableData = true
-	tae := testutil.NewTestEngine(ctx, ModuleName, t, opts)
-	defer tae.Close()
-	colCount := 2
-	schema := catalog.MockSchema(colCount, -1)
-	schema.Extra.BlockMaxRows = 10
-	schema.Extra.ObjectMaxBlocks = 2
-	tae.BindSchema(schema)
-	bat := catalog.MockBatch(schema, 2)
-
-	tae.CreateRelAndAppend2(bat, true)
-	txn, table := tae.GetRelation()
-	tableEntry := table.GetMeta().(*catalog.TableEntry)
-	assert.NoError(t, txn.Commit(ctx))
-
-	dir := taerpc.GetDumpTableDir(tableEntry.ID, tae.TxnMgr.Now())
-
-	dumpArg := taerpc.NewDumpTableArg(
-		ctx,
-		tableEntry,
-		dir,
-		taerpc.MockInspectContext(tae.DB),
-		common.DebugAllocator,
-		tae.Opts.Fs,
-	)
-	err := dumpArg.Run()
-	assert.NoError(t, err)
-
-	needGC, err := taerpc.GCDumpTableFiles(dir, tae.Opts.Fs)
-	assert.NoError(t, err)
-	assert.False(t, needGC)
-
-	_, _, _, err = taerpc.DecodeDumpTableDir("a_b")
-	assert.Error(t, err)
-	_, _, _, err = taerpc.DecodeDumpTableDir("a_b_c")
-	assert.Error(t, err)
-	_, _, _, err = taerpc.DecodeDumpTableDir("1000_b_c")
-	assert.Error(t, err)
-
-	t.Log(tae.Catalog.SimplePPString(3))
-	fault.Enable()
-	defer fault.Disable()
-	rmFn, err := objectio.InjectGCDumpTable("")
-	assert.NoError(t, err)
-	defer rmFn()
-	needGC, err = taerpc.GCDumpTableFiles(dir, tae.Opts.Fs)
-	assert.NoError(t, err)
-	assert.True(t, needGC)
-}
 func Test_TmpFileService1(t *testing.T) {
 	ctx := context.Background()
 

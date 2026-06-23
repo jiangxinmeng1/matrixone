@@ -17,6 +17,7 @@ package rpc
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -363,26 +364,11 @@ func TestApplyTableData(t *testing.T) {
 	tableEntry := table.GetMeta().(*catalog.TableEntry)
 	assert.NoError(t, txn.Commit(ctx))
 
-	dumpTableCmd := fmt.Sprintf("dump-table -d %d -t %d", tableEntry.GetDB().ID, tableEntry.ID)
+	dir := filepath.Join(t.TempDir(), "dump")
+	dumpTableCmd := fmt.Sprintf("dump-table -d %d -t %d -o %s", tableEntry.GetDB().ID, tableEntry.ID, dir)
 
 	_, err := mh.runInspectCmd(dumpTableCmd)
 	require.NoError(t, err)
-
-	dumpTableFS, err := tae.Runtime.TmpFS.GetOrCreateApp(
-		&fileservice.AppConfig{
-			Name: DumpTableDir,
-			GCFn: GCDumpTableFiles,
-		},
-	)
-	require.NoError(t, err)
-
-	dirs := dumpTableFS.List(ctx, "")
-	var dir string
-	for entry, err := range dirs {
-		assert.NoError(t, err)
-		t.Log(entry.Name)
-		dir = entry.Name
-	}
 
 	applyTableCmd := fmt.Sprintf("apply-table-data -d %v -t %v -o %s", "db2", "table2", dir)
 
@@ -419,38 +405,23 @@ func TestApplyTableDataError(t *testing.T) {
 	tableEntry := table.GetMeta().(*catalog.TableEntry)
 	assert.NoError(t, txn.Commit(ctx))
 
-	dumpTableCmd := fmt.Sprintf("dump-table -d %d -t %d", tableEntry.GetDB().ID, tableEntry.ID)
+	dir := filepath.Join(t.TempDir(), "dump")
+	dumpTableCmd := fmt.Sprintf("dump-table -d %d -t %d -o %s", tableEntry.GetDB().ID, tableEntry.ID, dir)
 
 	_, err := mh.runInspectCmd(dumpTableCmd)
 	require.NoError(t, err)
 
-	dumpTableCmd2 := fmt.Sprintf("dump-table -d %d -t %d", tae.Catalog.NextDB(), tableEntry.ID)
+	dumpTableCmd2 := fmt.Sprintf("dump-table -d %d -t %d -o %s", tae.Catalog.NextDB(), tableEntry.ID, dir)
 	resp, err := mh.runInspectCmd(dumpTableCmd2)
 	require.NoError(t, err)
 	assert.True(t, strings.Contains(resp.Message, "get database by id"))
 	t.Log(resp.Message)
 
-	dumpTableCmd3 := fmt.Sprintf("dump-table -d %d -t %d", tableEntry.GetDB().ID, tae.Catalog.NextTable())
+	dumpTableCmd3 := fmt.Sprintf("dump-table -d %d -t %d -o %s", tableEntry.GetDB().ID, tae.Catalog.NextTable(), dir)
 	resp, err = mh.runInspectCmd(dumpTableCmd3)
 	require.NoError(t, err)
 	assert.True(t, strings.Contains(resp.Message, "get table by id"))
 	t.Log(resp.Message)
-
-	dumpTableFS, err := tae.Runtime.TmpFS.GetOrCreateApp(
-		&fileservice.AppConfig{
-			Name: DumpTableDir,
-			GCFn: GCDumpTableFiles,
-		},
-	)
-	require.NoError(t, err)
-
-	dirs := dumpTableFS.List(ctx, "")
-	var dir string
-	for entry, err := range dirs {
-		assert.NoError(t, err)
-		t.Log(entry.Name)
-		dir = entry.Name
-	}
 
 	applyTableCmd := fmt.Sprintf("apply-table-data -d %v -t %v -o %s", "db2", "table2", dir)
 
@@ -459,7 +430,7 @@ func TestApplyTableDataError(t *testing.T) {
 	require.NoError(t, err)
 
 	resp, err = mh.runInspectCmd(applyTableCmd)
-	assert.True(t, strings.Contains(resp.Message, "database \"db2\" already exists"))
+	assert.True(t, strings.Contains(resp.Message, "table \"db2\".\"table2\" already exists"))
 	require.NoError(t, err)
 }
 
