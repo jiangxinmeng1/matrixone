@@ -534,16 +534,21 @@ func (c *DumpTableArg) applyAppendableTombstoneForBlock(
 ) error {
 	schema := tombstone.GetTable().GetLastestSchema(true)
 	var bat *containers.Batch
-	if err := tombstone.GetObjectData().Scan(
-		c.ctx,
-		&bat,
-		c.txn,
-		schema,
-		0,
-		[]int{objectio.TombstoneAttr_Rowid_SeqNum},
-		c.mp,
-	); err != nil {
-		return err
+	for blkID := 0; blkID < tombstone.BlockCnt(); blkID++ {
+		if err := tombstone.GetObjectData().Scan(
+			c.ctx,
+			&bat,
+			c.txn,
+			schema,
+			uint16(blkID),
+			[]int{objectio.TombstoneAttr_Rowid_SeqNum},
+			c.mp,
+		); err != nil {
+			return err
+		}
+	}
+	if bat == nil {
+		return nil
 	}
 	defer bat.Close()
 	if bat.Length() == 0 {
