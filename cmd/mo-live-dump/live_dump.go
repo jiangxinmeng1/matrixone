@@ -191,6 +191,7 @@ func applyCommand() *cobra.Command {
 	var from string
 	var targetDatabase string
 	var targetTable string
+	var jobs int
 	cmd := &cobra.Command{
 		Use:   "apply",
 		Short: "Apply a live object dump package",
@@ -210,6 +211,9 @@ func applyCommand() *cobra.Command {
 				return err
 			}
 			defer db.Close()
+			workers := liveDumpWorkerCount(jobs)
+			db.SetMaxOpenConns(workers + 1)
+			db.SetMaxIdleConns(workers + 1)
 
 			// Resolve tables to apply. If --target-table is given, apply a single
 			// table. Otherwise scan --from for table subdirectories and apply each
@@ -230,31 +234,14 @@ func applyCommand() *cobra.Command {
 				}
 			}
 
-			for _, t := range tasks {
-				// Allow empty table name → TN reads original name from dump.
-				operation := fmt.Sprintf(
-					"apply-table-data -d %s -t %s -o %s",
-					shellArg(targetDatabase),
-					shellArg(t.tableName),
-					shellArg(t.dir),
-				)
-				sqlText := fmt.Sprintf("select mo_ctl('dn', 'inspect', %s)", sqlString(operation))
-				resp, err := querySingleString(db, sqlText)
-				if err != nil {
-					return fmt.Errorf("apply %s: %w", t.dir, err)
-				}
-				if err = inspectResponseError(resp); err != nil {
-					return fmt.Errorf("apply %s: %w", t.dir, err)
-				}
-				cmd.Println(strings.TrimSpace(resp))
-			}
-			return nil
+			return applyTablesParallel(cmd, db, tasks, targetDatabase, workers)
 		},
 	}
 	addCommonFlags(cmd, &opts, "target")
 	cmd.Flags().StringVar(&from, "from", "", "dump directory to apply")
 	cmd.Flags().StringVar(&targetDatabase, "target-database", "", "target database name")
 	cmd.Flags().StringVar(&targetTable, "target-table", "", "target table name (optional for database-level apply)")
+	cmd.Flags().IntVar(&jobs, "jobs", 0, "number of concurrent table jobs; 0 chooses a fixed worker count from CPU and memory")
 	return cmd
 }
 
@@ -505,6 +492,106 @@ func sqlString(s string) string {
 type applyTableTask struct {
 	dir       string
 	tableName string
+}
+
+func applyTablesParallel(cmd *cobra.Command, db *sql.DB, tasks []applyTableTask, targetDatabase string, workers int) error {
+	if len(tasks) == 0 {
+		return nil
+	}
+	tableWorkers := workers
+	if tableWorkers > len(tasks) {
+		tableWorkers = len(tasks)
+	}
+	type result struct {
+		task applyTableTask
+		resp string
+		err  error
+	}
+
+	jobsCh := make(chan applyTableTask)
+	results := make(chan result, tableWorkers)
+	var busy atomic.Int64
+	var queued atomic.Int64
+	queued.Store(int64(len(tasks)))
+
+	cmd.Printf("live-dump apply start: total_tables=%d table_workers=%d object_workers=%d\n", len(tasks), tableWorkers, workers)
+	done := make(chan struct{})
+	var printerWG sync.WaitGroup
+	printerWG.Add(1)
+	go func() {
+		defer printerWG.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if busy.Load() > 0 || queued.Load() > 0 {
+					cmd.Printf(
+						"live-dump apply status: total_tables=%d active_table_workers=%d queued_tables=%d table_workers=%d object_workers=%d\n",
+						len(tasks),
+						busy.Load(),
+						queued.Load(),
+						tableWorkers,
+						workers,
+					)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < tableWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for t := range jobsCh {
+				queued.Add(-1)
+				busy.Add(1)
+				// Allow empty table name: TN reads the original name from the dump.
+				operation := fmt.Sprintf(
+					"apply-table-data -d %s -t %s -o %s --workers %d",
+					shellArg(targetDatabase),
+					shellArg(t.tableName),
+					shellArg(t.dir),
+					workers,
+				)
+				sqlText := fmt.Sprintf("select mo_ctl('dn', 'inspect', %s)", sqlString(operation))
+				resp, err := querySingleString(db, sqlText)
+				if err == nil {
+					err = inspectResponseError(resp)
+				}
+				busy.Add(-1)
+				if err != nil {
+					err = fmt.Errorf("apply %s: %w", t.dir, err)
+				}
+				results <- result{task: t, resp: resp, err: err}
+			}
+		}()
+	}
+	go func() {
+		for _, t := range tasks {
+			jobsCh <- t
+		}
+		close(jobsCh)
+		wg.Wait()
+		close(results)
+	}()
+
+	var firstErr error
+	for res := range results {
+		if res.err != nil && firstErr == nil {
+			firstErr = res.err
+			continue
+		}
+		if res.err == nil {
+			cmd.Printf("Table %s applied\n%s\n", res.task.dir, strings.TrimSpace(res.resp))
+		}
+	}
+	close(done)
+	printerWG.Wait()
+	return firstErr
 }
 
 // resolveApplyTables scans the dump root directory for table subdirectories

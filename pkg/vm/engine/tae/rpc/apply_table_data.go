@@ -18,6 +18,9 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
@@ -62,7 +65,27 @@ type ApplyTableDataArg struct {
 
 	autoIncrementCols []incrservice.AutoColumn
 	autoIncrementMaxs []uint64
+
+	workers int
 }
+
+type applyObjectResult struct {
+	index            int
+	stats            []byte
+	autoIncrementMax []uint64
+	err              error
+}
+
+type applyObjectJob struct {
+	index int
+	stats []byte
+}
+
+var globalApplyObjectWorkers = struct {
+	sync.Mutex
+	ch     chan struct{}
+	active atomic.Int64
+}{}
 
 func NewApplyTableDataArg(
 	ctx context.Context,
@@ -102,6 +125,7 @@ func (a *ApplyTableDataArg) PrepareCommand() *cobra.Command {
 	applyTableDataCmd.Flags().StringP("tname", "t", "", "set table name")
 	applyTableDataCmd.Flags().StringP("dname", "d", "", "set database name")
 	applyTableDataCmd.Flags().StringP("dir", "o", "", "set output directory")
+	applyTableDataCmd.Flags().IntP("workers", "w", 0, "object apply workers; 0 chooses a fixed worker count from CPU and memory")
 	return applyTableDataCmd
 }
 
@@ -109,6 +133,8 @@ func (a *ApplyTableDataArg) FromCommand(cmd *cobra.Command) (err error) {
 	a.tableName, _ = cmd.Flags().GetString("tname")
 	a.databaseName, _ = cmd.Flags().GetString("dname")
 	a.dir, _ = cmd.Flags().GetString("dir")
+	a.workers, _ = cmd.Flags().GetInt("workers")
+	a.workers = dumpTableWorkerCount(a.workers)
 	if cmd.Flag("ictx") != nil {
 		if a.dir == "" {
 			return moerr.NewInternalErrorNoCtx("dump directory is required")
@@ -149,10 +175,14 @@ func (a *ApplyTableDataArg) Usage() (res string) {
 	return
 }
 func (a *ApplyTableDataArg) Run() (err error) {
+	if a.workers <= 0 {
+		a.workers = dumpTableWorkerCount(0)
+	}
 	logutil.Info(
 		"APPLY-TABLE-DATA-START",
 		zap.String("dir", a.dir),
 		zap.String("start ts", a.txn.GetStartTS().ToString()),
+		zap.Int("workers", a.workers),
 	)
 	defer func() {
 		if err != nil {
@@ -195,19 +225,21 @@ func (a *ApplyTableDataArg) Run() (err error) {
 	defer objectlistBatch.Clean(a.mp)
 	objTypes := vector.MustFixedColNoTypeCheck[int8](objectlistBatch.Vecs[ObjectListAttr_ObjectType_Idx])
 	idVec := objectlistBatch.Vecs[ObjectListAttr_ID_Idx]
-
-	statsVec := containers.MakeVector(types.T_varchar.ToType(), a.mp)
-	defer statsVec.Close()
+	dataObjects := make([][]byte, 0, objectlistBatch.RowCount())
 	for i := 0; i < objectlistBatch.RowCount(); i++ {
 		if objTypes[i] == ckputil.ObjectType_Data {
-			if err = a.applyDataObject(idVec.GetBytesAt(i), statsVec); err != nil {
-				return
-			}
+			dataObjects = append(dataObjects, append([]byte(nil), idVec.GetBytesAt(i)...))
 		} else if objTypes[i] == ckputil.ObjectType_Tombstone {
 			return moerr.NewInternalErrorNoCtx("invalid dump table object list: tombstone object is not supported")
 		} else {
 			panic(fmt.Sprintf("invalid object type: %d", objTypes[i]))
 		}
+	}
+
+	statsVec := containers.MakeVector(types.T_varchar.ToType(), a.mp)
+	defer statsVec.Close()
+	if err = a.applyDataObjectsParallel(dataObjects, statsVec); err != nil {
+		return
 	}
 	if statsVec.Length() > 0 {
 		if err = a.rel.AddDataFiles(a.ctx, statsVec); err != nil {
@@ -222,21 +254,132 @@ func (a *ApplyTableDataArg) Run() (err error) {
 
 }
 
-func (a *ApplyTableDataArg) applyDataObject(
-	rawStats []byte,
+func (a *ApplyTableDataArg) applyDataObjectsParallel(
+	objects [][]byte,
 	statsVec containers.Vector,
-) (err error) {
+) error {
+	if len(objects) == 0 {
+		return nil
+	}
+	workers := a.workers
+	if workers > len(objects) {
+		workers = len(objects)
+	}
+	limiter := getGlobalApplyObjectLimiter(a.workers)
+	jobsCh := make(chan applyObjectJob)
+	results := make(chan applyObjectResult, workers)
+	var queued atomic.Int64
+	queued.Store(int64(len(objects)))
+
+	done := make(chan struct{})
+	var printerWG sync.WaitGroup
+	printerWG.Add(1)
+	go func() {
+		defer printerWG.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if queued.Load() > 0 || globalApplyObjectWorkers.active.Load() > 0 {
+					logutil.Info(
+						"APPLY-TABLE-DATA-PIPELINE-STATUS",
+						zap.String("dir", a.dir),
+						zap.String("table", fmt.Sprintf("%d-%s", a.tableID, a.tableName)),
+						zap.Int("total_objects", len(objects)),
+						zap.Int64("queued_objects", queued.Load()),
+						zap.Int64("active_workers", globalApplyObjectWorkers.active.Load()),
+						zap.Int("total_workers", cap(limiter)),
+					)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobsCh {
+				limiter <- struct{}{}
+				globalApplyObjectWorkers.active.Add(1)
+				queued.Add(-1)
+				res := func() applyObjectResult {
+					defer func() {
+						globalApplyObjectWorkers.active.Add(-1)
+						<-limiter
+					}()
+					return a.applyDataObject(job.index, job.stats)
+				}()
+				results <- res
+			}
+		}()
+	}
+	go func() {
+		for i, rawStats := range objects {
+			jobsCh <- applyObjectJob{index: i, stats: rawStats}
+		}
+		close(jobsCh)
+		wg.Wait()
+		close(results)
+	}()
+
+	var firstErr error
+	ordered := make([]applyObjectResult, len(objects))
+	for res := range results {
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
+			}
+			continue
+		}
+		ordered[res.index] = res
+	}
+	for _, res := range ordered {
+		if res.err != nil || res.stats == nil {
+			continue
+		}
+		statsVec.Append(res.stats, false)
+		a.mergeAutoIncrementMaxs(res.autoIncrementMax)
+	}
+	close(done)
+	printerWG.Wait()
+	return firstErr
+}
+
+func getGlobalApplyObjectLimiter(workers int) chan struct{} {
+	if workers <= 0 {
+		workers = dumpTableWorkerCount(0)
+	}
+	globalApplyObjectWorkers.Lock()
+	defer globalApplyObjectWorkers.Unlock()
+	if globalApplyObjectWorkers.ch == nil ||
+		(cap(globalApplyObjectWorkers.ch) != workers &&
+			globalApplyObjectWorkers.active.Load() == 0 &&
+			len(globalApplyObjectWorkers.ch) == 0) {
+		globalApplyObjectWorkers.ch = make(chan struct{}, workers)
+	}
+	return globalApplyObjectWorkers.ch
+}
+
+func (a *ApplyTableDataArg) applyDataObject(
+	index int,
+	rawStats []byte,
+) applyObjectResult {
 	sourceStats := objectio.ObjectStats(rawStats)
 	sourceName := sourceStats.ObjectName().String()
 	schema := a.rel.GetMeta().(*catalog.TableEntry).GetLastestSchema(false)
 	attrs := append(append([]string{}, schema.AllNames()...), objectio.PhysicalAddr_Attr, objectio.TombstoneAttr_CommitTs_Attr)
 	bats, release, err := a.readBatches(sourceName, nil, attrs)
 	if err != nil {
-		return err
+		return applyObjectResult{index: index, err: err}
 	}
 	defer releaseBatches(release, bats, a.mp)
 	if len(bats) == 0 {
-		return nil
+		return applyObjectResult{index: index}
 	}
 
 	arena := objectio.GetArena(objectio.ArenaSmall)
@@ -256,7 +399,7 @@ func (a *ApplyTableDataArg) applyDataObject(
 		arena,
 	)
 	if err != nil {
-		return err
+		return applyObjectResult{index: index, err: err}
 	}
 	if schema.HasPK() {
 		writer.SetPrimaryKey(uint16(schema.GetSingleSortKeyIdx()))
@@ -269,18 +412,19 @@ func (a *ApplyTableDataArg) applyDataObject(
 
 	userColCnt := len(schema.AllNames())
 	totalRows := 0
+	autoIncrementMaxs := make([]uint64, len(a.autoIncrementCols))
 	for _, bat := range bats {
 		if bat.RowCount() == 0 {
 			continue
 		}
-		a.collectAutoIncrementMax(bat)
+		a.collectAutoIncrementMax(bat, autoIncrementMaxs)
 		writeBat := batch.NewWithSize(userColCnt)
 		writeBat.Vecs = bat.Vecs[:userColCnt]
 		writeBat.Attrs = attrs[:userColCnt]
 		writeBat.SetRowCount(bat.RowCount())
 		totalRows += bat.RowCount()
 		if _, err = writer.WriteBatch(writeBat); err != nil {
-			return err
+			return applyObjectResult{index: index, err: err}
 		}
 	}
 	if totalRows == 0 {
@@ -289,13 +433,12 @@ func (a *ApplyTableDataArg) applyDataObject(
 			zap.String("dir", a.dir),
 			zap.String("source-name", sourceName),
 		)
-		return nil
+		return applyObjectResult{index: index}
 	}
 	if _, _, err = writer.Sync(a.ctx); err != nil {
-		return err
+		return applyObjectResult{index: index, err: err}
 	}
 	stats := writer.GetObjectStats(objectio.WithCNCreated())
-	statsVec.Append(stats[:], false)
 	logutil.Info(
 		"APPLY-TABLE-DATA-WRITE-OBJECT",
 		zap.String("dir", a.dir),
@@ -303,7 +446,11 @@ func (a *ApplyTableDataArg) applyDataObject(
 		zap.String("target-name", name.String()),
 		zap.Int("rows", totalRows),
 	)
-	return nil
+	return applyObjectResult{
+		index:            index,
+		stats:            append([]byte(nil), stats[:]...),
+		autoIncrementMax: autoIncrementMaxs,
+	}
 }
 
 func releaseBatches(release func(), bats []*batch.Batch, mp *mpool.MPool) {
@@ -480,8 +627,11 @@ func (a *ApplyTableDataArg) initAutoIncrementMetadata() {
 	}
 }
 
-func (a *ApplyTableDataArg) collectAutoIncrementMax(bat *batch.Batch) {
+func (a *ApplyTableDataArg) collectAutoIncrementMax(bat *batch.Batch, maxs []uint64) {
 	for i, col := range a.autoIncrementCols {
+		if i >= len(maxs) {
+			continue
+		}
 		if col.ColIndex < 0 || col.ColIndex >= len(bat.Vecs) {
 			continue
 		}
@@ -490,9 +640,17 @@ func (a *ApplyTableDataArg) collectAutoIncrementMax(bat *batch.Batch) {
 			if vec.IsNull(uint64(row)) {
 				continue
 			}
-			if v, ok := autoIncrementValueToUint64(vec, row); ok && v > a.autoIncrementMaxs[i] {
-				a.autoIncrementMaxs[i] = v
+			if v, ok := autoIncrementValueToUint64(vec, row); ok && v > maxs[i] {
+				maxs[i] = v
 			}
+		}
+	}
+}
+
+func (a *ApplyTableDataArg) mergeAutoIncrementMaxs(maxs []uint64) {
+	for i, v := range maxs {
+		if i < len(a.autoIncrementMaxs) && v > a.autoIncrementMaxs[i] {
+			a.autoIncrementMaxs[i] = v
 		}
 	}
 }
