@@ -18,9 +18,14 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	mosystem "github.com/matrixorigin/matrixone/pkg/common/system"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
@@ -92,8 +97,17 @@ type DumpTableArg struct {
 	inspectContext  *inspectContext
 	objectListBatch *batch.Batch
 	tombstones      []*catalog.ObjectEntry
+	workers         int
 	mp              *mpool.MPool
 	srcfs, dstfs    fileservice.FileService
+}
+
+type dumpObjectListEntry struct {
+	objectType  int8
+	stats       objectio.ObjectStats
+	createTS    types.TS
+	deleteTS    types.TS
+	isPersisted bool
 }
 
 // for UT
@@ -128,6 +142,7 @@ func (c *DumpTableArg) PrepareCommand() *cobra.Command {
 	dumpTableCmd.Flags().IntP("did", "d", 0, "set database id")
 	dumpTableCmd.Flags().StringP("dir", "o", "", "set dump directory")
 	dumpTableCmd.Flags().StringP("snapshot-ts", "s", "", "snapshot timestamp for consistent cross-table dump")
+	dumpTableCmd.Flags().IntP("workers", "w", 0, "object pipeline workers; 0 chooses a fixed worker count from CPU and memory")
 	return dumpTableCmd
 }
 
@@ -136,6 +151,8 @@ func (c *DumpTableArg) FromCommand(cmd *cobra.Command) (err error) {
 	did, _ := cmd.Flags().GetInt("did")
 	c.dir, _ = cmd.Flags().GetString("dir")
 	c.snapshotTSStr, _ = cmd.Flags().GetString("snapshot-ts")
+	c.workers, _ = cmd.Flags().GetInt("workers")
+	c.workers = dumpTableWorkerCount(c.workers)
 	if cmd.Flag("ictx") != nil {
 		if c.dir == "" {
 			return moerr.NewInternalErrorNoCtx("dump directory is required")
@@ -183,6 +200,9 @@ func (c *DumpTableArg) Usage() (res string) {
 	return
 }
 func (c *DumpTableArg) Run() (err error) {
+	if c.workers <= 0 {
+		c.workers = dumpTableWorkerCount(0)
+	}
 	if c.snapshotTSStr != "" {
 		snapshotTS := types.StringToTS(c.snapshotTSStr)
 		if c.txn, err = c.inspectContext.db.StartTxnWithStartTSAndSnapshotTS(nil, snapshotTS); err != nil {
@@ -209,18 +229,6 @@ func (c *DumpTableArg) Run() (err error) {
 		zap.String("dir", c.dir),
 	)
 	defer c.objectListBatch.Clean(c.mp)
-	var txn txnif.AsyncTxn
-	if c.snapshotTSStr != "" {
-		snapshotTS := types.StringToTS(c.snapshotTSStr)
-		txn, err = c.inspectContext.db.StartTxnWithStartTSAndSnapshotTS(nil, snapshotTS)
-	} else {
-		txn, err = c.inspectContext.db.StartTxn(nil)
-	}
-	if err != nil {
-		return err
-	}
-	defer txn.Commit(c.ctx)
-
 	if err := c.flushTableSchema(); err != nil {
 		return err
 	}
@@ -234,9 +242,11 @@ func (c *DumpTableArg) Run() (err error) {
 		return err
 	}
 
-	p = &catalog.LoopProcessor{}
-	p.ObjectFn = c.onObject
-	if err = c.table.RecurLoop(p); err != nil {
+	objects, err := c.collectDataObjects()
+	if err != nil {
+		return err
+	}
+	if err = c.dumpObjectsParallel(objects); err != nil {
 		return err
 	}
 	if err := c.flush(DumpTableObjectList, c.objectListBatch); err != nil {
@@ -306,17 +316,137 @@ func (c *DumpTableArg) flushTableEntry() (err error) {
 	return
 }
 
-func (c *DumpTableArg) onObject(e *catalog.ObjectEntry) error {
+func (c *DumpTableArg) collectDataObjects() ([]*catalog.ObjectEntry, error) {
+	var objects []*catalog.ObjectEntry
+	p := &catalog.LoopProcessor{}
+	p.ObjectFn = func(e *catalog.ObjectEntry) error {
+		objects = append(objects, e)
+		return nil
+	}
+	if err := c.table.RecurLoop(p); err != nil {
+		return nil, err
+	}
+	return objects, nil
+}
+
+func (c *DumpTableArg) dumpObjectsParallel(objects []*catalog.ObjectEntry) error {
+	if len(objects) == 0 {
+		return nil
+	}
+	type result struct {
+		entry *dumpObjectListEntry
+		err   error
+	}
+
+	workers := c.workers
+	if workers > len(objects) {
+		workers = len(objects)
+	}
+	jobsCh := make(chan *catalog.ObjectEntry)
+	results := make(chan result, workers)
+	var busy atomic.Int64
+	var queued atomic.Int64
+	var objectListWorkers atomic.Int64
+	queued.Store(int64(len(objects)))
+
+	done := make(chan struct{})
+	var printerWG sync.WaitGroup
+	printerWG.Add(1)
+	go func() {
+		defer printerWG.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if busy.Load() > 0 || objectListWorkers.Load() > 0 {
+					logutil.Info(
+						"DUMP-TABLE-PIPELINE-STATUS",
+						zap.String("dir", c.dir),
+						zap.Int64("busy_workers", busy.Load()),
+						zap.Int64("queued_objects", queued.Load()),
+						zap.Int64("objectlist_workers", objectListWorkers.Load()),
+						zap.Int("total_workers", workers),
+					)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			txn, err := c.startWorkerTxn()
+			if err != nil {
+				for range jobsCh {
+					queued.Add(-1)
+					results <- result{err: err}
+				}
+				return
+			}
+			defer txn.Commit(c.ctx)
+			for e := range jobsCh {
+				queued.Add(-1)
+				busy.Add(1)
+				entry, err := c.dumpObject(txn, e)
+				busy.Add(-1)
+				if err == nil && entry != nil {
+					objectListWorkers.Add(1)
+				}
+				results <- result{entry: entry, err: err}
+			}
+		}()
+	}
+	go func() {
+		for _, e := range objects {
+			jobsCh <- e
+		}
+		close(jobsCh)
+		wg.Wait()
+		close(results)
+	}()
+
+	var firstErr error
+	for res := range results {
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
+			}
+			continue
+		}
+		if res.entry != nil {
+			if firstErr == nil {
+				if err := c.appendObjectListEntry(res.entry); err != nil {
+					firstErr = err
+				}
+			}
+			objectListWorkers.Add(-1)
+		}
+	}
+	close(done)
+	printerWG.Wait()
+	return firstErr
+}
+
+func (c *DumpTableArg) startWorkerTxn() (txnif.AsyncTxn, error) {
+	return c.inspectContext.db.StartTxnWithStartTSAndSnapshotTS(nil, c.txn.GetStartTS())
+}
+
+func (c *DumpTableArg) dumpObject(txn txnif.AsyncTxn, e *catalog.ObjectEntry) (*dumpObjectListEntry, error) {
 	if e.IsTombstone {
-		return nil
+		return nil, nil
 	}
-	startTS := c.txn.GetStartTS()
+	startTS := txn.GetStartTS()
 	if e.CreatedAt.EQ(&txnif.UncommitTS) || e.DeleteBefore(startTS) {
-		return nil
+		return nil, nil
 	}
-	bat, err := c.visitObjectData(e)
+	bat, err := c.visitObjectData(txn, e)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if bat == nil {
 		logutil.Info(
@@ -324,11 +454,11 @@ func (c *DumpTableArg) onObject(e *catalog.ObjectEntry) error {
 			zap.String("dir", c.dir),
 			zap.String("name", objectio.BuildObjectNameWithObjectID(e.ID()).String()),
 		)
-		return nil
+		return nil, nil
 	}
 	defer bat.Close()
-	if err = c.filterDeletedRows(bat); err != nil {
-		return err
+	if err = c.filterDeletedRows(txn, bat); err != nil {
+		return nil, err
 	}
 	if bat.Length() == 0 {
 		logutil.Info(
@@ -336,21 +466,21 @@ func (c *DumpTableArg) onObject(e *catalog.ObjectEntry) error {
 			zap.String("dir", c.dir),
 			zap.String("name", objectio.BuildObjectNameWithObjectID(e.ID()).String()),
 		)
-		return nil
+		return nil, nil
 	}
-	isPersisted, err := c.collectObjectList(e)
+	objectListEntry, err := c.prepareObjectListEntry(txn, e)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cnBatch := containers.ToCNBatch(bat)
 	objectName := objectio.BuildObjectNameWithObjectID(e.ID())
-	if isPersisted {
+	if objectListEntry.isPersisted {
 		objectName = e.ObjectStats.ObjectName()
 	}
 	if err := c.flush(objectName.String(), cnBatch); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return objectListEntry, nil
 }
 
 func (c *DumpTableArg) flush(name string, bat *batch.Batch) (err error) {
@@ -384,8 +514,8 @@ func (c *DumpTableArg) flush(name string, bat *batch.Batch) (err error) {
 	return
 }
 
-func (c *DumpTableArg) collectObjectList(e *catalog.ObjectEntry) (isPersisted bool, err error) {
-	startTS := c.txn.GetStartTS()
+func (c *DumpTableArg) prepareObjectListEntry(txn txnif.AsyncTxn, e *catalog.ObjectEntry) (*dumpObjectListEntry, error) {
+	startTS := txn.GetStartTS()
 	objectType := int8(ckputil.ObjectType_Data)
 	var deleteTS types.TS
 	if e.DeletedAt.EQ(&txnif.UncommitTS) || e.DeletedAt.LT(&startTS) {
@@ -393,45 +523,56 @@ func (c *DumpTableArg) collectObjectList(e *catalog.ObjectEntry) (isPersisted bo
 	} else {
 		deleteTS = e.DeletedAt
 	}
-	if isPersisted, err = c.isObjectPersisted(e); err != nil {
-		return false, err
+	isPersisted, err := c.isObjectPersisted(txn, e)
+	if err != nil {
+		return nil, err
 	}
 	stats := e.ObjectStats
 	if !isPersisted {
-		if err = objectio.SetObjectStatsObjectName(&stats, objectio.BuildObjectNameWithObjectID(e.ID())); err != nil {
-			return false, err
+		if err := objectio.SetObjectStatsObjectName(&stats, objectio.BuildObjectNameWithObjectID(e.ID())); err != nil {
+			return nil, err
 		}
 	}
-	if err := vector.AppendFixed(
-		c.objectListBatch.Vecs[ObjectListAttr_ObjectType_Idx], objectType, false, c.mp,
-	); err != nil {
-		return false, err
-	}
-	if err := vector.AppendBytes(
-		c.objectListBatch.Vecs[ObjectListAttr_ID_Idx], []byte(stats[:]), false, c.mp,
-	); err != nil {
-		return false, err
-	}
-	if err := vector.AppendFixed(
-		c.objectListBatch.Vecs[ObjectListAttr_CreateTS_Idx], e.CreatedAt, false, c.mp,
-	); err != nil {
-		return false, err
-	}
-	if err := vector.AppendFixed(
-		c.objectListBatch.Vecs[ObjectListAttr_DeleteTS_Idx], deleteTS, false, c.mp,
-	); err != nil {
-		return false, err
-	}
-	if err := vector.AppendFixed(
-		c.objectListBatch.Vecs[ObjectListAttr_IsPersisted_Idx], isPersisted, false, c.mp,
-	); err != nil {
-		return false, err
-	}
-	c.objectListBatch.SetRowCount(c.objectListBatch.Vecs[0].Length())
-	return
+	return &dumpObjectListEntry{
+		objectType:  objectType,
+		stats:       stats,
+		createTS:    e.CreatedAt,
+		deleteTS:    deleteTS,
+		isPersisted: isPersisted,
+	}, nil
 }
 
-func (c *DumpTableArg) visitObjectData(e *catalog.ObjectEntry) (bat *containers.Batch, err error) {
+func (c *DumpTableArg) appendObjectListEntry(entry *dumpObjectListEntry) error {
+	if err := vector.AppendFixed(
+		c.objectListBatch.Vecs[ObjectListAttr_ObjectType_Idx], entry.objectType, false, c.mp,
+	); err != nil {
+		return err
+	}
+	if err := vector.AppendBytes(
+		c.objectListBatch.Vecs[ObjectListAttr_ID_Idx], []byte(entry.stats[:]), false, c.mp,
+	); err != nil {
+		return err
+	}
+	if err := vector.AppendFixed(
+		c.objectListBatch.Vecs[ObjectListAttr_CreateTS_Idx], entry.createTS, false, c.mp,
+	); err != nil {
+		return err
+	}
+	if err := vector.AppendFixed(
+		c.objectListBatch.Vecs[ObjectListAttr_DeleteTS_Idx], entry.deleteTS, false, c.mp,
+	); err != nil {
+		return err
+	}
+	if err := vector.AppendFixed(
+		c.objectListBatch.Vecs[ObjectListAttr_IsPersisted_Idx], entry.isPersisted, false, c.mp,
+	); err != nil {
+		return err
+	}
+	c.objectListBatch.SetRowCount(c.objectListBatch.Vecs[0].Length())
+	return nil
+}
+
+func (c *DumpTableArg) visitObjectData(txn txnif.AsyncTxn, e *catalog.ObjectEntry) (bat *containers.Batch, err error) {
 	schema := e.GetTable().GetLastestSchema(false)
 	colIdxes := make([]int, 0)
 	// user rows, rowID, commitTS
@@ -441,7 +582,7 @@ func (c *DumpTableArg) visitObjectData(e *catalog.ObjectEntry) (bat *containers.
 	colIdxes = append(colIdxes, objectio.SEQNUM_ROWID)
 	colIdxes = append(colIdxes, objectio.SEQNUM_COMMITTS)
 	for blkID := 0; blkID < e.BlockCnt(); blkID++ {
-		if err = e.GetObjectData().Scan(c.ctx, &bat, c.txn, schema, uint16(blkID), colIdxes, c.mp); err != nil {
+		if err = e.GetObjectData().Scan(c.ctx, &bat, txn, schema, uint16(blkID), colIdxes, c.mp); err != nil {
 			return
 		}
 	}
@@ -457,7 +598,7 @@ func (c *DumpTableArg) collectTombstoneObject(e *catalog.ObjectEntry) error {
 	return nil
 }
 
-func (c *DumpTableArg) filterDeletedRows(bat *containers.Batch) error {
+func (c *DumpTableArg) filterDeletedRows(txn txnif.AsyncTxn, bat *containers.Batch) error {
 	if bat == nil {
 		return nil
 	}
@@ -479,7 +620,7 @@ func (c *DumpTableArg) filterDeletedRows(bat *containers.Batch) error {
 		deletedRows, ok := deletedByBlock[blockID]
 		if !ok {
 			var err error
-			if deletedRows, err = c.getDeletedMaskForBlock(&blockID); err != nil {
+			if deletedRows, err = c.getDeletedMaskForBlock(txn, &blockID); err != nil {
 				return err
 			}
 			deletedByBlock[blockID] = deletedRows
@@ -495,15 +636,15 @@ func (c *DumpTableArg) filterDeletedRows(bat *containers.Batch) error {
 	return nil
 }
 
-func (c *DumpTableArg) getDeletedMaskForBlock(blockID *types.Blockid) (objectio.Bitmap, error) {
+func (c *DumpTableArg) getDeletedMaskForBlock(txn txnif.AsyncTxn, blockID *types.Blockid) (objectio.Bitmap, error) {
 	deletedRows := objectio.GetReusableBitmap()
-	startTS := c.txn.GetStartTS()
+	startTS := txn.GetStartTS()
 	for _, tombstone := range c.tombstones {
 		stats := tombstone.ObjectStats
 		if !stats.ZMIsEmpty() && !stats.SortKeyZoneMap().RowidPrefixEq(blockID[:]) {
 			continue
 		}
-		isPersisted, err := c.isObjectPersisted(tombstone)
+		isPersisted, err := c.isObjectPersisted(txn, tombstone)
 		if err != nil {
 			deletedRows.Release()
 			return deletedRows, err
@@ -530,7 +671,7 @@ func (c *DumpTableArg) getDeletedMaskForBlock(blockID *types.Blockid) (objectio.
 			}
 			continue
 		}
-		if err := c.applyAppendableTombstoneForBlock(tombstone, blockID, &deletedRows); err != nil {
+		if err := c.applyAppendableTombstoneForBlock(txn, tombstone, blockID, &deletedRows); err != nil {
 			deletedRows.Release()
 			return deletedRows, err
 		}
@@ -539,6 +680,7 @@ func (c *DumpTableArg) getDeletedMaskForBlock(blockID *types.Blockid) (objectio.
 }
 
 func (c *DumpTableArg) applyAppendableTombstoneForBlock(
+	txn txnif.AsyncTxn,
 	tombstone *catalog.ObjectEntry,
 	blockID *types.Blockid,
 	deletedRows *objectio.Bitmap,
@@ -549,7 +691,7 @@ func (c *DumpTableArg) applyAppendableTombstoneForBlock(
 		if err := tombstone.GetObjectData().Scan(
 			c.ctx,
 			&bat,
-			c.txn,
+			txn,
 			schema,
 			uint16(blkID),
 			[]int{objectio.TombstoneAttr_Rowid_SeqNum},
@@ -575,8 +717,8 @@ func (c *DumpTableArg) applyAppendableTombstoneForBlock(
 	return nil
 }
 
-func (c *DumpTableArg) isObjectPersisted(e *catalog.ObjectEntry) (bool, error) {
-	startTS := c.txn.GetStartTS()
+func (c *DumpTableArg) isObjectPersisted(txn txnif.AsyncTxn, e *catalog.ObjectEntry) (bool, error) {
+	startTS := txn.GetStartTS()
 	var deleteTS types.TS
 	if e.DeletedAt.EQ(&txnif.UncommitTS) || e.DeletedAt.LT(&startTS) {
 		deleteTS = types.TS{}
@@ -584,4 +726,26 @@ func (c *DumpTableArg) isObjectPersisted(e *catalog.ObjectEntry) (bool, error) {
 		deleteTS = e.DeletedAt
 	}
 	return !e.GetAppendable() || !deleteTS.IsEmpty(), nil
+}
+
+func dumpTableWorkerCount(requested int) int {
+	if requested > 0 {
+		return requested
+	}
+	cpuWorkers := runtime.GOMAXPROCS(0)
+	if cpuWorkers < 1 {
+		cpuWorkers = 1
+	}
+	mem := mosystem.MemoryAvailable()
+	if mem == 0 {
+		mem = mosystem.MemoryTotal() / 2
+	}
+	memWorkers := int(mem / (2 << 30))
+	if memWorkers < 1 {
+		memWorkers = 1
+	}
+	if cpuWorkers < memWorkers {
+		return cpuWorkers
+	}
+	return memWorkers
 }

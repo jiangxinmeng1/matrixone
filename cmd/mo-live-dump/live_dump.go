@@ -22,10 +22,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	mosystem "github.com/matrixorigin/matrixone/pkg/common/system"
 	"github.com/spf13/cobra"
 )
 
@@ -150,7 +155,9 @@ func dumpCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_ = jobs // v1 runs serially; keep the flag for CLI compatibility.
+			workers := liveDumpWorkerCount(jobs)
+			db.SetMaxOpenConns(workers + 1)
+			db.SetMaxIdleConns(workers + 1)
 			// Obtain a single snapshot timestamp for consistent cross-table dump.
 			getTSSQL := fmt.Sprintf("select mo_ctl('dn', 'inspect', %s)", sqlString("get-ts"))
 			resp, err := querySingleString(db, getTSSQL)
@@ -161,24 +168,8 @@ func dumpCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("parse snapshot timestamp: %w", err)
 			}
-			for _, tbl := range tables {
-				dir := tableDumpDir(root, tbl)
-				operation := fmt.Sprintf(
-					"dump-table -d %d -t %d -o %s --snapshot-ts %s",
-					tbl.dbID,
-					tbl.tableID,
-					shellArg(dir),
-					snapshotTS,
-				)
-				sqlText := fmt.Sprintf("select mo_ctl('dn', 'inspect', %s)", sqlString(operation))
-				resp, err := querySingleString(db, sqlText)
-				if err != nil {
-					return fmt.Errorf("dump %s.%s(%d): %w", tbl.dbName, tbl.tableName, tbl.tableID, err)
-				}
-				if err = inspectResponseError(resp); err != nil {
-					return fmt.Errorf("dump %s.%s(%d): %w", tbl.dbName, tbl.tableName, tbl.tableID, err)
-				}
-				cmd.Printf("Table %d %s.%s dumped to %s\n%s\n", tbl.tableID, tbl.dbName, tbl.tableName, dir, strings.TrimSpace(resp))
+			if err = dumpTablesParallel(cmd, db, tables, root, snapshotTS, workers); err != nil {
+				return err
 			}
 			cmd.Printf("Dumped %d tables to %s\n", len(tables), root)
 			return nil
@@ -191,7 +182,7 @@ func dumpCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&cluster, "cluster", false, "dump all visible supported tables")
 	cmd.Flags().StringVarP(&output, "output", "o", "", "dump output root")
 	cmd.Flags().StringVar(&outputDir, "output-dir", "", "dump output root for batch scopes")
-	cmd.Flags().IntVar(&jobs, "jobs", 5, "number of concurrent table jobs; v1 executes serially")
+	cmd.Flags().IntVar(&jobs, "jobs", 0, "number of concurrent table jobs; 0 chooses a fixed worker count from CPU and memory")
 	return cmd
 }
 
@@ -396,6 +387,99 @@ func querySingleString(db *sql.DB, sqlText string) (string, error) {
 	return s.String, nil
 }
 
+func dumpTablesParallel(cmd *cobra.Command, db *sql.DB, tables []tableInfo, root, snapshotTS string, workers int) error {
+	type result struct {
+		tbl  tableInfo
+		dir  string
+		resp string
+		err  error
+	}
+
+	jobsCh := make(chan tableInfo)
+	results := make(chan result, workers)
+	var busy atomic.Int64
+	var queued atomic.Int64
+	queued.Store(int64(len(tables)))
+
+	done := make(chan struct{})
+	var printerWG sync.WaitGroup
+	printerWG.Add(1)
+	go func() {
+		defer printerWG.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if busy.Load() > 0 {
+					cmd.Printf(
+						"live-dump status: busy_workers=%d queued_tables=%d objectlist_workers=%d total_workers=%d\n",
+						busy.Load(),
+						queued.Load(),
+						busy.Load(),
+						workers,
+					)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for tbl := range jobsCh {
+				queued.Add(-1)
+				busy.Add(1)
+				dir := tableDumpDir(root, tbl)
+				operation := fmt.Sprintf(
+					"dump-table -d %d -t %d -o %s --snapshot-ts %s --workers %d",
+					tbl.dbID,
+					tbl.tableID,
+					shellArg(dir),
+					snapshotTS,
+					workers,
+				)
+				sqlText := fmt.Sprintf("select mo_ctl('dn', 'inspect', %s)", sqlString(operation))
+				resp, err := querySingleString(db, sqlText)
+				if err == nil {
+					err = inspectResponseError(resp)
+				}
+				busy.Add(-1)
+				if err != nil {
+					err = fmt.Errorf("dump %s.%s(%d): %w", tbl.dbName, tbl.tableName, tbl.tableID, err)
+				}
+				results <- result{tbl: tbl, dir: dir, resp: resp, err: err}
+			}
+		}()
+	}
+	go func() {
+		for _, tbl := range tables {
+			jobsCh <- tbl
+		}
+		close(jobsCh)
+		wg.Wait()
+		close(results)
+	}()
+
+	var firstErr error
+	for res := range results {
+		if res.err != nil && firstErr == nil {
+			firstErr = res.err
+			continue
+		}
+		if res.err == nil {
+			cmd.Printf("Table %d %s.%s dumped to %s\n%s\n", res.tbl.tableID, res.tbl.dbName, res.tbl.tableName, res.dir, strings.TrimSpace(res.resp))
+		}
+	}
+	close(done)
+	printerWG.Wait()
+	return firstErr
+}
+
 func tableDumpDir(root string, tbl tableInfo) string {
 	if len(root) > 0 && root[len(root)-1] == '/' {
 		root = strings.TrimRight(root, "/")
@@ -472,4 +556,26 @@ func inspectResponseError(resp string) error {
 		return nil
 	}
 	return fmt.Errorf("%s", s)
+}
+
+func liveDumpWorkerCount(requested int) int {
+	if requested > 0 {
+		return requested
+	}
+	cpuWorkers := runtime.GOMAXPROCS(0)
+	if cpuWorkers < 1 {
+		cpuWorkers = 1
+	}
+	mem := mosystem.MemoryAvailable()
+	if mem == 0 {
+		mem = mosystem.MemoryTotal() / 2
+	}
+	memWorkers := int(mem / (2 << 30))
+	if memWorkers < 1 {
+		memWorkers = 1
+	}
+	if cpuWorkers < memWorkers {
+		return cpuWorkers
+	}
+	return memWorkers
 }
