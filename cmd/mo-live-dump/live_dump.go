@@ -215,6 +215,10 @@ func applyCommand() *cobra.Command {
 			db.SetMaxOpenConns(workers + 1)
 			db.SetMaxIdleConns(workers + 1)
 
+			if err = ensureTargetDatabase(db, targetDatabase); err != nil {
+				return err
+			}
+
 			// Resolve tables to apply. If --target-table is given, apply a single
 			// table. Otherwise scan --from for table subdirectories and apply each
 			// one with its original name.
@@ -483,6 +487,17 @@ func shellArg(s string) string {
 
 func sqlString(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func sqlIdent(s string) string {
+	return "`" + strings.ReplaceAll(s, "`", "``") + "`"
+}
+
+func ensureTargetDatabase(db *sql.DB, name string) error {
+	if _, err := db.Exec("create database if not exists " + sqlIdent(name)); err != nil {
+		return fmt.Errorf("create target database %q: %w", name, err)
+	}
+	return nil
 }
 
 // resolveApplyTables scans the dump root directory for table subdirectories

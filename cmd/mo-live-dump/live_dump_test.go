@@ -27,6 +27,14 @@ func TestSQLString(t *testing.T) {
 	}
 }
 
+func TestSQLIdent(t *testing.T) {
+	got := sqlIdent("restore`db")
+	want := "`restore``db`"
+	if got != want {
+		t.Fatalf("sqlIdent() = %q, want %q", got, want)
+	}
+}
+
 func TestTableDumpDir(t *testing.T) {
 	tbl := tableInfo{
 		accountID: 7,
