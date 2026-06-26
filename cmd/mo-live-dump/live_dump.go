@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +49,12 @@ type tableInfo struct {
 	tableName string
 	relKind   string
 }
+
+const (
+	dumpRelKindOrdinary = "r"
+	dumpRelKindCluster  = "cluster"
+	dumpRelKindView     = "v"
+)
 
 func PrepareCommand() *cobra.Command {
 	cmd := &cobra.Command{
@@ -281,8 +288,8 @@ func resolveDumpTables(db *sql.DB, tableID, databaseID uint64, accountID uint32,
 func queryTables(db *sql.DB, where string) ([]tableInfo, error) {
 	sqlText := fmt.Sprintf(`select account_id, reldatabase_id, reldatabase, rel_id, relname, relkind
 from mo_catalog.mo_tables
-where %s and relkind = 'r'
-order by account_id, reldatabase_id, rel_id`, where)
+where %s and %s
+order by account_id, reldatabase_id, rel_id`, where, supportedDumpRelkindSQL())
 	rows, err := db.Query(sqlText)
 	if err != nil {
 		return nil, err
@@ -306,7 +313,7 @@ order by account_id, reldatabase_id, rel_id`, where)
 }
 
 func printTables(cmd *cobra.Command, db *sql.DB, accountID uint32, databaseID uint64) error {
-	conds := []string{"relkind = 'r'"}
+	conds := []string{supportedDumpRelkindSQL()}
 	if accountID != 0 {
 		conds = append(conds, "account_id = "+strconv.FormatUint(uint64(accountID), 10))
 	}
@@ -322,6 +329,15 @@ func printTables(cmd *cobra.Command, db *sql.DB, accountID uint32, databaseID ui
 		cmd.Printf("%d\t%d\t%s\t%d\t%s\t%s\n", tbl.accountID, tbl.dbID, tbl.dbName, tbl.tableID, tbl.tableName, tbl.relKind)
 	}
 	return nil
+}
+
+func supportedDumpRelkindSQL() string {
+	return fmt.Sprintf(
+		"relkind in (%s, %s, %s)",
+		sqlString(dumpRelKindOrdinary),
+		sqlString(dumpRelKindCluster),
+		sqlString(dumpRelKindView),
+	)
 }
 
 func printDatabases(cmd *cobra.Command, db *sql.DB, accountID uint32) error {
@@ -633,7 +649,16 @@ func resolveApplyTables(root string) ([]applyTableTask, error) {
 		// Pass empty table name → TN handler reads original name from dump.
 		tasks = append(tasks, applyTableTask{dir: m, tableName: ""})
 	}
+	sort.Slice(tasks, func(i, j int) bool {
+		return applyTaskTableID(tasks[i]) < applyTaskTableID(tasks[j])
+	})
 	return tasks, nil
+}
+
+func applyTaskTableID(t applyTableTask) uint64 {
+	base := filepath.Base(t.dir)
+	id, _ := strconv.ParseUint(strings.TrimPrefix(base, "table_"), 10, 64)
+	return id
 }
 
 // parseSnapshotTS extracts the timestamp string from a get-ts inspect command

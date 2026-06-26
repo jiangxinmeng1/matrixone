@@ -32,10 +32,12 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
 	pkgcatalog "github.com/matrixorigin/matrixone/pkg/catalog"
+	enginepkg "github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/ckputil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
@@ -216,6 +218,9 @@ func (a *ApplyTableDataArg) Run() (err error) {
 	if err = a.createTable(); err != nil {
 		return
 	}
+	if a.isView() {
+		return nil
+	}
 
 	objectlistBatch, release, err := a.readBatch(DumpTableObjectList, ObjectListAttrs)
 	if err != nil {
@@ -252,6 +257,10 @@ func (a *ApplyTableDataArg) Run() (err error) {
 	}
 	return
 
+}
+
+func (a *ApplyTableDataArg) isView() bool {
+	return a.schema != nil && a.schema.Relkind == pkgcatalog.SystemViewRel
 }
 
 func (a *ApplyTableDataArg) applyDataObjectsParallel(
@@ -531,6 +540,10 @@ func (a *ApplyTableDataArg) createTable() (err error) {
 	defer tableRelease()
 	defer tableBatch.Clean(a.mp)
 	tnTableBatch := containers.ToTNBatch(tableBatch, a.mp)
+	originalTableID := vector.MustFixedColNoTypeCheck[uint64](
+		tnTableBatch.GetVectorByName(pkgcatalog.SystemRelAttr_ID).GetDownstreamVector(),
+	)[0]
+	useOriginalTableID := a.tableName == ""
 
 	// If no target table name provided, use the original name from the dump.
 	if a.tableName == "" {
@@ -544,7 +557,12 @@ func (a *ApplyTableDataArg) createTable() (err error) {
 
 	a.schema, err = readSchema(a.tableName, tnSchemaBatch, tnTableBatch)
 
-	if a.rel, err = db.CreateRelation(a.schema); err != nil {
+	if useOriginalTableID {
+		a.rel, err = db.CreateRelationWithID(a.schema, originalTableID)
+	} else {
+		a.rel, err = db.CreateRelation(a.schema)
+	}
+	if err != nil {
 		if moerr.IsMoErrCode(err, moerr.OkExpectedDup) {
 			return moerr.NewInternalErrorNoCtx(fmt.Sprintf("table %q.%q already exists", a.databaseName, a.tableName))
 		}
@@ -606,7 +624,135 @@ func (a *ApplyTableDataArg) createTable() (err error) {
 	if err = table.Append(a.ctx, tnTableBatch); err != nil {
 		return
 	}
+	if useOriginalTableID {
+		err = a.createForeignKeyMetadata()
+	}
 	return
+}
+
+func (a *ApplyTableDataArg) createForeignKeyMetadata() error {
+	if a.schema == nil || len(a.schema.Constraint) == 0 {
+		return nil
+	}
+	constraints := new(enginepkg.ConstraintDef)
+	if err := constraints.UnmarshalBinary(a.schema.Constraint); err != nil {
+		return err
+	}
+
+	var fkeys []*enginepkg.ForeignKeyDef
+	for _, ct := range constraints.Cts {
+		if fkDef, ok := ct.(*enginepkg.ForeignKeyDef); ok {
+			fkeys = append(fkeys, fkDef)
+		}
+	}
+	if len(fkeys) == 0 {
+		return nil
+	}
+
+	var moCatalog handle.Database
+	var err error
+	if moCatalog, err = a.txn.GetDatabase(pkgcatalog.MO_CATALOG); err != nil {
+		return err
+	}
+	var fkTable handle.Relation
+	if fkTable, err = moCatalog.GetRelationByName(pkgcatalog.MOForeignKeys); err != nil {
+		return err
+	}
+
+	tableEntry, ok := fkTable.GetMeta().(*catalog.TableEntry)
+	if !ok {
+		return moerr.NewInternalErrorNoCtx(fmt.Sprintf("invalid %s metadata", pkgcatalog.MOForeignKeys))
+	}
+	fkSchema := tableEntry.GetLastestSchema(false)
+	bat := containers.NewBatch()
+	defer bat.Close()
+	for _, def := range fkSchema.ColDefs {
+		if def.IsPhyAddr() {
+			continue
+		}
+		bat.AddVector(def.Name, containers.MakeVector(def.Type, a.mp))
+	}
+
+	for _, fkDef := range fkeys {
+		for _, fk := range fkDef.Fkeys {
+			if err = a.appendForeignKeyRows(bat, fk); err != nil {
+				return err
+			}
+		}
+	}
+	if bat.Length() == 0 {
+		return nil
+	}
+	return fkTable.Append(a.ctx, bat)
+}
+
+func (a *ApplyTableDataArg) appendForeignKeyRows(bat *containers.Batch, fk *plan.ForeignKeyDef) error {
+	if fk == nil || len(fk.Cols) == 0 {
+		return nil
+	}
+	parentSchema := a.schema
+	parentName := a.tableName
+	if fk.ForeignTbl != 0 && fk.ForeignTbl != a.tableID {
+		db, err := a.txn.GetDatabase(a.databaseName)
+		if err != nil {
+			return err
+		}
+		parentRel, err := db.GetRelationByID(fk.ForeignTbl)
+		if err != nil {
+			return err
+		}
+		parentEntry, ok := parentRel.GetMeta().(*catalog.TableEntry)
+		if !ok {
+			return moerr.NewInternalErrorNoCtx(fmt.Sprintf("invalid parent table %d metadata", fk.ForeignTbl))
+		}
+		parentSchema = parentEntry.GetLastestSchema(false)
+		parentName = parentSchema.Name
+	}
+	for i, childColID := range fk.Cols {
+		if i >= len(fk.ForeignCols) {
+			return moerr.NewInternalErrorNoCtx(fmt.Sprintf("invalid foreign key %q column mapping", fk.Name))
+		}
+		childColName, ok := schemaColumnNameByID(a.schema, childColID)
+		if !ok {
+			return moerr.NewInternalErrorNoCtx(fmt.Sprintf("foreign key %q child column %d not found", fk.Name, childColID))
+		}
+		parentColName, ok := schemaColumnNameByID(parentSchema, fk.ForeignCols[i])
+		if !ok {
+			return moerr.NewInternalErrorNoCtx(fmt.Sprintf("foreign key %q parent column %d not found", fk.Name, fk.ForeignCols[i]))
+		}
+		appendForeignKeyValue(bat, "constraint_name", []byte(fk.Name))
+		appendForeignKeyValue(bat, "constraint_id", uint64(0))
+		appendForeignKeyValue(bat, "db_name", []byte(a.databaseName))
+		appendForeignKeyValue(bat, "db_id", uint64(0))
+		appendForeignKeyValue(bat, "table_name", []byte(a.tableName))
+		appendForeignKeyValue(bat, "table_id", uint64(0))
+		appendForeignKeyValue(bat, "column_name", []byte(childColName))
+		appendForeignKeyValue(bat, "column_id", childColID)
+		appendForeignKeyValue(bat, "refer_db_name", []byte(a.databaseName))
+		appendForeignKeyValue(bat, "refer_db_id", uint64(0))
+		appendForeignKeyValue(bat, "refer_table_name", []byte(parentName))
+		appendForeignKeyValue(bat, "refer_table_id", uint64(0))
+		appendForeignKeyValue(bat, "refer_column_name", []byte(parentColName))
+		appendForeignKeyValue(bat, "refer_column_id", fk.ForeignCols[i])
+		appendForeignKeyValue(bat, "on_delete", []byte(fk.OnDelete.String()))
+		appendForeignKeyValue(bat, "on_update", []byte(fk.OnUpdate.String()))
+	}
+	return nil
+}
+
+func appendForeignKeyValue(bat *containers.Batch, name string, v any) {
+	bat.GetVectorByName(name).Append(v, false)
+}
+
+func schemaColumnNameByID(schema *catalog.Schema, id uint64) (string, bool) {
+	if schema == nil || id > uint64(len(schema.ColDefs)) {
+		return "", false
+	}
+	idx := int(id)
+	if idx < 0 || idx >= len(schema.ColDefs) {
+		return "", false
+	}
+	return schema.ColDefs[idx].Name, true
 }
 
 func (a *ApplyTableDataArg) initAutoIncrementMetadata() {

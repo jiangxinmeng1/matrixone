@@ -48,6 +48,22 @@ func TestTableDumpDir(t *testing.T) {
 	}
 }
 
+func TestSupportedDumpRelkindSQL(t *testing.T) {
+	got := supportedDumpRelkindSQL()
+	for _, want := range []string{"'r'", "'cluster'", "'v'"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("supportedDumpRelkindSQL() = %q, want it to contain %s", got, want)
+		}
+	}
+}
+
+func TestApplyTaskTableID(t *testing.T) {
+	got := applyTaskTableID(applyTableTask{dir: "/tmp/dump/tables/account_0/db_1/table_42"})
+	if got != 42 {
+		t.Fatalf("applyTaskTableID() = %d, want 42", got)
+	}
+}
+
 func TestParseSnapshotTS(t *testing.T) {
 	tests := []struct {
 		name string
