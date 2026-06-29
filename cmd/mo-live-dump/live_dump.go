@@ -558,12 +558,13 @@ func applyTablesParallel(cmd *cobra.Command, db *sql.DB, tasks []applyTableTask,
 			case <-ticker.C:
 				if busy.Load() > 0 || queued.Load() > 0 {
 					cmd.Printf(
-						"live-dump apply status: total_tables=%d active_table_workers=%d queued_tables=%d table_workers=%d object_workers=%d\n",
+						"live-dump apply status: total_tables=%d active_table_workers=%d queued_tables=%d table_workers=%d object_workers=%d max_active_object_workers=%d\n",
 						len(tasks),
 						busy.Load(),
 						queued.Load(),
 						tableWorkers,
 						workers,
+						busy.Load()*int64(workers),
 					)
 				}
 			case <-done:

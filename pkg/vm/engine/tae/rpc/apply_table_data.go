@@ -277,6 +277,7 @@ func (a *ApplyTableDataArg) applyDataObjectsParallel(
 	limiter := getGlobalApplyObjectLimiter(a.workers)
 	jobsCh := make(chan applyObjectJob)
 	results := make(chan applyObjectResult, workers)
+	var active atomic.Int64
 	var queued atomic.Int64
 	queued.Store(int64(len(objects)))
 
@@ -290,14 +291,15 @@ func (a *ApplyTableDataArg) applyDataObjectsParallel(
 		for {
 			select {
 			case <-ticker.C:
-				if queued.Load() > 0 || globalApplyObjectWorkers.active.Load() > 0 {
+				if queued.Load() > 0 || active.Load() > 0 {
 					logutil.Info(
 						"APPLY-TABLE-DATA-PIPELINE-STATUS",
 						zap.String("dir", a.dir),
 						zap.String("table", fmt.Sprintf("%d-%s", a.tableID, a.tableName)),
 						zap.Int("total_objects", len(objects)),
 						zap.Int64("queued_objects", queued.Load()),
-						zap.Int64("active_workers", globalApplyObjectWorkers.active.Load()),
+						zap.Int64("active_objects", active.Load()),
+						zap.Int64("active_objects_global", globalApplyObjectWorkers.active.Load()),
 						zap.Int("total_workers", cap(limiter)),
 					)
 				}
@@ -314,10 +316,12 @@ func (a *ApplyTableDataArg) applyDataObjectsParallel(
 			defer wg.Done()
 			for job := range jobsCh {
 				limiter <- struct{}{}
+				active.Add(1)
 				globalApplyObjectWorkers.active.Add(1)
 				queued.Add(-1)
 				res := func() applyObjectResult {
 					defer func() {
+						active.Add(-1)
 						globalApplyObjectWorkers.active.Add(-1)
 						<-limiter
 					}()
