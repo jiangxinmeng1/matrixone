@@ -45,6 +45,7 @@ import (
 )
 
 type inspectContext struct {
+	ctx    context.Context
 	db     *db.DB
 	acinfo *cmd_util.AccessInfo
 	args   []string
@@ -54,6 +55,7 @@ type inspectContext struct {
 
 func MockInspectContext(db *db.DB) *inspectContext {
 	return &inspectContext{
+		ctx:    context.Background(),
 		db:     db,
 		acinfo: nil,
 		args:   nil,
@@ -61,12 +63,19 @@ func MockInspectContext(db *db.DB) *inspectContext {
 	}
 }
 
+func (i *inspectContext) Context() context.Context {
+	if i != nil && i.ctx != nil {
+		return i.ctx
+	}
+	return context.Background()
+}
+
 // impl Pflag.Value interface
 func (i *inspectContext) String() string   { return "" }
 func (i *inspectContext) Set(string) error { return nil }
 func (i *inspectContext) Type() string     { return "ictx" }
 
-func initCommand(_ context.Context, inspectCtx *inspectContext) *cobra.Command {
+func initCommand(ctx context.Context, inspectCtx *inspectContext) *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use: "inspect",
 	}
@@ -76,6 +85,7 @@ func initCommand(_ context.Context, inspectCtx *inspectContext) *cobra.Command {
 	rootCmd.SetArgs(inspectCtx.args)
 	rootCmd.SetErr(inspectCtx.out)
 	rootCmd.SetOut(inspectCtx.out)
+	rootCmd.SetContext(ctx)
 
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
 

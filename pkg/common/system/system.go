@@ -90,6 +90,9 @@ func MemoryAvailable() uint64 {
 	if err != nil {
 		logutil.Errorf("failed to get memory stats: %v", err)
 	}
+	if mem.ActualFree > 0 {
+		return mem.ActualFree
+	}
 	return mem.Free
 }
 

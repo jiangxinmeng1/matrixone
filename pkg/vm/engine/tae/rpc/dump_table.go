@@ -164,7 +164,7 @@ func (c *DumpTableArg) FromCommand(cmd *cobra.Command) (err error) {
 		}
 		c.dir = ""
 		c.srcfs = c.inspectContext.db.Opts.Fs
-		c.ctx = context.Background()
+		c.ctx = c.inspectContext.Context()
 		database, err := c.inspectContext.db.Catalog.GetDatabaseByID(uint64(did))
 		if err != nil {
 			err = moerr.NewInternalErrorNoCtx(fmt.Sprintf("get database by id %d failed", did))
@@ -213,7 +213,18 @@ func (c *DumpTableArg) Run() (err error) {
 			return
 		}
 	}
-	defer c.txn.Commit(c.ctx)
+	defer func() {
+		if err == nil {
+			err = c.ctx.Err()
+		}
+		if err != nil {
+			if err2 := c.txn.Rollback(c.ctx); err2 != nil {
+				logutil.Error("DUMP-TABLE-ROLLBACK-ERROR", zap.Error(err2))
+			}
+			return
+		}
+		err = c.txn.Commit(c.ctx)
+	}()
 	logutil.Info(
 		"DUMP-TABLE-START",
 		zap.String(
@@ -342,6 +353,8 @@ func (c *DumpTableArg) dumpObjectsParallel(objects []*catalog.ObjectEntry) error
 	if workers > len(objects) {
 		workers = len(objects)
 	}
+	ctx, cancel := context.WithCancel(c.ctx)
+	defer cancel()
 	jobsCh := make(chan *catalog.ObjectEntry)
 	results := make(chan result, workers)
 	var busy atomic.Int64
@@ -382,14 +395,32 @@ func (c *DumpTableArg) dumpObjectsParallel(objects []*catalog.ObjectEntry) error
 			defer wg.Done()
 			txn, err := c.startWorkerTxn()
 			if err != nil {
-				for range jobsCh {
-					queued.Add(-1)
-					results <- result{err: err}
-				}
+				cancel()
+				results <- result{err: err}
 				return
 			}
-			defer txn.Commit(c.ctx)
-			for e := range jobsCh {
+			defer func() {
+				if ctx.Err() != nil {
+					if err2 := txn.Rollback(c.ctx); err2 != nil {
+						logutil.Error("DUMP-TABLE-WORKER-ROLLBACK-ERROR", zap.Error(err2))
+					}
+					return
+				}
+				if err2 := txn.Commit(c.ctx); err2 != nil {
+					logutil.Error("DUMP-TABLE-WORKER-COMMIT-ERROR", zap.Error(err2))
+				}
+			}()
+			for {
+				var e *catalog.ObjectEntry
+				var ok bool
+				select {
+				case <-ctx.Done():
+					return
+				case e, ok = <-jobsCh:
+					if !ok {
+						return
+					}
+				}
 				queued.Add(-1)
 				busy.Add(1)
 				entry, err := c.dumpObject(txn, e)
@@ -402,12 +433,18 @@ func (c *DumpTableArg) dumpObjectsParallel(objects []*catalog.ObjectEntry) error
 		}()
 	}
 	go func() {
+		defer close(results)
 		for _, e := range objects {
-			jobsCh <- e
+			select {
+			case <-ctx.Done():
+				close(jobsCh)
+				wg.Wait()
+				return
+			case jobsCh <- e:
+			}
 		}
 		close(jobsCh)
 		wg.Wait()
-		close(results)
 	}()
 
 	var firstErr error
@@ -415,6 +452,7 @@ func (c *DumpTableArg) dumpObjectsParallel(objects []*catalog.ObjectEntry) error
 		if res.err != nil {
 			if firstErr == nil {
 				firstErr = res.err
+				cancel()
 			}
 			continue
 		}
@@ -429,6 +467,9 @@ func (c *DumpTableArg) dumpObjectsParallel(objects []*catalog.ObjectEntry) error
 	}
 	close(done)
 	printerWG.Wait()
+	if firstErr == nil && ctx.Err() != nil {
+		firstErr = ctx.Err()
+	}
 	return firstErr
 }
 

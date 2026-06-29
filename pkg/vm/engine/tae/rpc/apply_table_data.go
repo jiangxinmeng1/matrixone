@@ -85,8 +85,11 @@ type applyObjectJob struct {
 
 var globalApplyObjectWorkers = struct {
 	sync.Mutex
-	ch     chan struct{}
-	active atomic.Int64
+	ch        chan struct{}
+	total     atomic.Int64
+	queued    atomic.Int64
+	active    atomic.Int64
+	completed atomic.Int64
 }{}
 
 func NewApplyTableDataArg(
@@ -148,7 +151,7 @@ func (a *ApplyTableDataArg) FromCommand(cmd *cobra.Command) (err error) {
 		}
 		a.dir = ""
 		a.dstFS = a.inspectContext.db.Opts.Fs
-		a.ctx = context.Background()
+		a.ctx = a.inspectContext.Context()
 		if a.txn, err = a.inspectContext.db.StartTxn(nil); err != nil {
 			return err
 		}
@@ -187,6 +190,9 @@ func (a *ApplyTableDataArg) Run() (err error) {
 		zap.Int("workers", a.workers),
 	)
 	defer func() {
+		if err == nil {
+			err = a.ctx.Err()
+		}
 		if err != nil {
 			err2 := a.txn.Rollback(a.ctx)
 			if err2 != nil {
@@ -274,12 +280,22 @@ func (a *ApplyTableDataArg) applyDataObjectsParallel(
 	if workers > len(objects) {
 		workers = len(objects)
 	}
+	ctx, cancel := context.WithCancel(a.ctx)
+	defer cancel()
 	limiter := getGlobalApplyObjectLimiter(a.workers)
 	jobsCh := make(chan applyObjectJob)
 	results := make(chan applyObjectResult, workers)
 	var active atomic.Int64
 	var queued atomic.Int64
+	var completed atomic.Int64
 	queued.Store(int64(len(objects)))
+	globalApplyObjectWorkers.total.Add(int64(len(objects)))
+	globalApplyObjectWorkers.queued.Add(int64(len(objects)))
+	defer func() {
+		globalApplyObjectWorkers.total.Add(-int64(len(objects)))
+		globalApplyObjectWorkers.queued.Add(-queued.Load())
+		globalApplyObjectWorkers.completed.Add(-completed.Load())
+	}()
 
 	done := make(chan struct{})
 	var printerWG sync.WaitGroup
@@ -300,7 +316,10 @@ func (a *ApplyTableDataArg) applyDataObjectsParallel(
 						zap.Int64("queued_objects", queued.Load()),
 						zap.Int64("active_objects", active.Load()),
 						zap.Int64("active_objects_global", globalApplyObjectWorkers.active.Load()),
-						zap.Int("total_workers", cap(limiter)),
+						zap.Int64("total_objects_global", globalApplyObjectWorkers.total.Load()),
+						zap.Int64("queued_objects_global", globalApplyObjectWorkers.queued.Load()),
+						zap.Int64("completed_objects_global", globalApplyObjectWorkers.completed.Load()),
+						zap.Int("object_worker_limit", cap(limiter)),
 					)
 				}
 			case <-done:
@@ -314,11 +333,26 @@ func (a *ApplyTableDataArg) applyDataObjectsParallel(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for job := range jobsCh {
-				limiter <- struct{}{}
+			for {
+				var job applyObjectJob
+				var ok bool
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok = <-jobsCh:
+					if !ok {
+						return
+					}
+				}
+				select {
+				case limiter <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
 				active.Add(1)
 				globalApplyObjectWorkers.active.Add(1)
 				queued.Add(-1)
+				globalApplyObjectWorkers.queued.Add(-1)
 				res := func() applyObjectResult {
 					defer func() {
 						active.Add(-1)
@@ -327,17 +361,25 @@ func (a *ApplyTableDataArg) applyDataObjectsParallel(
 					}()
 					return a.applyDataObject(job.index, job.stats)
 				}()
+				completed.Add(1)
+				globalApplyObjectWorkers.completed.Add(1)
 				results <- res
 			}
 		}()
 	}
 	go func() {
+		defer close(results)
 		for i, rawStats := range objects {
-			jobsCh <- applyObjectJob{index: i, stats: rawStats}
+			select {
+			case <-ctx.Done():
+				close(jobsCh)
+				wg.Wait()
+				return
+			case jobsCh <- applyObjectJob{index: i, stats: rawStats}:
+			}
 		}
 		close(jobsCh)
 		wg.Wait()
-		close(results)
 	}()
 
 	var firstErr error
@@ -346,6 +388,7 @@ func (a *ApplyTableDataArg) applyDataObjectsParallel(
 		if res.err != nil {
 			if firstErr == nil {
 				firstErr = res.err
+				cancel()
 			}
 			continue
 		}
@@ -360,6 +403,9 @@ func (a *ApplyTableDataArg) applyDataObjectsParallel(
 	}
 	close(done)
 	printerWG.Wait()
+	if firstErr == nil && ctx.Err() != nil {
+		firstErr = ctx.Err()
+	}
 	return firstErr
 }
 

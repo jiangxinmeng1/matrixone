@@ -54,6 +54,8 @@ const (
 	dumpRelKindOrdinary = "r"
 	dumpRelKindCluster  = "cluster"
 	dumpRelKindView     = "v"
+
+	autoObjectWorkers = 0
 )
 
 func PrepareCommand() *cobra.Command {
@@ -545,7 +547,7 @@ func applyTablesParallel(cmd *cobra.Command, db *sql.DB, tasks []applyTableTask,
 	var queued atomic.Int64
 	queued.Store(int64(len(tasks)))
 
-	cmd.Printf("live-dump apply start: total_tables=%d table_workers=%d object_workers=%d\n", len(tasks), tableWorkers, workers)
+	cmd.Printf("live-dump apply start: total_tables=%d table_workers=%d object_workers=auto\n", len(tasks), tableWorkers)
 	done := make(chan struct{})
 	var printerWG sync.WaitGroup
 	printerWG.Add(1)
@@ -558,13 +560,11 @@ func applyTablesParallel(cmd *cobra.Command, db *sql.DB, tasks []applyTableTask,
 			case <-ticker.C:
 				if busy.Load() > 0 || queued.Load() > 0 {
 					cmd.Printf(
-						"live-dump apply status: total_tables=%d active_table_workers=%d queued_tables=%d table_workers=%d object_workers=%d max_active_object_workers=%d\n",
+						"live-dump apply status: total_tables=%d active_table_workers=%d queued_tables=%d table_workers=%d object_workers=auto\n",
 						len(tasks),
 						busy.Load(),
 						queued.Load(),
 						tableWorkers,
-						workers,
-						busy.Load()*int64(workers),
 					)
 				}
 			case <-done:
@@ -587,7 +587,7 @@ func applyTablesParallel(cmd *cobra.Command, db *sql.DB, tasks []applyTableTask,
 					shellArg(targetDatabase),
 					shellArg(t.tableName),
 					shellArg(t.dir),
-					workers,
+					autoObjectWorkers,
 				)
 				sqlText := fmt.Sprintf("select mo_ctl('dn', 'inspect', %s)", sqlString(operation))
 				resp, err := querySingleString(db, sqlText)

@@ -909,6 +909,7 @@ func (h *Handle) HandleInspectTN(
 	b := &bytes.Buffer{}
 
 	inspectCtx := &inspectContext{
+		ctx:    ctx,
 		db:     h.db,
 		acinfo: &req.AccessInfo,
 		args:   args,
