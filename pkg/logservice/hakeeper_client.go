@@ -124,10 +124,16 @@ var _ ProxyHAKeeperClient = (*managedHAKeeperClient)(nil)
 var newHAKeeperClientFunc = newHAKeeperClient
 var sendCNAllocateIDFunc = (*hakeeperClient).sendCNAllocateID
 
+// NewClusterHAKeeperClient creates a HAKeeper client to query cluster details.
+//
+// NB: caller must set a deadline on ctx and could specify options for morpc.Client via ctx.
 func NewClusterHAKeeperClient(
 	ctx context.Context, sid string, cfg HAKeeperClientConfig,
 ) (ClusterHAKeeperClient, error) {
 	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if err := validateHAKeeperClientContext(ctx); err != nil {
 		return nil, err
 	}
 	return newManagedHAKeeperClient(ctx, sid, cfg)
@@ -135,7 +141,7 @@ func NewClusterHAKeeperClient(
 
 // NewCNHAKeeperClient creates a HAKeeper client to be used by a CN node.
 //
-// NB: caller could specify options for morpc.Client via ctx.
+// NB: caller must set a deadline on ctx and could specify options for morpc.Client via ctx.
 func NewCNHAKeeperClient(
 	ctx context.Context,
 	sid string,
@@ -144,12 +150,15 @@ func NewCNHAKeeperClient(
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if err := validateHAKeeperClientContext(ctx); err != nil {
+		return nil, err
+	}
 	return newManagedHAKeeperClient(ctx, sid, cfg)
 }
 
 // NewTNHAKeeperClient creates a HAKeeper client to be used by a TN node.
 //
-// NB: caller could specify options for morpc.Client via ctx.
+// NB: caller must set a deadline on ctx and could specify options for morpc.Client via ctx.
 func NewTNHAKeeperClient(
 	ctx context.Context,
 	sid string,
@@ -158,18 +167,24 @@ func NewTNHAKeeperClient(
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if err := validateHAKeeperClientContext(ctx); err != nil {
+		return nil, err
+	}
 	return newManagedHAKeeperClient(ctx, sid, cfg)
 }
 
 // NewLogHAKeeperClient creates a HAKeeper client to be used by a Log Service node.
 //
-// NB: caller could specify options for morpc.Client via ctx.
+// NB: caller must set a deadline on ctx and could specify options for morpc.Client via ctx.
 func NewLogHAKeeperClient(
 	ctx context.Context,
 	sid string,
 	cfg HAKeeperClientConfig,
 ) (LogHAKeeperClient, error) {
 	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if err := validateHAKeeperClientContext(ctx); err != nil {
 		return nil, err
 	}
 	return newManagedHAKeeperClient(ctx, sid, cfg)
@@ -216,7 +231,7 @@ func NewLogHAKeeperClientWithRetry(
 
 // NewProxyHAKeeperClient creates a HAKeeper client to be used by a proxy service.
 //
-// NB: caller could specify options for morpc.Client via ctx.
+// NB: caller must set a deadline on ctx and could specify options for morpc.Client via ctx.
 func NewProxyHAKeeperClient(
 	ctx context.Context,
 	sid string,
@@ -225,7 +240,20 @@ func NewProxyHAKeeperClient(
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if err := validateHAKeeperClientContext(ctx); err != nil {
+		return nil, err
+	}
 	return newManagedHAKeeperClient(ctx, sid, cfg)
+}
+
+func validateHAKeeperClientContext(ctx context.Context) error {
+	if ctx == nil {
+		return moerr.NewInvalidInputNoCtx("nil context")
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		return moerr.NewInvalidInput(ctx, "HAKeeper client context deadline not set")
+	}
+	return nil
 }
 
 func newManagedHAKeeperClient(

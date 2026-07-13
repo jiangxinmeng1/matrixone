@@ -50,6 +50,65 @@ func TestHAKeeperClientConfigIsValidated(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestHAKeeperClientConstructorsRejectContextWithoutDeadline(t *testing.T) {
+	original := newHAKeeperClientFunc
+	newHAKeeperClientFunc = func(
+		context.Context,
+		string,
+		HAKeeperClientConfig,
+	) (*hakeeperClient, error) {
+		t.Fatal("constructor must not dial without a context deadline")
+		return nil, nil
+	}
+	defer func() {
+		newHAKeeperClientFunc = original
+	}()
+
+	cfg := HAKeeperClientConfig{}
+	tests := []struct {
+		name string
+		fn   func(context.Context, string, HAKeeperClientConfig) (any, error)
+	}{
+		{
+			name: "cluster",
+			fn: func(ctx context.Context, sid string, cfg HAKeeperClientConfig) (any, error) {
+				return NewClusterHAKeeperClient(ctx, sid, cfg)
+			},
+		},
+		{
+			name: "cn",
+			fn: func(ctx context.Context, sid string, cfg HAKeeperClientConfig) (any, error) {
+				return NewCNHAKeeperClient(ctx, sid, cfg)
+			},
+		},
+		{
+			name: "tn",
+			fn: func(ctx context.Context, sid string, cfg HAKeeperClientConfig) (any, error) {
+				return NewTNHAKeeperClient(ctx, sid, cfg)
+			},
+		},
+		{
+			name: "log",
+			fn: func(ctx context.Context, sid string, cfg HAKeeperClientConfig) (any, error) {
+				return NewLogHAKeeperClient(ctx, sid, cfg)
+			},
+		},
+		{
+			name: "proxy",
+			fn: func(ctx context.Context, sid string, cfg HAKeeperClientConfig) (any, error) {
+				return NewProxyHAKeeperClient(ctx, sid, cfg)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := tt.fn(context.TODO(), "", cfg)
+			require.Nil(t, c)
+			require.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput))
+		})
+	}
+}
+
 func TestHAKeeperClientsCanBeCreated(t *testing.T) {
 	fn := func(t *testing.T, s *Service) {
 		cfg := HAKeeperClientConfig{
