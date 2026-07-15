@@ -50,6 +50,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/options"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
+	"go.uber.org/zap"
 )
 
 var (
@@ -62,6 +63,8 @@ var (
 )
 
 const opName = "external"
+
+const loadPipelineBatchLogInterval = 10 * time.Second
 
 func (external *External) String(buf *bytes.Buffer) {
 	buf.WriteString(opName)
@@ -81,6 +84,8 @@ func (external *External) Prepare(proc *process.Process) error {
 	} else {
 		external.OpAnalyzer.Reset()
 	}
+	external.ctr.batchCnt = 0
+	external.ctr.lastPipelineLogAt = time.Time{}
 
 	param := external.Es
 	if proc.GetLim().MaxMsgSize == 0 {
@@ -287,9 +292,51 @@ func (external *External) Call(proc *process.Process) (vm.CallResult, error) {
 		external.ctr.maxAllocSize = max(external.ctr.maxAllocSize, external.ctr.buf.Size())
 		param.addParquetProfile(process.ParquetProfileStats{PeakBatchBytes: int64(external.ctr.buf.Size())})
 		result.Batch.ShuffleIDX = int32(param.Idx)
+		external.maybeLogLoadPipelineBatch(proc, param, result.Batch)
 	}
 
 	return result, nil
+}
+
+func (external *External) maybeLogLoadPipelineBatch(proc *process.Process, param *ExternalParam, bat *batch.Batch) {
+	if !external.shouldLogLoadPipelineBatch(param, bat) {
+		return
+	}
+
+	external.ctr.batchCnt++
+	now := time.Now()
+	if !external.ctr.lastPipelineLogAt.IsZero() && now.Sub(external.ctr.lastPipelineLogAt) < loadPipelineBatchLogInterval {
+		return
+	}
+	external.ctr.lastPipelineLogAt = now
+
+	opBase := external.GetOperatorBase()
+	pipelineCount := int(opBase.MaxParallel)
+	if pipelineCount < 1 {
+		pipelineCount = 1
+	}
+	proc.Info(proc.Ctx, "load data pipeline batch stats",
+		zap.Int("current-pipeline-id", int(opBase.ParallelID)),
+		zap.Int("current-pipeline-count", pipelineCount),
+		zap.Int64("current-pipeline-batches", external.ctr.batchCnt),
+		zap.Int("current-batch-rows", bat.RowCount()),
+		zap.Int("current-batch-size", bat.Size()),
+		zap.String("file", param.Fileparam.Filepath),
+		zap.Bool("parallel-load", param.ParallelLoad))
+}
+
+func (external *External) shouldLogLoadPipelineBatch(param *ExternalParam, bat *batch.Batch) bool {
+	if param == nil || param.Extern == nil || bat == nil || bat.RowCount() == 0 {
+		return false
+	}
+	if param.Extern.ExternType != int32(plan.ExternType_LOAD) {
+		return false
+	}
+	opBase := external.GetOperatorBase()
+	return param.ParallelLoad ||
+		param.Extern.Parallel ||
+		param.Extern.ParallelLoadRequested ||
+		opBase.MaxParallel > 1
 }
 
 // finishCurrentFile handles unified file completion.

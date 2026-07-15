@@ -1719,3 +1719,24 @@ func TestMakeTypeParallelLoadKeepsVectorType(t *testing.T) {
 	require.Equal(t, int32(3), vectorType.Width)
 	require.Equal(t, types.T_varchar, makeType(&plan.Type{Id: int32(types.T_int64)}, true).Oid)
 }
+
+func TestShouldLogLoadPipelineBatch(t *testing.T) {
+	ext := NewArgument()
+	defer ext.Release()
+	ext.GetOperatorBase().MaxParallel = 2
+
+	bat := batch.NewWithSize(0)
+	bat.SetRowCount(1)
+
+	param := &ExternalParam{ExParamConst: ExParamConst{
+		Extern: &tree.ExternParam{ExParam: tree.ExParam{ExternType: int32(plan.ExternType_LOAD)}},
+	}}
+	require.True(t, ext.shouldLogLoadPipelineBatch(param, bat))
+
+	bat.SetRowCount(0)
+	require.False(t, ext.shouldLogLoadPipelineBatch(param, bat))
+
+	bat.SetRowCount(1)
+	param.Extern.ExternType = int32(plan.ExternType_EXTERNAL_TB)
+	require.False(t, ext.shouldLogLoadPipelineBatch(param, bat))
+}

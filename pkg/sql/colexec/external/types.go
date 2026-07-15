@@ -19,6 +19,7 @@ import (
 	"context"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/parquet-go/parquet-go"
 
@@ -121,8 +122,10 @@ type ExternalFileReader interface {
 }
 
 type container struct {
-	maxAllocSize int
-	buf          *batch.Batch
+	maxAllocSize      int
+	buf               *batch.Batch
+	batchCnt          int64
+	lastPipelineLogAt time.Time
 }
 
 type External struct {
