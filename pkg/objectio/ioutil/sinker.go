@@ -441,7 +441,7 @@ func (sinker *Sinker) fetchBuffer() (*batch.Batch, error) {
 	bat := sinker.buf.buffers.FetchWithSchema(sinker.schema.attrs, sinker.schema.attrTypes)
 	y := sinker.buf.buffers.Len()
 
-	if x < y {
+	if x > y {
 		sinker.buf.bufStats.updateCount(-1)
 		sinker.buf.bufStats.updateBytes(-bat.Size())
 	}
@@ -457,7 +457,7 @@ func (sinker *Sinker) putBackBuffer(bat *batch.Batch) {
 	sinker.buf.buffers.Putback(bat, sinker.mp)
 	y := sinker.buf.buffers.Len()
 
-	if x > y {
+	if x < y {
 		sinker.buf.bufStats.updateCount(1)
 		sinker.buf.bufStats.updateBytes(bat.Size())
 	}
@@ -1051,6 +1051,14 @@ func (sinker *Sinker) PipelineRawPending() (batches int64, bytes int64) {
 	}
 	return atomic.LoadInt64(&sinker.pipe.result.rawPendingBatches),
 		atomic.LoadInt64(&sinker.pipe.result.rawPendingBytes)
+}
+
+func (sinker *Sinker) BufferPoolStats() (batches int, bytes int) {
+	if sinker.buf.buffers == nil {
+		return 0, 0
+	}
+	bytes, _, _, _ = sinker.buf.buffers.Usage()
+	return sinker.buf.buffers.Len(), bytes
 }
 
 func (sinker *Sinker) Close() error {

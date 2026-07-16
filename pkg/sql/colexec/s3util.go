@@ -233,6 +233,13 @@ func (w *CNS3Writer) PipelineRawPendingStats() (batches int64, bytes int64) {
 	return w.sinker.PipelineRawPending()
 }
 
+func (w *CNS3Writer) BufferPoolStats() (batches int, bytes int) {
+	if w == nil || w.sinker == nil {
+		return 0, 0
+	}
+	return w.sinker.BufferPoolStats()
+}
+
 func (w *CNS3Writer) WriteOwned(ctx context.Context, bat *batch.Batch) (bool, error) {
 	return w.sinker.WriteOwned(ctx, bat)
 }

@@ -452,6 +452,7 @@ func (insert *Insert) maybeLogLoadS3Memory(proc *process.Process, event string) 
 func (insert *Insert) logLoadS3Memory(proc *process.Process, event string) {
 	stagedBatches, stagedBytes := insert.ctr.s3Writer.StagedBatchStats()
 	pendingBatches, pendingBytes := insert.ctr.s3Writer.PipelineRawPendingStats()
+	bufferPoolBatches, bufferPoolBytes := insert.ctr.s3Writer.BufferPoolStats()
 	var throttlerAvailable int64
 	if insert.ctr.s3MemThrottler != nil {
 		throttlerAvailable = insert.ctr.s3MemThrottler.Available()
@@ -464,6 +465,8 @@ func (insert *Insert) logLoadS3Memory(proc *process.Process, event string) {
 		zap.Int("staged-bytes", stagedBytes),
 		zap.Int64("pipeline-raw-pending-batches", pendingBatches),
 		zap.Int64("pipeline-raw-pending-bytes", pendingBytes),
+		zap.Int("buffer-pool-batches", bufferPoolBatches),
+		zap.Int("buffer-pool-bytes", bufferPoolBytes),
 		zap.Int64("s3-mem-granted", insert.ctr.s3MemGranted),
 		zap.Int64("s3-throttler-available", throttlerAvailable),
 		zap.Int64("mpool-current-bytes", mpool.GlobalStats().NumCurrBytes.Load()))
