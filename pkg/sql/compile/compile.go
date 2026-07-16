@@ -96,9 +96,10 @@ import (
 // Note: Now the cost going from stat is actually the number of rows, so we can only estimate a number for the size of each row.
 // The current insertion of around 200,000 rows triggers cn to write s3 directly
 const (
-	DistributedThreshold     uint64 = 10 * mpool.MB
-	SingleLineSizeEstimate   uint64 = 300 * mpool.B
-	shuffleChannelBufferSize        = 32
+	DistributedThreshold         uint64 = 10 * mpool.MB
+	SingleLineSizeEstimate       uint64 = 300 * mpool.B
+	shuffleChannelBufferSize            = 32
+	loadWriteS3ParallelSizeLimit        = 4
 
 	NoAccountId = -1
 )
@@ -1899,6 +1900,14 @@ func (c *Compile) getParallelSizeForExternalScan(node *plan.Node, cpuNum int) in
 	return cpuNum
 }
 
+func (c *Compile) getLoadWriteS3ParallelSize(node *plan.Node, cpuNum int) int {
+	parallelSize := c.getParallelSizeForExternalScan(node, cpuNum)
+	if c.anal != nil && c.anal.qry != nil && c.anal.qry.LoadTag {
+		parallelSize = min(parallelSize, loadWriteS3ParallelSizeLimit)
+	}
+	return parallelSize
+}
+
 // load data inline goes here, should always be single parallel
 func (c *Compile) compileExternValueScan(node *plan.Node, param *tree.ExternParam, strictSqlMode bool) ([]*Scope, error) {
 	s := c.constructScopeForExternal(c.addr, false)
@@ -1935,7 +1944,7 @@ func (c *Compile) compileExternScanParallelWrite(node *plan.Node, param *tree.Ex
 	scope.setRootOperator(extern)
 	c.anal.isFirst = false
 
-	mcpu := c.getParallelSizeForExternalScan(node, c.ncpu) // dop of insert scopes
+	mcpu := c.getLoadWriteS3ParallelSize(node, c.ncpu) // dop of insert scopes
 	if mcpu == 1 {
 		return []*Scope{scope}, nil
 	}
@@ -4220,10 +4229,10 @@ func (c *Compile) compileInsert(nodes []*plan.Node, node *plan.Node, ss []*Scope
 		if c.anal.qry.LoadTag {
 			// reset the channel buffer of sink for load
 			dataScope.Proc.Reg.MergeReceivers[0].ResetForReuse(
-				dataScope.NodeInfo.Mcpu,
+				loadMergeReceiverChannelBufferSize,
 				dataScope.Proc.Reg.MergeReceivers[0].NilBatchCnt)
 		}
-		parallelSize := c.getParallelSizeForExternalScan(node, c.ncpu)
+		parallelSize := c.getLoadWriteS3ParallelSize(node, c.ncpu)
 		scopes := make([]*Scope, 0, parallelSize)
 		c.hasMergeOp = true
 		for i := 0; i < parallelSize; i++ {

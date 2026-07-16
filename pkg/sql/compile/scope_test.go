@@ -515,6 +515,21 @@ func TestCompileExternScanParallelWrite(t *testing.T) {
 	require.NoError(t, checkScopeWithExpectedList(rs[0].PreScopes[0], []vm.OpType{vm.External, vm.Dispatch}))
 }
 
+func TestGetLoadWriteS3ParallelSizeCapsLoad(t *testing.T) {
+	testCompile := NewMockCompile(t)
+	testCompile.ncpu = 16
+	testCompile.anal = &AnalyzeModule{qry: &plan.Query{}}
+	n := &plan.Node{Stats: &plan.Stats{
+		Cost:    float64(colexec.WriteS3Threshold * 16),
+		Rowsize: 1,
+	}}
+
+	require.Equal(t, 16, testCompile.getLoadWriteS3ParallelSize(n, 16))
+
+	testCompile.anal.qry.LoadTag = true
+	require.Equal(t, loadWriteS3ParallelSizeLimit, testCompile.getLoadWriteS3ParallelSize(n, 16))
+}
+
 // TestCompileExternScanParallelWriteSourceScopeHasCorrectAddr verifies the
 // regression fix for #25554: compileExternScanParallelWrite constructs the
 // source scope with the current CN address so sameExecutionNode correctly
