@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/common/rscthrottler"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
@@ -37,6 +38,7 @@ import (
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
+	"go.uber.org/zap"
 )
 
 // flushSemaphore limits concurrent flushS3WriterOnMemoryPressure calls to
@@ -108,6 +110,8 @@ func flushConcurrencyForGOMAXPROCS(gomaxprocs int) int {
 
 const opName = "insert"
 
+const loadS3MemoryLogInterval = 10 * time.Second
+
 func (insert *Insert) String(buf *bytes.Buffer) {
 	buf.WriteString(opName)
 	buf.WriteString(": insert")
@@ -178,6 +182,9 @@ func (insert *Insert) Prepare(proc *process.Process) error {
 
 		insert.ctr.s3Writer = s3Writer
 		insert.ctr.s3MemGranted = 0
+		insert.ctr.s3WrittenBatches = 0
+		insert.ctr.s3WrittenBytes = 0
+		insert.ctr.lastLoadS3LogAt = time.Time{}
 		insert.ctr.s3MemNoThresholdCap = pipelineFlush
 		insert.ctr.s3MemThrottler = nil
 		if throttler, ok := runtime.ServiceRuntime(proc.GetService()).GetGlobalVariables(runtime.CNMemoryThrottler); ok {
@@ -335,6 +342,9 @@ func (insert *Insert) insert_s3(proc *process.Process, analyzer process.Analyzer
 				insert.ctr.state = vm.End
 				return vm.CancelResult, err
 			}
+			insert.ctr.s3WrittenBatches++
+			insert.ctr.s3WrittenBytes += int64(input.Batch.Size())
+			insert.maybeLogLoadS3Memory(proc, "write")
 		}
 	}
 
@@ -344,12 +354,14 @@ func (insert *Insert) insert_s3(proc *process.Process, analyzer process.Analyzer
 		// for more info, refer to the comments about reSizeBatch.
 		//
 		// data returned to the result would be raw data if it is a memory table.
+		insert.maybeLogLoadS3Memory(proc, "final-flush-begin")
 		err := flushTailBatch(proc, writer, &result, analyzer, insert.isMemoryTable())
 		if err != nil {
 			insert.ctr.state = vm.End
 			return result, err
 		}
 		insert.refreshAndReleaseS3MemGrant()
+		insert.maybeLogLoadS3Memory(proc, "final-flush-end")
 		insert.ctr.state = vm.End
 		return result, nil
 	}
@@ -425,6 +437,38 @@ func (insert *Insert) tryAcquireS3WriteMemory(ask int64) bool {
 	return false
 }
 
+func (insert *Insert) maybeLogLoadS3Memory(proc *process.Process, event string) {
+	if proc == nil || !proc.Base.LoadTag || insert.ctr.s3Writer == nil {
+		return
+	}
+	now := time.Now()
+	if event == "write" && !insert.ctr.lastLoadS3LogAt.IsZero() && now.Sub(insert.ctr.lastLoadS3LogAt) < loadS3MemoryLogInterval {
+		return
+	}
+	insert.ctr.lastLoadS3LogAt = now
+	insert.logLoadS3Memory(proc, event)
+}
+
+func (insert *Insert) logLoadS3Memory(proc *process.Process, event string) {
+	stagedBatches, stagedBytes := insert.ctr.s3Writer.StagedBatchStats()
+	pendingBatches, pendingBytes := insert.ctr.s3Writer.PipelineRawPendingStats()
+	var throttlerAvailable int64
+	if insert.ctr.s3MemThrottler != nil {
+		throttlerAvailable = insert.ctr.s3MemThrottler.Available()
+	}
+	proc.Info(proc.Ctx, "load data s3 writer memory stats",
+		zap.String("event", event),
+		zap.Int64("written-batches", insert.ctr.s3WrittenBatches),
+		zap.Int64("written-bytes", insert.ctr.s3WrittenBytes),
+		zap.Int("staged-batches", stagedBatches),
+		zap.Int("staged-bytes", stagedBytes),
+		zap.Int64("pipeline-raw-pending-batches", pendingBatches),
+		zap.Int64("pipeline-raw-pending-bytes", pendingBytes),
+		zap.Int64("s3-mem-granted", insert.ctr.s3MemGranted),
+		zap.Int64("s3-throttler-available", throttlerAvailable),
+		zap.Int64("mpool-current-bytes", mpool.GlobalStats().NumCurrBytes.Load()))
+}
+
 func forcedRefresh(throttler interface{ Refresh() }) {
 	if refresher, ok := throttler.(forceRefreshThrottler); ok {
 		refresher.ForceRefresh()
@@ -450,6 +494,8 @@ func (insert *Insert) flushS3WriterOnMemoryPressure(proc *process.Process, analy
 	}
 	defer releaseFlushSlot()
 
+	insert.maybeLogLoadS3Memory(proc, "flush-begin")
+
 	crs := analyzer.GetOpCounterSet()
 	newCtx := perfcounter.AttachS3RequestKey(proc.Ctx, crs)
 
@@ -471,6 +517,7 @@ func (insert *Insert) flushS3WriterOnMemoryPressure(proc *process.Process, analy
 	}
 
 	insert.refreshAndReleaseS3MemGrant()
+	insert.maybeLogLoadS3Memory(proc, "flush-end")
 	return nil
 }
 

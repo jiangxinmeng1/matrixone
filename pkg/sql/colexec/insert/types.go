@@ -15,6 +15,8 @@
 package insert
 
 import (
+	"time"
+
 	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 	"github.com/matrixorigin/matrixone/pkg/common/rscthrottler"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
@@ -43,6 +45,9 @@ type container struct {
 	s3MemGranted        int64
 	s3MemThrottler      rscthrottler.RSCThrottler
 	s3MemNoThresholdCap bool
+	s3WrittenBatches    int64
+	s3WrittenBytes      int64
+	lastLoadS3LogAt     time.Time
 
 	source engine.Relation
 

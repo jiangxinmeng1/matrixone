@@ -219,6 +219,20 @@ func (w *CNS3Writer) MemorySizeThreshold() int {
 	return w.memorySizeThreshold
 }
 
+func (w *CNS3Writer) StagedBatchStats() (batches int, bytes int) {
+	if w == nil || w.sinker == nil {
+		return 0, 0
+	}
+	return w.sinker.StagedBatchCount(), w.sinker.StagedSize()
+}
+
+func (w *CNS3Writer) PipelineRawPendingStats() (batches int64, bytes int64) {
+	if w == nil || w.sinker == nil {
+		return 0, 0
+	}
+	return w.sinker.PipelineRawPending()
+}
+
 func (w *CNS3Writer) WriteOwned(ctx context.Context, bat *batch.Batch) (bool, error) {
 	return w.sinker.WriteOwned(ctx, bat)
 }

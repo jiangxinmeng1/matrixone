@@ -1041,6 +1041,18 @@ func (sinker *Sinker) StagedSize() int {
 	return sinker.staged.inMemorySize
 }
 
+func (sinker *Sinker) StagedBatchCount() int {
+	return len(sinker.staged.inMemory)
+}
+
+func (sinker *Sinker) PipelineRawPending() (batches int64, bytes int64) {
+	if sinker.pipe.result == nil {
+		return 0, 0
+	}
+	return atomic.LoadInt64(&sinker.pipe.result.rawPendingBatches),
+		atomic.LoadInt64(&sinker.pipe.result.rawPendingBytes)
+}
+
 func (sinker *Sinker) Close() error {
 	var drainErr error
 	if sinker.pipe.enabled && sinker.pipe.result != nil {

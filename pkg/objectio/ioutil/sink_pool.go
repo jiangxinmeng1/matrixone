@@ -74,8 +74,10 @@ type pipelineResult struct {
 
 	pending sync.WaitGroup // tracks in-flight jobs for this Sinker
 
-	sinkNs int64 // atomic, total serialization time across workers
-	syncNs int64 // atomic, total IO time across workers
+	rawPendingBatches int64 // atomic, raw batches submitted to sink workers and not yet Cleaned
+	rawPendingBytes   int64 // atomic, raw bytes submitted to sink workers and not yet Cleaned
+	sinkNs            int64 // atomic, total serialization time across workers
+	syncNs            int64 // atomic, total IO time across workers
 }
 
 var (
@@ -140,6 +142,7 @@ func (p *SinkPool) runSinkWorker() {
 	for job := range p.sinkChan {
 		r := job.result
 		if r.hasError() {
+			r.releaseRawPending(job.data)
 			freeBatches(job.data, job.mp)
 			r.pending.Done()
 			continue
@@ -155,6 +158,7 @@ func (p *SinkPool) runSinkWorker() {
 			}
 		}
 		atomic.AddInt64(&r.sinkNs, int64(time.Since(sinkStart)))
+		r.releaseRawPending(job.data)
 		freeBatches(job.data, job.mp)
 
 		if sinkErr != nil {
@@ -216,6 +220,7 @@ func (p *SinkPool) Submit(job *poolSinkJob) error {
 		return err
 	}
 	r.pending.Add(1)
+	r.addRawPending(job.data)
 
 	p.closeMu.RLock()
 	defer p.closeMu.RUnlock()
@@ -227,6 +232,7 @@ func (p *SinkPool) Submit(job *poolSinkJob) error {
 	select {
 	case <-p.done:
 		r.pending.Done()
+		r.releaseRawPending(job.data)
 		freeBatches(job.data, job.mp)
 		return context.Canceled
 	default:
@@ -236,6 +242,7 @@ func (p *SinkPool) Submit(job *poolSinkJob) error {
 	select {
 	case <-r.ctx.Done():
 		r.pending.Done()
+		r.releaseRawPending(job.data)
 		freeBatches(job.data, job.mp)
 		if err := r.getError(); err != nil {
 			return err
@@ -249,6 +256,7 @@ func (p *SinkPool) Submit(job *poolSinkJob) error {
 		return nil
 	case <-r.ctx.Done():
 		r.pending.Done()
+		r.releaseRawPending(job.data)
 		freeBatches(job.data, job.mp)
 		if err := r.getError(); err != nil {
 			return err
@@ -256,6 +264,7 @@ func (p *SinkPool) Submit(job *poolSinkJob) error {
 		return context.Cause(r.ctx)
 	case <-p.done:
 		r.pending.Done()
+		r.releaseRawPending(job.data)
 		freeBatches(job.data, job.mp)
 		return context.Canceled
 	}
@@ -293,6 +302,34 @@ func (r *pipelineResult) setError(err error) {
 	}
 	r.mu.Unlock()
 	r.cancel()
+}
+
+func (r *pipelineResult) addRawPending(batches []*batch.Batch) {
+	var bytes int64
+	var count int64
+	for _, bat := range batches {
+		if bat == nil {
+			continue
+		}
+		count++
+		bytes += int64(bat.Size())
+	}
+	atomic.AddInt64(&r.rawPendingBatches, count)
+	atomic.AddInt64(&r.rawPendingBytes, bytes)
+}
+
+func (r *pipelineResult) releaseRawPending(batches []*batch.Batch) {
+	var bytes int64
+	var count int64
+	for _, bat := range batches {
+		if bat == nil {
+			continue
+		}
+		count++
+		bytes += int64(bat.Size())
+	}
+	atomic.AddInt64(&r.rawPendingBatches, -count)
+	atomic.AddInt64(&r.rawPendingBytes, -bytes)
 }
 
 func freeBatches(batches []*batch.Batch, mp *mpool.MPool) {
