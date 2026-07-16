@@ -28,6 +28,29 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 )
 
+func TestPipelineSpoolSlotState(t *testing.T) {
+	mp := mpool.MustNewZeroNoFixed()
+	t.Cleanup(func() {
+		mpool.DeleteMPool(mp)
+	})
+
+	src := batch.NewWithSize(0)
+	src.SetRowCount(1)
+	sp := InitMyPipelineSpool(mp, 3)
+
+	used, total := sp.SlotState()
+	require.Equal(t, 0, used)
+	require.Equal(t, 3, total)
+
+	queryDone, err := sp.SendBatch(context.Background(), 0, src, nil)
+	require.NoError(t, err)
+	require.False(t, queryDone)
+
+	used, total = sp.SlotState()
+	require.Equal(t, 1, used)
+	require.Equal(t, 3, total)
+}
+
 // TestPipelineSpoolForceCleanupRetainsUntilReceiversDrained verifies that
 // ForceCleanup does NOT free spool memory while a receiver still has an
 // unconsumed batch (a pending reference). Freeing it then would let that

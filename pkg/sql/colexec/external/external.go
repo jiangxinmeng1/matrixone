@@ -319,6 +319,7 @@ func (external *External) maybeLogLoadPipelineBatch(proc *process.Process, param
 		zap.Int("current-pipeline-id", int(opBase.ParallelID)),
 		zap.Int("current-pipeline-count", pipelineCount),
 		zap.Int64("current-pipeline-batches", external.ctr.batchCnt),
+		zap.Int64("current-pipeline-produced-batches", external.ctr.batchCnt),
 		zap.Int("current-batch-rows", bat.RowCount()),
 		zap.Int("current-batch-size", bat.Size()),
 		zap.String("file", param.Fileparam.Filepath),

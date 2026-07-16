@@ -17,6 +17,7 @@ package dispatch
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/container/pSpool"
 
@@ -71,7 +72,9 @@ type container struct {
 	batchCnt []int
 	rowCnt   []int
 
-	marshalBuf bytes.Buffer
+	marshalBuf                    bytes.Buffer
+	lastLoadDispatchQueueLogAt    time.Time
+	lastLoadDispatchQueueLogCount int64
 }
 
 type Dispatch struct {

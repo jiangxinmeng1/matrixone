@@ -55,3 +55,13 @@ func getBufferLength(cnt uint32) uint32 {
 	}
 	return cnt
 }
+
+// SlotState returns a diagnostic snapshot of occupied slots and total slots.
+func (ps *PipelineSpool) SlotState() (used int, total int) {
+	if ps == nil || ps.freeShardPool == nil {
+		return 0, 0
+	}
+	total = cap(ps.freeShardPool)
+	used = total - len(ps.freeShardPool)
+	return used, total
+}

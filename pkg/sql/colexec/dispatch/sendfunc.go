@@ -17,6 +17,7 @@ package dispatch
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/pSpool"
@@ -48,6 +49,8 @@ var (
 	sendToAnyLocal  = sendToAnyLocalFunc
 	sendToAnyRemote = sendToAnyRemoteFunc
 )
+
+const loadDispatchQueueLogInterval = 10 * time.Second
 
 func (ctr *container) removeIdxReceiver(idx int) {
 	ctr.remoteReceivers = append(ctr.remoteReceivers[:idx], ctr.remoteReceivers[idx+1:]...)
@@ -267,6 +270,38 @@ func onlyOneRegToDealThis(sendto int, ap *Dispatch, proc *process.Process) bool 
 	return ap.LocalRegs[sendto].SendData(proc.Ctx, ap.ctr.sp, sendto)
 }
 
+func (ctr *container) maybeLogLoadDispatchQueue(proc *process.Process, ap *Dispatch, sendto int, bat *batch.Batch, sendWait time.Duration) {
+	if proc == nil || !proc.Base.LoadTag || ap == nil || bat == nil || bat.RowCount() == 0 {
+		return
+	}
+	now := time.Now()
+	if !ctr.lastLoadDispatchQueueLogAt.IsZero() && now.Sub(ctr.lastLoadDispatchQueueLogAt) < loadDispatchQueueLogInterval {
+		return
+	}
+	ctr.lastLoadDispatchQueueLogAt = now
+	ctr.lastLoadDispatchQueueLogCount++
+
+	channelLen, channelCap := process.WaitRegisterChannelState(ap.LocalRegs[sendto])
+	spoolUsed, spoolTotal := ctr.sp.SlotState()
+	opBase := ap.GetOperatorBase()
+	pipelineCount := int(opBase.MaxParallel)
+	if pipelineCount < 1 {
+		pipelineCount = 1
+	}
+	proc.Info(proc.Ctx, "load data dispatch queue stats",
+		zap.Int("current-pipeline-id", int(opBase.ParallelID)),
+		zap.Int("current-pipeline-count", pipelineCount),
+		zap.Int64("current-log-count", ctr.lastLoadDispatchQueueLogCount),
+		zap.Int("target-receiver-index", sendto),
+		zap.Int("receiver-channel-len", channelLen),
+		zap.Int("receiver-channel-cap", channelCap),
+		zap.Int("spool-used-slots", spoolUsed),
+		zap.Int("spool-total-slots", spoolTotal),
+		zap.Int("current-batch-rows", bat.RowCount()),
+		zap.Int("current-batch-size", bat.Size()),
+		zap.Duration("receiver-send-wait", sendWait))
+}
+
 // common sender: send to any LocalReceiver
 // if the reg which you want to send to is closed
 // send it to next one.
@@ -277,9 +312,12 @@ func sendToAnyLocalFunc(bat *batch.Batch, ap *Dispatch, proc *process.Process) (
 	if err != nil || queryDone {
 		return true, err
 	}
+	sendStart := time.Now()
 	if !onlyOneRegToDealThis(sendto, ap, proc) {
+		ap.ctr.maybeLogLoadDispatchQueue(proc, ap, sendto, bat, time.Since(sendStart))
 		return true, nil
 	}
+	ap.ctr.maybeLogLoadDispatchQueue(proc, ap, sendto, bat, time.Since(sendStart))
 
 	ap.ctr.sendCnt++
 

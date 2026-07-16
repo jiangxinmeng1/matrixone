@@ -589,6 +589,29 @@ func TestConstructLocalDispatchFromScopesRejectsRemoteTarget(t *testing.T) {
 	require.Empty(t, remoteTarget.RemoteReceivRegInfos)
 }
 
+func TestNewMergeScopeLimitsLoadReceiverChannelBuffer(t *testing.T) {
+	testCompile := NewMockCompile(t)
+	testCompile.anal = &AnalyzeModule{qry: &plan.Query{}}
+
+	normalScope := &Scope{
+		NodeInfo: engine.Node{Addr: "cn1:6001", Mcpu: 8},
+		Proc:     testCompile.proc.NewNoContextChildProc(0),
+	}
+	normalMerge := testCompile.newMergeScope([]*Scope{normalScope})
+	_, normalCap := process.WaitRegisterChannelState(normalMerge.Proc.Reg.MergeReceivers[0])
+	require.Equal(t, 8, normalCap)
+
+	loadProc := testCompile.proc.NewNoContextChildProc(0)
+	loadProc.Base.LoadTag = true
+	loadScope := &Scope{
+		NodeInfo: engine.Node{Addr: "cn1:6001", Mcpu: 8},
+		Proc:     loadProc,
+	}
+	loadMerge := testCompile.newMergeScope([]*Scope{loadScope})
+	_, loadCap := process.WaitRegisterChannelState(loadMerge.Proc.Reg.MergeReceivers[0])
+	require.Equal(t, loadMergeReceiverChannelBufferSize, loadCap)
+}
+
 func TestConstructLocalDispatchFromScopesRejectsInvalidInputs(t *testing.T) {
 	testCompile := NewMockCompile(t)
 	source := &Scope{NodeInfo: engine.Node{Addr: "cn1:6001", Mcpu: 2}}
