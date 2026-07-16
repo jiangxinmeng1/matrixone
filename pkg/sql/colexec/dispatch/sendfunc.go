@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/pSpool"
 
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
@@ -288,6 +289,11 @@ func (ctr *container) maybeLogLoadDispatchQueue(proc *process.Process, ap *Dispa
 	if pipelineCount < 1 {
 		pipelineCount = 1
 	}
+	globalMPoolBytes := mpool.GlobalStats().NumCurrBytes.Load()
+	var processMPoolBytes int64
+	if proc.Mp() != nil {
+		processMPoolBytes = proc.Mp().CurrNB()
+	}
 	proc.Info(proc.Ctx, "load data dispatch queue stats",
 		zap.Int("current-pipeline-id", int(opBase.ParallelID)),
 		zap.Int("current-pipeline-count", pipelineCount),
@@ -299,6 +305,8 @@ func (ctr *container) maybeLogLoadDispatchQueue(proc *process.Process, ap *Dispa
 		zap.Int("spool-total-slots", spoolTotal),
 		zap.Int("current-batch-rows", bat.RowCount()),
 		zap.Int("current-batch-size", bat.Size()),
+		zap.Int64("process-mpool-current-bytes", processMPoolBytes),
+		zap.Int64("global-mpool-current-bytes", globalMPoolBytes),
 		zap.Duration("receiver-send-wait", sendWait))
 }
 

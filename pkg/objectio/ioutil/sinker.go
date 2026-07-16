@@ -100,6 +100,10 @@ type FileSinker interface {
 
 var _ FileSinker = new(FSinkerImpl)
 
+type fileSinkerMemoryStatter interface {
+	MemoryStats() objectio.WriteArenaStats
+}
+
 type FSinkerImpl struct {
 	writer *BlockWriter
 	arena  *objectio.WriteArena
@@ -159,6 +163,13 @@ func (s *FSinkerImpl) Sync(ctx context.Context) (*objectio.ObjectStats, error) {
 	s.writer = nil
 
 	return &ss, nil
+}
+
+func (s *FSinkerImpl) MemoryStats() objectio.WriteArenaStats {
+	if s == nil {
+		return objectio.WriteArenaStats{}
+	}
+	return s.arena.Stats()
 }
 
 func (s *FSinkerImpl) Reset() {
@@ -1053,12 +1064,31 @@ func (sinker *Sinker) PipelineRawPending() (batches int64, bytes int64) {
 		atomic.LoadInt64(&sinker.pipe.result.rawPendingBytes)
 }
 
+func (sinker *Sinker) PipelineFileSinkerPending() (count int64, arenaBytes int64) {
+	if sinker.pipe.result == nil {
+		return 0, 0
+	}
+	return atomic.LoadInt64(&sinker.pipe.result.sinkerPendingCnt),
+		atomic.LoadInt64(&sinker.pipe.result.sinkerArenaBytes)
+}
+
 func (sinker *Sinker) BufferPoolStats() (batches int, bytes int) {
 	if sinker.buf.buffers == nil {
 		return 0, 0
 	}
 	bytes, _, _, _ = sinker.buf.buffers.Usage()
 	return sinker.buf.buffers.Len(), bytes
+}
+
+func (sinker *Sinker) FileSinkerMemoryStats() objectio.WriteArenaStats {
+	if sinker == nil || sinker.fSinker.executor == nil {
+		return objectio.WriteArenaStats{}
+	}
+	statter, ok := sinker.fSinker.executor.(fileSinkerMemoryStatter)
+	if !ok {
+		return objectio.WriteArenaStats{}
+	}
+	return statter.MemoryStats()
 }
 
 func (sinker *Sinker) Close() error {

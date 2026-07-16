@@ -30,6 +30,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/perfcounter"
@@ -452,11 +453,22 @@ func (insert *Insert) maybeLogLoadS3Memory(proc *process.Process, event string) 
 func (insert *Insert) logLoadS3Memory(proc *process.Process, event string) {
 	stagedBatches, stagedBytes := insert.ctr.s3Writer.StagedBatchStats()
 	pendingBatches, pendingBytes := insert.ctr.s3Writer.PipelineRawPendingStats()
+	pendingFileSinkers, pendingFileSinkerArenaBytes := insert.ctr.s3Writer.PipelineFileSinkerPendingStats()
 	bufferPoolBatches, bufferPoolBytes := insert.ctr.s3Writer.BufferPoolStats()
+	arenaStats := insert.ctr.s3Writer.FileSinkerMemoryStats()
+	arenaPoolStats := objectio.GetWriteArenaPoolStats()
+	writeArenaMPoolBytes := objectio.WriteArenaMPoolCurrentBytes()
+	globalMPoolBytes := mpool.GlobalStats().NumCurrBytes.Load()
+	var processMPoolBytes int64
+	if proc != nil && proc.Mp() != nil {
+		processMPoolBytes = proc.Mp().CurrNB()
+	}
 	var throttlerAvailable int64
 	if insert.ctr.s3MemThrottler != nil {
 		throttlerAvailable = insert.ctr.s3MemThrottler.Available()
 	}
+	currentWriterArenaMPoolBytes := int64(arenaStats.DataBytes + arenaStats.CompressBufferBytes)
+	loadAccountedMPoolBytes := int64(stagedBytes) + pendingBytes + int64(bufferPoolBytes) + pendingFileSinkerArenaBytes + currentWriterArenaMPoolBytes
 	proc.Info(proc.Ctx, "load data s3 writer memory stats",
 		zap.String("event", event),
 		zap.Int64("written-batches", insert.ctr.s3WrittenBatches),
@@ -465,11 +477,29 @@ func (insert *Insert) logLoadS3Memory(proc *process.Process, event string) {
 		zap.Int("staged-bytes", stagedBytes),
 		zap.Int64("pipeline-raw-pending-batches", pendingBatches),
 		zap.Int64("pipeline-raw-pending-bytes", pendingBytes),
+		zap.Int64("pipeline-filesinker-pending-count", pendingFileSinkers),
+		zap.Int64("pipeline-filesinker-arena-bytes", pendingFileSinkerArenaBytes),
 		zap.Int("buffer-pool-batches", bufferPoolBatches),
 		zap.Int("buffer-pool-bytes", bufferPoolBytes),
 		zap.Int64("s3-mem-granted", insert.ctr.s3MemGranted),
 		zap.Int64("s3-throttler-available", throttlerAvailable),
-		zap.Int64("mpool-current-bytes", mpool.GlobalStats().NumCurrBytes.Load()))
+		zap.Int64("write-arena-mpool-current-bytes", writeArenaMPoolBytes),
+		zap.Int("s3-writer-arena-data-bytes", arenaStats.DataBytes),
+		zap.Int("s3-writer-arena-used-bytes", arenaStats.UsedBytes),
+		zap.Int("s3-writer-arena-compress-buffer-bytes", arenaStats.CompressBufferBytes),
+		zap.Int64("s3-writer-arena-mpool-bytes", currentWriterArenaMPoolBytes),
+		zap.Int("s3-writer-arena-serial-buffer-bytes", arenaStats.SerialBufferBytes),
+		zap.Int("s3-writer-arena-total-requested-bytes", arenaStats.TotalRequestedBytes),
+		zap.Int("s3-writer-arena-size-limit-bytes", arenaStats.SizeLimitBytes),
+		zap.Int32("write-arena-small-pool-count", arenaPoolStats.SmallCount),
+		zap.Int32("write-arena-small-pool-max-count", arenaPoolStats.SmallMaxCount),
+		zap.Int32("write-arena-large-pool-count", arenaPoolStats.LargeCount),
+		zap.Int32("write-arena-large-pool-max-count", arenaPoolStats.LargeMaxCount),
+		zap.Int64("process-mpool-current-bytes", processMPoolBytes),
+		zap.Int64("global-mpool-current-bytes", globalMPoolBytes),
+		zap.Int64("mpool-accounted-load-bytes", loadAccountedMPoolBytes),
+		zap.Int64("mpool-unaccounted-bytes", globalMPoolBytes-loadAccountedMPoolBytes),
+		zap.Int64("mpool-current-bytes", globalMPoolBytes))
 }
 
 func forcedRefresh(throttler interface{ Refresh() }) {

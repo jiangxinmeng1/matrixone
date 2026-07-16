@@ -41,6 +41,15 @@ const arenaMaxSize = 128 * 1024 * 1024
 // the backing arrays out of Go's heap and invisible to pprof inuse_space.
 var arenaMPool = mpool.MustNew("write-arena")
 
+type WriteArenaStats struct {
+	DataBytes           int
+	UsedBytes           int
+	CompressBufferBytes int
+	SerialBufferBytes   int
+	TotalRequestedBytes int
+	SizeLimitBytes      int
+}
+
 type WriteArena struct {
 	data           []byte
 	usedOffset     int
@@ -58,6 +67,24 @@ func NewArena(size int) *WriteArena {
 	return &WriteArena{
 		data: data,
 	}
+}
+
+func (a *WriteArena) Stats() WriteArenaStats {
+	if a == nil {
+		return WriteArenaStats{}
+	}
+	return WriteArenaStats{
+		DataBytes:           len(a.data),
+		UsedBytes:           a.usedOffset,
+		CompressBufferBytes: len(a.compressBuf),
+		SerialBufferBytes:   a.serialBuf.Cap(),
+		TotalRequestedBytes: a.totalRequested,
+		SizeLimitBytes:      a.sizeLimit,
+	}
+}
+
+func WriteArenaMPoolCurrentBytes() int64 {
+	return arenaMPool.CurrNB()
 }
 
 // Alloc returns a slice of exactly size bytes.  When the arena has

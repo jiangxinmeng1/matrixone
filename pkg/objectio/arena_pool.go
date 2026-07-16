@@ -56,6 +56,22 @@ type arenaFreeList struct {
 
 var arenaPools [2]arenaFreeList
 
+type WriteArenaPoolStats struct {
+	SmallCount    int32
+	SmallMaxCount int32
+	LargeCount    int32
+	LargeMaxCount int32
+}
+
+func GetWriteArenaPoolStats() WriteArenaPoolStats {
+	return WriteArenaPoolStats{
+		SmallCount:    arenaPools[ArenaSmall].count.Load(),
+		SmallMaxCount: arenaPools[ArenaSmall].maxCount,
+		LargeCount:    arenaPools[ArenaLarge].count.Load(),
+		LargeMaxCount: arenaPools[ArenaLarge].maxCount,
+	}
+}
+
 func init() {
 	procs := int32(runtime.GOMAXPROCS(0))
 	half := procs / 2

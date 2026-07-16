@@ -58,8 +58,9 @@ type poolSinkJob struct {
 }
 
 type poolSyncJob struct {
-	fSinker FileSinker
-	result  *pipelineResult
+	fSinker    FileSinker
+	result     *pipelineResult
+	arenaBytes int64
 }
 
 // pipelineResult tracks accumulated results and errors for one Sinker's
@@ -76,6 +77,8 @@ type pipelineResult struct {
 
 	rawPendingBatches int64 // atomic, raw batches submitted to sink workers and not yet Cleaned
 	rawPendingBytes   int64 // atomic, raw bytes submitted to sink workers and not yet Cleaned
+	sinkerPendingCnt  int64 // atomic, FSinkers waiting for or running Sync
+	sinkerArenaBytes  int64 // atomic, WriteArena mpool bytes held by pending FSinkers
 	sinkNs            int64 // atomic, total serialization time across workers
 	syncNs            int64 // atomic, total IO time across workers
 }
@@ -168,15 +171,19 @@ func (p *SinkPool) runSinkWorker() {
 			continue
 		}
 
+		arenaBytes := fSinkerArenaMPoolBytes(fSinker)
+		r.addSinkerPending(arenaBytes)
 		// Forward to sync worker. Do NOT call r.pending.Done() here;
 		// the sync worker calls it after completing the IO.
 		select {
-		case p.syncChan <- &poolSyncJob{fSinker: fSinker, result: r}:
+		case p.syncChan <- &poolSyncJob{fSinker: fSinker, result: r, arenaBytes: arenaBytes}:
 		case <-r.ctx.Done():
+			r.releaseSinkerPending(arenaBytes)
 			fSinker.Close()
 			r.setError(context.Cause(r.ctx))
 			r.pending.Done()
 		case <-p.done:
+			r.releaseSinkerPending(arenaBytes)
 			fSinker.Close()
 			r.setError(context.Canceled)
 			r.pending.Done()
@@ -190,6 +197,7 @@ func (p *SinkPool) runSyncWorker() {
 		r := job.result
 		if r.hasError() {
 			job.fSinker.Close()
+			r.releaseSinkerPending(job.arenaBytes)
 			r.pending.Done()
 			continue
 		}
@@ -197,7 +205,12 @@ func (p *SinkPool) runSyncWorker() {
 		syncStart := time.Now()
 		stats, err := job.fSinker.Sync(r.ctx)
 		atomic.AddInt64(&r.syncNs, int64(time.Since(syncStart)))
+		if currentArenaBytes := fSinkerArenaMPoolBytes(job.fSinker); currentArenaBytes != job.arenaBytes {
+			atomic.AddInt64(&r.sinkerArenaBytes, currentArenaBytes-job.arenaBytes)
+			job.arenaBytes = currentArenaBytes
+		}
 		job.fSinker.Close()
+		r.releaseSinkerPending(job.arenaBytes)
 
 		if err != nil {
 			r.setError(err)
@@ -208,6 +221,15 @@ func (p *SinkPool) runSyncWorker() {
 		}
 		r.pending.Done()
 	}
+}
+
+func fSinkerArenaMPoolBytes(fSinker FileSinker) int64 {
+	statter, ok := fSinker.(fileSinkerMemoryStatter)
+	if !ok {
+		return 0
+	}
+	stats := statter.MemoryStats()
+	return int64(stats.DataBytes + stats.CompressBufferBytes)
 }
 
 // Submit enqueues a sink job for async processing. The job's result.pending
@@ -330,6 +352,16 @@ func (r *pipelineResult) releaseRawPending(batches []*batch.Batch) {
 	}
 	atomic.AddInt64(&r.rawPendingBatches, -count)
 	atomic.AddInt64(&r.rawPendingBytes, -bytes)
+}
+
+func (r *pipelineResult) addSinkerPending(arenaBytes int64) {
+	atomic.AddInt64(&r.sinkerPendingCnt, 1)
+	atomic.AddInt64(&r.sinkerArenaBytes, arenaBytes)
+}
+
+func (r *pipelineResult) releaseSinkerPending(arenaBytes int64) {
+	atomic.AddInt64(&r.sinkerPendingCnt, -1)
+	atomic.AddInt64(&r.sinkerArenaBytes, -arenaBytes)
 }
 
 func freeBatches(batches []*batch.Batch, mp *mpool.MPool) {
