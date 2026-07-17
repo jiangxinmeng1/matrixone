@@ -103,3 +103,25 @@ func TestProfileWritable(t *testing.T) {
 
 	mp.Free(bs)
 }
+
+func TestProfileInuseTopSummary(t *testing.T) {
+	EnableProfiling()
+	defer DisableProfiling()
+
+	mp, err := NewMPool("test-profile-summary", 0, NoFixed)
+	require.NoError(t, err)
+	defer DeleteMPool(mp)
+
+	before := ProfileTrackedCount()
+	bs, err := mp.Alloc(8192, true)
+	require.NoError(t, err)
+	require.Equal(t, before+1, ProfileTrackedCount())
+
+	top := malloc.GlobalHeapProfileInuseTop(8, 1, 4)
+	require.NotEmpty(t, top)
+	require.GreaterOrEqual(t, top[0].InuseBytes, int64(8192))
+	require.NotEmpty(t, top[0].Stack)
+
+	mp.Free(bs)
+	require.Equal(t, before, ProfileTrackedCount())
+}

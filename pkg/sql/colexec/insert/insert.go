@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/common/malloc"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/common/rscthrottler"
@@ -46,8 +47,11 @@ import (
 // prevent thundering-herd mpool explosion when many workers are denied memory
 // simultaneously and all try to flush + read objectio metadata at once.
 const (
-	minFlushConcurrencyLimit = 4
-	maxFlushConcurrencyLimit = 16
+	minFlushConcurrencyLimit   = 4
+	maxFlushConcurrencyLimit   = 16
+	loadMPoolProfileTopLimit   = 8
+	loadMPoolProfileMinBytes   = 64 * mpool.MB
+	loadMPoolProfileStackDepth = 8
 )
 
 type flushLimiter struct {
@@ -442,6 +446,9 @@ func (insert *Insert) maybeLogLoadS3Memory(proc *process.Process, event string) 
 	if proc == nil || !proc.Base.LoadTag || insert.ctr.s3Writer == nil {
 		return
 	}
+	if !mpool.ProfilingEnabled() {
+		mpool.EnableProfiling()
+	}
 	now := time.Now()
 	if event == "write" && !insert.ctr.lastLoadS3LogAt.IsZero() && now.Sub(insert.ctr.lastLoadS3LogAt) < loadS3MemoryLogInterval {
 		return
@@ -459,6 +466,7 @@ func (insert *Insert) logLoadS3Memory(proc *process.Process, event string) {
 	arenaPoolStats := objectio.GetWriteArenaPoolStats()
 	writeArenaMPoolBytes := objectio.WriteArenaMPoolCurrentBytes()
 	globalMPoolBytes := mpool.GlobalStats().NumCurrBytes.Load()
+	mpoolProfileTop := malloc.GlobalHeapProfileInuseTop(loadMPoolProfileTopLimit, loadMPoolProfileMinBytes, loadMPoolProfileStackDepth)
 	var processMPoolBytes int64
 	if proc != nil && proc.Mp() != nil {
 		processMPoolBytes = proc.Mp().CurrNB()
@@ -497,6 +505,9 @@ func (insert *Insert) logLoadS3Memory(proc *process.Process, event string) {
 		zap.Int32("write-arena-large-pool-max-count", arenaPoolStats.LargeMaxCount),
 		zap.Int64("process-mpool-current-bytes", processMPoolBytes),
 		zap.Int64("global-mpool-current-bytes", globalMPoolBytes),
+		zap.Bool("mpool-profiling-enabled", mpool.ProfilingEnabled()),
+		zap.Int("mpool-profile-tracked-count", mpool.ProfileTrackedCount()),
+		zap.Any("mpool-profile-inuse-top", mpoolProfileTop),
 		zap.Int64("mpool-accounted-load-bytes", loadAccountedMPoolBytes),
 		zap.Int64("mpool-unaccounted-bytes", globalMPoolBytes-loadAccountedMPoolBytes),
 		zap.Int64("mpool-current-bytes", globalMPoolBytes))
