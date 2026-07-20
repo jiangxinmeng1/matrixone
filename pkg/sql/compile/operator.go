@@ -1888,6 +1888,7 @@ func rewriteJoinExprToHashBuildExpr(src []*plan.Expr) []*plan.Expr {
 func constructBroadcastHashBuild(op vm.Operator, proc *process.Process, mcpu int32) *hashbuild.HashBuild {
 	ret := hashbuild.NewArgument()
 	ret.IsShuffle = false
+	ret.SourceOpType = op.OpType().String()
 
 	switch op.OpType() {
 	case vm.HashJoin:
@@ -1970,6 +1971,7 @@ func constructShuffleHashBuild(node *plan.Node, op vm.Operator, proc *process.Pr
 	ret := hashbuild.NewArgument()
 	ret.NeedHashMap = true
 	ret.IsShuffle = true
+	ret.SourceOpType = op.OpType().String()
 	ret.JoinMapRefCnt = 1
 	ret.DelColIdx = -1
 	ret.SpillThreshold = node.SpillMem

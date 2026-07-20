@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -105,7 +106,8 @@ const (
 )
 
 var (
-	cantCompileForPrepareErr = moerr.NewCantCompileForPrepareNoCtx()
+	cantCompileForPrepareErr  = moerr.NewCantCompileForPrepareNoCtx()
+	compileDiagS3OptionRegexp = regexp.MustCompile(`(?is)s3option\{.*?\}`)
 )
 
 // NewCompile is used to new an object of compile
@@ -3210,6 +3212,81 @@ func (c *Compile) compileJoin(node, left, right *plan.Node, probeScopes, buildSc
 	return c.compileBuildSideForBroadcastJoin(node, rs, buildScopes)
 }
 
+func (c *Compile) logDedupJoinCompileStrategy(node, left, right *plan.Node, sourceOpType string) {
+	if node == nil || node.JoinType != plan.Node_DEDUP {
+		return
+	}
+	sqlPrefix := truncateCompileDiagSQL(redactCompileDiagSQL(c.sql), 512)
+	isLoad := strings.HasPrefix(strings.ToUpper(strings.TrimSpace(c.sql)), "LOAD")
+	leftOutcnt, rightOutcnt := -1.0, -1.0
+	leftTableCnt, rightTableCnt := -1.0, -1.0
+	leftHashmapSize, rightHashmapSize := -1.0, -1.0
+	if left != nil && left.Stats != nil {
+		leftOutcnt = left.Stats.Outcnt
+		leftTableCnt = left.Stats.TableCnt
+		if left.Stats.HashmapStats != nil {
+			leftHashmapSize = left.Stats.HashmapStats.HashmapSize
+		}
+	}
+	if right != nil && right.Stats != nil {
+		rightOutcnt = right.Stats.Outcnt
+		rightTableCnt = right.Stats.TableCnt
+		if right.Stats.HashmapStats != nil {
+			rightHashmapSize = right.Stats.HashmapStats.HashmapSize
+		}
+	}
+	planShuffle := false
+	shuffleColIdx := int32(-1)
+	shuffleType := plan.ShuffleType_Hash
+	shuffleMethod := plan.ShuffleMethod_Normal
+	hashmapSize := -1.0
+	spillMem := node.SpillMem
+	if node.Stats != nil && node.Stats.HashmapStats != nil {
+		planShuffle = node.Stats.HashmapStats.Shuffle
+		shuffleColIdx = node.Stats.HashmapStats.ShuffleColIdx
+		shuffleType = node.Stats.HashmapStats.ShuffleType
+		shuffleMethod = node.Stats.HashmapStats.ShuffleMethod
+		hashmapSize = node.Stats.HashmapStats.HashmapSize
+	}
+	rightDedupLeftOutcntTooSmall := node.IsRightJoin && leftOutcnt >= 0 && leftOutcnt <= 200000
+	rightDedupHashShuffleDisabled := node.IsRightJoin && shuffleType == plan.ShuffleType_Hash
+	logutil.Infof(
+		"compile dedup join strategy: source-op-type=%q, is-right-join=%v, plan-shuffle=%v, right-dedup-left-outcnt-too-small=%v, right-dedup-hash-shuffle-disabled=%v, on-duplicate-action=%v, old-col-list-len=%d, old-col-capture-list-len=%d, left-outcnt=%f, right-outcnt=%f, left-tablecnt=%f, right-tablecnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, spill-mem=%d, is-load=%v, sql-prefix=%q",
+		sourceOpType,
+		node.IsRightJoin,
+		planShuffle,
+		rightDedupLeftOutcntTooSmall,
+		rightDedupHashShuffleDisabled,
+		node.OnDuplicateAction,
+		len(node.GetDedupJoinCtx().GetOldColList()),
+		len(node.GetDedupJoinCtx().GetOldColCaptureList()),
+		leftOutcnt,
+		rightOutcnt,
+		leftTableCnt,
+		rightTableCnt,
+		hashmapSize,
+		leftHashmapSize,
+		rightHashmapSize,
+		shuffleColIdx,
+		shuffleType,
+		shuffleMethod,
+		spillMem,
+		isLoad,
+		sqlPrefix,
+	)
+}
+
+func redactCompileDiagSQL(sql string) string {
+	return compileDiagS3OptionRegexp.ReplaceAllString(sql, "s3option{...redacted...}")
+}
+
+func truncateCompileDiagSQL(sql string, maxLen int) string {
+	if len(sql) <= maxLen {
+		return sql
+	}
+	return sql[:maxLen] + "..."
+}
+
 func (c *Compile) compileShuffleJoinV2(node, left, right *plan.Node, leftscopes, rightscopes []*Scope) []*Scope {
 	if node.Stats.Dop != left.Stats.Dop || node.Stats.Dop != right.Stats.Dop {
 		panic("wrong dop for shuffle join!")
@@ -3434,6 +3511,7 @@ func (c *Compile) compileProbeSideForBroadcastJoin(node, left, right *plan.Node,
 		c.anal.isFirst = false
 	case plan.Node_DEDUP:
 		if node.IsRightJoin {
+			c.logDedupJoinCompileStrategy(node, left, right, vm.RightDedupJoin.String())
 			rs = c.newProbeScopeListForBroadcastJoin(probeScopes, true)
 			currentFirstFlag := c.anal.isFirst
 			for i := range rs {
@@ -3444,6 +3522,7 @@ func (c *Compile) compileProbeSideForBroadcastJoin(node, left, right *plan.Node,
 			}
 			c.anal.isFirst = false
 		} else {
+			c.logDedupJoinCompileStrategy(node, left, right, vm.DedupJoin.String())
 			rs = c.newProbeScopeListForBroadcastJoin(probeScopes, true)
 			currentFirstFlag := c.anal.isFirst
 			for i := range rs {
