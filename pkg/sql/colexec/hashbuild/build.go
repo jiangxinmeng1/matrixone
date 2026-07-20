@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -185,7 +186,9 @@ func (hashBuild *HashBuild) build(proc *process.Process, analyzer process.Analyz
 		}
 
 		// Check if we should enter spill mode based on batch memory size
-		if hashBuild.shouldSpillBatches() {
+		shouldSpill, spillReason := hashBuild.shouldSpillBatchesWithReason()
+		hashBuild.logSpillDecision(proc, "check", spillReason, result.Batch.RowCount())
+		if shouldSpill {
 			spillMode = true
 			// Initialize spill executors once for reuse across all batches
 			if ctr.spillExprExecs == nil {
@@ -199,6 +202,7 @@ func (hashBuild *HashBuild) build(proc *process.Process, analyzer process.Analyz
 				return err
 			}
 			ctr.spillUUID = uid.String()
+			hashBuild.logSpillDecision(proc, "enter-spill", "threshold-exceeded", result.Batch.RowCount())
 			logutil.Infof("entering spill mode, uid: %s", ctr.spillUUID)
 
 			spillFiles = make([]*os.File, spillNumBuckets)
@@ -240,6 +244,9 @@ func (hashBuild *HashBuild) build(proc *process.Process, analyzer process.Analyz
 		// Transfer ownership to container; nil local slice so defer won't close
 		ctr.spilledFds = spillFiles
 		spillFiles = nil
+		hashBuild.logSpillDecision(proc, "finish-spill-build", "spilled-build-side", 0)
+	} else {
+		hashBuild.logSpillDecision(proc, "finish-memory-build", "not-spilled", 0)
 	}
 
 	// If we never entered spill mode, build the hashmap
@@ -261,6 +268,141 @@ func (hashBuild *HashBuild) build(proc *process.Process, analyzer process.Analyz
 
 	analyzer.Alloc(ctr.hashmapBuilder.GetSize())
 	return nil
+}
+
+func (hashBuild *HashBuild) shouldSpillBatchesWithReason() (bool, string) {
+	if !hashBuild.IsShuffle {
+		return false, "not-shuffle"
+	}
+	if !hashBuild.NeedHashMap {
+		return false, "no-hashmap"
+	}
+	ctr := &hashBuild.ctr
+	memUsed := ctr.memUsed()
+	rowCount := int64(ctr.hashmapBuilder.InputBatchRowCount)
+	if colexec.ShouldSpill(memUsed, rowCount, ctr.spillThreshold) {
+		return true, "threshold-exceeded"
+	}
+	if ctr.spillThreshold <= 100000 {
+		return false, "row-threshold-not-reached"
+	}
+	return false, "mem-threshold-not-reached"
+}
+
+func (hashBuild *HashBuild) logSpillDecision(proc *process.Process, event, reason string, inputBatchRows int) {
+	if proc == nil {
+		return
+	}
+	ctr := &hashBuild.ctr
+	rowCount := int64(ctr.hashmapBuilder.InputBatchRowCount)
+	memUsed := ctr.memUsed()
+	if !hashBuild.shouldLogSpillDecision(event, rowCount, memUsed) {
+		return
+	}
+
+	sqlPrefix := ""
+	stmtType := ""
+	queryType := ""
+	sqlSourceType := ""
+	isLoad := false
+	if sp := proc.GetStmtProfile(); sp != nil {
+		sql := sp.GetSqlOfStmt()
+		sqlPrefix = truncateHashBuildDiagSQL(redactHashBuildDiagSQL(sql), 512)
+		isLoad = strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sql)), "LOAD")
+		stmtType = sp.GetStmtType()
+		queryType = sp.GetQueryType()
+		sqlSourceType = sp.GetSqlSourceType()
+	}
+
+	sessionDB := ""
+	user := ""
+	if si := proc.GetSessionInfo(); si != nil {
+		sessionDB = si.GetDatabase()
+		user = si.GetUser()
+	}
+
+	proc.Infof(proc.Ctx,
+		"hashbuild spill decision: event=%s, reason=%s, is-shuffle=%v, need-hashmap=%v, need-batches=%v, is-dedup=%v, join-map-tag=%d, shuffle-idx=%d, join-map-ref-cnt=%d, spill-threshold=%d, row-count=%d, mem-used=%d, input-batch-rows=%d, batch-buffer-count=%d, need-allocate-sels=%v, hash-on-pk=%v, runtime-filter=%v, on-duplicate-action=%v, dedup-col-name=%q, stmt-type=%q, query-type=%q, sql-source-type=%q, user=%q, database=%q, is-load=%v, sql-prefix=%q",
+		event,
+		reason,
+		hashBuild.IsShuffle,
+		hashBuild.NeedHashMap,
+		hashBuild.NeedBatches,
+		hashBuild.IsDedup,
+		hashBuild.JoinMapTag,
+		hashBuild.ShuffleIdx,
+		hashBuild.JoinMapRefCnt,
+		ctr.spillThreshold,
+		rowCount,
+		memUsed,
+		inputBatchRows,
+		len(ctr.hashmapBuilder.Batches.Buf),
+		hashBuild.NeedAllocateSels,
+		hashBuild.HashOnPK,
+		hashBuild.RuntimeFilterSpec != nil,
+		hashBuild.OnDuplicateAction,
+		hashBuild.DedupColName,
+		stmtType,
+		queryType,
+		sqlSourceType,
+		user,
+		sessionDB,
+		isLoad,
+		sqlPrefix,
+	)
+}
+
+func (hashBuild *HashBuild) shouldLogSpillDecision(event string, rowCount, memUsed int64) bool {
+	if event != "check" {
+		return true
+	}
+	ctr := &hashBuild.ctr
+	if rowCount == 0 {
+		return true
+	}
+	const rowStep = int64(100000)
+	const memStep = int64(1 << 30)
+	if ctr.spillDiagLastRows == 0 && ctr.spillDiagLastMem == 0 {
+		ctr.spillDiagLastRows = rowCount
+		ctr.spillDiagLastMem = memUsed
+		return true
+	}
+	if rowCount-ctr.spillDiagLastRows >= rowStep || memUsed-ctr.spillDiagLastMem >= memStep {
+		ctr.spillDiagLastRows = rowCount
+		ctr.spillDiagLastMem = memUsed
+		return true
+	}
+	return false
+}
+
+func truncateHashBuildDiagSQL(sql string, limit int) string {
+	if limit <= 0 || len(sql) <= limit {
+		return sql
+	}
+	return sql[:limit] + "...(truncated)"
+}
+
+func redactHashBuildDiagSQL(sql string) string {
+	lower := strings.ToLower(sql)
+	start := strings.Index(lower, "s3option{")
+	if start < 0 {
+		return sql
+	}
+	pos := start + len("s3option{")
+	depth := 1
+	for pos < len(sql) {
+		switch sql[pos] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return sql[:start] + "s3option{...redacted...}" + sql[pos+1:]
+			}
+		}
+		pos++
+	}
+	return sql[:start] + "s3option{...redacted...}"
 }
 
 // calculateBloomFilterProbability calculates the false positive rate for bloom filter

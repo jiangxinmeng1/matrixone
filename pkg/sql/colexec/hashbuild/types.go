@@ -55,6 +55,9 @@ type container struct {
 
 	// cached expression executors for spill (reused across batches)
 	spillExprExecs []colexec.ExpressionExecutor
+
+	spillDiagLastRows int64
+	spillDiagLastMem  int64
 }
 
 type HashBuild struct {
@@ -132,6 +135,8 @@ func (hashBuild *HashBuild) Reset(proc *process.Process, pipelineFailed bool, er
 	hashBuild.ctr.spilledFds = nil
 	hashBuild.ctr.state = BuildHashMap
 	hashBuild.ctr.runtimeFilterIn = false
+	hashBuild.ctr.spillDiagLastRows = 0
+	hashBuild.ctr.spillDiagLastMem = 0
 	message.FinalizeRuntimeFilter(hashBuild.RuntimeFilterSpec, runtimeSucceed, proc.GetMessageBoard())
 	message.FinalizeJoinMapMessage(proc.GetMessageBoard(), hashBuild.JoinMapTag, hashBuild.IsShuffle, hashBuild.ShuffleIdx, mapSucceed)
 }
