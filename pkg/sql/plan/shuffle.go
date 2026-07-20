@@ -15,8 +15,10 @@
 package plan
 
 import (
+	"fmt"
 	"math"
 	"math/bits"
+	"strings"
 	"unsafe"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
@@ -659,11 +661,15 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 }
 
 func logDedupJoinShuffleDecision(reason string, node *plan.Node, builder *QueryBuilder) {
+	nodeID := findPlanNodeID(builder, node)
 	leftOutcnt := -1.0
 	rightOutcnt := -1.0
 	leftHashmapSize := -1.0
 	rightHashmapSize := -1.0
+	leftNodeID := int32(-1)
+	rightNodeID := int32(-1)
 	if len(node.Children) > 0 {
+		leftNodeID = node.Children[0]
 		leftChild := builder.qry.Nodes[node.Children[0]]
 		if leftChild != nil && leftChild.Stats != nil {
 			leftOutcnt = leftChild.Stats.Outcnt
@@ -673,6 +679,7 @@ func logDedupJoinShuffleDecision(reason string, node *plan.Node, builder *QueryB
 		}
 	}
 	if len(node.Children) > 1 {
+		rightNodeID = node.Children[1]
 		rightChild := builder.qry.Nodes[node.Children[1]]
 		if rightChild != nil && rightChild.Stats != nil {
 			rightOutcnt = rightChild.Stats.Outcnt
@@ -708,13 +715,16 @@ func logDedupJoinShuffleDecision(reason string, node *plan.Node, builder *QueryB
 	}
 
 	logutil.Infof(
-		"dedup join shuffle decision: reason=%s, shuffle=%v, is-right-join=%v, on-duplicate-action=%v, old-col-list-len=%d, old-col-capture-list-len=%d, left-outcnt=%f, right-outcnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, highest-ndv=%f, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v",
+		"dedup join shuffle decision: reason=%s, node-id=%d, shuffle=%v, is-right-join=%v, on-duplicate-action=%v, old-col-list-len=%d, old-col-capture-list-len=%d, left-node-id=%d, right-node-id=%d, left-outcnt=%f, right-outcnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, highest-ndv=%f, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, load-tag=%v, stmt-type=%v, left-child=%s, right-child=%s, left-load-source=%s, right-load-source=%s",
 		reason,
+		nodeID,
 		shuffle,
 		node.IsRightJoin,
 		node.OnDuplicateAction,
 		oldColListLen,
 		oldColCaptureListLen,
+		leftNodeID,
+		rightNodeID,
 		leftOutcnt,
 		rightOutcnt,
 		hashmapSize,
@@ -724,7 +734,133 @@ func logDedupJoinShuffleDecision(reason string, node *plan.Node, builder *QueryB
 		shuffleColIdx,
 		shuffleType,
 		shuffleMethod,
+		builder.qry.LoadTag,
+		builder.qry.StmtType,
+		formatPlanNodeForDedupShuffleLog(builder, leftNodeID),
+		formatPlanNodeForDedupShuffleLog(builder, rightNodeID),
+		traceLoadExternalScanForDedupShuffleLog(builder, leftNodeID),
+		traceLoadExternalScanForDedupShuffleLog(builder, rightNodeID),
 	)
+}
+
+func findPlanNodeID(builder *QueryBuilder, target *plan.Node) int32 {
+	if builder == nil || builder.qry == nil || target == nil {
+		return -1
+	}
+	for i, node := range builder.qry.Nodes {
+		if node == target {
+			return int32(i)
+		}
+	}
+	return -1
+}
+
+func formatPlanNodeForDedupShuffleLog(builder *QueryBuilder, nodeID int32) string {
+	return formatPlanNodeForDedupShuffleLogWithDepth(builder, nodeID, 1)
+}
+
+func formatPlanNodeForDedupShuffleLogWithDepth(builder *QueryBuilder, nodeID int32, sourceDepth int) string {
+	if builder == nil || builder.qry == nil || nodeID < 0 || int(nodeID) >= len(builder.qry.Nodes) {
+		return "invalid"
+	}
+	node := builder.qry.Nodes[nodeID]
+	if node == nil {
+		return "nil"
+	}
+
+	stats := "stats=nil"
+	if node.Stats != nil {
+		hashmapSize := -1.0
+		shuffle := false
+		if node.Stats.HashmapStats != nil {
+			hashmapSize = node.Stats.HashmapStats.HashmapSize
+			shuffle = node.Stats.HashmapStats.Shuffle
+		}
+		stats = fmt.Sprintf("outcnt=%f tablecnt=%f cost=%f blocknum=%d hashmap-size=%f shuffle=%v",
+			node.Stats.Outcnt, node.Stats.TableCnt, node.Stats.Cost, node.Stats.BlockNum, hashmapSize, shuffle)
+	}
+
+	tableName := ""
+	if node.TableDef != nil {
+		tableName = node.TableDef.Name
+	}
+	objName := ""
+	if node.ObjRef != nil {
+		objName = node.ObjRef.ObjName
+	}
+
+	sourceStep := int32(-1)
+	sourceRoot := "none"
+	if len(node.GetSourceStep()) > 0 {
+		sourceStep = node.GetSourceStep()[0]
+		if sourceStep >= 0 && int(sourceStep) < len(builder.qry.Steps) {
+			sourceRootID := builder.qry.Steps[sourceStep]
+			if sourceDepth > 0 {
+				sourceRoot = formatPlanNodeForDedupShuffleLogWithDepth(builder, sourceRootID, sourceDepth-1)
+			} else {
+				sourceRoot = fmt.Sprintf("{id=%d depth-limit}", sourceRootID)
+			}
+		}
+	}
+
+	return fmt.Sprintf("{id=%d type=%s join-type=%s table=%q obj=%q children=%v source-step=%d stats={%s} source-root=%s}",
+		nodeID, node.NodeType.String(), node.JoinType.String(), tableName, objName, node.Children, sourceStep, stats, sourceRoot)
+}
+
+func traceLoadExternalScanForDedupShuffleLog(builder *QueryBuilder, rootID int32) string {
+	if builder == nil || builder.qry == nil || rootID < 0 || int(rootID) >= len(builder.qry.Nodes) {
+		return "invalid"
+	}
+
+	const maxVisit = 64
+	type item struct {
+		id   int32
+		path string
+	}
+	queue := []item{{id: rootID, path: fmt.Sprintf("%d", rootID)}}
+	visited := make(map[int32]bool)
+	for len(queue) > 0 && len(visited) < maxVisit {
+		cur := queue[0]
+		queue = queue[1:]
+		if cur.id < 0 || int(cur.id) >= len(builder.qry.Nodes) || visited[cur.id] {
+			continue
+		}
+		visited[cur.id] = true
+		node := builder.qry.Nodes[cur.id]
+		if node == nil {
+			continue
+		}
+		if node.NodeType == plan.Node_EXTERNAL_SCAN && node.ExternScan != nil && plan.ExternType(node.ExternScan.Type) == plan.ExternType_LOAD {
+			stats := "stats=nil"
+			if node.Stats != nil {
+				stats = fmt.Sprintf("outcnt=%f tablecnt=%f cost=%f blocknum=%d rowsize=%f",
+					node.Stats.Outcnt, node.Stats.TableCnt, node.Stats.Cost, node.Stats.BlockNum, node.Stats.Rowsize)
+			}
+			tableName := ""
+			if node.TableDef != nil {
+				tableName = node.TableDef.Name
+			}
+			return fmt.Sprintf("{found=true external-scan-id=%d path=%s table=%q %s}", cur.id, cur.path, tableName, stats)
+		}
+
+		for _, childID := range node.Children {
+			queue = append(queue, item{id: childID, path: cur.path + "->" + fmt.Sprintf("%d", childID)})
+		}
+		for _, sourceStep := range node.GetSourceStep() {
+			if sourceStep >= 0 && int(sourceStep) < len(builder.qry.Steps) {
+				sourceRootID := builder.qry.Steps[sourceStep]
+				queue = append(queue, item{id: sourceRootID, path: cur.path + fmt.Sprintf("->step[%d]->%d", sourceStep, sourceRootID)})
+			}
+		}
+	}
+
+	visitedTypes := make([]string, 0, len(visited))
+	for id := range visited {
+		if id >= 0 && int(id) < len(builder.qry.Nodes) && builder.qry.Nodes[id] != nil {
+			visitedTypes = append(visitedTypes, fmt.Sprintf("%d:%s", id, builder.qry.Nodes[id].NodeType.String()))
+		}
+	}
+	return fmt.Sprintf("{found=false visited=%s}", strings.Join(visitedTypes, ","))
 }
 
 // find mergegroup or mergegroup->filter node
