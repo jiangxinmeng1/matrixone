@@ -722,6 +722,165 @@ func highestNDVForJoinShuffleLog(node *plan.Node) float64 {
 	return highestNDV
 }
 
+type FinalJoinShuffleState struct {
+	Reason               string
+	SelectedOnIdx        int
+	HighestNDV           float64
+	HashColType          int32
+	RightHashColType     int32
+	HashmapSizeThreshold float64
+	HashmapSizeFactor    float64
+}
+
+// ExplainFinalJoinShuffleState derives the final reason a join is not planned as
+// shuffle from the finished plan state. This is intentionally independent from
+// QueryBuilder so compile-time diagnostics can still explain a false final
+// Shuffle flag even when the original planner decision log was not emitted or
+// cannot be correlated with the statement.
+func ExplainFinalJoinShuffleState(node, left, right *plan.Node) FinalJoinShuffleState {
+	state := FinalJoinShuffleState{
+		Reason:               "shuffle-enabled",
+		SelectedOnIdx:        -1,
+		HighestNDV:           highestNDVForJoinShuffleLog(node),
+		HashColType:          -1,
+		RightHashColType:     -1,
+		HashmapSizeThreshold: -1,
+		HashmapSizeFactor:    -1,
+	}
+	if node == nil {
+		state.Reason = "node-nil"
+		return state
+	}
+	if node.Stats == nil || node.Stats.HashmapStats == nil {
+		state.Reason = "hashmap-stats-missing"
+		return state
+	}
+	if node.Stats.HashmapStats.Shuffle {
+		return state
+	}
+
+	switch node.JoinType {
+	case plan.Node_DEDUP:
+		if !node.IsRightJoin {
+			if len(node.Children) > 1 && right != nil && right.Stats != nil && right.Stats.Outcnt <= 320000 {
+				state.Reason = "non-right-dedup-right-outcnt-too-small"
+				return state
+			}
+		}
+	case plan.Node_INNER, plan.Node_ANTI, plan.Node_SEMI, plan.Node_LEFT, plan.Node_RIGHT, plan.Node_OUTER:
+	default:
+		state.Reason = "unsupported-join-type"
+		return state
+	}
+
+	hashmapSize := node.Stats.HashmapStats.HashmapSize
+	if node.IsRightJoin {
+		state.HashmapSizeThreshold = threshHoldForRightJoinShuffle
+		if hashmapSize < threshHoldForRightJoinShuffle {
+			state.Reason = "right-join-hashmap-size-too-small"
+			return state
+		}
+	} else if left != nil && left.Stats != nil && right != nil && right.Stats != nil && right.Stats.Outcnt > 0 {
+		state.HashmapSizeFactor = math.Pow((left.Stats.Outcnt / right.Stats.Outcnt), 0.4)
+		state.HashmapSizeThreshold = threshHoldForShuffleJoin * state.HashmapSizeFactor
+		if hashmapSize < state.HashmapSizeThreshold {
+			state.Reason = "hashmap-size-too-small"
+			return state
+		}
+	}
+
+	selectedOnIdx := int(node.Stats.HashmapStats.ShuffleColIdx)
+	if selectedOnIdx < 0 || selectedOnIdx >= len(node.OnList) {
+		selectedOnIdx = firstJoinEqualCondIdx(node.OnList)
+	}
+	state.SelectedOnIdx = selectedOnIdx
+	if selectedOnIdx < 0 {
+		state.Reason = "not-equi-join"
+		return state
+	}
+
+	expr0, expr1 := joinCondArgs(node.OnList[selectedOnIdx])
+	if expr0 == nil || expr1 == nil {
+		state.Reason = "join-condition-not-supported"
+		return state
+	}
+	leftHashCol, typ := GetHashColumn(expr0)
+	state.HashColType = typ
+	if leftHashCol == nil && typ == -1 {
+		state.Reason = "left-hash-column-not-supported"
+		return state
+	}
+	rightHashCol, rightTyp := GetHashColumn(expr1)
+	state.RightHashColType = rightTyp
+	if rightHashCol == nil && rightTyp == -1 {
+		state.Reason = "right-hash-column-not-supported"
+		return state
+	}
+
+	switch types.T(typ) {
+	case types.T_int64, types.T_int32, types.T_int16, types.T_uint64, types.T_uint32, types.T_uint16, types.T_varchar, types.T_char, types.T_text:
+	default:
+		state.Reason = "hash-column-type-not-supported"
+		return state
+	}
+
+	if node.Stats.HashmapStats.ShuffleType == plan.ShuffleType_Hash && hashmapSize < threshHoldForHashShuffle {
+		state.Reason = "hash-shuffle-hashmap-size-too-small"
+		return state
+	}
+	if node.Stats.HashmapStats.ShuffleType == plan.ShuffleType_Range &&
+		node.Stats.HashmapStats.Ranges == nil &&
+		node.Stats.HashmapStats.ShuffleColMax-node.Stats.HashmapStats.ShuffleColMin < 100000 {
+		state.Reason = "range-shuffle-range-too-small"
+		return state
+	}
+	if node.Stats.HashmapStats.ShuffleMethod != plan.ShuffleMethod_Reuse {
+		ndv := -1.0
+		if node.OnList[selectedOnIdx] != nil {
+			ndv = node.OnList[selectedOnIdx].Ndv
+		}
+		if ndv > state.HighestNDV {
+			state.HighestNDV = ndv
+		}
+		if ndv < ShuffleThreshHoldOfNDV {
+			state.Reason = "ndv-too-small"
+			return state
+		}
+	}
+	if node.Stats.HashmapStats.ShuffleType == plan.ShuffleType_Hash && node.JoinType == plan.Node_DEDUP && node.IsRightJoin {
+		state.Reason = "right-dedup-hash-shuffle-disabled"
+		return state
+	}
+
+	state.Reason = "shuffle-field-default-or-later-disabled"
+	return state
+}
+
+func firstJoinEqualCondIdx(exprs []*plan.Expr) int {
+	for i, expr := range exprs {
+		if expr == nil {
+			continue
+		}
+		if e, ok := expr.GetExpr().(*plan.Expr_F); ok && e.F != nil && e.F.Func != nil && len(e.F.Args) >= 2 && IsEqualFunc(e.F.Func.GetObj()) {
+			lpos, rpos := HasColExpr(e.F.Args[0], -1), HasColExpr(e.F.Args[1], -1)
+			if lpos != -1 && rpos != -1 && lpos != rpos {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func joinCondArgs(expr *plan.Expr) (*plan.Expr, *plan.Expr) {
+	if expr == nil {
+		return nil, nil
+	}
+	if e, ok := expr.GetExpr().(*plan.Expr_F); ok && e.F != nil && len(e.F.Args) >= 2 {
+		return e.F.Args[0], e.F.Args[1]
+	}
+	return nil, nil
+}
+
 func logJoinShuffleDecision(reason string, node *plan.Node, builder *QueryBuilder, diag joinShuffleDiag) {
 	if builder == nil || builder.qry == nil || node == nil {
 		return
@@ -784,9 +943,10 @@ func logJoinShuffleDecision(reason string, node *plan.Node, builder *QueryBuilde
 	if currentNDV := highestNDVForJoinShuffleLog(node); currentNDV > highestNDV {
 		highestNDV = currentNDV
 	}
+	sessionID, statementID, txnID, queryID, sqlPrefix := joinShuffleDiagIDs(builder)
 
 	logutil.Infof(
-		"join shuffle decision: reason=%s, node-id=%d, node-type=%v, join-type=%v, shuffle=%v, is-right-join=%v, on-duplicate-action=%v, old-col-list-len=%d, old-col-capture-list-len=%d, left-node-id=%d, right-node-id=%d, left-outcnt=%f, right-outcnt=%f, left-tablecnt=%f, right-tablecnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, hashmap-size-threshold=%f, hashmap-size-factor=%f, highest-ndv=%f, is-equi-join=%v, left-dont-shuffle=%v, right-dont-shuffle=%v, expr-based-shuffle=%v, hash-col-type=%d, right-hash-col-type=%d, selected-on-idx=%d, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, load-tag=%v, stmt-type=%v, left-child=%s, right-child=%s, left-load-source=%s, right-load-source=%s",
+		"join shuffle decision: reason=%s, node-id=%d, node-type=%v, join-type=%v, shuffle=%v, is-right-join=%v, on-duplicate-action=%v, old-col-list-len=%d, old-col-capture-list-len=%d, left-node-id=%d, right-node-id=%d, left-outcnt=%f, right-outcnt=%f, left-tablecnt=%f, right-tablecnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, hashmap-size-threshold=%f, hashmap-size-factor=%f, highest-ndv=%f, is-equi-join=%v, left-dont-shuffle=%v, right-dont-shuffle=%v, expr-based-shuffle=%v, hash-col-type=%d, right-hash-col-type=%d, selected-on-idx=%d, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, load-tag=%v, stmt-type=%v, session-id=%q, statement-id=%q, txn-id=%q, query-id=%q, sql-prefix=%q, left-child=%s, right-child=%s, left-load-source=%s, right-load-source=%s",
 		reason,
 		nodeID,
 		node.NodeType,
@@ -820,6 +980,11 @@ func logJoinShuffleDecision(reason string, node *plan.Node, builder *QueryBuilde
 		shuffleMethod,
 		builder.qry.LoadTag,
 		builder.qry.StmtType,
+		sessionID,
+		statementID,
+		txnID,
+		queryID,
+		sqlPrefix,
 		formatPlanNodeForDedupShuffleLog(builder, leftNodeID),
 		formatPlanNodeForDedupShuffleLog(builder, rightNodeID),
 		traceLoadExternalScanForDedupShuffleLog(builder, leftNodeID),
@@ -880,9 +1045,10 @@ func logDedupJoinShuffleDecision(reason string, node *plan.Node, builder *QueryB
 			highestNDV = expr.Ndv
 		}
 	}
+	sessionID, statementID, txnID, queryID, sqlPrefix := joinShuffleDiagIDs(builder)
 
 	logutil.Infof(
-		"dedup join shuffle decision: reason=%s, node-id=%d, shuffle=%v, is-right-join=%v, on-duplicate-action=%v, old-col-list-len=%d, old-col-capture-list-len=%d, left-node-id=%d, right-node-id=%d, left-outcnt=%f, right-outcnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, highest-ndv=%f, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, load-tag=%v, stmt-type=%v, left-child=%s, right-child=%s, left-load-source=%s, right-load-source=%s",
+		"dedup join shuffle decision: reason=%s, node-id=%d, shuffle=%v, is-right-join=%v, on-duplicate-action=%v, old-col-list-len=%d, old-col-capture-list-len=%d, left-node-id=%d, right-node-id=%d, left-outcnt=%f, right-outcnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, highest-ndv=%f, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, load-tag=%v, stmt-type=%v, session-id=%q, statement-id=%q, txn-id=%q, query-id=%q, sql-prefix=%q, left-child=%s, right-child=%s, left-load-source=%s, right-load-source=%s",
 		reason,
 		nodeID,
 		shuffle,
@@ -903,11 +1069,63 @@ func logDedupJoinShuffleDecision(reason string, node *plan.Node, builder *QueryB
 		shuffleMethod,
 		builder.qry.LoadTag,
 		builder.qry.StmtType,
+		sessionID,
+		statementID,
+		txnID,
+		queryID,
+		sqlPrefix,
 		formatPlanNodeForDedupShuffleLog(builder, leftNodeID),
 		formatPlanNodeForDedupShuffleLog(builder, rightNodeID),
 		traceLoadExternalScanForDedupShuffleLog(builder, leftNodeID),
 		traceLoadExternalScanForDedupShuffleLog(builder, rightNodeID),
 	)
+}
+
+func joinShuffleDiagIDs(builder *QueryBuilder) (sessionID, statementID, txnID, queryID, sqlPrefix string) {
+	if builder == nil || builder.compCtx == nil {
+		return "", "", "", "", ""
+	}
+	sqlPrefix = redactShuffleDiagSQL(builder.compCtx.GetRootSql())
+	if len(sqlPrefix) > 512 {
+		sqlPrefix = sqlPrefix[:512] + "..."
+	}
+	proc := builder.compCtx.GetProcess()
+	if proc == nil {
+		return sessionID, statementID, txnID, queryID, sqlPrefix
+	}
+	if si := proc.GetSessionInfo(); si != nil {
+		sessionID = si.SessionId.String()
+		if len(si.QueryId) > 0 {
+			queryID = si.QueryId[len(si.QueryId)-1]
+		}
+	}
+	if sp := proc.GetStmtProfile(); sp != nil {
+		statementID = sp.GetStmtId().String()
+		txnID = sp.GetTxnId().String()
+	}
+	return sessionID, statementID, txnID, queryID, sqlPrefix
+}
+
+func redactShuffleDiagSQL(sql string) string {
+	const marker = "s3option{"
+	lower := strings.ToLower(sql)
+	start := strings.Index(lower, marker)
+	if start < 0 {
+		return sql
+	}
+	depth := 0
+	for i := start + len("s3option"); i < len(sql); i++ {
+		switch sql[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return sql[:start] + "s3option{...redacted...}" + sql[i+1:]
+			}
+		}
+	}
+	return sql[:start] + "s3option{...redacted...}"
 }
 
 func findPlanNodeID(builder *QueryBuilder, target *plan.Node) int32 {

@@ -3249,6 +3249,7 @@ func (c *Compile) logJoinCompileStrategy(node, left, right *plan.Node) {
 		shuffleMethod = node.Stats.HashmapStats.ShuffleMethod
 		hashmapSize = node.Stats.HashmapStats.HashmapSize
 	}
+	finalShuffleState := plan2.ExplainFinalJoinShuffleState(node, left, right)
 	joinMapTag := int32(-1)
 	for i := range node.SendMsgList {
 		if node.SendMsgList[i].MsgType == int32(message.MsgJoinMap) {
@@ -3257,12 +3258,16 @@ func (c *Compile) logJoinCompileStrategy(node, left, right *plan.Node) {
 		}
 	}
 	nonEqCond, eqConds := extraJoinConditions(node.OnList)
+	nodeID := c.findCompilePlanNodeID(node)
+	sessionID, statementID, txnID, queryID := c.compileDiagIDs()
 
 	logutil.Infof(
-		"compile join strategy: join-type=%v, is-right-join=%v, plan-shuffle=%v, join-map-tag=%d, on-duplicate-action=%v, eq-cond-count=%d, has-non-eq-cond=%v, result-col-count=%d, old-col-list-len=%d, old-col-capture-list-len=%d, left-outcnt=%f, right-outcnt=%f, left-tablecnt=%f, right-tablecnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, spill-mem=%d, is-load=%v, sql-prefix=%q",
+		"compile join strategy: node-id=%d, join-type=%v, is-right-join=%v, plan-shuffle=%v, final-shuffle-reason=%q, join-map-tag=%d, on-duplicate-action=%v, eq-cond-count=%d, has-non-eq-cond=%v, result-col-count=%d, old-col-list-len=%d, old-col-capture-list-len=%d, left-outcnt=%f, right-outcnt=%f, left-tablecnt=%f, right-tablecnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, hashmap-size-threshold=%f, hashmap-size-factor=%f, highest-ndv=%f, selected-on-idx=%d, hash-col-type=%d, right-hash-col-type=%d, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, spill-mem=%d, is-load=%v, session-id=%q, statement-id=%q, txn-id=%q, query-id=%q, sql-prefix=%q",
+		nodeID,
 		node.JoinType,
 		node.IsRightJoin,
 		planShuffle,
+		finalShuffleState.Reason,
 		joinMapTag,
 		node.OnDuplicateAction,
 		len(eqConds),
@@ -3277,11 +3282,21 @@ func (c *Compile) logJoinCompileStrategy(node, left, right *plan.Node) {
 		hashmapSize,
 		leftHashmapSize,
 		rightHashmapSize,
+		finalShuffleState.HashmapSizeThreshold,
+		finalShuffleState.HashmapSizeFactor,
+		finalShuffleState.HighestNDV,
+		finalShuffleState.SelectedOnIdx,
+		finalShuffleState.HashColType,
+		finalShuffleState.RightHashColType,
 		shuffleColIdx,
 		shuffleType,
 		shuffleMethod,
 		node.SpillMem,
 		isLoad,
+		sessionID,
+		statementID,
+		txnID,
+		queryID,
 		sqlPrefix,
 	)
 }
@@ -3322,13 +3337,18 @@ func (c *Compile) logDedupJoinCompileStrategy(node, left, right *plan.Node, sour
 		shuffleMethod = node.Stats.HashmapStats.ShuffleMethod
 		hashmapSize = node.Stats.HashmapStats.HashmapSize
 	}
+	finalShuffleState := plan2.ExplainFinalJoinShuffleState(node, left, right)
 	rightDedupLeftOutcntTooSmall := node.IsRightJoin && leftOutcnt >= 0 && leftOutcnt <= 200000
 	rightDedupHashShuffleDisabled := node.IsRightJoin && shuffleType == plan.ShuffleType_Hash
+	nodeID := c.findCompilePlanNodeID(node)
+	sessionID, statementID, txnID, queryID := c.compileDiagIDs()
 	logutil.Infof(
-		"compile dedup join strategy: source-op-type=%q, is-right-join=%v, plan-shuffle=%v, right-dedup-left-outcnt-too-small=%v, right-dedup-hash-shuffle-disabled=%v, on-duplicate-action=%v, old-col-list-len=%d, old-col-capture-list-len=%d, left-outcnt=%f, right-outcnt=%f, left-tablecnt=%f, right-tablecnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, spill-mem=%d, is-load=%v, sql-prefix=%q",
+		"compile dedup join strategy: node-id=%d, source-op-type=%q, is-right-join=%v, plan-shuffle=%v, final-shuffle-reason=%q, right-dedup-left-outcnt-too-small=%v, right-dedup-hash-shuffle-disabled=%v, on-duplicate-action=%v, old-col-list-len=%d, old-col-capture-list-len=%d, left-outcnt=%f, right-outcnt=%f, left-tablecnt=%f, right-tablecnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, hashmap-size-threshold=%f, hashmap-size-factor=%f, highest-ndv=%f, selected-on-idx=%d, hash-col-type=%d, right-hash-col-type=%d, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, spill-mem=%d, is-load=%v, session-id=%q, statement-id=%q, txn-id=%q, query-id=%q, sql-prefix=%q",
+		nodeID,
 		sourceOpType,
 		node.IsRightJoin,
 		planShuffle,
+		finalShuffleState.Reason,
 		rightDedupLeftOutcntTooSmall,
 		rightDedupHashShuffleDisabled,
 		node.OnDuplicateAction,
@@ -3341,13 +3361,52 @@ func (c *Compile) logDedupJoinCompileStrategy(node, left, right *plan.Node, sour
 		hashmapSize,
 		leftHashmapSize,
 		rightHashmapSize,
+		finalShuffleState.HashmapSizeThreshold,
+		finalShuffleState.HashmapSizeFactor,
+		finalShuffleState.HighestNDV,
+		finalShuffleState.SelectedOnIdx,
+		finalShuffleState.HashColType,
+		finalShuffleState.RightHashColType,
 		shuffleColIdx,
 		shuffleType,
 		shuffleMethod,
 		spillMem,
 		isLoad,
+		sessionID,
+		statementID,
+		txnID,
+		queryID,
 		sqlPrefix,
 	)
+}
+
+func (c *Compile) findCompilePlanNodeID(target *plan.Node) int32 {
+	if c == nil || c.anal == nil || c.anal.qry == nil || target == nil {
+		return -1
+	}
+	for i, node := range c.anal.qry.Nodes {
+		if node == target {
+			return int32(i)
+		}
+	}
+	return -1
+}
+
+func (c *Compile) compileDiagIDs() (sessionID, statementID, txnID, queryID string) {
+	if c == nil || c.proc == nil {
+		return "", "", "", ""
+	}
+	if si := c.proc.GetSessionInfo(); si != nil {
+		sessionID = si.SessionId.String()
+		if len(si.QueryId) > 0 {
+			queryID = si.QueryId[len(si.QueryId)-1]
+		}
+	}
+	if sp := c.proc.GetStmtProfile(); sp != nil {
+		statementID = sp.GetStmtId().String()
+		txnID = sp.GetTxnId().String()
+	}
+	return sessionID, statementID, txnID, queryID
 }
 
 func redactCompileDiagSQL(sql string) string {

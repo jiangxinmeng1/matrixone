@@ -312,6 +312,60 @@ func TestDetermineShuffleForDedupJoin(t *testing.T) {
 	}
 }
 
+func TestExplainFinalJoinShuffleStateNDVTooSmall(t *testing.T) {
+	left := &plan.Node{
+		Stats: &plan.Stats{
+			Outcnt:       1000,
+			HashmapStats: &plan.HashMapStats{},
+		},
+	}
+	right := &plan.Node{
+		Stats: &plan.Stats{
+			Outcnt:       252175522,
+			HashmapStats: &plan.HashMapStats{},
+		},
+	}
+	node := &plan.Node{
+		NodeType: plan.Node_JOIN,
+		JoinType: plan.Node_INNER,
+		Stats: &plan.Stats{
+			HashmapStats: &plan.HashMapStats{
+				HashmapSize:   252175522,
+				Shuffle:       false,
+				ShuffleColIdx: 0,
+				ShuffleType:   plan.ShuffleType_Hash,
+			},
+		},
+		OnList: []*plan.Expr{
+			{
+				Typ: plan.Type{Id: int32(types.T_int64)},
+				Ndv: 50,
+				Expr: &plan.Expr_F{F: &plan.Function{
+					Func: &plan.ObjectRef{ObjName: "="},
+					Args: []*plan.Expr{
+						{
+							Typ:  plan.Type{Id: int32(types.T_int64)},
+							Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 1, ColPos: 0}},
+						},
+						{
+							Typ:  plan.Type{Id: int32(types.T_int64)},
+							Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 2, ColPos: 0}},
+						},
+					},
+				}},
+			},
+		},
+	}
+
+	state := ExplainFinalJoinShuffleState(node, left, right)
+	require.Equal(t, "ndv-too-small", state.Reason)
+	require.Equal(t, 0, state.SelectedOnIdx)
+	require.Equal(t, 50.0, state.HighestNDV)
+	require.Equal(t, int32(types.T_int64), state.HashColType)
+	require.Equal(t, int32(types.T_int64), state.RightHashColType)
+	require.Greater(t, node.Stats.HashmapStats.HashmapSize, state.HashmapSizeThreshold)
+}
+
 func TestGetRangeShuffleIndexForZM(t *testing.T) {
 	zm := index2.NewZM(types.T_datetime, 0)
 	defer func() {
