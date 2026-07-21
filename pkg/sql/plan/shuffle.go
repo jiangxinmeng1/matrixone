@@ -475,14 +475,25 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 		return
 	}
 
+	diag := joinShuffleDiag{
+		idx:                  -1,
+		hashmapSizeThreshold: -1,
+		hashmapSizeFactor:    -1,
+		hashColType:          -1,
+		rightHashColType:     -1,
+		highestNDV:           highestNDVForJoinShuffleLog(node),
+	}
+
 	switch node.JoinType {
 	case plan.Node_DEDUP:
 		dedupJoinCtx := node.GetDedupJoinCtx()
 		if len(dedupJoinCtx.GetOldColCaptureList()) > 0 {
+			logJoinShuffleDecision("old-col-capture-list", node, builder, diag)
 			logDedupJoinShuffleDecision("old-col-capture-list", node, builder)
 			return
 		}
 		if (node.OnDuplicateAction == plan.Node_FAIL || node.OnDuplicateAction == plan.Node_IGNORE) && len(dedupJoinCtx.GetOldColList()) > 0 {
+			logJoinShuffleDecision("old-col-list", node, builder, diag)
 			logDedupJoinShuffleDecision("old-col-list", node, builder)
 			return
 		}
@@ -490,6 +501,7 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 		if node.IsRightJoin {
 			leftChild := builder.qry.Nodes[node.Children[0]]
 			if leftChild.Stats.Outcnt <= 200000 {
+				logJoinShuffleDecision("right-dedup-left-outcnt-too-small", node, builder, diag)
 				logDedupJoinShuffleDecision("right-dedup-left-outcnt-too-small", node, builder)
 				return
 			}
@@ -500,8 +512,10 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 				node.Stats.HashmapStats.Shuffle = true
 				node.Stats.HashmapStats.ShuffleColIdx = 0
 				node.Stats.HashmapStats.ShuffleType = plan.ShuffleType_Hash
+				logJoinShuffleDecision("non-right-dedup-right-outcnt-enable-hash-shuffle", node, builder, diag)
 				logDedupJoinShuffleDecision("non-right-dedup-right-outcnt-enable-hash-shuffle", node, builder)
 			} else {
+				logJoinShuffleDecision("non-right-dedup-right-outcnt-too-small", node, builder, diag)
 				logDedupJoinShuffleDecision("non-right-dedup-right-outcnt-too-small", node, builder)
 			}
 
@@ -511,11 +525,15 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 	case plan.Node_INNER, plan.Node_ANTI, plan.Node_SEMI, plan.Node_LEFT, plan.Node_RIGHT, plan.Node_OUTER:
 
 	default:
+		logJoinShuffleDecision("unsupported-join-type", node, builder, diag)
 		return
 	}
 
 	// for now, if join children is merge group or filter, do not allow shuffle
-	if dontShuffle(builder.qry.Nodes[node.Children[0]], builder) || dontShuffle(builder.qry.Nodes[node.Children[1]], builder) {
+	diag.leftDontShuffle = dontShuffle(builder.qry.Nodes[node.Children[0]], builder)
+	diag.rightDontShuffle = dontShuffle(builder.qry.Nodes[node.Children[1]], builder)
+	if diag.leftDontShuffle || diag.rightDontShuffle {
+		logJoinShuffleDecision("child-dont-shuffle", node, builder, diag)
 		if node.JoinType == plan.Node_DEDUP {
 			logDedupJoinShuffleDecision("child-dont-shuffle", node, builder)
 		}
@@ -523,7 +541,9 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 	}
 
 	idx := 0
-	if !builder.IsEquiJoin(node) {
+	diag.isEquiJoin = builder.IsEquiJoin(node)
+	if !diag.isEquiJoin {
+		logJoinShuffleDecision("not-equi-join", node, builder, diag)
 		if node.JoinType == plan.Node_DEDUP {
 			logDedupJoinShuffleDecision("not-equi-join", node, builder)
 		}
@@ -544,9 +564,12 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 			break
 		}
 	}
+	diag.idx = idx
 
 	if node.IsRightJoin {
+		diag.hashmapSizeThreshold = threshHoldForRightJoinShuffle
 		if node.Stats.HashmapStats.HashmapSize < threshHoldForRightJoinShuffle {
+			logJoinShuffleDecision("right-join-hashmap-size-too-small", node, builder, diag)
 			if node.JoinType == plan.Node_DEDUP {
 				logDedupJoinShuffleDecision("right-join-hashmap-size-too-small", node, builder)
 			}
@@ -556,7 +579,10 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 		leftchild := builder.qry.Nodes[node.Children[0]]
 		rightchild := builder.qry.Nodes[node.Children[1]]
 		factor := math.Pow((leftchild.Stats.Outcnt / rightchild.Stats.Outcnt), 0.4)
-		if node.Stats.HashmapStats.HashmapSize < threshHoldForShuffleJoin*factor {
+		diag.hashmapSizeFactor = factor
+		diag.hashmapSizeThreshold = threshHoldForShuffleJoin * factor
+		if node.Stats.HashmapStats.HashmapSize < diag.hashmapSizeThreshold {
+			logJoinShuffleDecision("hashmap-size-too-small", node, builder, diag)
 			if node.JoinType == plan.Node_DEDUP {
 				logDedupJoinShuffleDecision("hashmap-size-too-small", node, builder)
 			}
@@ -574,14 +600,18 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 	}
 
 	leftHashCol, typ := GetHashColumn(expr0)
+	diag.hashColType = typ
 	if leftHashCol == nil && typ == -1 {
+		logJoinShuffleDecision("left-hash-column-not-supported", node, builder, diag)
 		if node.JoinType == plan.Node_DEDUP {
 			logDedupJoinShuffleDecision("left-hash-column-not-supported", node, builder)
 		}
 		return
 	}
 	rightHashCol, rightTyp := GetHashColumn(expr1)
+	diag.rightHashColType = rightTyp
 	if rightHashCol == nil && rightTyp == -1 {
+		logJoinShuffleDecision("right-hash-column-not-supported", node, builder, diag)
 		if node.JoinType == plan.Node_DEDUP {
 			logDedupJoinShuffleDecision("right-hash-column-not-supported", node, builder)
 		}
@@ -590,6 +620,7 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 
 	//for now ,only support integer and string type
 	isExprBasedShuffle := leftHashCol == nil || rightHashCol == nil
+	diag.exprBasedShuffle = isExprBasedShuffle
 	switch types.T(typ) {
 	case types.T_int64, types.T_int32, types.T_int16, types.T_uint64, types.T_uint32, types.T_uint16, types.T_varchar, types.T_char, types.T_text:
 		node.Stats.HashmapStats.ShuffleColIdx = int32(idx)
@@ -607,6 +638,7 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 			}
 		}
 	default:
+		logJoinShuffleDecision("hash-column-type-not-supported", node, builder, diag)
 		if node.JoinType == plan.Node_DEDUP {
 			logDedupJoinShuffleDecision("hash-column-type-not-supported", node, builder)
 		}
@@ -654,10 +686,145 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 		if node.JoinType == plan.Node_DEDUP && disabledReason != "" {
 			logDedupJoinShuffleDecision(disabledReason, node, builder)
 		}
+		if disabledReason != "" {
+			logJoinShuffleDecision(disabledReason, node, builder, diag)
+		}
 	}
+	logJoinShuffleDecision("final", node, builder, diag)
 	if node.JoinType == plan.Node_DEDUP {
 		logDedupJoinShuffleDecision("final", node, builder)
 	}
+}
+
+type joinShuffleDiag struct {
+	idx                  int
+	leftDontShuffle      bool
+	rightDontShuffle     bool
+	isEquiJoin           bool
+	exprBasedShuffle     bool
+	hashmapSizeThreshold float64
+	hashmapSizeFactor    float64
+	hashColType          int32
+	rightHashColType     int32
+	highestNDV           float64
+}
+
+func highestNDVForJoinShuffleLog(node *plan.Node) float64 {
+	highestNDV := -1.0
+	if node == nil {
+		return highestNDV
+	}
+	for _, expr := range node.OnList {
+		if expr != nil && expr.Ndv > highestNDV {
+			highestNDV = expr.Ndv
+		}
+	}
+	return highestNDV
+}
+
+func logJoinShuffleDecision(reason string, node *plan.Node, builder *QueryBuilder, diag joinShuffleDiag) {
+	if builder == nil || builder.qry == nil || node == nil {
+		return
+	}
+	nodeID := findPlanNodeID(builder, node)
+	leftNodeID := int32(-1)
+	rightNodeID := int32(-1)
+	leftOutcnt := -1.0
+	rightOutcnt := -1.0
+	leftTableCnt := -1.0
+	rightTableCnt := -1.0
+	leftHashmapSize := -1.0
+	rightHashmapSize := -1.0
+	if len(node.Children) > 0 {
+		leftNodeID = node.Children[0]
+		if int(leftNodeID) < len(builder.qry.Nodes) {
+			leftChild := builder.qry.Nodes[leftNodeID]
+			if leftChild != nil && leftChild.Stats != nil {
+				leftOutcnt = leftChild.Stats.Outcnt
+				leftTableCnt = leftChild.Stats.TableCnt
+				if leftChild.Stats.HashmapStats != nil {
+					leftHashmapSize = leftChild.Stats.HashmapStats.HashmapSize
+				}
+			}
+		}
+	}
+	if len(node.Children) > 1 {
+		rightNodeID = node.Children[1]
+		if int(rightNodeID) < len(builder.qry.Nodes) {
+			rightChild := builder.qry.Nodes[rightNodeID]
+			if rightChild != nil && rightChild.Stats != nil {
+				rightOutcnt = rightChild.Stats.Outcnt
+				rightTableCnt = rightChild.Stats.TableCnt
+				if rightChild.Stats.HashmapStats != nil {
+					rightHashmapSize = rightChild.Stats.HashmapStats.HashmapSize
+				}
+			}
+		}
+	}
+
+	oldColListLen := 0
+	oldColCaptureListLen := 0
+	if node.DedupJoinCtx != nil {
+		oldColListLen = len(node.DedupJoinCtx.OldColList)
+		oldColCaptureListLen = len(node.DedupJoinCtx.OldColCaptureList)
+	}
+	hashmapSize := -1.0
+	shuffle := false
+	shuffleColIdx := int32(-1)
+	shuffleType := plan.ShuffleType_Hash
+	shuffleMethod := plan.ShuffleMethod_Normal
+	if node.Stats != nil && node.Stats.HashmapStats != nil {
+		hashmapSize = node.Stats.HashmapStats.HashmapSize
+		shuffle = node.Stats.HashmapStats.Shuffle
+		shuffleColIdx = node.Stats.HashmapStats.ShuffleColIdx
+		shuffleType = node.Stats.HashmapStats.ShuffleType
+		shuffleMethod = node.Stats.HashmapStats.ShuffleMethod
+	}
+	highestNDV := diag.highestNDV
+	if currentNDV := highestNDVForJoinShuffleLog(node); currentNDV > highestNDV {
+		highestNDV = currentNDV
+	}
+
+	logutil.Infof(
+		"join shuffle decision: reason=%s, node-id=%d, node-type=%v, join-type=%v, shuffle=%v, is-right-join=%v, on-duplicate-action=%v, old-col-list-len=%d, old-col-capture-list-len=%d, left-node-id=%d, right-node-id=%d, left-outcnt=%f, right-outcnt=%f, left-tablecnt=%f, right-tablecnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, hashmap-size-threshold=%f, hashmap-size-factor=%f, highest-ndv=%f, is-equi-join=%v, left-dont-shuffle=%v, right-dont-shuffle=%v, expr-based-shuffle=%v, hash-col-type=%d, right-hash-col-type=%d, selected-on-idx=%d, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, load-tag=%v, stmt-type=%v, left-child=%s, right-child=%s, left-load-source=%s, right-load-source=%s",
+		reason,
+		nodeID,
+		node.NodeType,
+		node.JoinType,
+		shuffle,
+		node.IsRightJoin,
+		node.OnDuplicateAction,
+		oldColListLen,
+		oldColCaptureListLen,
+		leftNodeID,
+		rightNodeID,
+		leftOutcnt,
+		rightOutcnt,
+		leftTableCnt,
+		rightTableCnt,
+		hashmapSize,
+		leftHashmapSize,
+		rightHashmapSize,
+		diag.hashmapSizeThreshold,
+		diag.hashmapSizeFactor,
+		highestNDV,
+		diag.isEquiJoin,
+		diag.leftDontShuffle,
+		diag.rightDontShuffle,
+		diag.exprBasedShuffle,
+		diag.hashColType,
+		diag.rightHashColType,
+		diag.idx,
+		shuffleColIdx,
+		shuffleType,
+		shuffleMethod,
+		builder.qry.LoadTag,
+		builder.qry.StmtType,
+		formatPlanNodeForDedupShuffleLog(builder, leftNodeID),
+		formatPlanNodeForDedupShuffleLog(builder, rightNodeID),
+		traceLoadExternalScanForDedupShuffleLog(builder, leftNodeID),
+		traceLoadExternalScanForDedupShuffleLog(builder, rightNodeID),
+	)
 }
 
 func logDedupJoinShuffleDecision(reason string, node *plan.Node, builder *QueryBuilder) {
