@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -137,6 +138,9 @@ func (hashBuild *HashBuild) Call(proc *process.Process) (vm.CallResult, error) {
 
 func (hashBuild *HashBuild) build(proc *process.Process, analyzer process.Analyzer) error {
 	ctr := &hashBuild.ctr
+	if ctr.buildStart.IsZero() {
+		ctr.buildStart = time.Now()
+	}
 	spillMode := false
 	var spillFiles []*os.File
 	var spillBuffers []*batch.Batch
@@ -299,6 +303,16 @@ func (hashBuild *HashBuild) logSpillDecision(proc *process.Process, event, reaso
 	if !hashBuild.shouldLogSpillDecision(event, rowCount, memUsed) {
 		return
 	}
+	elapsedMS := int64(0)
+	rowsPerSec := float64(0)
+	if !ctr.buildStart.IsZero() {
+		elapsed := time.Since(ctr.buildStart)
+		elapsedMS = elapsed.Milliseconds()
+		if elapsed > 0 {
+			rowsPerSec = float64(rowCount) / elapsed.Seconds()
+		}
+	}
+	heavy := memUsed >= int64(1<<30) || elapsedMS >= 10000 || event != "check"
 
 	sqlPrefix := ""
 	stmtType := ""
@@ -322,9 +336,10 @@ func (hashBuild *HashBuild) logSpillDecision(proc *process.Process, event, reaso
 	}
 
 	proc.Infof(proc.Ctx,
-		"hashbuild spill decision: event=%s, reason=%s, source-op-type=%q, is-shuffle=%v, need-hashmap=%v, need-batches=%v, is-dedup=%v, join-map-tag=%d, shuffle-idx=%d, join-map-ref-cnt=%d, spill-threshold=%d, row-count=%d, mem-used=%d, input-batch-rows=%d, input-batch-bytes=%d, batch-buffer-count=%d, need-allocate-sels=%v, hash-on-pk=%v, runtime-filter=%v, on-duplicate-action=%v, dedup-col-name=%q, stmt-type=%q, query-type=%q, sql-source-type=%q, user=%q, database=%q, is-load=%v, sql-prefix=%q",
+		"hashbuild spill decision: event=%s, reason=%s, heavy=%v, source-op-type=%q, is-shuffle=%v, need-hashmap=%v, need-batches=%v, is-dedup=%v, join-map-tag=%d, shuffle-idx=%d, join-map-ref-cnt=%d, spill-threshold=%d, row-count=%d, mem-used=%d, elapsed-ms=%d, rows-per-sec=%f, input-batch-rows=%d, input-batch-bytes=%d, batch-buffer-count=%d, need-allocate-sels=%v, hash-on-pk=%v, runtime-filter=%v, on-duplicate-action=%v, dedup-col-name=%q, stmt-type=%q, query-type=%q, sql-source-type=%q, user=%q, database=%q, is-load=%v, sql-prefix=%q",
 		event,
 		reason,
+		heavy,
 		hashBuild.SourceOpType,
 		hashBuild.IsShuffle,
 		hashBuild.NeedHashMap,
@@ -336,6 +351,8 @@ func (hashBuild *HashBuild) logSpillDecision(proc *process.Process, event, reaso
 		ctr.spillThreshold,
 		rowCount,
 		memUsed,
+		elapsedMS,
+		rowsPerSec,
 		inputBatchRows,
 		inputBatchBytes,
 		len(ctr.hashmapBuilder.Batches.Buf),

@@ -17,6 +17,7 @@ package hashbuild
 import (
 	"bytes"
 	"os"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
@@ -58,6 +59,7 @@ type container struct {
 
 	spillDiagLastRows int64
 	spillDiagLastMem  int64
+	buildStart        time.Time
 }
 
 type HashBuild struct {
@@ -138,6 +140,7 @@ func (hashBuild *HashBuild) Reset(proc *process.Process, pipelineFailed bool, er
 	hashBuild.ctr.runtimeFilterIn = false
 	hashBuild.ctr.spillDiagLastRows = 0
 	hashBuild.ctr.spillDiagLastMem = 0
+	hashBuild.ctr.buildStart = time.Time{}
 	message.FinalizeRuntimeFilter(hashBuild.RuntimeFilterSpec, runtimeSucceed, proc.GetMessageBoard())
 	message.FinalizeJoinMapMessage(proc.GetMessageBoard(), hashBuild.JoinMapTag, hashBuild.IsShuffle, hashBuild.ShuffleIdx, mapSucceed)
 }

@@ -3194,6 +3194,7 @@ func (c *Compile) compileUnionAll(node *plan.Node, ss []*Scope, children []*Scop
 }
 
 func (c *Compile) compileJoin(node, left, right *plan.Node, probeScopes, buildScopes []*Scope) []*Scope {
+	c.logJoinCompileStrategy(node, left, right)
 	if node.Stats.HashmapStats.Shuffle {
 		stageNodes := c.queryWorkerStageNodes()
 		if len(stageNodes) == 1 {
@@ -3210,6 +3211,79 @@ func (c *Compile) compileJoin(node, left, right *plan.Node, probeScopes, buildSc
 
 	rs := c.compileProbeSideForBroadcastJoin(node, left, right, probeScopes)
 	return c.compileBuildSideForBroadcastJoin(node, rs, buildScopes)
+}
+
+func (c *Compile) logJoinCompileStrategy(node, left, right *plan.Node) {
+	if node == nil || node.NodeType != plan.Node_JOIN {
+		return
+	}
+	sqlPrefix := truncateCompileDiagSQL(redactCompileDiagSQL(c.sql), 512)
+	isLoad := strings.HasPrefix(strings.ToUpper(strings.TrimSpace(c.sql)), "LOAD")
+	leftOutcnt, rightOutcnt := -1.0, -1.0
+	leftTableCnt, rightTableCnt := -1.0, -1.0
+	leftHashmapSize, rightHashmapSize := -1.0, -1.0
+	if left != nil && left.Stats != nil {
+		leftOutcnt = left.Stats.Outcnt
+		leftTableCnt = left.Stats.TableCnt
+		if left.Stats.HashmapStats != nil {
+			leftHashmapSize = left.Stats.HashmapStats.HashmapSize
+		}
+	}
+	if right != nil && right.Stats != nil {
+		rightOutcnt = right.Stats.Outcnt
+		rightTableCnt = right.Stats.TableCnt
+		if right.Stats.HashmapStats != nil {
+			rightHashmapSize = right.Stats.HashmapStats.HashmapSize
+		}
+	}
+
+	planShuffle := false
+	shuffleColIdx := int32(-1)
+	shuffleType := plan.ShuffleType_Hash
+	shuffleMethod := plan.ShuffleMethod_Normal
+	hashmapSize := -1.0
+	if node.Stats != nil && node.Stats.HashmapStats != nil {
+		planShuffle = node.Stats.HashmapStats.Shuffle
+		shuffleColIdx = node.Stats.HashmapStats.ShuffleColIdx
+		shuffleType = node.Stats.HashmapStats.ShuffleType
+		shuffleMethod = node.Stats.HashmapStats.ShuffleMethod
+		hashmapSize = node.Stats.HashmapStats.HashmapSize
+	}
+	joinMapTag := int32(-1)
+	for i := range node.SendMsgList {
+		if node.SendMsgList[i].MsgType == int32(message.MsgJoinMap) {
+			joinMapTag = node.SendMsgList[i].MsgTag
+			break
+		}
+	}
+	nonEqCond, eqConds := extraJoinConditions(node.OnList)
+
+	logutil.Infof(
+		"compile join strategy: join-type=%v, is-right-join=%v, plan-shuffle=%v, join-map-tag=%d, on-duplicate-action=%v, eq-cond-count=%d, has-non-eq-cond=%v, result-col-count=%d, old-col-list-len=%d, old-col-capture-list-len=%d, left-outcnt=%f, right-outcnt=%f, left-tablecnt=%f, right-tablecnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, spill-mem=%d, is-load=%v, sql-prefix=%q",
+		node.JoinType,
+		node.IsRightJoin,
+		planShuffle,
+		joinMapTag,
+		node.OnDuplicateAction,
+		len(eqConds),
+		nonEqCond != nil,
+		len(node.ProjectList),
+		len(node.GetDedupJoinCtx().GetOldColList()),
+		len(node.GetDedupJoinCtx().GetOldColCaptureList()),
+		leftOutcnt,
+		rightOutcnt,
+		leftTableCnt,
+		rightTableCnt,
+		hashmapSize,
+		leftHashmapSize,
+		rightHashmapSize,
+		shuffleColIdx,
+		shuffleType,
+		shuffleMethod,
+		node.SpillMem,
+		isLoad,
+		sqlPrefix,
+	)
 }
 
 func (c *Compile) logDedupJoinCompileStrategy(node, left, right *plan.Node, sourceOpType string) {
