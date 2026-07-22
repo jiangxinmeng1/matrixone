@@ -857,6 +857,64 @@ func (builder *QueryBuilder) determineShuffleForDMLSteps() {
 		determineShuffleMethod2(rootID, -1, builder)
 		builder.forceJoinOnOneCN(rootID, false)
 	}
+
+	// createQuery generates runtime filters after the final shuffle decision.
+	// Repeat that pass only after every late DML step has finalized shuffle:
+	// shuffle hashbuild requires a (PASS) runtime-filter spec even when the probe
+	// side is a SINK_SCAN and no data filtering can be pushed into it.
+	for i := range builder.qry.Steps {
+		builder.generateRuntimeFilters(builder.qry.Steps[i])
+	}
+
+	visited := make(map[int32]bool)
+	for i := range builder.qry.Steps {
+		builder.logLateDMLShuffleRuntimeFilters(builder.qry.Steps[i], visited)
+	}
+}
+
+func (builder *QueryBuilder) logLateDMLShuffleRuntimeFilters(nodeID int32, visited map[int32]bool) {
+	if nodeID < 0 || int(nodeID) >= len(builder.qry.Nodes) || visited[nodeID] {
+		return
+	}
+	visited[nodeID] = true
+	node := builder.qry.Nodes[nodeID]
+	for _, childID := range node.Children {
+		builder.logLateDMLShuffleRuntimeFilters(childID, visited)
+	}
+	if node.NodeType != plan.Node_JOIN || node.Stats == nil || node.Stats.HashmapStats == nil || !node.Stats.HashmapStats.Shuffle {
+		return
+	}
+
+	status := "ready"
+	if len(node.RuntimeFilterProbeList) == 0 || len(node.RuntimeFilterBuildList) == 0 {
+		status = "missing"
+	}
+	probeTag, buildTag := int32(-1), int32(-1)
+	if len(node.RuntimeFilterProbeList) > 0 {
+		probeTag = node.RuntimeFilterProbeList[0].Tag
+	}
+	if len(node.RuntimeFilterBuildList) > 0 {
+		buildTag = node.RuntimeFilterBuildList[0].Tag
+	}
+	sessionID, statementID, txnID, queryID, sqlPrefix := joinShuffleDiagIDs(builder)
+	logutil.Infof(
+		"late DML shuffle runtime filter: status=%s, node-id=%d, join-type=%v, shuffle=%v, probe-spec-count=%d, build-spec-count=%d, probe-tag=%d, build-tag=%d, load-tag=%v, stmt-type=%v, session-id=%q, statement-id=%q, txn-id=%q, query-id=%q, sql-prefix=%q",
+		status,
+		nodeID,
+		node.JoinType,
+		node.Stats.HashmapStats.Shuffle,
+		len(node.RuntimeFilterProbeList),
+		len(node.RuntimeFilterBuildList),
+		probeTag,
+		buildTag,
+		builder.qry.LoadTag,
+		builder.qry.StmtType,
+		sessionID,
+		statementID,
+		txnID,
+		queryID,
+		sqlPrefix,
+	)
 }
 
 // buildOnDupTargetPkResolution builds the conflict-resolution subgraph for

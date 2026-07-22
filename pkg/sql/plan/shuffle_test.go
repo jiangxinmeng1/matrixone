@@ -459,6 +459,11 @@ func TestDetermineShuffleForLatePlanStep(t *testing.T) {
 	builder.determineShuffleForDMLSteps()
 
 	require.True(t, join.Stats.HashmapStats.Shuffle)
+	require.Len(t, join.RuntimeFilterProbeList, 1)
+	require.Len(t, join.RuntimeFilterBuildList, 1)
+	require.Equal(t, join.RuntimeFilterProbeList[0].Tag, join.RuntimeFilterBuildList[0].Tag)
+	require.Nil(t, join.RuntimeFilterProbeList[0].Expr)
+	require.Nil(t, join.RuntimeFilterBuildList[0].Expr)
 
 	// A same-side equality remains non-equi for join planning after remapping.
 	sameSideCond, err := BindFuncExprImplByPlanExpr(context.Background(), "=", []*plan.Expr{
@@ -468,8 +473,12 @@ func TestDetermineShuffleForLatePlanStep(t *testing.T) {
 	require.NoError(t, err)
 	join.OnList = []*plan.Expr{sameSideCond}
 	join.Stats.HashmapStats.Shuffle = false
+	join.RuntimeFilterProbeList = nil
+	join.RuntimeFilterBuildList = nil
 	builder.determineShuffleForDMLSteps()
 	require.False(t, join.Stats.HashmapStats.Shuffle)
+	require.Empty(t, join.RuntimeFilterProbeList)
+	require.Empty(t, join.RuntimeFilterBuildList)
 }
 
 func TestGetRangeShuffleIndexForZM(t *testing.T) {
