@@ -3196,8 +3196,8 @@ func (c *Compile) compileUnionAll(node *plan.Node, ss []*Scope, children []*Scop
 func (c *Compile) compileJoin(node, left, right *plan.Node, probeScopes, buildScopes []*Scope) []*Scope {
 	c.logJoinCompileStrategy(node, left, right)
 	if node.Stats.HashmapStats.Shuffle {
-		stageNodes := c.queryWorkerStageNodes()
-		if len(stageNodes) == 1 {
+		stageNodes, hasLocalDependency := c.shuffleJoinStageNodes(probeScopes, buildScopes)
+		if len(stageNodes) == 1 && !hasLocalDependency {
 			if node.JoinType == plan.Node_DEDUP && node.Stats.HashmapStats.ShuffleType == plan.ShuffleType_Hash {
 				logutil.Infof("not support shuffle v2 for dedup join now")
 			} else if probeScopes[0].NodeInfo.Mcpu != int(left.Stats.Dop) || buildScopes[0].NodeInfo.Mcpu != int(right.Stats.Dop) {
@@ -3206,7 +3206,7 @@ func (c *Compile) compileJoin(node, left, right *plan.Node, probeScopes, buildSc
 				return c.compileShuffleJoinV2(node, left, right, probeScopes, buildScopes)
 			}
 		}
-		return c.compileShuffleJoin(node, left, right, probeScopes, buildScopes)
+		return c.compileShuffleJoin(node, left, right, probeScopes, buildScopes, stageNodes, hasLocalDependency)
 	}
 
 	rs := c.compileProbeSideForBroadcastJoin(node, left, right, probeScopes)
@@ -3510,8 +3510,8 @@ func constructShuffleJoinOP(c *Compile, shuffleJoins []*Scope, node, left, right
 	c.anal.isFirst = false
 }
 
-func (c *Compile) compileShuffleJoin(node, left, right *plan.Node, lefts, rights []*Scope) []*Scope {
-	shuffleJoins := c.newShuffleJoinScopeList(lefts, rights, node)
+func (c *Compile) compileShuffleJoin(node, left, right *plan.Node, lefts, rights []*Scope, stageNodes engine.Nodes, attachRemoteSources bool) []*Scope {
+	shuffleJoins := c.newShuffleJoinScopeList(lefts, rights, node, stageNodes, attachRemoteSources)
 	constructShuffleJoinOP(c, shuffleJoins, node, left, right, false)
 
 	//construct shuffle build
@@ -4938,6 +4938,81 @@ func (c *Compile) queryWorkerStageNodes() engine.Nodes {
 	return c.materializeScheduledWorkers(decision.Workers)
 }
 
+// shuffleJoinStageNodes keeps shuffle receivers on the coordinator when either
+// input depends on a SINK_SCAN. SINK_SCAN consumes an in-process PipelineEdge
+// created for another query step; that edge cannot be serialized and registered
+// on a remote CN. The scan/table side may still execute remotely and dispatch to
+// these local shuffle buckets, so hashbuild remains partitioned and spillable.
+func (c *Compile) shuffleJoinStageNodes(probeScopes, buildScopes []*Scope) (engine.Nodes, bool) {
+	stageNode, hasSinkScan := sinkScanDependencyNode(probeScopes, buildScopes)
+	if !hasSinkScan {
+		return c.queryWorkerStageNodes(), false
+	}
+	if stageNode.Addr == "" {
+		stageNode = c.materializeScheduledWorker(c.currentCNWorker())
+	}
+	stageNode = scopeNodeWithMcpu(stageNode, 1)
+	sessionID, statementID, txnID, queryID := c.compileDiagIDs()
+	logutil.Infof(
+		"compile shuffle join placement: reason=sink-scan-local-dependency, placement=coordinator-local, cn-id=%q, cn-address=%q, worker-mcpu=%d, session-id=%q, statement-id=%q, txn-id=%q, query-id=%q, sql-prefix=%q",
+		stageNode.Id,
+		stageNode.Addr,
+		stageNode.Mcpu,
+		sessionID,
+		statementID,
+		txnID,
+		queryID,
+		truncateCompileDiagSQL(redactCompileDiagSQL(c.sql), 512),
+	)
+	return engine.Nodes{stageNode}, true
+}
+
+func sinkScanDependencyNode(scopeLists ...[]*Scope) (engine.Node, bool) {
+	visitedScopes := make(map[*Scope]bool)
+	visitedOps := make(map[vm.Operator]bool)
+	for _, scopes := range scopeLists {
+		for _, s := range scopes {
+			if node, ok := scopeTreeSinkScanNode(s, visitedScopes, visitedOps); ok {
+				return node, true
+			}
+		}
+	}
+	return engine.Node{}, false
+}
+
+func scopeTreeSinkScanNode(s *Scope, visitedScopes map[*Scope]bool, visitedOps map[vm.Operator]bool) (engine.Node, bool) {
+	if s == nil || visitedScopes[s] {
+		return engine.Node{}, false
+	}
+	visitedScopes[s] = true
+	if operatorTreeContainsSinkScan(s.RootOp, visitedOps) {
+		return s.NodeInfo, true
+	}
+	for _, pre := range s.PreScopes {
+		if node, ok := scopeTreeSinkScanNode(pre, visitedScopes, visitedOps); ok {
+			return node, true
+		}
+	}
+	return engine.Node{}, false
+}
+
+func operatorTreeContainsSinkScan(op vm.Operator, visited map[vm.Operator]bool) bool {
+	if op == nil || visited[op] {
+		return false
+	}
+	visited[op] = true
+	if mergeOp, ok := op.(*merge.Merge); ok && mergeOp.SinkScan {
+		return true
+	}
+	base := op.GetOperatorBase()
+	for i := 0; i < base.NumChildren(); i++ {
+		if operatorTreeContainsSinkScan(base.GetChildren(i), visited) {
+			return true
+		}
+	}
+	return false
+}
+
 func scopeNodeWithMcpu(node engine.Node, mcpu int) engine.Node {
 	return engine.Node{
 		Id:        node.Id,
@@ -5123,8 +5198,15 @@ func (c *Compile) mergeScopesByStageNodes(ss []*Scope, stageNodes engine.Nodes) 
 	return rs
 }
 
-func (c *Compile) newShuffleJoinScopeList(probeScopes, buildScopes []*Scope, node *plan.Node) []*Scope {
-	cnlist := c.queryWorkerStageNodes()
+func (c *Compile) newShuffleJoinScopeList(
+	probeScopes, buildScopes []*Scope,
+	node *plan.Node,
+	cnlist engine.Nodes,
+	attachRemoteSources bool,
+) []*Scope {
+	if len(cnlist) == 0 {
+		cnlist = c.queryWorkerStageNodes()
+	}
 	if len(cnlist) <= 1 {
 		node.Stats.HashmapStats.ShuffleTypeForMultiCN = plan.ShuffleTypeForMultiCN_Simple
 	}
@@ -5209,12 +5291,7 @@ func (c *Compile) newShuffleJoinScopeList(probeScopes, buildScopes []*Scope, nod
 			probeScopes[i].setRootOperator(dispatchArg)
 			probeScopes[i].IsEnd = true
 
-			for _, js := range shuffleProbes {
-				if sameExecutionNode(js.NodeInfo, probeScopes[i].NodeInfo) {
-					js.PreScopes = append(js.PreScopes, probeScopes[i])
-					break
-				}
-			}
+			attachShuffleDispatchSource(shuffleProbes, probeScopes[i], attachRemoteSources)
 		}
 	}
 
@@ -5234,12 +5311,7 @@ func (c *Compile) newShuffleJoinScopeList(probeScopes, buildScopes []*Scope, nod
 		buildScopes[i].setRootOperator(dispatchArg)
 		buildScopes[i].IsEnd = true
 
-		for _, js := range shuffleBuilds {
-			if sameExecutionNode(js.NodeInfo, buildScopes[i].NodeInfo) {
-				js.PreScopes = append(js.PreScopes, buildScopes[i])
-				break
-			}
-		}
+		attachShuffleDispatchSource(shuffleBuilds, buildScopes[i], attachRemoteSources)
 	}
 	c.anal.isFirst = false
 	c.hasMergeOp = true
@@ -5252,6 +5324,25 @@ func (c *Compile) newShuffleJoinScopeList(probeScopes, buildScopes []*Scope, nod
 	}
 
 	return shuffleProbes
+}
+
+// attachShuffleDispatchSource prefers a receiver bucket on the source CN. A
+// coordinator-local shuffle (used for SINK_SCAN dependencies) has no receiver
+// bucket on remote scan CNs, so attach those remote dispatch sources to the
+// first receiver tree to ensure RemoteRun still starts them.
+func attachShuffleDispatchSource(receivers []*Scope, source *Scope, allowFallback bool) {
+	if len(receivers) == 0 || source == nil {
+		return
+	}
+	for _, receiver := range receivers {
+		if sameExecutionNode(receiver.NodeInfo, source.NodeInfo) {
+			receiver.PreScopes = append(receiver.PreScopes, source)
+			return
+		}
+	}
+	if allowFallback {
+		receivers[0].PreScopes = append(receivers[0].PreScopes, source)
+	}
 }
 
 func collectTombstones(

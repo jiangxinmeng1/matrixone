@@ -2075,3 +2075,50 @@ func TestBuildScanParallelRunSetsOrderByOnParallelReaders(t *testing.T) {
 		require.Equal(t, orderBy, reader.orderBy)
 	}
 }
+
+func TestShuffleJoinStageNodesKeepsSinkScanReceiversLocal(t *testing.T) {
+	c := NewMockCompile(t)
+	c.addr = "cn-local:6001"
+	c.cnList = engine.Nodes{
+		{Id: "cn-local", Addr: "cn-local:6001", Mcpu: 8},
+		{Id: "cn-remote", Addr: "cn-remote:6001", Mcpu: 8},
+	}
+
+	sinkMerge := merge.NewArgument().WithSinkScan(true)
+	root := projection.NewArgument()
+	root.AppendChild(sinkMerge)
+	sinkScope := &Scope{
+		RootOp:   root,
+		NodeInfo: engine.Node{Id: "cn-local", Addr: "cn-local:6001", Mcpu: 1},
+	}
+
+	stageNodes, local := c.shuffleJoinStageNodes([]*Scope{sinkScope}, nil)
+	require.True(t, local)
+	require.Len(t, stageNodes, 1)
+	require.Equal(t, "cn-local:6001", stageNodes[0].Addr)
+
+	normalScope := &Scope{RootOp: merge.NewArgument()}
+	stageNodes, local = c.shuffleJoinStageNodes([]*Scope{normalScope}, nil)
+	require.False(t, local)
+	require.Len(t, stageNodes, 2)
+}
+
+func TestAttachShuffleDispatchSourceFallsBackToFirstReceiver(t *testing.T) {
+	receivers := []*Scope{
+		{NodeInfo: engine.Node{Id: "cn-local", Addr: "cn-local:6001", Mcpu: 1}},
+		{NodeInfo: engine.Node{Id: "cn-local", Addr: "cn-local:6001", Mcpu: 1}},
+	}
+	remoteSource := &Scope{NodeInfo: engine.Node{Id: "cn-remote", Addr: "cn-remote:6001", Mcpu: 8}}
+
+	attachShuffleDispatchSource(receivers, remoteSource, true)
+	require.Equal(t, []*Scope{remoteSource}, receivers[0].PreScopes)
+	require.Empty(t, receivers[1].PreScopes)
+
+	localSource := &Scope{NodeInfo: engine.Node{Id: "cn-local", Addr: "cn-local:6001", Mcpu: 8}}
+	attachShuffleDispatchSource(receivers[1:], localSource, false)
+	require.Equal(t, []*Scope{localSource}, receivers[1].PreScopes)
+
+	unmatched := []*Scope{{NodeInfo: engine.Node{Id: "cn-local", Addr: "cn-local:6001", Mcpu: 1}}}
+	attachShuffleDispatchSource(unmatched, remoteSource, false)
+	require.Empty(t, unmatched[0].PreScopes)
+}
