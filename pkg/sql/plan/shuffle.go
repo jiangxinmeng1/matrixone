@@ -660,7 +660,11 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 		}
 		if node.Stats.HashmapStats.ShuffleMethod != plan.ShuffleMethod_Reuse {
 			highestNDV := node.OnList[idx].Ndv
-			if highestNDV < ShuffleThreshHoldOfNDV {
+			// A negative NDV means that statistics are unavailable.  Do not treat
+			// unknown cardinality as low cardinality: for a large build side that
+			// would turn a valid shuffle plan back into a broadcast hash build and
+			// can concentrate the entire hash table on one CN.
+			if highestNDV >= 0 && highestNDV < ShuffleThreshHoldOfNDV {
 				node.Stats.HashmapStats.Shuffle = false
 				if disabledReason == "" {
 					disabledReason = "ndv-too-small"
@@ -842,7 +846,7 @@ func ExplainFinalJoinShuffleState(node, left, right *plan.Node) FinalJoinShuffle
 		if ndv > state.HighestNDV {
 			state.HighestNDV = ndv
 		}
-		if ndv < ShuffleThreshHoldOfNDV {
+		if ndv >= 0 && ndv < ShuffleThreshHoldOfNDV {
 			state.Reason = "ndv-too-small"
 			return state
 		}

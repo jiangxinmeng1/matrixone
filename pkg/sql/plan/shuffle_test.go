@@ -16,6 +16,7 @@ package plan
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
@@ -364,6 +365,91 @@ func TestExplainFinalJoinShuffleStateNDVTooSmall(t *testing.T) {
 	require.Equal(t, int32(types.T_int64), state.HashColType)
 	require.Equal(t, int32(types.T_int64), state.RightHashColType)
 	require.Greater(t, node.Stats.HashmapStats.HashmapSize, state.HashmapSizeThreshold)
+}
+
+func TestDetermineShuffleForJoinNDVGuard(t *testing.T) {
+	left := &plan.Node{
+		NodeType:    plan.Node_TABLE_SCAN,
+		BindingTags: []int32{1},
+		Stats:       &plan.Stats{Outcnt: 1000, HashmapStats: &plan.HashMapStats{}},
+	}
+	right := &plan.Node{
+		NodeType:    plan.Node_SINK_SCAN,
+		BindingTags: []int32{2},
+		Stats:       &plan.Stats{Outcnt: 10_000_000, HashmapStats: &plan.HashMapStats{}},
+	}
+	leftKey := &plan.Expr{
+		Typ:  plan.Type{Id: int32(types.T_int64)},
+		Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 1, ColPos: 0}},
+	}
+	rightKey := &plan.Expr{
+		Typ:  plan.Type{Id: int32(types.T_int64)},
+		Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 2, ColPos: 0}},
+	}
+	cond, err := BindFuncExprImplByPlanExpr(context.Background(), "=", []*plan.Expr{leftKey, rightKey})
+	require.NoError(t, err)
+	builder := &QueryBuilder{qry: &plan.Query{Nodes: []*plan.Node{left, right}}}
+	newJoin := func(ndv float64) *plan.Node {
+		joinCond := DeepCopyExpr(cond)
+		joinCond.Ndv = ndv
+		return &plan.Node{
+			NodeType: plan.Node_JOIN,
+			JoinType: plan.Node_INNER,
+			Children: []int32{0, 1},
+			OnList:   []*plan.Expr{joinCond},
+			Stats: &plan.Stats{HashmapStats: &plan.HashMapStats{
+				HashmapSize: 10_000_000,
+			}},
+		}
+	}
+
+	unknownNDVJoin := newJoin(-1)
+	determineShuffleForJoin(unknownNDVJoin, builder)
+	require.True(t, unknownNDVJoin.Stats.HashmapStats.Shuffle)
+	require.Equal(t, int32(0), unknownNDVJoin.Stats.HashmapStats.ShuffleColIdx)
+	require.Equal(t, plan.ShuffleType_Hash, unknownNDVJoin.Stats.HashmapStats.ShuffleType)
+
+	lowNDVJoin := newJoin(10)
+	determineShuffleForJoin(lowNDVJoin, builder)
+	require.False(t, lowNDVJoin.Stats.HashmapStats.Shuffle)
+}
+
+func TestDetermineShuffleForLatePlanStep(t *testing.T) {
+	left := &plan.Node{
+		NodeType:    plan.Node_TABLE_SCAN,
+		BindingTags: []int32{1},
+		TableDef:    &plan.TableDef{},
+		Stats:       &plan.Stats{Outcnt: 1000, HashmapStats: &plan.HashMapStats{}},
+	}
+	right := &plan.Node{
+		NodeType:    plan.Node_SINK_SCAN,
+		BindingTags: []int32{2},
+		Stats:       &plan.Stats{Outcnt: 10_000_000, HashmapStats: &plan.HashMapStats{}},
+	}
+	cond, err := BindFuncExprImplByPlanExpr(context.Background(), "=", []*plan.Expr{
+		{Typ: plan.Type{Id: int32(types.T_int64)}, Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 1, ColPos: 0}}},
+		{Typ: plan.Type{Id: int32(types.T_int64)}, Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 2, ColPos: 0}}},
+	})
+	require.NoError(t, err)
+	cond.Ndv = -1
+	join := &plan.Node{
+		NodeType: plan.Node_JOIN,
+		JoinType: plan.Node_INNER,
+		Children: []int32{0, 1},
+		OnList:   []*plan.Expr{cond},
+		Stats: &plan.Stats{HashmapStats: &plan.HashMapStats{
+			HashmapSize: 10_000_000,
+		}},
+	}
+	builder := NewQueryBuilder(plan.Query_INSERT, NewMockCompilerContext(true), false, true)
+	builder.qry = &plan.Query{
+		Nodes: []*plan.Node{left, right, join},
+		Steps: []int32{0, 2},
+	}
+
+	builder.determineShuffleForDMLSteps()
+
+	require.True(t, join.Stats.HashmapStats.Shuffle)
 }
 
 func TestGetRangeShuffleIndexForZM(t *testing.T) {
