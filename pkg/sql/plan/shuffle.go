@@ -469,6 +469,15 @@ func determineShuffleType(col *plan.ColRef, node *plan.Node, builder *QueryBuild
 
 // to determine if join need to go shuffle
 func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
+	determineShuffleForJoinWithColRefMode(node, builder, false)
+}
+
+// determineShuffleForJoinWithColRefMode plans join shuffle either before or
+// after column remapping. Normal optimizer plans use binding tags to identify
+// the two join sides. Late DML/index-maintenance plans are appended after
+// createQuery has remapped column references to local RelPos 0/1, so they must
+// use the positional form instead.
+func determineShuffleForJoinWithColRefMode(node *plan.Node, builder *QueryBuilder, afterRemap bool) {
 	// do not shuffle by default
 	node.Stats.HashmapStats.ShuffleColIdx = -1
 	if node.NodeType != plan.Node_JOIN {
@@ -482,6 +491,11 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 		hashColType:          -1,
 		rightHashColType:     -1,
 		highestNDV:           highestNDVForJoinShuffleLog(node),
+	}
+	if afterRemap {
+		diag.equiJoinDetection = "local-position"
+	} else {
+		diag.equiJoinDetection = "binding-tag"
 	}
 
 	switch node.JoinType {
@@ -541,7 +555,11 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 	}
 
 	idx := 0
-	diag.isEquiJoin = builder.IsEquiJoin(node)
+	if afterRemap {
+		diag.isEquiJoin = IsEquiJoin2(node.OnList)
+	} else {
+		diag.isEquiJoin = builder.IsEquiJoin(node)
+	}
 	if !diag.isEquiJoin {
 		logJoinShuffleDecision("not-equi-join", node, builder, diag)
 		if node.JoinType == plan.Node_DEDUP {
@@ -559,7 +577,11 @@ func determineShuffleForJoin(node *plan.Node, builder *QueryBuilder) {
 	}
 	// for now ,only support the first join condition
 	for i := range node.OnList {
-		if isEquiCond(node.OnList[i], leftTags, rightTags) {
+		isEqui := isEquiCond(node.OnList[i], leftTags, rightTags)
+		if afterRemap {
+			isEqui = isEquiCond2(node.OnList[i])
+		}
+		if isEqui {
 			idx = i
 			break
 		}
@@ -705,6 +727,7 @@ type joinShuffleDiag struct {
 	leftDontShuffle      bool
 	rightDontShuffle     bool
 	isEquiJoin           bool
+	equiJoinDetection    string
 	exprBasedShuffle     bool
 	hashmapSizeThreshold float64
 	hashmapSizeFactor    float64
@@ -950,7 +973,7 @@ func logJoinShuffleDecision(reason string, node *plan.Node, builder *QueryBuilde
 	sessionID, statementID, txnID, queryID, sqlPrefix := joinShuffleDiagIDs(builder)
 
 	logutil.Infof(
-		"join shuffle decision: reason=%s, node-id=%d, node-type=%v, join-type=%v, shuffle=%v, is-right-join=%v, on-duplicate-action=%v, old-col-list-len=%d, old-col-capture-list-len=%d, left-node-id=%d, right-node-id=%d, left-outcnt=%f, right-outcnt=%f, left-tablecnt=%f, right-tablecnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, hashmap-size-threshold=%f, hashmap-size-factor=%f, highest-ndv=%f, is-equi-join=%v, left-dont-shuffle=%v, right-dont-shuffle=%v, expr-based-shuffle=%v, hash-col-type=%d, right-hash-col-type=%d, selected-on-idx=%d, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, load-tag=%v, stmt-type=%v, session-id=%q, statement-id=%q, txn-id=%q, query-id=%q, sql-prefix=%q, left-child=%s, right-child=%s, left-load-source=%s, right-load-source=%s",
+		"join shuffle decision: reason=%s, node-id=%d, node-type=%v, join-type=%v, shuffle=%v, is-right-join=%v, on-duplicate-action=%v, old-col-list-len=%d, old-col-capture-list-len=%d, left-node-id=%d, right-node-id=%d, left-outcnt=%f, right-outcnt=%f, left-tablecnt=%f, right-tablecnt=%f, hashmap-size=%f, left-hashmap-size=%f, right-hashmap-size=%f, hashmap-size-threshold=%f, hashmap-size-factor=%f, highest-ndv=%f, is-equi-join=%v, equi-join-detection=%s, left-dont-shuffle=%v, right-dont-shuffle=%v, expr-based-shuffle=%v, hash-col-type=%d, right-hash-col-type=%d, selected-on-idx=%d, shuffle-col-idx=%d, shuffle-type=%v, shuffle-method=%v, load-tag=%v, stmt-type=%v, session-id=%q, statement-id=%q, txn-id=%q, query-id=%q, sql-prefix=%q, left-child=%s, right-child=%s, left-load-source=%s, right-load-source=%s",
 		reason,
 		nodeID,
 		node.NodeType,
@@ -973,6 +996,7 @@ func logJoinShuffleDecision(reason string, node *plan.Node, builder *QueryBuilde
 		diag.hashmapSizeFactor,
 		highestNDV,
 		diag.isEquiJoin,
+		diag.equiJoinDetection,
 		diag.leftDontShuffle,
 		diag.rightDontShuffle,
 		diag.exprBasedShuffle,
@@ -1383,13 +1407,21 @@ func determineShuffleForScan(node *plan.Node, builder *QueryBuilder) {
 }
 
 func determineShuffleMethod(nodeID int32, builder *QueryBuilder) {
+	determineShuffleMethodWithColRefMode(nodeID, builder, false)
+}
+
+func determineShuffleMethodAfterRemap(nodeID int32, builder *QueryBuilder) {
+	determineShuffleMethodWithColRefMode(nodeID, builder, true)
+}
+
+func determineShuffleMethodWithColRefMode(nodeID int32, builder *QueryBuilder, afterRemap bool) {
 	if builder.optimizerHints != nil && builder.optimizerHints.determineShuffle == 1 {
 		return
 	}
 	node := builder.qry.Nodes[nodeID]
 	if len(node.Children) > 0 {
 		for _, child := range node.Children {
-			determineShuffleMethod(child, builder)
+			determineShuffleMethodWithColRefMode(child, builder, afterRemap)
 		}
 	}
 	switch node.NodeType {
@@ -1398,7 +1430,7 @@ func determineShuffleMethod(nodeID int32, builder *QueryBuilder) {
 	case plan.Node_TABLE_SCAN:
 		determineShuffleForScan(node, builder)
 	case plan.Node_JOIN:
-		determineShuffleForJoin(node, builder)
+		determineShuffleForJoinWithColRefMode(node, builder, afterRemap)
 	default:
 	}
 }

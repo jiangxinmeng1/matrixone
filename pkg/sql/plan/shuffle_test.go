@@ -416,8 +416,8 @@ func TestDetermineShuffleForJoinNDVGuard(t *testing.T) {
 
 func TestDetermineShuffleForLatePlanStep(t *testing.T) {
 	// IVF maintenance also contains internal scans without binding tags. The
-	// post-createQuery shuffle pass must tolerate those scans while still planning
-	// shuffle for a separate large maintenance join.
+	// post-createQuery shuffle pass must recognize its local RelPos 0/1 join
+	// condition while tolerating unrelated untagged scans.
 	ivfScanWithoutBindingTag := &plan.Node{
 		NodeType: plan.Node_TABLE_SCAN,
 		TableDef: &plan.TableDef{Pkey: &plan.PrimaryKeyDef{
@@ -427,19 +427,17 @@ func TestDetermineShuffleForLatePlanStep(t *testing.T) {
 		Stats: &plan.Stats{Outcnt: 1000, HashmapStats: &plan.HashMapStats{}},
 	}
 	left := &plan.Node{
-		NodeType:    plan.Node_TABLE_SCAN,
-		BindingTags: []int32{1},
-		TableDef:    &plan.TableDef{},
-		Stats:       &plan.Stats{Outcnt: 1000, HashmapStats: &plan.HashMapStats{}},
+		NodeType: plan.Node_TABLE_SCAN,
+		TableDef: &plan.TableDef{},
+		Stats:    &plan.Stats{Outcnt: 1000, HashmapStats: &plan.HashMapStats{}},
 	}
 	right := &plan.Node{
-		NodeType:    plan.Node_SINK_SCAN,
-		BindingTags: []int32{2},
-		Stats:       &plan.Stats{Outcnt: 10_000_000, HashmapStats: &plan.HashMapStats{}},
+		NodeType: plan.Node_SINK_SCAN,
+		Stats:    &plan.Stats{Outcnt: 10_000_000, HashmapStats: &plan.HashMapStats{}},
 	}
 	cond, err := BindFuncExprImplByPlanExpr(context.Background(), "=", []*plan.Expr{
+		{Typ: plan.Type{Id: int32(types.T_int64)}, Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 0, ColPos: 0}}},
 		{Typ: plan.Type{Id: int32(types.T_int64)}, Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 1, ColPos: 0}}},
-		{Typ: plan.Type{Id: int32(types.T_int64)}, Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 2, ColPos: 0}}},
 	})
 	require.NoError(t, err)
 	cond.Ndv = -1
@@ -461,6 +459,17 @@ func TestDetermineShuffleForLatePlanStep(t *testing.T) {
 	builder.determineShuffleForDMLSteps()
 
 	require.True(t, join.Stats.HashmapStats.Shuffle)
+
+	// A same-side equality remains non-equi for join planning after remapping.
+	sameSideCond, err := BindFuncExprImplByPlanExpr(context.Background(), "=", []*plan.Expr{
+		{Typ: plan.Type{Id: int32(types.T_int64)}, Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 0, ColPos: 0}}},
+		{Typ: plan.Type{Id: int32(types.T_int64)}, Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 0, ColPos: 1}}},
+	})
+	require.NoError(t, err)
+	join.OnList = []*plan.Expr{sameSideCond}
+	join.Stats.HashmapStats.Shuffle = false
+	builder.determineShuffleForDMLSteps()
+	require.False(t, join.Stats.HashmapStats.Shuffle)
 }
 
 func TestGetRangeShuffleIndexForZM(t *testing.T) {
