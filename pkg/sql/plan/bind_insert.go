@@ -853,7 +853,6 @@ func (builder *QueryBuilder) determineShuffleForDMLSteps() {
 	// late IVF/fulltext joins retain Shuffle=false and build a broadcast hash table.
 	for i := range builder.qry.Steps {
 		rootID := builder.qry.Steps[i]
-		determineHashOnPK(rootID, builder)
 		determineShuffleMethod(rootID, builder)
 		determineShuffleMethod2(rootID, -1, builder)
 		builder.forceJoinOnOneCN(rootID, false)

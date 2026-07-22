@@ -415,6 +415,17 @@ func TestDetermineShuffleForJoinNDVGuard(t *testing.T) {
 }
 
 func TestDetermineShuffleForLatePlanStep(t *testing.T) {
+	// IVF maintenance also contains internal scans without binding tags. The
+	// post-createQuery shuffle pass must tolerate those scans while still planning
+	// shuffle for a separate large maintenance join.
+	ivfScanWithoutBindingTag := &plan.Node{
+		NodeType: plan.Node_TABLE_SCAN,
+		TableDef: &plan.TableDef{Pkey: &plan.PrimaryKeyDef{
+			PkeyColName: "id",
+			Names:       []string{"id"},
+		}},
+		Stats: &plan.Stats{Outcnt: 1000, HashmapStats: &plan.HashMapStats{}},
+	}
 	left := &plan.Node{
 		NodeType:    plan.Node_TABLE_SCAN,
 		BindingTags: []int32{1},
@@ -443,8 +454,8 @@ func TestDetermineShuffleForLatePlanStep(t *testing.T) {
 	}
 	builder := NewQueryBuilder(plan.Query_INSERT, NewMockCompilerContext(true), false, true)
 	builder.qry = &plan.Query{
-		Nodes: []*plan.Node{left, right, join},
-		Steps: []int32{0, 2},
+		Nodes: []*plan.Node{left, right, join, ivfScanWithoutBindingTag},
+		Steps: []int32{3, 2},
 	}
 
 	builder.determineShuffleForDMLSteps()
