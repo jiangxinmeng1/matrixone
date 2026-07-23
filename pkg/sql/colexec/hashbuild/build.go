@@ -194,6 +194,7 @@ func (hashBuild *HashBuild) build(proc *process.Process, analyzer process.Analyz
 		hashBuild.logSpillDecision(proc, "check", spillReason, result.Batch.RowCount(), result.Batch.Size())
 		if shouldSpill {
 			spillMode = true
+			ctr.setSpillBufferRowLimit(result.Batch)
 			// Initialize spill executors once for reuse across all batches
 			if ctr.spillExprExecs == nil {
 				if _, err := ctr.initSpillExprExecs(proc, hashBuild.Conditions); err != nil {
@@ -212,15 +213,27 @@ func (hashBuild *HashBuild) build(proc *process.Process, analyzer process.Analyz
 			spillFiles = make([]*os.File, spillNumBuckets)
 			spillBuffers = make([]*batch.Batch, spillNumBuckets)
 
-			// Spill all batches collected so far
-			for _, bat := range ctr.hashmapBuilder.Batches.Buf {
+			// Detach the in-memory build batches and release each one as soon as
+			// it has been copied into the bounded spill buffers. Keeping the
+			// whole build side alive until redistribution finishes creates a
+			// large transition peak, especially when many shuffle hashbuilds
+			// enter spill together.
+			buildBatches := ctr.hashmapBuilder.Batches.Buf
+			ctr.hashmapBuilder.Batches.Buf = nil
+			ctr.hashmapBuilder.Batches.MemSize = 0
+			for i, bat := range buildBatches {
 				err := ctr.appendBuildBatchToSpillFiles(proc, bat, spillFiles, spillBuffers, ctr.spillExprExecs, analyzer)
 				if err != nil {
+					for _, remaining := range buildBatches[i:] {
+						if remaining != nil {
+							remaining.Clean(proc.Mp())
+						}
+					}
 					return err
 				}
+				bat.Clean(proc.Mp())
+				buildBatches[i] = nil
 			}
-			// Clear batches to save memory
-			ctr.hashmapBuilder.Batches.Clean(proc.Mp())
 		}
 	}
 
@@ -336,7 +349,7 @@ func (hashBuild *HashBuild) logSpillDecision(proc *process.Process, event, reaso
 	}
 
 	proc.Infof(proc.Ctx,
-		"hashbuild spill decision: event=%s, reason=%s, heavy=%v, source-op-type=%q, is-shuffle=%v, need-hashmap=%v, need-batches=%v, is-dedup=%v, join-map-tag=%d, shuffle-idx=%d, join-map-ref-cnt=%d, spill-threshold=%d, row-count=%d, mem-used=%d, elapsed-ms=%d, rows-per-sec=%f, input-batch-rows=%d, input-batch-bytes=%d, batch-buffer-count=%d, need-allocate-sels=%v, hash-on-pk=%v, runtime-filter=%v, on-duplicate-action=%v, dedup-col-name=%q, stmt-type=%q, query-type=%q, sql-source-type=%q, user=%q, database=%q, is-load=%v, sql-prefix=%q",
+		"hashbuild spill decision: event=%s, reason=%s, heavy=%v, source-op-type=%q, is-shuffle=%v, need-hashmap=%v, need-batches=%v, is-dedup=%v, join-map-tag=%d, shuffle-idx=%d, join-map-ref-cnt=%d, spill-threshold=%d, spill-buffer-row-limit=%d, spill-buffer-target-bytes=%d, row-count=%d, mem-used=%d, elapsed-ms=%d, rows-per-sec=%f, input-batch-rows=%d, input-batch-bytes=%d, batch-buffer-count=%d, need-allocate-sels=%v, hash-on-pk=%v, runtime-filter=%v, on-duplicate-action=%v, dedup-col-name=%q, stmt-type=%q, query-type=%q, sql-source-type=%q, user=%q, database=%q, is-load=%v, sql-prefix=%q",
 		event,
 		reason,
 		heavy,
@@ -349,6 +362,8 @@ func (hashBuild *HashBuild) logSpillDecision(proc *process.Process, event, reaso
 		hashBuild.ShuffleIdx,
 		hashBuild.JoinMapRefCnt,
 		ctr.spillThreshold,
+		ctr.spillBufferRowLimit,
+		spillBucketBufferTargetBytes,
 		rowCount,
 		memUsed,
 		elapsedMS,

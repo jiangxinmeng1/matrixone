@@ -47,6 +47,10 @@ type container struct {
 	spillFS         fileservice.MutableFileService
 	spillUUID       string // unique prefix for anonymous file paths
 	spillThreshold  int64
+	// spillBufferRowLimit targets a byte-sized spill bucket buffer using the
+	// input batch's average row width. Wide rows must not inherit the historical
+	// 8192-row buffer because all spill buckets and shuffle hashbuilds coexist.
+	spillBufferRowLimit int
 
 	// reusable buffers for spill operations
 	spillHashValues   []uint64
@@ -141,6 +145,7 @@ func (hashBuild *HashBuild) Reset(proc *process.Process, pipelineFailed bool, er
 	hashBuild.ctr.spillDiagLastRows = 0
 	hashBuild.ctr.spillDiagLastMem = 0
 	hashBuild.ctr.buildStart = time.Time{}
+	hashBuild.ctr.spillBufferRowLimit = 0
 	message.FinalizeRuntimeFilter(hashBuild.RuntimeFilterSpec, runtimeSucceed, proc.GetMessageBoard())
 	message.FinalizeJoinMapMessage(proc.GetMessageBoard(), hashBuild.JoinMapTag, hashBuild.IsShuffle, hashBuild.ShuffleIdx, mapSucceed)
 }
