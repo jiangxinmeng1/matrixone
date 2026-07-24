@@ -1547,7 +1547,7 @@ func TestCreateAppendableObjectWithOptions(t *testing.T) {
 	assert.NoError(t, txn.Commit(ctx))
 }
 
-func TestCreateAppendableObjectWithOptionsRejectsNonAppendable(t *testing.T) {
+func TestCreateAppendableObjectWithOptionsRejectsInvalidOptions(t *testing.T) {
 	defer testutils.AfterTest(t)()
 	testutils.EnsureNoLeak(t)
 
@@ -1564,6 +1564,12 @@ func TestCreateAppendableObjectWithOptionsRejectsNonAppendable(t *testing.T) {
 	assert.NoError(t, err)
 	rel, err := db.CreateRelation(catalog.MockSchema(1, 0))
 	assert.NoError(t, err)
+
+	_, err = rel.CreateObjectWithOpt(false, nil)
+	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), err)
+
+	_, err = rel.CreateObjectWithOpt(false, &objectio.CreateObjOpt{})
+	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), err)
 
 	id := objectio.NewObjectid()
 	stats := objectio.NewObjectStatsWithObjectID(&id, false, false, false)
@@ -1604,6 +1610,10 @@ func TestCreateAppendableObjectWithOptionsErrors(t *testing.T) {
 
 	txnDB, err := store.getOrSetDB(db.GetID())
 	assert.NoError(t, err)
+	_, err = store.CreateObjectWithOpt(db.GetID(), rel.ID(), false, nil)
+	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), err)
+	_, err = txnDB.CreateObjectWithOpt(rel.ID(), nil, false)
+	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), err)
 	_, err = txnDB.CreateObjectWithOpt(rel.ID()+1, newOpt(), false)
 	assert.Error(t, err)
 
