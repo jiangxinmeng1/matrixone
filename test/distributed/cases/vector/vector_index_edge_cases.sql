@@ -32,17 +32,17 @@ LIMIT 3;
 
 -- ============================================================================
 -- Test Case 2: PARAMETERIZED LIMIT with FILTER (covers line 283-285)
--- This tests the case where LIMIT is not a constant literal
--- Note: In SQL test files, we can simulate this using expressions
+-- This tests the case where LIMIT is not a constant literal.
 -- ============================================================================
 
--- Test 2a: LIMIT as an expression (1+2 = 3)
+-- Test 2a: LIMIT as a user variable
 -- Should have filters but cannot calculate over-fetch factor at plan time
+SET @vector_limit = 3;
 -- @separator:table
 SELECT id, name, score FROM test_vector_edge_cases
 WHERE score >= 4.0
 ORDER BY l2_distance(embedding, '[0.863103449344635,0.6232981085777283,0.3308980166912079,0.06355834752321243,0.3109823167324066,0.32518333196640015,0.7296061515808105,0.6375574469566345,0.8872127532958984,0.472214937210083,0.11959424614906311,0.7132447957992554,0.7607850432395935,0.5612772107124329,0.7709671854972839,0.49379560351371765]')
-LIMIT (1+2);
+LIMIT @vector_limit;
 
 -- Test 2b: Subquery as LIMIT - NOT SUPPORTED in MatrixOne
 -- MatrixOne does not allow subqueries in LIMIT clause

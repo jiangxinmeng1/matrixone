@@ -1,6 +1,9 @@
 drop table if exists t1(a int);
 create table t1 (a int);
 insert into t1 values (1),(1),(1),(1),(1);
+-- Regression for #25331: MySQL rejects strings and expressions in LIMIT.
+select * from t1 limit '2';
+select * from t1 limit 1 + 1;
 select * from t1 limit 0,18446744073709551615;
 select * from t1 limit 18446744073709551615,18446744073709551615;
 select * from t1 limit 18446744073709551615,0;

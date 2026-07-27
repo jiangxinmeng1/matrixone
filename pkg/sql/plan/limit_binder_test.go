@@ -124,11 +124,48 @@ func TestLimitBinder_OffsetNull(t *testing.T) {
 	require.Contains(t, err.Error(), "OFFSET cannot be NULL")
 }
 
-func TestLimitBinder_LimitString(t *testing.T) {
-	astLimit := parseLimit(t, "SELECT 1 LIMIT '10'")
+func TestLimitBinder_RejectsNonMySQLExpressions(t *testing.T) {
+	testCases := []struct {
+		name     string
+		sql      string
+		isOffset bool
+	}{
+		{name: "quoted limit", sql: "SELECT 1 LIMIT '10'"},
+		{name: "arithmetic limit", sql: "SELECT 1 LIMIT 1 + 1"},
+		{name: "parenthesized limit", sql: "SELECT 1 LIMIT (2)"},
+		{name: "float limit", sql: "SELECT 1 LIMIT 2.0"},
+		{name: "quoted comma offset", sql: "SELECT 1 LIMIT '1', 2", isOffset: true},
+		{name: "arithmetic comma offset", sql: "SELECT 1 LIMIT 1 + 1, 2", isOffset: true},
+		{name: "quoted offset", sql: "SELECT 1 LIMIT 2 OFFSET '1'", isOffset: true},
+		{name: "arithmetic offset", sql: "SELECT 1 LIMIT 2 OFFSET 1 + 1", isOffset: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			astLimit := parseLimit(t, tc.sql)
+			astExpr := astLimit.Count
+			if tc.isOffset {
+				astExpr = astLimit.Offset
+			}
+
+			_, err := bindLimitExpr(t, astExpr, tc.isOffset)
+			require.ErrorContains(t, err, "unsupported expression")
+		})
+	}
+}
+
+func TestLimitBinder_AllowsDynamicValues(t *testing.T) {
+	astLimit := parseLimit(t, "SELECT 1 LIMIT @page_size")
 	require.NotNil(t, astLimit.Count)
 
 	expr, err := bindLimitExpr(t, astLimit.Count, false)
+	require.NoError(t, err)
+	require.Equal(t, int32(types.T_uint64), expr.Typ.Id)
+
+	astLimit = parseLimit(t, "SELECT 1 LIMIT ?")
+	builder, bindCtx := genBuilderAndCtx()
+	builder.isPrepareStatement = true
+	expr, err = NewLimitBinder(builder, bindCtx, false).BindExpr(astLimit.Count, 0, true)
 	require.NoError(t, err)
 	require.Equal(t, int32(types.T_uint64), expr.Typ.Id)
 }

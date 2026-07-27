@@ -33,9 +33,30 @@ func NewLimitBinder(builder *QueryBuilder, ctx *BindContext, isOffset bool) *Lim
 }
 
 func (b *LimitBinder) BindExpr(astExpr tree.Expr, depth int32, isRoot bool) (*plan.Expr, error) {
-	switch astExpr.(type) {
+	switch expr := astExpr.(type) {
 	case *tree.UnqualifiedStar:
 		return nil, moerr.NewSyntaxError(b.GetContext(), "unsupported expr in limit clause")
+	case *tree.NumVal:
+		if expr.ValType != tree.P_int64 &&
+			expr.ValType != tree.P_uint64 &&
+			expr.ValType != tree.P_null {
+			return nil, b.unsupportedExpressionError()
+		}
+	case *tree.ParamExpr:
+		// MySQL permits parameter markers in prepared LIMIT/OFFSET statements.
+		// Their values are validated at execution.
+	case *tree.VarExpr:
+		// Retain MatrixOne's existing dynamic LIMIT/OFFSET variable support.
+	case *tree.UnaryExpr:
+		// Keep the existing diagnostic for negative numeric literals below.
+		if expr.Op != tree.UNARY_MINUS {
+			return nil, b.unsupportedExpressionError()
+		}
+		if _, ok := expr.Expr.(*tree.NumVal); !ok {
+			return nil, b.unsupportedExpressionError()
+		}
+	default:
+		return nil, b.unsupportedExpressionError()
 	}
 
 	// Handle LIMIT -N / OFFSET -N: unary minus applied to a numeric literal.
@@ -84,8 +105,7 @@ func (b *LimitBinder) BindExpr(astExpr tree.Expr, depth int32, isRoot bool) (*pl
 				}
 			}
 		}
-		// limit '10' / offset '2'
-		// the valid string should be cast to int64
+		// Dynamic parameters and variables may require conversion to uint64.
 		if expr.Typ.Id == int32(types.T_varchar) || expr.Typ.Id == int32(types.T_int64) {
 			targetType := types.T_uint64.ToType()
 			planTargetType := makePlan2Type(&targetType)
@@ -138,6 +158,14 @@ func (b *LimitBinder) BindExpr(astExpr tree.Expr, depth int32, isRoot bool) (*pl
 	}
 
 	return b.foldConstant(expr)
+}
+
+func (b *LimitBinder) unsupportedExpressionError() error {
+	clause := "LIMIT"
+	if b.isOffset {
+		clause = "OFFSET"
+	}
+	return moerr.NewSyntaxErrorf(b.GetContext(), "unsupported expression in %s clause", clause)
 }
 
 func (b *LimitBinder) foldConstant(expr *plan.Expr) (*plan.Expr, error) {

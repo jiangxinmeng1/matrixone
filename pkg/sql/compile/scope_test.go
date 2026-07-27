@@ -130,7 +130,7 @@ func TestScopeSerialization(t *testing.T) {
 func TestCompileOrderByLimitOffsetUsesTopCandidateBudget(t *testing.T) {
 	catalog.SetupDefines("")
 	scope := generateScopeCases(t, []string{
-		"select n_regionkey from nation order by n_regionkey limit 2 + 3 offset 0 + 2",
+		"select n_regionkey from nation order by n_regionkey limit 5 offset 2",
 	})[0]
 
 	var topLimits []uint64

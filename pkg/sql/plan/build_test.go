@@ -505,11 +505,11 @@ func TestSingleTableSQLBuilder(t *testing.T) {
 		"select 2222332222222223333333333333333333, 0x616263,-10, bit_and(2), bit_or(2), 'aaa' like '%a',str_to_date('04/31/2004', '%m/%d/%Y'),unix_timestamp(from_unixtime(2147483647))",
 		"select max(n_nationkey) over  (partition by N_REGIONKEY) from nation",
 		"select * from generate_series(1, 5) g",
-		"prepare stmt1 from select * from nation where n_name like ? or n_nationkey > 10 order by 2 limit '10'",
+		"prepare stmt1 from select * from nation where n_name like ? or n_nationkey > 10 order by 2 limit ?",
 
 		"values row(1,1), row(2,2), row(3,3) order by column_0 limit 2",
 		"select * from (values row(1,1), row(2,2), row(3,3)) a (c1, c2)",
-		"prepare stmt1 from select * from nation where n_name like ? or n_nationkey > 10 order by 2 limit '10' for update",
+		"prepare stmt1 from select * from nation where n_name like ? or n_nationkey > 10 order by 2 limit ? for update",
 
 		// get_format: DATE/TIME/DATETIME/TIMESTAMP should be treated as type keywords, not column names
 		"select get_format(DATE, 'USA')",
