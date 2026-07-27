@@ -63,6 +63,52 @@ import (
 var dummyBadRequestErr = moerr.NewInternalError(context.TODO(), "bad request")
 var dummyErr = moerr.NewInternalError(context.TODO(), "dummy error")
 
+func Test_service_handleISCPDrainConsumerInstallFenceOnlyUsesToken(t *testing.T) {
+	const runnerCN = "install-fence-runner-cn"
+	s := &service{cfg: &Config{UUID: runnerCN}}
+	key := iscp.NewJobRuntimeKey(1, 42, "index_idx1", 7)
+	defer iscp.RemoveCNJobFenceWithToken(runnerCN, key, "generation-1")
+
+	install := func(token string) error {
+		return s.handleISCPDrainConsumer(
+			context.Background(),
+			&query.Request{ISCPDrainConsumerRequest: &query.ISCPDrainConsumerRequest{
+				AccountID:        key.AccountID,
+				TableID:          key.TableID,
+				JobName:          key.JobName,
+				JobID:            key.JobID,
+				FenceToken:       token,
+				InstallFenceOnly: true,
+			}},
+			&query.Response{},
+			nil,
+		)
+	}
+
+	require.NoError(t, install("generation-1"))
+	require.ErrorContains(t, install("generation-2"), "another ownership generation")
+
+	require.NoError(t, s.handleISCPDrainConsumer(
+		context.Background(),
+		&query.Request{ISCPDrainConsumerRequest: &query.ISCPDrainConsumerRequest{
+			AccountID:       key.AccountID,
+			TableID:         key.TableID,
+			JobName:         key.JobName,
+			JobID:           key.JobID,
+			FenceToken:      "generation-2",
+			RemoveFenceOnly: true,
+		}},
+		&query.Response{},
+		nil,
+	))
+	require.True(t, iscp.RenewCNJobFenceWithToken(
+		runnerCN,
+		key,
+		"generation-1",
+		time.Minute,
+	))
+}
+
 func Test_service_handleISCPDrainConsumerRenewFenceOnly(t *testing.T) {
 	exec := &iscp.ISCPTaskExecutor{}
 	iscp.RegisterExecutorRuntime("runner-cn", exec)

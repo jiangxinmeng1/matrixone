@@ -273,4 +273,7 @@ message Details {
      [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
    google.protobuf.Timestamp LastRun = 13
      [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
+   uint64 Epoch = 14;
+   string FenceToken = 15;
+   int64 FenceExpireAt = 16;
  }

@@ -140,15 +140,39 @@ func (c *taskStatusCond) sql() string {
 
 type taskEpochCond struct {
 	op        Op
-	taskEpoch uint32
+	taskEpoch uint64
 }
 
 func (c *taskEpochCond) eval(v any) bool {
-	epoch, ok := v.(uint32)
-	if !ok {
+	var epoch uint64
+	switch value := v.(type) {
+	case uint32:
+		epoch = uint64(value)
+	case uint64:
+		epoch = value
+	default:
 		return false
 	}
 	return compare(c.op, epoch, c.taskEpoch)
+}
+
+type taskFenceExpiredCond struct {
+	now int64
+}
+
+func (c *taskFenceExpiredCond) eval(v any) bool {
+	t, ok := v.(task.DaemonTask)
+	if !ok {
+		return false
+	}
+	return t.FenceToken == "" || t.FenceExpireAt <= c.now
+}
+
+func (c *taskFenceExpiredCond) sql() string {
+	return fmt.Sprintf(
+		"(task_fence_token='' OR task_fence_token IS NULL OR task_fence_expire_at<=%d)",
+		c.now,
+	)
 }
 
 func (c *taskEpochCond) sql() string {
@@ -457,6 +481,7 @@ const (
 	CondSQLTaskRunStatus
 	CondSQLTaskTriggerType
 	CondSQLTaskRunner
+	CondTaskFenceExpired
 )
 
 var (
@@ -471,13 +496,15 @@ var (
 		CondTaskMetadataId:   {},
 	}
 	daemonWhereConditionCodes = map[condCode]struct{}{
-		CondTaskID:        {},
-		CondTaskRunner:    {},
-		CondTaskStatus:    {},
-		CondTaskType:      {},
-		CondAccountID:     {},
-		CondAccount:       {},
-		CondLastHeartbeat: {},
+		CondTaskID:           {},
+		CondTaskRunner:       {},
+		CondTaskStatus:       {},
+		CondTaskType:         {},
+		CondAccountID:        {},
+		CondAccount:          {},
+		CondLastHeartbeat:    {},
+		CondTaskEpoch:        {},
+		CondTaskFenceExpired: {},
 	}
 )
 
@@ -535,9 +562,17 @@ func WithTaskStatusCond(value ...task.TaskStatus) Condition {
 }
 
 // WithTaskEpochCond set task epoch condition
-func WithTaskEpochCond(op Op, value uint32) Condition {
+func WithTaskEpochCond(op Op, value uint64) Condition {
 	return func(c *conditions) {
 		(*c)[CondTaskEpoch] = &taskEpochCond{op: op, taskEpoch: value}
+	}
+}
+
+// WithTaskFenceExpired only matches daemon tasks whose ownership fence is
+// absent or expired at the supplied Unix-millisecond timestamp.
+func WithTaskFenceExpired(now int64) Condition {
+	return func(c *conditions) {
+		(*c)[CondTaskFenceExpired] = &taskFenceExpiredCond{now: now}
 	}
 }
 

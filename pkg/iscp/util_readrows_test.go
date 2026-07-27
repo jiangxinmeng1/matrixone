@@ -17,6 +17,7 @@ package iscp
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
@@ -107,6 +108,94 @@ func TestGetTaskRunnerQueriesMOTaskWithSystemAccount(t *testing.T) {
 	runner, err := GetTaskRunner(tenantCtx, "cn0", nil)
 	require.NoError(t, err)
 	require.Equal(t, "cn1", runner)
+}
+
+func TestReadSingleTaskOwnershipIncludesEpoch(t *testing.T) {
+	mp := mpool.MustNewZero()
+	memRes := executor.NewMemResult(
+		[]types.Type{types.T_varchar.ToType(), types.T_uint64.ToType()},
+		mp,
+	)
+	memRes.NewBatchWithRowCount(1)
+	require.NoError(t, executor.AppendStringRows(memRes, 0, []string{"cn1"}))
+	require.NoError(t, executor.AppendFixedRows(memRes, 1, []uint64{7}))
+	result := memRes.GetResult()
+	defer func() {
+		result.Close()
+		require.Equal(t, int64(0), mp.CurrNB())
+		mpool.DeleteMPool(mp)
+	}()
+
+	ownership, err := readSingleTaskOwnership(result)
+	require.NoError(t, err)
+	require.Equal(t, TaskOwnership{Runner: "cn1", Epoch: 7}, ownership)
+}
+
+func TestTaskOwnershipFenceUsesRunnerEpochAndTokenCAS(t *testing.T) {
+	oldExecWithResult := ExecWithResult
+	defer func() {
+		ExecWithResult = oldExecWithResult
+	}()
+
+	var sqls []string
+	affectedRows := []uint64{1, 1, 0}
+	ExecWithResult = func(
+		_ context.Context,
+		sql string,
+		_ string,
+		txn client.TxnOperator,
+	) (executor.Result, error) {
+		require.Nil(t, txn)
+		sqls = append(sqls, sql)
+		affected := affectedRows[0]
+		affectedRows = affectedRows[1:]
+		return executor.Result{AffectedRows: affected}, nil
+	}
+
+	ownership := TaskOwnership{Runner: "cn1", Epoch: 7}
+	require.NoError(t, AcquireTaskOwnershipFence(
+		context.Background(), "ddl-cn", ownership, "token-1", time.Minute,
+	))
+	require.NoError(t, RenewTaskOwnershipFence(
+		context.Background(), "ddl-cn", ownership, "token-1", time.Minute,
+	))
+	require.NoError(t, RemoveTaskOwnershipFence(
+		context.Background(), "ddl-cn", ownership, "stale-token",
+	))
+
+	require.Len(t, sqls, 3)
+	for _, sql := range sqls {
+		require.Contains(t, sql, "task_runner='cn1'")
+		require.Contains(t, sql, "task_epoch=7")
+	}
+	require.Contains(t, sqls[0], "task_fence_token='token-1'")
+	require.Contains(t, sqls[1], "task_fence_token='token-1'")
+	require.Contains(t, sqls[1], "task_fence_expire_at>")
+	require.Contains(t, sqls[2], "task_fence_token='stale-token'")
+}
+
+func TestAcquireTaskOwnershipFenceRejectsLostGeneration(t *testing.T) {
+	oldExecWithResult := ExecWithResult
+	defer func() {
+		ExecWithResult = oldExecWithResult
+	}()
+	ExecWithResult = func(
+		context.Context,
+		string,
+		string,
+		client.TxnOperator,
+	) (executor.Result, error) {
+		return executor.Result{AffectedRows: 0}, nil
+	}
+
+	err := AcquireTaskOwnershipFence(
+		context.Background(),
+		"ddl-cn",
+		TaskOwnership{Runner: "cn1", Epoch: 7},
+		"token-1",
+		time.Minute,
+	)
+	require.ErrorContains(t, err, "ownership changed or is already fenced")
 }
 
 func newTaskRunnerResult(t *testing.T, batches [][]string) (executor.Result, *mpool.MPool) {

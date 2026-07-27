@@ -209,6 +209,18 @@ func (s *service) handleISCPDrainConsumer(ctx context.Context, req *query.Reques
 	}
 	r := req.ISCPDrainConsumerRequest
 	key := iscp.NewJobRuntimeKey(r.AccountID, r.TableID, r.JobName, r.JobID)
+	ttl := iscp.RollbackFenceTTL()
+	if r.InstallFenceOnly {
+		if !iscp.InstallCNJobFenceWithToken(s.cfg.UUID, key, r.FenceToken, ttl) {
+			return moerr.NewInternalErrorf(
+				ctx,
+				"ISCP consumer on CN %s is fenced by another ownership generation",
+				s.cfg.UUID,
+			)
+		}
+		resp.ISCPDrainConsumerResponse = &query.ISCPDrainConsumerResponse{Success: true}
+		return nil
+	}
 	if r.RemoveFenceOnly {
 		if _, msg, injected := fault.TriggerFault(objectio.FJ_ISCPCancelRemoveFenceError); injected {
 			if msg == "" {
@@ -216,16 +228,15 @@ func (s *service) handleISCPDrainConsumer(ctx context.Context, req *query.Reques
 			}
 			return moerr.NewInternalErrorNoCtxf("injected ISCP remove fence error: %s", msg)
 		}
-		iscp.RemoveCNJobFence(s.cfg.UUID, key)
+		iscp.RemoveCNJobFenceWithToken(s.cfg.UUID, key, r.FenceToken)
 		resp.ISCPDrainConsumerResponse = &query.ISCPDrainConsumerResponse{Success: true}
 		return nil
 	}
 	if r.RenewFenceOnly {
-		ttl := iscp.RollbackFenceTTL()
 		// Renewal must never create a fence. A delayed renew can be processed
 		// after rollback cleanup; requiring the CN fence to exist makes remove
 		// terminal even when RPC handling is reordered.
-		if !iscp.RenewCNJobFence(s.cfg.UUID, key, ttl) {
+		if !iscp.RenewCNJobFenceWithToken(s.cfg.UUID, key, r.FenceToken, ttl) {
 			return moerr.NewInternalErrorf(
 				ctx,
 				"cannot renew ISCP consumer quiescence fence on CN %s for tableID=%d jobName=%s jobID=%d",
@@ -242,7 +253,13 @@ func (s *service) handleISCPDrainConsumer(ctx context.Context, req *query.Reques
 	// Install the CN-scoped fence before looking up the executor. This closes
 	// the task-assignment/readiness gap: a replacement executor generation on
 	// this CN observes the fence even if it is published after this request.
-	iscp.InstallCNJobFence(s.cfg.UUID, key, iscp.RollbackFenceTTL())
+	if !iscp.InstallCNJobFenceWithToken(s.cfg.UUID, key, r.FenceToken, ttl) {
+		return moerr.NewInternalErrorf(
+			ctx,
+			"ISCP consumer on CN %s is fenced by another ownership generation",
+			s.cfg.UUID,
+		)
+	}
 	// A daemon task publishes task_runner before its executor has completed
 	// recovery and registered its runtime.
 	readyCtx, cancel := context.WithTimeout(ctx, iscpExecutorReadyTimeout)
@@ -259,8 +276,15 @@ func (s *service) handleISCPDrainConsumer(ctx context.Context, req *query.Reques
 		// is retried by the compile-side drain path only.
 		return moerr.NewRetryForCNRollingRestart()
 	}
-	if err := exec.CancelAndDrainJobConsumer(ctx, r.AccountID, r.TableID, r.JobName, r.JobID); err != nil {
-		exec.RemoveJobFence(key)
+	if err := exec.CancelAndDrainJobConsumerWithToken(
+		ctx,
+		r.AccountID,
+		r.TableID,
+		r.JobName,
+		r.JobID,
+		r.FenceToken,
+	); err != nil {
+		exec.RemoveJobFenceWithToken(key, r.FenceToken)
 		return err
 	}
 	resp.ISCPDrainConsumerResponse = &query.ISCPDrainConsumerResponse{Success: true}

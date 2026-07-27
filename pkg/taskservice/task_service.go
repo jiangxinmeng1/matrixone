@@ -168,7 +168,7 @@ func (s *taskService) Allocate(ctx context.Context, value task.AsyncTask, taskRu
 	n, err := s.store.UpdateAsyncTask(ctx,
 		[]task.AsyncTask{old},
 		WithTaskIDCond(EQ, old.ID),
-		WithTaskEpochCond(EQ, old.Epoch-1))
+		WithTaskEpochCond(EQ, uint64(old.Epoch-1)))
 	if err != nil {
 		return err
 	}
@@ -192,7 +192,7 @@ func (s *taskService) Complete(
 	n, err := s.store.UpdateAsyncTask(ctx, []task.AsyncTask{value},
 		WithTaskStatusCond(task.TaskStatus_Running),
 		WithTaskRunnerCond(EQ, taskRunner),
-		WithTaskEpochCond(EQ, value.Epoch))
+		WithTaskEpochCond(EQ, uint64(value.Epoch)))
 	if err != nil {
 		return err
 	}
@@ -259,7 +259,7 @@ func (s *taskService) Heartbeat(ctx context.Context, value task.AsyncTask) error
 	n, err := s.store.UpdateAsyncTask(ctx, []task.AsyncTask{value},
 		WithTaskIDCond(EQ, value.ID),
 		WithTaskStatusCond(task.TaskStatus_Running),
-		WithTaskEpochCond(LE, value.Epoch),
+		WithTaskEpochCond(LE, uint64(value.Epoch)),
 		WithTaskRunnerCond(EQ, value.TaskRunner))
 	if err != nil {
 		return err

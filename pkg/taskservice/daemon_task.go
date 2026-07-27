@@ -151,9 +151,21 @@ func (t *resumeTask) Handle(ctx context.Context) error {
 	nowTime := time.Now()
 	tk.LastRun = nowTime
 	tk.LastHeartbeat = nowTime
-	_, err = t.runner.service.UpdateDaemonTask(handleCtx, []task.DaemonTask{tk})
+	affected, err := t.runner.service.UpdateDaemonTask(
+		handleCtx,
+		[]task.DaemonTask{tk},
+		WithTaskEpochCond(EQ, tk.Epoch),
+		WithTaskFenceExpired(nowTime.UnixMilli()),
+	)
 	if err != nil {
 		return moerr.AttachCause(handleCtx, err)
+	}
+	if affected != 1 {
+		return moerr.NewInternalErrorf(
+			handleCtx,
+			"cannot resume daemon task %d while its ownership generation is fenced or has changed",
+			tk.ID,
+		)
 	}
 	t.runner.logger.Info("cdc.task.resume.finish",
 		zap.Uint64("task-id", tk.ID),
@@ -254,13 +266,25 @@ func (t *restartTask) Handle(ctx context.Context) error {
 	nowTime := time.Now()
 	tk.LastRun = nowTime
 	tk.LastHeartbeat = nowTime
-	_, err = t.runner.service.UpdateDaemonTask(handleCtx, []task.DaemonTask{tk})
+	affected, err := t.runner.service.UpdateDaemonTask(
+		handleCtx,
+		[]task.DaemonTask{tk},
+		WithTaskEpochCond(EQ, tk.Epoch),
+		WithTaskFenceExpired(nowTime.UnixMilli()),
+	)
 	if err != nil {
 		t.runner.logger.Error("cdc.task.restart.update_status_failed",
 			zap.Uint64("task-id", tk.ID),
 			zap.Error(err),
 		)
 		return moerr.AttachCause(handleCtx, err)
+	}
+	if affected != 1 {
+		return moerr.NewInternalErrorf(
+			handleCtx,
+			"cannot restart daemon task %d while its ownership generation is fenced or has changed",
+			tk.ID,
+		)
 	}
 
 	t.runner.logger.Info("cdc.task.restart.status_updated",
@@ -918,8 +942,12 @@ func (r *taskRunner) doSendHeartbeat(ctx context.Context) {
 
 func (r *taskRunner) startDaemonTask(ctx context.Context, dt *daemonTask) (bool, error) {
 	t := dt.task
+	oldEpoch := t.Epoch
 	t.TaskRunner = r.runnerID
 	t.TaskStatus = task.TaskStatus_Running
+	t.Epoch++
+	t.FenceToken = ""
+	t.FenceExpireAt = 0
 	nowTime := time.Now()
 	t.UpdateAt = nowTime
 	t.LastRun = nowTime
@@ -938,7 +966,9 @@ func (r *taskRunner) startDaemonTask(ctx context.Context, dt *daemonTask) (bool,
 	// the task must be timeout or be null, which means that other runners does
 	// NOT try to start this task.
 	c, err := r.service.UpdateDaemonTask(ctx, []task.DaemonTask{t},
-		WithLastHeartbeat(LE, nowTime.UnixNano()-r.options.heartbeatTimeout.Nanoseconds()))
+		WithLastHeartbeat(LE, nowTime.UnixNano()-r.options.heartbeatTimeout.Nanoseconds()),
+		WithTaskEpochCond(EQ, oldEpoch),
+		WithTaskFenceExpired(nowTime.UnixMilli()))
 	if err != nil {
 		return false, err
 	}
@@ -948,6 +978,7 @@ func (r *taskRunner) startDaemonTask(ctx context.Context, dt *daemonTask) (bool,
 		return false, nil
 	}
 
+	dt.task = t
 	r.addDaemonTask(dt)
 	return true, nil
 }

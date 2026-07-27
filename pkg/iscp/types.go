@@ -174,6 +174,7 @@ type JobRuntimeKey struct {
 
 type JobFence struct {
 	ExpireAt time.Time
+	Token    string
 }
 
 type RunningJobConsumer struct {

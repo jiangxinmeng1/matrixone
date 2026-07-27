@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -664,6 +665,96 @@ func TestHeartbeatDaemonTask(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(ts))
 	assert.False(t, ts[0].LastHeartbeat.IsZero())
+}
+
+func TestHeartbeatDaemonTaskRejectsStaleOwnershipEpoch(t *testing.T) {
+	store := NewMemTaskStorage()
+	s := NewTaskService(runtime.DefaultRuntime(), store)
+	defer func() {
+		assert.NoError(t, s.Close())
+	}()
+
+	ctx := context.Background()
+	current := newTestDaemonTask(1, "t1")
+	current.TaskStatus = task.TaskStatus_Running
+	current.TaskRunner = "runner-a"
+	current.Epoch = 2
+	current.LastHeartbeat = time.Now().Add(-time.Minute)
+	mustAddTestDaemonTask(t, store, 1, current)
+
+	stale := current
+	stale.Epoch = 1
+	require.Error(t, s.HeartbeatDaemonTask(ctx, stale))
+
+	tasks, err := s.QueryDaemonTask(ctx, WithTaskIDCond(EQ, current.ID))
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	require.Equal(t, uint64(2), tasks[0].Epoch)
+	require.Equal(t, current.LastHeartbeat, tasks[0].LastHeartbeat)
+}
+
+func TestGenericDaemonTaskUpdatePreservesOwnershipFence(t *testing.T) {
+	store := NewMemTaskStorage()
+	s := NewTaskService(runtime.DefaultRuntime(), store)
+	defer func() {
+		assert.NoError(t, s.Close())
+	}()
+
+	ctx := context.Background()
+	current := newTestDaemonTask(1, "t1")
+	current.FenceToken = "ddl-generation"
+	current.FenceExpireAt = time.Now().Add(time.Minute).UnixMilli()
+	mustAddTestDaemonTask(t, store, 1, current)
+
+	stale := current
+	stale.TaskStatus = task.TaskStatus_PauseRequested
+	stale.FenceToken = ""
+	stale.FenceExpireAt = 0
+	affected, err := s.UpdateDaemonTask(ctx, []task.DaemonTask{stale})
+	require.NoError(t, err)
+	require.Equal(t, 1, affected)
+
+	tasks, err := s.QueryDaemonTask(ctx, WithTaskIDCond(EQ, current.ID))
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	require.Equal(t, task.TaskStatus_PauseRequested, tasks[0].TaskStatus)
+	require.Equal(t, "ddl-generation", tasks[0].FenceToken)
+	require.Equal(t, current.FenceExpireAt, tasks[0].FenceExpireAt)
+
+	require.NoError(t, s.HeartbeatDaemonTask(ctx, stale))
+	tasks, err = s.QueryDaemonTask(ctx, WithTaskIDCond(EQ, current.ID))
+	require.NoError(t, err)
+	require.Equal(t, "ddl-generation", tasks[0].FenceToken)
+	require.Equal(t, current.FenceExpireAt, tasks[0].FenceExpireAt)
+}
+
+func TestGenericDaemonTaskUpdateCannotRegressOwnershipEpoch(t *testing.T) {
+	store := NewMemTaskStorage()
+	s := NewTaskService(runtime.DefaultRuntime(), store)
+	defer func() {
+		assert.NoError(t, s.Close())
+	}()
+
+	ctx := context.Background()
+	current := newTestDaemonTask(1, "t1")
+	current.TaskRunner = "runner-b"
+	current.Epoch = 2
+	mustAddTestDaemonTask(t, store, 1, current)
+
+	stale := current
+	stale.TaskRunner = "runner-a"
+	stale.Epoch = 1
+	stale.TaskStatus = task.TaskStatus_PauseRequested
+	affected, err := s.UpdateDaemonTask(ctx, []task.DaemonTask{stale})
+	require.NoError(t, err)
+	require.Zero(t, affected)
+
+	tasks, err := s.QueryDaemonTask(ctx, WithTaskIDCond(EQ, current.ID))
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	require.Equal(t, uint64(2), tasks[0].Epoch)
+	require.Equal(t, "runner-b", tasks[0].TaskRunner)
+	require.NotEqual(t, task.TaskStatus_PauseRequested, tasks[0].TaskStatus)
 }
 
 func TestAddCdcTask1(t *testing.T) {

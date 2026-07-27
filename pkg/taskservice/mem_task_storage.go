@@ -465,8 +465,15 @@ func (s *memTaskStorage) UpdateDaemonTask(ctx context.Context, tasks []task.Daem
 
 	n := 0
 	for _, t := range tasks {
-		if v, ok := s.daemonTasks[t.ID]; ok && s.filterDaemonTask(c, v) {
+		if v, ok := s.daemonTasks[t.ID]; ok &&
+			v.Epoch <= t.Epoch &&
+			s.filterDaemonTask(c, v) {
 			n++
+			// Ownership fences are managed through their own token-checked
+			// storage protocol. A generic daemon-task update may have read the
+			// row before a DDL acquired its fence and must not erase it.
+			t.FenceToken = v.FenceToken
+			t.FenceExpireAt = v.FenceExpireAt
 			s.daemonTasks[t.ID] = t
 		}
 	}
@@ -527,8 +534,12 @@ func (s *memTaskStorage) HeartbeatDaemonTask(ctx context.Context, tasks []task.D
 
 	n := 0
 	for _, t := range tasks {
-		if _, ok := s.daemonTasks[t.ID]; ok {
+		if current, ok := s.daemonTasks[t.ID]; ok &&
+			current.TaskRunner == t.TaskRunner &&
+			current.Epoch == t.Epoch {
 			n++
+			t.FenceToken = current.FenceToken
+			t.FenceExpireAt = current.FenceExpireAt
 			s.daemonTasks[t.ID] = t
 		}
 	}
@@ -624,6 +635,20 @@ func (s *memTaskStorage) filterDaemonTask(c *conditions, task task.DaemonTask) b
 
 	if cond, e := (*c)[CondLastHeartbeat]; e {
 		ok = cond.eval(task.LastHeartbeat.UnixNano())
+	}
+	if !ok {
+		return false
+	}
+
+	if cond, e := (*c)[CondTaskEpoch]; e {
+		ok = cond.eval(task.Epoch)
+	}
+	if !ok {
+		return false
+	}
+
+	if cond, e := (*c)[CondTaskFenceExpired]; e {
+		ok = cond.eval(task)
 	}
 	return ok
 }

@@ -90,18 +90,49 @@ func NewJobRuntimeKey(accountID uint32, tableID uint64, jobName string, jobID ui
 // A replacement executor published under the same CN UUID therefore observes
 // the fence before admitting any consumer.
 func InstallCNJobFence(cnUUID string, key JobRuntimeKey, ttl time.Duration) {
+	_ = InstallCNJobFenceWithToken(cnUUID, key, "", ttl)
+}
+
+func InstallCNJobFenceWithToken(cnUUID string, key JobRuntimeKey, token string, ttl time.Duration) bool {
 	if cnUUID == "" || ttl <= 0 {
-		return
+		return false
 	}
 	now := time.Now()
 	cnJobFences.Lock()
+	defer cnJobFences.Unlock()
 	cleanupExpiredCNJobFencesLocked(now)
-	cnJobFences.fences[cnJobFenceKey{CNUUID: cnUUID, JobRuntimeKey: key}] =
-		JobFence{ExpireAt: now.Add(ttl)}
-	cnJobFences.Unlock()
+	fenceKey := cnJobFenceKey{CNUUID: cnUUID, JobRuntimeKey: key}
+	if current, ok := cnJobFences.fences[fenceKey]; ok && current.Token != token {
+		return false
+	}
+	fence := JobFence{ExpireAt: now.Add(ttl), Token: token}
+	if value, ok := iscpExecutors.Load(cnUUID); ok {
+		exec, ok := value.(*ISCPTaskExecutor)
+		if !ok || exec == nil {
+			return false
+		}
+		exec.runtimeMu.Lock()
+		defer exec.runtimeMu.Unlock()
+		exec.ensureRuntimeMapsLocked()
+		if current, ok := exec.fencedJobs[key]; ok &&
+			(current.ExpireAt.IsZero() || now.Before(current.ExpireAt)) &&
+			current.Token != token {
+			return false
+		}
+		// Publish to the current executor under the same lock order used by
+		// executor registration. The install acknowledgement is therefore an
+		// admission barrier for both current and replacement generations.
+		exec.fencedJobs[key] = fence
+	}
+	cnJobFences.fences[fenceKey] = fence
+	return true
 }
 
 func RenewCNJobFence(cnUUID string, key JobRuntimeKey, ttl time.Duration) bool {
+	return RenewCNJobFenceWithToken(cnUUID, key, "", ttl)
+}
+
+func RenewCNJobFenceWithToken(cnUUID string, key JobRuntimeKey, token string, ttl time.Duration) bool {
 	if cnUUID == "" || ttl <= 0 {
 		return false
 	}
@@ -110,10 +141,11 @@ func RenewCNJobFence(cnUUID string, key JobRuntimeKey, ttl time.Duration) bool {
 	cnJobFences.Lock()
 	defer cnJobFences.Unlock()
 	cleanupExpiredCNJobFencesLocked(now)
-	if _, ok := cnJobFences.fences[fenceKey]; !ok {
+	current, ok := cnJobFences.fences[fenceKey]
+	if !ok || current.Token != token {
 		return false
 	}
-	fence := JobFence{ExpireAt: now.Add(ttl)}
+	fence := JobFence{ExpireAt: now.Add(ttl), Token: token}
 	if value, ok := iscpExecutors.Load(cnUUID); ok {
 		exec, ok := value.(*ISCPTaskExecutor)
 		if !ok || exec == nil {
@@ -133,19 +165,31 @@ func RenewCNJobFence(cnUUID string, key JobRuntimeKey, ttl time.Duration) bool {
 }
 
 func RemoveCNJobFence(cnUUID string, key JobRuntimeKey) {
+	_ = RemoveCNJobFenceWithToken(cnUUID, key, "")
+}
+
+func RemoveCNJobFenceWithToken(cnUUID string, key JobRuntimeKey, token string) bool {
 	if cnUUID == "" {
-		return
+		return false
 	}
 	cnJobFences.Lock()
-	delete(cnJobFences.fences, cnJobFenceKey{CNUUID: cnUUID, JobRuntimeKey: key})
+	defer cnJobFences.Unlock()
+	fenceKey := cnJobFenceKey{CNUUID: cnUUID, JobRuntimeKey: key}
+	current, ok := cnJobFences.fences[fenceKey]
+	if !ok || current.Token != token {
+		return false
+	}
+	delete(cnJobFences.fences, fenceKey)
 	if value, ok := iscpExecutors.Load(cnUUID); ok {
 		if exec, ok := value.(*ISCPTaskExecutor); ok && exec != nil {
 			exec.runtimeMu.Lock()
-			delete(exec.fencedJobs, key)
+			if current, ok := exec.fencedJobs[key]; ok && current.Token == token {
+				delete(exec.fencedJobs, key)
+			}
 			exec.runtimeMu.Unlock()
 		}
 	}
-	cnJobFences.Unlock()
+	return true
 }
 
 func removeCNTableJobFences(cnUUID string, accountID uint32, tableID uint64) {
@@ -227,21 +271,48 @@ func (exec *ISCPTaskExecutor) isJobFencedLocked(key JobRuntimeKey, now time.Time
 
 // InstallJobFence upserts both the executor-local and generation-independent CN fence.
 func (exec *ISCPTaskExecutor) InstallJobFence(key JobRuntimeKey, ttl time.Duration) {
+	_ = exec.InstallJobFenceWithToken(key, "", ttl)
+}
+
+func (exec *ISCPTaskExecutor) InstallJobFenceWithToken(key JobRuntimeKey, token string, ttl time.Duration) bool {
 	if exec == nil || ttl <= 0 {
-		return
+		return false
 	}
 	now := time.Now()
-	fence := JobFence{ExpireAt: now.Add(ttl)}
+	fence := JobFence{ExpireAt: now.Add(ttl), Token: token}
 	if exec.cnUUID != "" {
 		cnJobFences.Lock()
 		defer cnJobFences.Unlock()
 		cleanupExpiredCNJobFencesLocked(now)
-		cnJobFences.fences[cnJobFenceKey{CNUUID: exec.cnUUID, JobRuntimeKey: key}] = fence
+		fenceKey := cnJobFenceKey{CNUUID: exec.cnUUID, JobRuntimeKey: key}
+		if current, ok := cnJobFences.fences[fenceKey]; ok && current.Token != token {
+			return false
+		}
+		exec.runtimeMu.Lock()
+		defer exec.runtimeMu.Unlock()
+		exec.ensureRuntimeMapsLocked()
+		if current, ok := exec.fencedJobs[key]; ok &&
+			(current.ExpireAt.IsZero() || now.Before(current.ExpireAt)) &&
+			current.Token != token {
+			return false
+		}
+		// Validate both copies before publishing either one. Otherwise a
+		// conflicting executor-local generation could leave behind a CN fence
+		// that no request actually owns.
+		cnJobFences.fences[fenceKey] = fence
+		exec.fencedJobs[key] = fence
+		return true
 	}
 	exec.runtimeMu.Lock()
+	defer exec.runtimeMu.Unlock()
 	exec.ensureRuntimeMapsLocked()
+	if current, ok := exec.fencedJobs[key]; ok &&
+		(current.ExpireAt.IsZero() || now.Before(current.ExpireAt)) &&
+		current.Token != token {
+		return false
+	}
 	exec.fencedJobs[key] = fence
-	exec.runtimeMu.Unlock()
+	return true
 }
 
 func (exec *ISCPTaskExecutor) CancelAndDrainJobConsumer(
@@ -251,6 +322,17 @@ func (exec *ISCPTaskExecutor) CancelAndDrainJobConsumer(
 	jobName string,
 	jobID uint64,
 ) error {
+	return exec.CancelAndDrainJobConsumerWithToken(ctx, accountID, tableID, jobName, jobID, "")
+}
+
+func (exec *ISCPTaskExecutor) CancelAndDrainJobConsumerWithToken(
+	ctx context.Context,
+	accountID uint32,
+	tableID uint64,
+	jobName string,
+	jobID uint64,
+	token string,
+) error {
 	if exec == nil {
 		return nil
 	}
@@ -259,7 +341,9 @@ func (exec *ISCPTaskExecutor) CancelAndDrainJobConsumer(
 	cancelErr := moerr.NewInternalErrorNoCtx("iscp job consumer canceled")
 
 	ttl := RollbackFenceTTL()
-	exec.InstallJobFence(key, ttl)
+	if !exec.InstallJobFenceWithToken(key, token, ttl) {
+		return moerr.NewInternalErrorNoCtx("iscp job consumer is fenced by another ownership generation")
+	}
 	exec.runtimeMu.Lock()
 	exec.ensureRuntimeMapsLocked()
 	handles := make([]*RunningJobConsumer, 0, 1)
@@ -290,31 +374,46 @@ func (exec *ISCPTaskExecutor) CancelAndDrainJobConsumer(
 }
 
 func (exec *ISCPTaskExecutor) RemoveJobFence(key JobRuntimeKey) {
+	_ = exec.RemoveJobFenceWithToken(key, "")
+}
+
+func (exec *ISCPTaskExecutor) RemoveJobFenceWithToken(key JobRuntimeKey, token string) bool {
 	if exec == nil {
-		return
+		return false
 	}
-	RemoveCNJobFence(exec.cnUUID, key)
+	if exec.cnUUID != "" {
+		return RemoveCNJobFenceWithToken(exec.cnUUID, key, token)
+	}
 	exec.runtimeMu.Lock()
+	defer exec.runtimeMu.Unlock()
+	current, ok := exec.fencedJobs[key]
+	if !ok || current.Token != token {
+		return false
+	}
 	delete(exec.fencedJobs, key)
-	exec.runtimeMu.Unlock()
+	return true
 }
 
 func (exec *ISCPTaskExecutor) RenewJobFence(key JobRuntimeKey, ttl time.Duration) bool {
+	return exec.RenewJobFenceWithToken(key, "", ttl)
+}
+
+func (exec *ISCPTaskExecutor) RenewJobFenceWithToken(key JobRuntimeKey, token string, ttl time.Duration) bool {
 	if exec == nil || ttl <= 0 {
 		return false
 	}
 	now := time.Now()
 	if exec.cnUUID != "" {
-		return RenewCNJobFence(exec.cnUUID, key, ttl)
+		return RenewCNJobFenceWithToken(exec.cnUUID, key, token, ttl)
 	}
 
 	exec.runtimeMu.Lock()
 	defer exec.runtimeMu.Unlock()
 	exec.ensureRuntimeMapsLocked()
-	if !exec.isJobFencedLocked(key, now) {
+	if !exec.isJobFencedLocked(key, now) || exec.fencedJobs[key].Token != token {
 		return false
 	}
-	exec.fencedJobs[key] = JobFence{ExpireAt: now.Add(ttl)}
+	exec.fencedJobs[key] = JobFence{ExpireAt: now.Add(ttl), Token: token}
 	return true
 }
 

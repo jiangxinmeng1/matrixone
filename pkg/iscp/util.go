@@ -508,6 +508,29 @@ func GetTaskRunner(
 	return readSingleTaskRunner(result)
 }
 
+type TaskOwnership struct {
+	Runner string
+	Epoch  uint64
+}
+
+func GetTaskOwnership(
+	ctx context.Context,
+	cnUUID string,
+	txn client.TxnOperator,
+) (TaskOwnership, error) {
+	ctxWithSysAccount := context.WithValue(ctx, defines.TenantIDKey{}, catalog.System_Account)
+	ctxWithTimeout, cancel := context.WithTimeoutCause(ctxWithSysAccount, time.Minute*5, moerr.NewInternalErrorNoCtx("iscp get task runner timeout"))
+	defer cancel()
+
+	sql := `select task_runner, task_epoch from mo_task.sys_daemon_task where task_type = "ISCP" and task_runner is not null`
+	result, err := ExecWithResult(ctxWithTimeout, sql, cnUUID, txn)
+	if err != nil {
+		return TaskOwnership{}, err
+	}
+	defer result.Close()
+	return readSingleTaskOwnership(result)
+}
+
 func readSingleTaskRunner(result executor.Result) (string, error) {
 	runners := make([]string, 0, 1)
 	result.ReadRows(func(rows int, cols []*vector.Vector) bool {
@@ -527,4 +550,131 @@ func readSingleTaskRunner(result executor.Result) (string, error) {
 		return "", moerr.NewInternalErrorNoCtx("task runner is null")
 	}
 	return runners[0], nil
+}
+
+func readSingleTaskOwnership(result executor.Result) (TaskOwnership, error) {
+	owners := make([]TaskOwnership, 0, 1)
+	result.ReadRows(func(rows int, cols []*vector.Vector) bool {
+		if rows == 0 {
+			return true
+		}
+		runners := executor.GetStringRows(cols[0])
+		epochs := executor.GetFixedRows[uint64](cols[1])
+		for i := range runners {
+			owners = append(owners, TaskOwnership{Runner: runners[i], Epoch: epochs[i]})
+		}
+		return len(owners) < 2
+	})
+	if len(owners) == 0 {
+		return TaskOwnership{}, nil
+	}
+	if len(owners) != 1 {
+		return TaskOwnership{}, moerr.NewInternalErrorNoCtx(fmt.Sprintf("unexpected rows count: %d", len(owners)))
+	}
+	if owners[0].Runner == "" {
+		return TaskOwnership{}, moerr.NewInternalErrorNoCtx("task runner is null")
+	}
+	return owners[0], nil
+}
+
+func AcquireTaskOwnershipFence(
+	ctx context.Context,
+	cnUUID string,
+	ownership TaskOwnership,
+	token string,
+	ttl time.Duration,
+) error {
+	if ownership.Runner == "" || token == "" || ttl <= 0 {
+		return moerr.NewInternalErrorNoCtx("invalid ISCP task ownership fence")
+	}
+	now := time.Now().UnixMilli()
+	sql := fmt.Sprintf(
+		`update mo_task.sys_daemon_task set task_fence_token='%s', task_fence_expire_at=%d `+
+			`where task_type='ISCP' and task_runner='%s' and task_epoch=%d `+
+			`and (task_fence_token='' or task_fence_token is null or task_fence_expire_at<=%d)`,
+		token,
+		now+ttl.Milliseconds(),
+		ownership.Runner,
+		ownership.Epoch,
+		now,
+	)
+	result, err := ExecWithResult(ctx, sql, cnUUID, nil)
+	if err != nil {
+		return err
+	}
+	defer result.Close()
+	if result.AffectedRows != 1 {
+		return moerr.NewInternalErrorNoCtxf(
+			"ISCP task ownership changed or is already fenced: runner=%s epoch=%d",
+			ownership.Runner,
+			ownership.Epoch,
+		)
+	}
+	return nil
+}
+
+func RenewTaskOwnershipFence(
+	ctx context.Context,
+	cnUUID string,
+	ownership TaskOwnership,
+	token string,
+	ttl time.Duration,
+) error {
+	if token == "" || ttl <= 0 {
+		return moerr.NewInternalErrorNoCtx("invalid ISCP task ownership fence renewal")
+	}
+	now := time.Now().UnixMilli()
+	sql := fmt.Sprintf(
+		`update mo_task.sys_daemon_task set task_fence_expire_at=%d `+
+			`where task_type='ISCP' and task_runner='%s' and task_epoch=%d `+
+			`and task_fence_token='%s' and task_fence_expire_at>%d`,
+		now+ttl.Milliseconds(),
+		ownership.Runner,
+		ownership.Epoch,
+		token,
+		now,
+	)
+	result, err := ExecWithResult(ctx, sql, cnUUID, nil)
+	if err != nil {
+		return err
+	}
+	defer result.Close()
+	if result.AffectedRows != 1 {
+		return moerr.NewInternalErrorNoCtxf(
+			"ISCP task ownership fence lost: runner=%s epoch=%d",
+			ownership.Runner,
+			ownership.Epoch,
+		)
+	}
+	return nil
+}
+
+func RemoveTaskOwnershipFence(
+	ctx context.Context,
+	cnUUID string,
+	ownership TaskOwnership,
+	token string,
+) error {
+	if token == "" {
+		return nil
+	}
+	sql := fmt.Sprintf(
+		`update mo_task.sys_daemon_task set task_fence_token='', task_fence_expire_at=0 `+
+			`where task_type='ISCP' and task_runner='%s' and task_epoch=%d and task_fence_token='%s'`,
+		ownership.Runner,
+		ownership.Epoch,
+		token,
+	)
+	result, err := ExecWithResult(ctx, sql, cnUUID, nil)
+	if err != nil {
+		return err
+	}
+	defer result.Close()
+	if result.AffectedRows > 1 {
+		return moerr.NewInternalErrorNoCtxf(
+			"unexpected ISCP task ownership fence rows: %d",
+			result.AffectedRows,
+		)
+	}
+	return nil
 }

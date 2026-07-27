@@ -366,6 +366,8 @@ message ISCPDrainConsumerRequest {
   uint64 JobID = 4;
   bool RemoveFenceOnly = 5;
   bool RenewFenceOnly = 6;
+  string FenceToken = 7;
+  bool InstallFenceOnly = 8;
 }
 
 message ISCPDrainConsumerResponse {

@@ -186,6 +186,71 @@ func TestRenewJobFenceCannotResurrectRemovedCNFence(t *testing.T) {
 		"republishing an old executor must reconcile its local map with the removed CN fence")
 }
 
+func TestJobFenceTokenRejectsStaleRenewAndRemove(t *testing.T) {
+	const runnerCN = "token-runner-cn"
+	key := NewJobRuntimeKey(1, 2, "index_idx01", 1)
+	exec := newRuntimeTestExecutor()
+	exec.cnUUID = runnerCN
+	RegisterExecutorRuntime(runnerCN, exec)
+	defer func() {
+		RemoveCNJobFenceWithToken(runnerCN, key, "current")
+		UnregisterExecutorRuntime(runnerCN, exec)
+	}()
+
+	require.True(t, exec.InstallJobFenceWithToken(key, "current", time.Minute))
+	require.False(t, exec.RenewJobFenceWithToken(key, "stale", time.Hour))
+	require.False(t, exec.RemoveJobFenceWithToken(key, "stale"))
+	require.True(t, exec.IsJobFenced(key))
+
+	require.True(t, exec.RenewJobFenceWithToken(key, "current", time.Hour))
+	require.True(t, exec.RemoveJobFenceWithToken(key, "current"))
+	require.False(t, exec.IsJobFenced(key))
+}
+
+func TestCNFenceInstallImmediatelyBlocksCurrentExecutor(t *testing.T) {
+	const runnerCN = "current-executor-runner-cn"
+	key := NewJobRuntimeKey(1, 2, "index_idx01", 1)
+	exec := newRuntimeTestExecutor()
+	exec.cnUUID = runnerCN
+	RegisterExecutorRuntime(runnerCN, exec)
+	defer func() {
+		RemoveCNJobFenceWithToken(runnerCN, key, "generation-1")
+		UnregisterExecutorRuntime(runnerCN, exec)
+	}()
+
+	require.True(t, InstallCNJobFenceWithToken(
+		runnerCN,
+		key,
+		"generation-1",
+		time.Minute,
+	))
+	_, ok := exec.RegisterRunningConsumer(key, key.JobID, 1, func() {}, nil)
+	require.False(t, ok, "install acknowledgement must fence the current executor")
+}
+
+func TestTokenizedCNFenceSurvivesExecutorGenerationReplacement(t *testing.T) {
+	const runnerCN = "token-generation-runner-cn"
+	key := NewJobRuntimeKey(1, 2, "index_idx01", 1)
+	first := newRuntimeTestExecutor()
+	first.cnUUID = runnerCN
+	second := newRuntimeTestExecutor()
+	second.cnUUID = runnerCN
+	RegisterExecutorRuntime(runnerCN, first)
+
+	require.True(t, first.InstallJobFenceWithToken(key, "generation-1", time.Minute))
+	UnregisterExecutorRuntime(runnerCN, first)
+	RegisterExecutorRuntime(runnerCN, second)
+	defer func() {
+		RemoveCNJobFenceWithToken(runnerCN, key, "generation-1")
+		UnregisterExecutorRuntime(runnerCN, second)
+	}()
+
+	require.True(t, second.IsJobFenced(key))
+	require.False(t, second.RemoveJobFenceWithToken(key, "stale-generation"))
+	require.True(t, second.IsJobFenced(key))
+	require.True(t, second.RemoveJobFenceWithToken(key, "generation-1"))
+}
+
 func TestExpiredJobFenceIsClearedWhenChecked(t *testing.T) {
 	exec := newRuntimeTestExecutor()
 	key := NewJobRuntimeKey(1, 2, "index_idx01", 1)

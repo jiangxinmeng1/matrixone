@@ -285,6 +285,77 @@ func TestStartTaskHandleBranches(t *testing.T) {
 	}, time.Second, time.Millisecond*10)
 }
 
+func TestStartDaemonTaskRejectsActiveOwnershipFence(t *testing.T) {
+	r, store := newDaemonHandleTestRunner(t)
+	dt := newDaemonTaskForTest(1, task.TaskStatus_Created, "")
+	dt.Metadata.ID = "fenced-start-1"
+	dt.Epoch = 4
+	dt.FenceToken = "ddl-generation"
+	dt.FenceExpireAt = time.Now().Add(time.Minute).UnixMilli()
+	mustAddTestDaemonTask(t, store, 1, dt)
+	ref := &daemonTask{task: dt}
+
+	started, err := r.startDaemonTask(context.Background(), ref)
+	require.NoError(t, err)
+	require.False(t, started)
+
+	tasks, err := r.service.QueryDaemonTask(context.Background(), WithTaskIDCond(EQ, dt.ID))
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	require.Equal(t, uint64(4), tasks[0].Epoch)
+	require.Equal(t, "ddl-generation", tasks[0].FenceToken)
+	require.Empty(t, tasks[0].TaskRunner)
+}
+
+func TestResumeAndRestartRejectActiveOwnershipFence(t *testing.T) {
+	tests := []struct {
+		name   string
+		status task.TaskStatus
+		handle func(*taskRunner, *daemonTask) TaskHandler
+	}{
+		{
+			name:   "resume",
+			status: task.TaskStatus_ResumeRequested,
+			handle: func(r *taskRunner, dt *daemonTask) TaskHandler {
+				return newResumeTask(r, dt)
+			},
+		},
+		{
+			name:   "restart",
+			status: task.TaskStatus_RestartRequested,
+			handle: func(r *taskRunner, dt *daemonTask) TaskHandler {
+				return newRestartTask(r, dt)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r, store := newDaemonHandleTestRunner(t)
+			dt := newDaemonTaskForTest(1, test.status, r.runnerID)
+			dt.Metadata.ID = "fenced-" + test.name
+			dt.Epoch = 5
+			dt.FenceToken = "ddl-generation"
+			dt.FenceExpireAt = time.Now().Add(time.Minute).UnixMilli()
+			mustAddTestDaemonTask(t, store, 1, dt)
+			ref := &daemonTask{task: dt}
+			ar := ActiveRoutine(newMockActiveRoutine())
+			ref.activeRoutine.Store(&ar)
+
+			err := test.handle(r, ref).Handle(context.Background())
+			require.ErrorContains(t, err, "ownership generation is fenced or has changed")
+
+			tasks, queryErr := r.service.QueryDaemonTask(
+				context.Background(),
+				WithTaskIDCond(EQ, dt.ID),
+			)
+			require.NoError(t, queryErr)
+			require.Len(t, tasks, 1)
+			require.Equal(t, test.status, tasks[0].TaskStatus)
+			require.Equal(t, "ddl-generation", tasks[0].FenceToken)
+		})
+	}
+}
+
 func TestResumeTaskHandleBranchesDirect(t *testing.T) {
 	r, store := newDaemonHandleTestRunner(t)
 	hook := &serviceWithDaemonHook{TaskService: r.service}
@@ -598,6 +669,9 @@ func (r *taskRunner) testRegisterExecutor(t *testing.T, code task.TaskCode, star
 func expectTaskStatus(
 	t *testing.T, store TaskStorage, dt task.DaemonTask, before task.TaskStatus, after task.TaskStatus,
 ) {
+	current := mustGetTestDaemonTask(t, store, 1, WithTaskIDCond(EQ, dt.ID))[0]
+	dt.Epoch = current.Epoch
+	dt.TaskRunner = current.TaskRunner
 	dt.TaskStatus = before
 	mustUpdateTestDaemonTask(t, store, 1, []task.DaemonTask{dt})
 	timer := time.NewTimer(time.Second * 5)
@@ -858,6 +932,9 @@ func TestRestartDaemonTaskWithEmptyRunner(t *testing.T) {
 		waitStarted(&started, time.Second*5)
 
 		// Update task status to RestartRequested (TaskRunner still empty)
+		current := mustGetTestDaemonTask(t, store, 1, WithTaskIDCond(EQ, dt.ID))[0]
+		dt.Epoch = current.Epoch
+		dt.TaskRunner = current.TaskRunner
 		dt.TaskStatus = task.TaskStatus_RestartRequested
 		mustUpdateTestDaemonTask(t, store, 1, []task.DaemonTask{dt})
 

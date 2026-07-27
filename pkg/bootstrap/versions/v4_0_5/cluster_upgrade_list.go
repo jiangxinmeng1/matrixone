@@ -14,7 +14,59 @@
 
 package v4_0_5
 
-import "github.com/matrixorigin/matrixone/pkg/bootstrap/versions"
+import (
+	"fmt"
 
-// No cluster-level upgrades for v4.0.5.
-var clusterUpgEntries = []versions.UpgradeEntry{}
+	"github.com/matrixorigin/matrixone/pkg/bootstrap/versions"
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
+)
+
+var clusterUpgEntries = []versions.UpgradeEntry{
+	upgDaemonTaskEpoch,
+	upgDaemonTaskFenceToken,
+	upgDaemonTaskFenceExpireAt,
+}
+
+var upgDaemonTaskEpoch = addDaemonTaskColumn(
+	"task_epoch",
+	"bigint unsigned not null default 0",
+)
+
+var upgDaemonTaskFenceToken = addDaemonTaskColumn(
+	"task_fence_token",
+	"varchar(64) not null default ''",
+)
+
+var upgDaemonTaskFenceExpireAt = addDaemonTaskColumn(
+	"task_fence_expire_at",
+	"bigint not null default 0",
+)
+
+func addDaemonTaskColumn(name, definition string) versions.UpgradeEntry {
+	return versions.UpgradeEntry{
+		Schema:    catalog.MOTaskDB,
+		TableName: catalog.MOSysDaemonTask,
+		UpgType:   versions.ADD_COLUMN,
+		UpgSql: fmt.Sprintf(
+			"alter table %s.%s add column %s %s",
+			catalog.MOTaskDB,
+			catalog.MOSysDaemonTask,
+			name,
+			definition,
+		),
+		CheckFunc: func(txn executor.TxnExecutor, accountID uint32) (bool, error) {
+			info, err := versions.CheckTableColumn(
+				txn,
+				accountID,
+				catalog.MOTaskDB,
+				catalog.MOSysDaemonTask,
+				name,
+			)
+			if err != nil {
+				return false, err
+			}
+			return info.IsExits, nil
+		},
+	}
+}

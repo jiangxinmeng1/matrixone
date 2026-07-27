@@ -54,9 +54,12 @@ func TestIcebergOrphanCleanupTenantUpgradeEntries(t *testing.T) {
 	}
 }
 
-func TestIcebergOrphanCleanupVersionHandleMetadataAndClusterNoop(t *testing.T) {
+func TestIcebergOrphanCleanupVersionHandleMetadata(t *testing.T) {
 	meta := Handler.Metadata()
-	if meta.Version != "4.0.5" || meta.MinUpgradeVersion != "4.0.4" || meta.UpgradeTenant != versions.Yes {
+	if meta.Version != "4.0.5" ||
+		meta.MinUpgradeVersion != "4.0.4" ||
+		meta.UpgradeCluster != versions.Yes ||
+		meta.UpgradeTenant != versions.Yes {
 		t.Fatalf("unexpected metadata: %+v", meta)
 	}
 	if meta.VersionOffset != uint32(len(tenantUpgEntries)+len(clusterUpgEntries)) {
@@ -65,5 +68,23 @@ func TestIcebergOrphanCleanupVersionHandleMetadataAndClusterNoop(t *testing.T) {
 	err := Handler.HandleCreateFrameworkDeps(nil)
 	if err == nil || !strings.Contains(err.Error(), "Only v1.2.0") {
 		t.Fatalf("unexpected framework deps error: %v", err)
+	}
+}
+
+func TestDaemonTaskOwnershipFenceClusterUpgradeEntries(t *testing.T) {
+	if len(clusterUpgEntries) != 3 {
+		t.Fatalf("expected 3 daemon ownership upgrades, got %d", len(clusterUpgEntries))
+	}
+	for i, name := range []string{"task_epoch", "task_fence_token", "task_fence_expire_at"} {
+		entry := clusterUpgEntries[i]
+		if entry.UpgType != versions.ADD_COLUMN {
+			t.Fatalf("%s should be ADD_COLUMN", name)
+		}
+		lower := strings.ToLower(entry.UpgSql)
+		for _, want := range []string{"alter table", "mo_task.sys_daemon_task", "add column", name} {
+			if !strings.Contains(lower, want) {
+				t.Fatalf("%s upgrade SQL missing %q: %s", name, want, entry.UpgSql)
+			}
+		}
 	}
 }

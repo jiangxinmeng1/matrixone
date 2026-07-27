@@ -80,6 +80,11 @@ func TestBuildWhereClause(t *testing.T) {
 	}
 }
 
+func TestGenericDaemonTaskUpdateDoesNotOverwriteOwnershipFence(t *testing.T) {
+	require.NotContains(t, updateDaemonTask, "task_fence_token")
+	require.NotContains(t, updateDaemonTask, "task_fence_expire_at")
+}
+
 var (
 	asyncRows = []string{
 		"task_id",
@@ -121,6 +126,9 @@ var (
 		"task_type",
 		"task_runner",
 		"task_status",
+		"task_epoch",
+		"task_fence_token",
+		"task_fence_expire_at",
 		"last_heartbeat",
 		"create_at",
 		"update_at",
@@ -140,6 +148,9 @@ var (
 		"task_type",
 		"task_runner",
 		"task_status",
+		"task_epoch",
+		"task_fence_token",
+		"task_fence_expire_at",
 		"last_heartbeat",
 		"create_at",
 		"update_at",
@@ -464,6 +475,9 @@ func newDaemonTaskRows(t *testing.T, dt task.DaemonTask) *sqlmock.Rows {
 		dt.TaskType,
 		dt.TaskRunner,
 		dt.TaskStatus,
+		dt.Epoch,
+		dt.FenceToken,
+		dt.FenceExpireAt,
 		dt.LastHeartbeat,
 		dt.CreateAt,
 		dt.UpdateAt,
@@ -506,7 +520,8 @@ func TestAddCdcTask(t *testing.T) {
 		newDaemonTaskRows(t, dt),
 	)
 
-	mock.ExpectExec(updateDaemonTask).WithArgs(
+	mock.ExpectExec(updateDaemonTask+" AND task_epoch<=0").WithArgs(
+		sqlmock.AnyArg(),
 		sqlmock.AnyArg(),
 		sqlmock.AnyArg(),
 		sqlmock.AnyArg(),
@@ -603,7 +618,8 @@ func Test_AddDaemonTask(t *testing.T) {
 	assert.Greater(t, cnt, 0)
 
 	mock.ExpectBegin()
-	mock.ExpectExec(updateDaemonTask).WithArgs(
+	mock.ExpectExec(updateDaemonTask+" AND task_epoch<=0").WithArgs(
+		sqlmock.AnyArg(),
 		sqlmock.AnyArg(),
 		sqlmock.AnyArg(),
 		sqlmock.AnyArg(),
@@ -715,7 +731,7 @@ func TestDaemonTaskInSqlMock(t *testing.T) {
 
 	mock.ExpectQuery(selectDaemonTask + " AND task_id=1 order by task_id").
 		WillReturnRows(sqlmock.NewRows(daemonRows).
-			AddRow(1, "a", 0, []byte(nil), "{}", 0, 0, "", 0, 0, time.Time{}, time.Time{}, time.Time{}, time.Time{}, time.Time{}, 0))
+			AddRow(1, "a", 0, []byte(nil), "{}", 0, 0, "", 0, 0, 0, "", 0, time.Time{}, time.Time{}, time.Time{}, time.Time{}, time.Time{}, 0))
 
 	daemonTask, err := storage.QueryDaemonTask(context.Background(), WithTaskIDCond(EQ, 1))
 	assert.NoError(t, err)
@@ -723,8 +739,8 @@ func TestDaemonTaskInSqlMock(t *testing.T) {
 	assert.Equal(t, "a", daemonTask[0].Metadata.ID)
 
 	mock.ExpectBegin()
-	mock.ExpectExec(updateDaemonTask).
-		WithArgs(0, []byte(nil), "{}", "Unknown", 0, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+	mock.ExpectExec(updateDaemonTask+" AND task_epoch<=0").
+		WithArgs(0, []byte(nil), "{}", "Unknown", 0, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 	update, err := storage.UpdateDaemonTask(context.Background(), []task.DaemonTask{{
@@ -734,7 +750,7 @@ func TestDaemonTaskInSqlMock(t *testing.T) {
 	assert.Equal(t, 1, update)
 
 	mock.ExpectBegin()
-	mock.ExpectExec(heartbeatDaemonTask).WithArgs(time.Time{}, 0).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(heartbeatDaemonTask).WithArgs(time.Time{}, 0, "", uint64(0)).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
 	heartbeat, err := storage.HeartbeatDaemonTask(context.Background(), []task.DaemonTask{{
@@ -1492,7 +1508,7 @@ func TestUpdateDaemonTaskBranchesInSqlMock(t *testing.T) {
 	t.Run("rollback join error", func(t *testing.T) {
 		storage, mock := newMockStorage(t)
 		mock.ExpectBegin()
-		mock.ExpectExec(updateDaemonTask).WillReturnError(errors.New("exec failed"))
+		mock.ExpectExec(updateDaemonTask + " AND task_epoch<=0").WillReturnError(errors.New("exec failed"))
 		mock.ExpectRollback().WillReturnError(errors.New("rollback failed"))
 		_, err := storage.UpdateDaemonTask(ctx, []task.DaemonTask{d})
 		require.Error(t, err)
@@ -1505,7 +1521,7 @@ func TestUpdateDaemonTaskBranchesInSqlMock(t *testing.T) {
 	t.Run("commit error", func(t *testing.T) {
 		storage, mock := newMockStorage(t)
 		mock.ExpectBegin()
-		mock.ExpectExec(updateDaemonTask).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(updateDaemonTask + " AND task_epoch<=0").WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
 		_, err := storage.UpdateDaemonTask(ctx, []task.DaemonTask{d})
 		require.Error(t, err)
@@ -1521,6 +1537,7 @@ func TestRunUpdateDaemonTaskBranches(t *testing.T) {
 
 	d := newDaemonTaskForTest(1, task.TaskStatus_Running, "r1")
 	d.Metadata.ID = "run-update-daemon"
+	d.Epoch = 7
 	now := time.Now()
 	d.LastHeartbeat = now
 	d.UpdateAt = now
@@ -1529,7 +1546,8 @@ func TestRunUpdateDaemonTaskBranches(t *testing.T) {
 
 	t.Run("success", func(t *testing.T) {
 		n, err := m.RunUpdateDaemonTask(ctx, []task.DaemonTask{d}, &mockSqlExecutor{
-			execFn: func(context.Context, string, ...interface{}) (sql.Result, error) {
+			execFn: func(_ context.Context, query string, _ ...interface{}) (sql.Result, error) {
+				require.Contains(t, query, "task_epoch<=7")
 				return mockRowsAffectedResult{rows: 1}, nil
 			},
 		})
@@ -1827,7 +1845,7 @@ func TestUpdateCDCTaskBranchesInSqlMock(t *testing.T) {
 
 		mock.ExpectBegin()
 		mock.ExpectQuery(selectDaemonTask + " order by task_id").WillReturnRows(newDaemonTaskRows(t, d))
-		mock.ExpectExec(updateDaemonTask).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(updateDaemonTask + " AND task_epoch<=0").WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
 		n, err := storage.UpdateCDCTask(ctx, task.TaskStatus_PauseRequested, func(_ context.Context, _ task.TaskStatus, keyMap map[CDCTaskKey]struct{}, _ SqlExecutor) (int, error) {
 			keyMap[CDCTaskKey{

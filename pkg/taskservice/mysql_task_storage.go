@@ -136,13 +136,15 @@ var (
 		"task_type=?, " +
 		"task_status=?, " +
 		"task_runner=?, " +
+		"task_epoch=?, " +
 		"last_heartbeat=?, " +
 		"update_at=?, " +
 		"end_at=?, " +
 		"last_run=?, " +
 		"details=? where task_id=?"
 
-	heartbeatDaemonTask = "update sys_daemon_task set last_heartbeat=? where task_id=?"
+	heartbeatDaemonTask = "update sys_daemon_task set last_heartbeat=? " +
+		"where task_id=? and task_runner=? and task_epoch=?"
 
 	deleteDaemonTask = "delete from sys_daemon_task where 1=1"
 
@@ -157,6 +159,9 @@ var (
 		"task_type, " +
 		"task_runner, " +
 		"task_status, " +
+		"task_epoch, " +
+		"task_fence_token, " +
+		"task_fence_expire_at, " +
 		"last_heartbeat, " +
 		"create_at, " +
 		"update_at, " +
@@ -1578,13 +1583,18 @@ func (m *mysqlTaskStorage) RunUpdateDaemonTask(ctx context.Context, tasks []task
 				lastRun = t.LastRun
 			}
 
-			exec, err := db.ExecContext(ctx, updateSql,
+			// A stale generic update must never roll ownership back from a
+			// newer epoch (for example A/N -> B/N+1 -> stale A/N). Explicit
+			// claim conditions can make this stricter, but never weaker.
+			taskUpdateSQL := updateSql + fmt.Sprintf(" AND task_epoch<=%d", t.Epoch)
+			exec, err := db.ExecContext(ctx, taskUpdateSQL,
 				t.Metadata.Executor,
 				t.Metadata.Context,
 				string(j),
 				t.TaskType.String(),
 				t.TaskStatus,
 				t.TaskRunner,
+				t.Epoch,
 				lastHeartbeat,
 				updateAt,
 				endAt,
@@ -1674,6 +1684,9 @@ func (m *mysqlTaskStorage) RunQueryDaemonTask(ctx context.Context, db SqlExecuto
 			&taskType,
 			&runner,
 			&t.TaskStatus,
+			&t.Epoch,
+			&t.FenceToken,
+			&t.FenceExpireAt,
 			&lastHeartbeat,
 			&createAt,
 			&updateAt,
@@ -1769,6 +1782,8 @@ func (m *mysqlTaskStorage) HeartbeatDaemonTask(ctx context.Context, tasks []task
 			exec, err := tx.ExecContext(ctx, heartbeatDaemonTask,
 				lastHeartbeat,
 				t.ID,
+				t.TaskRunner,
+				t.Epoch,
 			)
 			if err != nil {
 				return err
