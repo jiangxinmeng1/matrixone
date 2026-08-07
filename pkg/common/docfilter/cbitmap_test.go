@@ -123,3 +123,75 @@ func TestCbitmapConstVector(t *testing.T) {
 		return f
 	})
 }
+
+// TestBuildIntegerFilterStaleNullBits is a regression test for the class of bugs
+// where vector.SetLength preserves stale null-bits beyond the logical length and
+// a downstream build path could mis-count non-null values, causing an out-of-
+// bounds panic or a semantically wrong filter. The current build path uses
+// vecFixedArgs which passes nitem = v.Length() to C, and the C code iterates
+// [0, nitem), so stale bits at positions >= nitem are never read. This test pins
+// that correctness assertion.
+//
+// Specifically: a length-10 int64 vector with ten non-null values and a stale
+// null bit at index 18 must produce a correct filter with all ten values present.
+// Nulls.Count() still reports the stale bit — the fix is that the build path
+// does not rely on Nulls.Count() for sizing.
+func TestBuildIntegerFilterStaleNullBits(t *testing.T) {
+	mp := mpool.MustNewZero()
+
+	vals := []int64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+	v := buildIntVec(t, mp, types.T_int64.ToType(), vals, nil)
+	defer v.Free(mp)
+
+	// Assert the pre-condition: 10 logical rows, none null inside the logical
+	// length. Then inject a stale null bit at index 18 and verify the null
+	// count is misleading — the build path must ignore it.
+	require.Equal(t, 10, v.Length())
+	require.Equal(t, 0, v.GetNulls().Count(), "no nulls inside logical length")
+
+	v.SetNull(18)
+	require.Equal(t, 1, v.GetNulls().Count(), "Nulls.Count() includes the stale bit at 18 — caller must not rely on it")
+	require.Equal(t, 10, v.Length(), "logical length unchanged")
+
+	// Build via the production entry point (BuildCbitmapBytes for a dense set,
+	// falling back to BuildCRoaringBytes for a sparse one — both paths must be
+	// safe). All ten logical values must be present.
+	payload, ok, err := BuildCbitmapBytes(v)
+	require.NoError(t, err)
+	if ok {
+		// Dense cbitmap path.
+		f, err := NewCbitmapFilter(payload)
+		require.NoError(t, err)
+		defer f.Free()
+		res := f.TestVector(v, nil)
+		require.Len(t, res, 10)
+		for i := 0; i < 10; i++ {
+			require.Equal(t, uint8(1), res[i], "cbitmap: row %d must be present", i)
+		}
+	} else {
+		// CRoaring fallback path.
+		payload, err := BuildCRoaringBytes(v)
+		require.NoError(t, err)
+		f, err := NewCRoaringFilter(payload)
+		require.NoError(t, err)
+		defer f.Free()
+		res := f.TestVector(v, nil)
+		require.Len(t, res, 10)
+		for i := 0; i < 10; i++ {
+			require.Equal(t, uint8(1), res[i], "croaring: row %d must be present", i)
+		}
+	}
+
+	// Also test the top-level Build + New round-trip (tag routing).
+	payload, err := Build(v)
+	require.NoError(t, err)
+	require.NotEmpty(t, payload)
+	f, err := New(payload)
+	require.NoError(t, err)
+	defer f.Free()
+	res := f.TestVector(v, nil)
+	require.Len(t, res, 10)
+	for i := 0; i < 10; i++ {
+		require.Equal(t, uint8(1), res[i], "Build/New round-trip: row %d must be present", i)
+	}
+}
