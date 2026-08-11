@@ -67,3 +67,35 @@ func TestContainsSkipsDuplicateAbortedOffsets(t *testing.T) {
 		return index.ErrNotFound
 	}), "all-aborted offsets must leave the key visible")
 }
+
+func TestGetDuplicatedRowsSkipsSelectionHoles(t *testing.T) {
+	mp := mpool.MustNewZero()
+	defer mpool.DeleteMPool(mp)
+	idx := NewMutIndex(types.T_int32.ToType())
+
+	values := vector.NewVec(types.T_int32.ToType())
+	defer values.Free(mp)
+	for _, value := range []int32{7, 7, 8} {
+		require.NoError(t, vector.AppendFixed(values, value, false, mp))
+	}
+	require.NoError(t, idx.BatchUpsert(values, 0))
+
+	keys := vector.NewVec(types.T_int32.ToType())
+	defer keys.Free(mp)
+	require.NoError(t, vector.AppendFixed(keys, int32(7), false, mp))
+	rowIDs := vector.NewVec(types.T_Rowid.ToType())
+	defer rowIDs.Free(mp)
+	require.NoError(t, vector.AppendFixed(rowIDs, types.Rowid{}, true, mp))
+
+	selection := index.RowSelection{}
+	selection.AddRange(0, 1)
+	selection.AddRange(2, 3)
+	blockID := types.Blockid{}
+	require.NoError(t, idx.GetDuplicatedRows(
+		context.Background(), keys, index.NewZM(types.T_int32, 0), &blockID, rowIDs,
+		func() (index.RowSelection, error) { return selection, nil }, nil, mp,
+	))
+	require.False(t, rowIDs.IsNull(0))
+	rowID := vector.GetFixedAtNoTypeCheck[types.Rowid](rowIDs, 0)
+	require.Equal(t, uint32(0), rowID.GetRowOffset())
+}

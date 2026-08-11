@@ -660,6 +660,44 @@ func FilterCachedRowsByCommitTSAndAbort(
 	return filtered, nil
 }
 
+// BuildCommitTSVisibilityMask returns the physical row offsets that are not
+// visible at snapshot. Commit timestamps need not be ordered by row offset.
+// The caller owns the returned bitmap.
+func BuildCommitTSVisibilityMask(
+	commitVec, abortVec *vector.Vector,
+	snapshot types.TS,
+) (Bitmap, error) {
+	if commitVec == nil || commitVec.GetType().Oid != types.T_TS || commitVec.IsConstNull() {
+		return NullBitmap, moerr.NewInvalidInputNoCtx("object commit-ts column is unavailable")
+	}
+	commits := vector.MustFixedColWithTypeCheck[types.TS](commitVec)
+	var aborts []bool
+	if abortVec != nil {
+		if abortVec.GetType().Oid != types.T_bool || abortVec.Length() != len(commits) {
+			return NullBitmap, moerr.NewInvalidInputNoCtx("object abort column is unavailable")
+		}
+		if !abortVec.IsConstNull() {
+			aborts = vector.MustFixedColWithTypeCheck[bool](abortVec)
+		}
+	}
+
+	mask := GetReusableBitmap()
+	for row, commit := range commits {
+		if commitVec.IsNull(uint64(row)) {
+			mask.Release()
+			return NullBitmap, moerr.NewInvalidInputNoCtxf("object commit-ts row %d is null", row)
+		}
+		if aborts != nil && abortVec.IsNull(uint64(row)) {
+			mask.Release()
+			return NullBitmap, moerr.NewInvalidInputNoCtxf("object abort row %d is null", row)
+		}
+		if commit.GT(&snapshot) || (aborts != nil && aborts[row]) {
+			mask.Add(uint64(row))
+		}
+	}
+	return mask, nil
+}
+
 // AnyCachedTSInRange checks selected commit timestamps without returning a
 // borrowed Vector. usable is false when the column cannot provide row-level
 // commit timestamps, preserving the caller's conservative fallback.

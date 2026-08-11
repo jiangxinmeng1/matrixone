@@ -1248,21 +1248,21 @@ func (p *PartitionState) countVisibleRowsInAppendableObject(
 				loadErr = err
 				return false // stop and propagate error
 			}
-			defer release()
 			if cacheVectors[0].Length() == 0 {
+				release()
 				return true
 			}
-			commitTSCol := vector.MustFixedColWithTypeCheck[types.TS](&cacheVectors[0])
-			abortColumn, err := ioutil.ValidateTombstoneAbortColumn(len(commitTSCol), &cacheVectors[1])
+			invisible, err := objectio.BuildCommitTSVisibilityMask(
+				&cacheVectors[0], &cacheVectors[1], snapshot,
+			)
 			if err != nil {
+				release()
 				loadErr = err
 				return false
 			}
-			for row, ts := range commitTSCol {
-				if (!abortColumn.IsPresent() || !abortColumn.IsAborted(row)) && ts.LE(&snapshot) {
-					count++
-				}
-			}
+			count += uint64(cacheVectors[0].Length() - invisible.Count())
+			invisible.Release()
+			release()
 			return true
 		}, obj.ObjectStats)
 	if loadErr != nil {

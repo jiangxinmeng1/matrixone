@@ -17,7 +17,6 @@ package tables
 import (
 	"context"
 	"fmt"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -196,14 +195,11 @@ func (obj *aobject) GetDuplicatedRows(
 	node := obj.PinNode()
 	defer node.Unref()
 	if !node.IsPersisted() {
-		fn := func() (minv, maxv int32, err error) {
-			obj.RUnlock()
-			defer obj.RLock()
-			if maxv, err = obj.GetMaxRowByTS(to); err != nil {
-				return
-			}
-			minv, err = obj.GetMaxRowByTS(from)
-			return
+		fn := func() (index.RowSelection, error) {
+			// memoryNode.GetDuplicatedRows invokes this callback while holding the
+			// object's read lock. Dedup checks the half-open timestamp window
+			// (from, to], matching the old row-offset boundaries.
+			return obj.appendMVCC.GetRowSelectionAfterLocked(from, to), nil
 		}
 		return node.GetDuplicatedRows(
 			ctx,
@@ -228,36 +224,6 @@ func (obj *aobject) GetDuplicatedRows(
 	}
 }
 
-func (obj *aobject) GetMaxRowByTS(ts types.TS) (int32, error) {
-	if ts.IsEmpty() {
-		return -1, nil
-	}
-	maxTS := types.MaxTs()
-	if ts.EQ(&maxTS) {
-		return math.MaxInt32, nil
-	}
-	node := obj.PinNode()
-	defer node.Unref()
-	if !node.IsPersisted() {
-		obj.RLock()
-		defer obj.RUnlock()
-		return int32(obj.appendMVCC.GetMaxRowByTSLocked(ts)), nil
-	} else {
-		vec, err := obj.LoadPersistedCommitTS(0)
-		if err != nil {
-			return 0, err
-		}
-		defer vec.Close()
-		tsVec := vector.MustFixedColNoTypeCheck[types.TS](
-			vec.GetDownstreamVector())
-		for i := range tsVec {
-			if tsVec[i].GT(&ts) {
-				return int32(i), nil
-			}
-		}
-		return int32(vec.Length()), nil
-	}
-}
 func (obj *aobject) ApplyDebugBatch(bat *containers.Batch, txn txnif.AsyncTxn) (ans []txnif.TxnEntry, err error) {
 	node := obj.PinNode()
 	defer node.Unref()

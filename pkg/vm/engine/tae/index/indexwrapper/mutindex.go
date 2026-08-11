@@ -145,7 +145,7 @@ func (idx *MutIndex) GetDuplicatedRows(
 	keysZM index.ZM,
 	blkID *types.Blockid,
 	rowIDs *vector.Vector,
-	getRowOffsetFn func() (min, max int32, err error),
+	getRowSelectionFn func() (index.RowSelection, error),
 	skipFn func(row uint32) error,
 	mp *mpool.MPool,
 ) (err error) {
@@ -159,7 +159,7 @@ func (idx *MutIndex) GetDuplicatedRows(
 			return
 		}
 	}
-	minVisibleRow, maxVisibleRow, err := getRowOffsetFn()
+	selection, err := getRowSelectionFn()
 	if err != nil {
 		return
 	}
@@ -189,10 +189,7 @@ func (idx *MutIndex) GetDuplicatedRows(
 		var maxRow uint32
 		exist := false
 		for i := len(rows) - 1; i >= 0; i-- {
-			if int32(rows[i]) <= minVisibleRow {
-				break
-			}
-			if int32(rows[i]) < maxVisibleRow {
+			if selection.Contains(rows[i]) {
 				if skipFn != nil {
 					err = skipFn(rows[i])
 					if err == index.ErrNotFound {

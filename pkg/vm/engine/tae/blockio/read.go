@@ -1101,19 +1101,13 @@ func readBlockData(
 			return
 		}
 
-		deletes = objectio.GetReusableBitmap()
-
 		t0 := time.Now()
 		abortVec := &cacheVectors2[len(cols)-1]
-		commits := vector.MustFixedColWithTypeCheck[types.TS](&cacheVectors2[len(cols)-2])
-		var aborts []bool
-		if !abortVec.IsConstNull() {
-			aborts = vector.MustFixedColWithTypeCheck[bool](abortVec)
-		}
-		for i := 0; i < len(commits); i++ {
-			if commits[i].GT(&ts) || (aborts != nil && aborts[i]) {
-				deletes.Add(uint64(i))
-			}
+		deletes, err2 = objectio.BuildCommitTSVisibilityMask(
+			&cacheVectors2[len(cols)-2], abortVec, ts,
+		)
+		if err2 != nil {
+			return
 		}
 		logutil.Debugf(
 			"blockread %s scan filter cost %v: base %s filter out %v\n ",

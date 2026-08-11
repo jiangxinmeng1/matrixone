@@ -928,6 +928,67 @@ func TestReadFilterPrefixSearchDoesNotAllocatePerBlockRow(t *testing.T) {
 	)
 }
 
+func TestBuildCommitTSVisibilityMaskWithUnorderedRows(t *testing.T) {
+	mp := mpool.MustNewZero()
+	defer mpool.DeleteMPool(mp)
+	commits := vector.NewVec(types.T_TS.ToType())
+	defer commits.Free(mp)
+	aborts := vector.NewVec(types.T_bool.ToType())
+	defer aborts.Free(mp)
+
+	for row, ts := range []types.TS{
+		types.BuildTS(10, 0),
+		types.BuildTS(4, 0),
+		types.BuildTS(8, 0),
+		types.BuildTS(3, 0),
+	} {
+		require.NoError(t, vector.AppendFixed(commits, ts, false, mp))
+		require.NoError(t, vector.AppendFixed(aborts, row == 3, false, mp))
+	}
+
+	mask, err := BuildCommitTSVisibilityMask(commits, aborts, types.BuildTS(5, 0))
+	require.NoError(t, err)
+	defer mask.Release()
+	require.Equal(t, 3, mask.Count())
+	require.True(t, mask.Contains(0), "a newer physical prefix row must be hidden")
+	require.False(t, mask.Contains(1), "a later physical row committed before the snapshot")
+	require.True(t, mask.Contains(2))
+	require.True(t, mask.Contains(3), "aborted rows are always hidden")
+
+	shortAbort := vector.NewConstNull(types.T_bool.ToType(), 1, mp)
+	defer shortAbort.Free(mp)
+	_, err = BuildCommitTSVisibilityMask(commits, shortAbort, types.BuildTS(5, 0))
+	require.Error(t, err, "a legacy const-null abort column must still align with commit-ts rows")
+}
+
+func BenchmarkBuildCommitTSVisibilityMask(b *testing.B) {
+	mp := mpool.MustNewZero()
+	defer mpool.DeleteMPool(mp)
+	commits := vector.NewVec(types.T_TS.ToType())
+	defer commits.Free(mp)
+	aborts := vector.NewVec(types.T_bool.ToType())
+	defer aborts.Free(mp)
+	for row := 0; row < 8192; row++ {
+		ts := types.BuildTS(int64((row*811)%8192), 0)
+		if err := vector.AppendFixed(commits, ts, false, mp); err != nil {
+			b.Fatal(err)
+		}
+		if err := vector.AppendFixed(aborts, false, false, mp); err != nil {
+			b.Fatal(err)
+		}
+	}
+	snapshot := types.BuildTS(4096, 0)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		mask, err := BuildCommitTSVisibilityMask(commits, aborts, snapshot)
+		if err != nil {
+			b.Fatal(err)
+		}
+		mask.Release()
+	}
+}
+
 func TestColumnCacheConstructorRejectsInvalidV2BeforeAdmission(t *testing.T) {
 	mp := mpool.MustNewZero()
 	source := vector.NewVec(types.T_varchar.ToType())

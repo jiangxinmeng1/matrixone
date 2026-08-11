@@ -20,13 +20,13 @@ import (
 	"unsafe"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
-	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 )
 
@@ -92,64 +92,90 @@ func (n *AppendMVCCHandle) GetAppendNodeByRowLocked(row uint32) (an *AppendNode)
 	return
 }
 
-func (n *AppendMVCCHandle) GetMaxRowByTSLocked(ts types.TS) uint32 {
-	_, node := n.appends.GetNodeToReadByPrepareTS(ts)
-	if node == nil {
-		return 0
-	}
-	return node.maxRow
+// GetRowSelectionByTSLocked returns rows prepared no later than ts. Physical
+// row order and prepare timestamp order are independent.
+func (n *AppendMVCCHandle) GetRowSelectionByTSLocked(ts types.TS) index.RowSelection {
+	selection := n.GetRowSelectionInRangeLocked(types.TS{}, ts)
+	selection.MakePrefix()
+	return selection
+}
+
+// GetRowSelectionInRangeLocked returns rows whose prepare timestamps are in
+// [start, end]. Holes represent physical rows between selected append nodes.
+func (n *AppendMVCCHandle) GetRowSelectionInRangeLocked(
+	start, end types.TS,
+) (selection index.RowSelection) {
+	n.appends.ForEach(func(node *AppendNode) bool {
+		if in, _ := node.PreparedIn(start, end); in {
+			selection.AddRange(node.startRow, node.maxRow)
+		}
+		return true
+	}, true)
+	return
+}
+
+// GetRowSelectionAfterLocked returns rows whose prepare timestamps are in
+// (start, end]. It is used by incremental dedup, whose lower bound was already
+// checked by the preceding timestamp window.
+func (n *AppendMVCCHandle) GetRowSelectionAfterLocked(
+	start, end types.TS,
+) (selection index.RowSelection) {
+	n.appends.ForEach(func(node *AppendNode) bool {
+		prepare := node.GetPrepare()
+		if prepare.GT(&start) && prepare.LE(&end) {
+			selection.AddRange(node.startRow, node.maxRow)
+		}
+		return true
+	}, true)
+	return
 }
 
 // it collects all append nodes in the range [start, end]
-// minRow: is the min row
-// maxRow: is the max row
+// selection: is the physical row selection, including holes between nodes
 // commitTSVec: is the commit ts vector
 // abortVec: is the abort vector
-// aborts: is the aborted bitmap
-// If checkCommit, it ignore all uncommitted nodes
+// The vectors contain selected rows only and follow physical row order.
 func (n *AppendMVCCHandle) CollectAppendLocked(
 	start, end types.TS, mp *mpool.MPool,
 ) (
-	minRow, maxRow uint32,
+	selection index.RowSelection,
 	commitTSVec, abortVec containers.Vector,
-	aborts *nulls.Bitmap,
 ) {
-	startOffset, node := n.appends.GetNodeToReadByPrepareTS(start)
-	if node != nil {
-		prepareTS := node.GetPrepare()
-		if prepareTS.LT(&start) {
-			startOffset++
+	for {
+		txns := make([]txnif.TxnReader, 0)
+		n.appends.ForEach(func(node *AppendNode) bool {
+			if in, _ := node.PreparedIn(start, end); in && node.GetTxn() != nil {
+				txns = append(txns, node.GetTxn())
+			}
+			return true
+		}, true)
+		if len(txns) == 0 {
+			break
 		}
+		n.RUnlock()
+		for _, txn := range txns {
+			txn.GetTxnState(true)
+		}
+		n.RLock()
 	}
-	endOffset, node := n.appends.GetNodeToReadByPrepareTS(end)
-	if node == nil || startOffset > endOffset {
+
+	selection = n.GetRowSelectionInRangeLocked(start, end)
+	if selection.IsEmpty() {
 		return
 	}
-	minRow = n.appends.GetNodeByOffset(startOffset).startRow
-	maxRow = node.maxRow
-
-	aborts = &nulls.Bitmap{}
 	commitTSVec = containers.MakeVector(types.T_TS.ToType(), mp)
 	abortVec = containers.MakeVector(types.T_bool.ToType(), mp)
-	n.appends.LoopOffsetRange(
-		startOffset,
-		endOffset,
+	n.appends.ForEach(
 		func(node *AppendNode) bool {
-			txn := node.GetTxn()
-			if txn != nil {
-				n.RUnlock()
-				txn.GetTxnState(true)
-				n.RLock()
-			}
-			if node.IsAborted() {
-				aborts.AddRange(uint64(node.startRow), uint64(node.maxRow))
+			if in, _ := node.PreparedIn(start, end); !in {
+				return true
 			}
 			for i := 0; i < int(node.maxRow-node.startRow); i++ {
 				commitTSVec.Append(node.GetCommitTS(), false)
 				abortVec.Append(node.IsAborted(), false)
 			}
 			return true
-		})
+		}, true)
 	return
 }
 
@@ -173,13 +199,11 @@ func (n *AppendMVCCHandle) GetCommitTSVecInRange(start, end types.TS, mp *mpool.
 	commitTSVec := containers.MakeVector(types.T_TS.ToType(), mp)
 	n.appends.ForEach(
 		func(node *AppendNode) bool {
-			in, before := node.PreparedIn(start, end)
+			in, _ := node.PreparedIn(start, end)
 			if in {
 				for i := 0; i < int(node.maxRow-node.startRow); i++ {
 					commitTSVec.Append(node.GetCommitTS(), false)
 				}
-			} else {
-				return before
 			}
 			return true
 		},
@@ -187,70 +211,40 @@ func (n *AppendMVCCHandle) GetCommitTSVecInRange(start, end types.TS, mp *mpool.
 	return commitTSVec
 }
 
-// it is used to get the visible max row for a txn
-// maxrow: is the max row that the txn can see
-// visible: is true if the txn can see any row
-// holes: is the bitmap of the holes that the txn cannot see
-// holes exists only if any append node was rollbacked
+// GetVisibleRowLocked returns all rows visible to txn. Holes include aborted
+// rows and committed rows outside the transaction snapshot.
 func (n *AppendMVCCHandle) GetVisibleRowLocked(
-	ctx context.Context,
+	_ context.Context,
 	txn txnif.TxnReader,
-) (maxrow uint32, visible bool, holes *nulls.Bitmap, err error) {
-	var holesMax uint32
-	anToWait := make([]*AppendNode, 0)
-	txnToWait := make([]txnif.TxnReader, 0)
-	n.appends.ForEach(func(an *AppendNode) bool {
-		if !an.IsSameTxn(txn) {
-			needWait, waitTxn := an.NeedWaitCommitting(txn.GetStartTS())
-			if needWait {
-				anToWait = append(anToWait, an)
-				txnToWait = append(txnToWait, waitTxn)
-				return true
+) (selection index.RowSelection, visible bool, err error) {
+	for {
+		txnToWait := make([]txnif.TxnReader, 0)
+		n.appends.ForEach(func(an *AppendNode) bool {
+			if !an.IsSameTxn(txn) {
+				if needWait, waitTxn := an.NeedWaitCommitting(txn.GetStartTS()); needWait {
+					txnToWait = append(txnToWait, waitTxn)
+				}
 			}
+			return true
+		}, true)
+		if len(txnToWait) == 0 {
+			break
 		}
-		if an.IsVisible(txn) {
-			visible = true
-			maxrow = an.maxRow
-		} else {
-			if holes == nil {
-				holes = nulls.NewWithSize(int(an.maxRow) + 1)
-			}
-			holes.AddRange(uint64(an.startRow), uint64(an.maxRow))
-			if holesMax < an.maxRow {
-				holesMax = an.maxRow
-			}
-		}
-		startTS := txn.GetStartTS()
-		return !an.Prepare.GT(&startTS)
-	}, true)
-	if len(anToWait) != 0 {
 		n.RUnlock()
-		for _, txn := range txnToWait {
-			txn.GetTxnState(true)
+		for _, waitTxn := range txnToWait {
+			waitTxn.GetTxnState(true)
 		}
 		n.RLock()
 	}
-	for _, an := range anToWait {
+
+	n.appends.ForEach(func(an *AppendNode) bool {
 		if an.IsVisible(txn) {
 			visible = true
-			if maxrow < an.maxRow {
-				maxrow = an.maxRow
-			}
-		} else {
-			if holes == nil {
-				holes = nulls.NewWithSize(int(an.maxRow) + 1)
-			}
-			holes.AddRange(uint64(an.startRow), uint64(an.maxRow))
-			if holesMax < an.maxRow {
-				holesMax = an.maxRow
-			}
+			selection.AddRange(an.startRow, an.maxRow)
 		}
-	}
-	if !holes.IsEmpty() {
-		for i := uint64(maxrow); i < uint64(holesMax); i++ {
-			holes.Del(i)
-		}
-	}
+		return true
+	}, true)
+	selection.MakePrefix()
 	return
 }
 
@@ -266,7 +260,7 @@ func (n *AppendMVCCHandle) CollectUncommittedANodesPreparedBeforeLocked(
 	n.appends.ForEach(func(an *AppendNode) bool {
 		needWait, txn := an.NeedWaitCommitting(ts)
 		if txn == nil {
-			return false
+			return true
 		}
 		if needWait {
 			foreachFn(an)
@@ -318,7 +312,15 @@ func (n *AppendMVCCHandle) GetLatestAppendPrepareTSLocked() types.TS {
 	if n.appends == nil || n.appends.IsEmpty() {
 		return types.TS{}
 	}
-	return n.appends.GetUpdateNodeLocked().Prepare
+	var latest types.TS
+	n.appends.ForEach(func(node *AppendNode) bool {
+		prepare := node.GetPrepare()
+		if prepare.GT(&latest) {
+			latest = prepare
+		}
+		return true
+	}, true)
+	return latest
 }
 func (n *AppendMVCCHandle) GetMeta() *catalog.ObjectEntry {
 	return n.meta
@@ -337,7 +339,15 @@ func (n *AppendMVCCHandle) allAppendsCommittedLocked() bool {
 	if n.appends.IsEmpty() {
 		return true
 	}
-	return n.appends.IsCommitted()
+	allCommitted := true
+	n.appends.ForEach(func(node *AppendNode) bool {
+		if !node.IsCommitted() {
+			allCommitted = false
+			return false
+		}
+		return true
+	}, true)
+	return allCommitted
 }
 
 func (n *AppendMVCCHandle) SetAppendListener(l func(txnif.AppendNode) error) {
@@ -350,20 +360,19 @@ func (n *AppendMVCCHandle) GetAppendListener() func(txnif.AppendNode) error {
 
 // AllAppendsCommittedBefore returns true if all appendnode is committed before ts.
 func (n *AppendMVCCHandle) AllAppendsCommittedBeforeLocked(ts types.TS) bool {
-	// get the latest appendnode
-	anode := n.appends.GetUpdateNodeLocked()
-	if anode == nil {
+	if n.appends == nil || n.appends.IsEmpty() {
 		return false
 	}
-
-	// if the latest appendnode is not committed, return false
-	if !anode.IsCommitted() {
-		return false
-	}
-
-	// check if the latest appendnode is committed before ts
-	commitTS := anode.GetCommitTS()
-	return commitTS.LT(&ts)
+	allBefore := true
+	n.appends.ForEach(func(node *AppendNode) bool {
+		commitTS := node.GetCommitTS()
+		if !node.IsCommitted() || !commitTS.LT(&ts) {
+			allBefore = false
+			return false
+		}
+		return true
+	}, true)
+	return allBefore
 }
 
 func (n *AppendMVCCHandle) StringLocked() string {

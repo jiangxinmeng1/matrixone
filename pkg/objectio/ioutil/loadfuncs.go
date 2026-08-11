@@ -245,21 +245,13 @@ func LoadColumnsDataInto(
 			return
 		}
 
-		deleteMask = objectio.GetReusableBitmap()
-		for i := 0; i < commits.Length(); i++ {
-			if commits.IsNull(uint64(i)) {
-				err = moerr.NewInvalidInputNoCtxf("object commit-ts row %d is null", i)
-				return
-			}
-			if hasAborts && aborts.IsNull(uint64(i)) {
-				err = moerr.NewInvalidInputNoCtxf("object abort row %d is null", i)
-				return
-			}
-			commit := vector.GetFixedAtNoTypeCheck[types.TS](&commits, i)
-			if commit.GT(visibilityTS) ||
-				(hasAborts && vector.GetFixedAtNoTypeCheck[bool](&aborts, i)) {
-				deleteMask.Add(uint64(i))
-			}
+		var abortPtr *vector.Vector
+		if hasAborts {
+			abortPtr = &aborts
+		}
+		deleteMask, err = objectio.BuildCommitTSVisibilityMask(&commits, abortPtr, *visibilityTS)
+		if err != nil {
+			return
 		}
 	}
 

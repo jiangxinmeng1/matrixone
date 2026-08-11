@@ -347,7 +347,7 @@ func TestUpdateDataBatch_RetainsSynthesizedRowID(t *testing.T) {
 	bat.Clean(mp)
 }
 
-func TestUpdatePersistedDataBatch_RetainsLeadingRowID(t *testing.T) {
+func TestUpdatePersistedDataBatch_UnorderedCommitTSRetainsLeadingRowID(t *testing.T) {
 	mp := mpool.MustNewZero()
 	defer mpool.DeleteMPool(mp)
 
@@ -359,13 +359,14 @@ func TestUpdatePersistedDataBatch_RetainsLeadingRowID(t *testing.T) {
 	bat.Vecs[3] = vector.NewVec(types.T_TS.ToType())
 	bat.Vecs[4] = vector.NewVec(types.T_bool.ToType())
 	blk := objectio.NewBlockid(objectio.NewSegmentid(), 0, 0)
+	commitTS := []int64{140, 160, 100}
 	for i, aborted := range []bool{false, true, false} {
 		require.NoError(t, vector.AppendFixed(bat.Vecs[0], int32(i+1), false, mp))
 		require.NoError(t, vector.AppendFixed(bat.Vecs[1], int32((i+1)*10), false, mp))
 		require.NoError(t, vector.AppendFixed(
 			bat.Vecs[2], types.NewRowid(blk, uint32(i)), false, mp))
 		require.NoError(t, vector.AppendFixed(
-			bat.Vecs[3], types.BuildTS(int64(100+i), 0), false, mp))
+			bat.Vecs[3], types.BuildTS(commitTS[i], 0), false, mp))
 		require.NoError(t, vector.AppendFixed(bat.Vecs[4], aborted, false, mp))
 	}
 	bat.SetRowCount(3)

@@ -201,7 +201,7 @@ func TestApplyAppendLockedPadsMissingColumnsForUpgradedSchema(t *testing.T) {
 	})
 }
 
-func TestMemoryNodeRollbackHoleVisibilityAndWriteLayout(t *testing.T) {
+func TestMemoryNodeUnorderedCommitTSAndRollbackWriteLayout(t *testing.T) {
 	defer testutils.AfterTest(t)()
 	rt := moruntime.ServiceRuntime("")
 	originalVersion, hadVersion := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
@@ -244,9 +244,10 @@ func TestMemoryNodeRollbackHoleVisibilityAndWriteLayout(t *testing.T) {
 	require.NoError(t, err)
 	defer mnode.data.Close()
 
+	prepareTS := []int64{2, 1, 2}
 	for row := uint32(0); row < 3; row++ {
 		appendNode, _ := mvcc.AddAppendNodeLocked(nil, row, row+1)
-		ts := types.BuildTS(int64(row+1), 0)
+		ts := types.BuildTS(prepareTS[row], 0)
 		appendNode.Start, appendNode.Prepare, appendNode.End = ts, ts, ts
 		if row == 1 {
 			appendNode.Aborted = true
@@ -271,6 +272,26 @@ func TestMemoryNodeRollbackHoleVisibilityAndWriteLayout(t *testing.T) {
 	)
 	require.Equal(t, []bool{false, true, false}, aborts)
 
+	// The timestamp window selects physical rows 0 and 2 with row 1 as a hole.
+	// A flush batch must compact both the user columns and MVCC columns together.
+	narrowBatches := make(map[uint32]*containers.BatchWithVersion)
+	err = mnode.getDataWindowOnWriteSchema(
+		context.Background(),
+		narrowBatches,
+		types.BuildTS(2, 0),
+		types.BuildTS(2, 0),
+		common.DefaultAllocator,
+	)
+	require.NoError(t, err)
+	narrowBatch := narrowBatches[schema.Version]
+	require.NotNil(t, narrowBatch)
+	defer narrowBatch.Close()
+	require.Equal(t, 2, narrowBatch.Length())
+	require.Equal(t, []types.TS{types.BuildTS(2, 0), types.BuildTS(2, 0)},
+		vector.MustFixedColWithTypeCheck[types.TS](
+			narrowBatch.GetVectorByName(objectio.TombstoneAttr_CommitTs_Attr).GetDownstreamVector(),
+		))
+
 	// During a rolling upgrade, the TN keeps the legacy layout and marks abort
 	// holes uncommitted so old readers hide them without shifting RowID offsets.
 	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion9)
@@ -293,9 +314,9 @@ func TestMemoryNodeRollbackHoleVisibilityAndWriteLayout(t *testing.T) {
 	legacyCommitTS := vector.MustFixedColWithTypeCheck[types.TS](
 		legacyBatch.GetVectorByName(objectio.TombstoneAttr_CommitTs_Attr).GetDownstreamVector(),
 	)
-	require.Equal(t, types.BuildTS(1, 0), legacyCommitTS[0])
+	require.Equal(t, types.BuildTS(2, 0), legacyCommitTS[0])
 	require.Equal(t, txnif.UncommitTS, legacyCommitTS[1])
-	require.Equal(t, types.BuildTS(3, 0), legacyCommitTS[2])
+	require.Equal(t, types.BuildTS(2, 0), legacyCommitTS[2])
 
 	var output *containers.Batch
 	err = mnode.Scan(

@@ -116,7 +116,7 @@ func (node *memoryNode) getDuplicatedRowsLocked(
 	keys containers.Vector,
 	keysZM index.ZM,
 	rowIDs containers.Vector,
-	getRowOffset func() (min, max int32, err error),
+	getRowSelection func() (index.RowSelection, error),
 	skipFn func(uint32) error,
 	mp *mpool.MPool,
 ) (err error) {
@@ -127,7 +127,7 @@ func (node *memoryNode) getDuplicatedRowsLocked(
 		keysZM,
 		&blkID,
 		rowIDs.GetDownstreamVector(),
-		getRowOffset,
+		getRowSelection,
 		skipFn,
 		mp)
 }
@@ -156,7 +156,7 @@ func (node *memoryNode) getDataWindowOnWriteSchema(
 	if node.data == nil {
 		return nil
 	}
-	from, to, commitTSVec, abort, _ :=
+	selection, commitTSVec, abort :=
 		node.object.appendMVCC.CollectAppendLocked(start, end, mp)
 	if commitTSVec == nil {
 		return nil
@@ -168,8 +168,22 @@ func (node *memoryNode) getDataWindowOnWriteSchema(
 		// changes. Keep the schema chosen by the first batch internally stable.
 		_, persistAbort = dest.Nameidx[objectio.TombstoneAttr_Abort_Attr]
 	}
-	inner := node.data.CloneWindowWithPool(
-		int(from), int(to-from), node.object.rt.VectorPool.Transient)
+	var inner *containers.Batch
+	selection.ForEachRange(func(from, to uint32) bool {
+		window := node.data.CloneWindowWithPool(
+			int(from), int(to-from), node.object.rt.VectorPool.Transient)
+		if inner == nil {
+			inner = window
+		} else {
+			inner.Extend(window)
+		}
+		return true
+	})
+	if inner == nil {
+		commitTSVec.Close()
+		abort.Close()
+		return nil
+	}
 	inner.AddVector(objectio.TombstoneAttr_CommitTs_Attr, commitTSVec)
 	if persistAbort {
 		inner.AddVector(objectio.TombstoneAttr_Abort_Attr, abort)
@@ -304,7 +318,7 @@ func (node *memoryNode) ApplyAppendLocked(
 func (node *memoryNode) GetDuplicatedRows(
 	ctx context.Context,
 	txn txnif.TxnReader,
-	getRowOffset func() (min, max int32, err error),
+	getRowSelection func() (index.RowSelection, error),
 	keys containers.Vector,
 	keysZM index.ZM,
 	rowIDs containers.Vector,
@@ -313,7 +327,7 @@ func (node *memoryNode) GetDuplicatedRows(
 	node.object.RLock()
 	defer node.object.RUnlock()
 	checkFn := node.checkConflictLocked(txn)
-	err = node.getDuplicatedRowsLocked(ctx, keys, keysZM, rowIDs, getRowOffset, checkFn, mp)
+	err = node.getDuplicatedRowsLocked(ctx, keys, keysZM, rowIDs, getRowSelection, checkFn, mp)
 
 	return
 }
@@ -357,7 +371,7 @@ func (node *memoryNode) Scan(
 	}
 	node.object.RLock()
 	defer node.object.RUnlock()
-	maxRow, visible, holes, err := node.object.appendMVCC.GetVisibleRowLocked(ctx, txn)
+	selection, visible, err := node.object.appendMVCC.GetVisibleRowLocked(ctx, txn)
 	if !visible || err != nil {
 		// blk.RUnlock()
 		return
@@ -371,17 +385,17 @@ func (node *memoryNode) Scan(
 		readSchema,
 		colIdxes,
 		0,
-		maxRow,
+		selection.MaxRow,
 		mp,
 	)
 	for _, idx := range colIdxes {
 		if idx == objectio.SEQNUM_COMMITTS {
 			node.object.appendMVCC.FillInCommitTSVecLocked(
-				(*bat).GetVectorByName(objectio.TombstoneAttr_CommitTs_Attr), maxRow, mp)
+				(*bat).GetVectorByName(objectio.TombstoneAttr_CommitTs_Attr), selection.MaxRow, mp)
 		}
 	}
-	if !holes.IsEmpty() {
-		holes.Foreach(func(row uint64) bool {
+	if selection.Holes != nil && !selection.Holes.IsEmpty() {
+		selection.Holes.Foreach(func(row uint64) bool {
 			(*bat).Delete(rowOffset + int(row))
 			return true
 		})
@@ -399,7 +413,7 @@ func (node *memoryNode) CollectObjectTombstoneInRange(
 ) (err error) {
 	node.object.RLock()
 	defer node.object.RUnlock()
-	minRow, maxRow, commitTSVec, abort, _ :=
+	selection, commitTSVec, abort :=
 		node.object.appendMVCC.CollectAppendLocked(start, end, mp)
 	if commitTSVec == nil {
 		return nil
@@ -411,8 +425,13 @@ func (node *memoryNode) CollectObjectTombstoneInRange(
 	commitTSs := vector.MustFixedColWithTypeCheck[types.TS](commitTSVec.GetDownstreamVector())
 	aborts := vector.MustFixedColWithTypeCheck[bool](abort.GetDownstreamVector())
 	pkVec := node.data.GetVectorByName(objectio.TombstoneAttr_PK_Attr)
-	for i := minRow; i < maxRow; i++ {
-		if aborts[i-minRow] {
+	selectedOffset := 0
+	for i := selection.MinRow; i < selection.MaxRow; i++ {
+		if !selection.Contains(i) {
+			continue
+		}
+		if aborts[selectedOffset] {
+			selectedOffset++
 			continue
 		}
 		if types.PrefixCompare(rowIDs[i][:], objID[:]) == 0 {
@@ -421,8 +440,9 @@ func (node *memoryNode) CollectObjectTombstoneInRange(
 			}
 			(*bat).GetVectorByName(objectio.TombstoneAttr_Rowid_Attr).Append(rowIDs[i], false)
 			(*bat).GetVectorByName(objectio.TombstoneAttr_PK_Attr).Append(pkVec.Get(int(i)), false)
-			(*bat).GetVectorByName(objectio.TombstoneAttr_CommitTs_Attr).Append(commitTSs[i-minRow], false)
+			(*bat).GetVectorByName(objectio.TombstoneAttr_CommitTs_Attr).Append(commitTSs[selectedOffset], false)
 		}
+		selectedOffset++
 	}
 	return
 }
@@ -436,15 +456,15 @@ func (node *memoryNode) FillBlockTombstones(
 	mp *mpool.MPool) error {
 	node.object.RLock()
 	defer node.object.RUnlock()
-	maxRow, visible, holes, err := node.object.appendMVCC.GetVisibleRowLocked(ctx, txn)
+	selection, visible, err := node.object.appendMVCC.GetVisibleRowLocked(ctx, txn)
 	if !visible || err != nil {
 		// blk.RUnlock()
 		return err
 	}
 	rowIDVec := node.data.GetVectorByName(objectio.TombstoneAttr_Rowid_Attr)
 	rowIDs := vector.MustFixedColWithTypeCheck[types.Rowid](rowIDVec.GetDownstreamVector())
-	for i := 0; i < int(maxRow); i++ {
-		if holes.Contains(uint64(i)) {
+	for i := 0; i < int(selection.MaxRow); i++ {
+		if !selection.Contains(uint32(i)) {
 			continue
 		}
 		rowID := rowIDs[i]
