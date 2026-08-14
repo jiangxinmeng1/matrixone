@@ -285,7 +285,7 @@ func (rt *Routine) handleRequest(req *Request) error {
 	// Span recording and profiling runtime.
 	routineCtx, cancelHungRequest := context.WithTimeoutCause(
 		rt.getCancelRoutineCtx(),
-		30*time.Minute,
+		10*time.Minute,
 		moerr.CauseNewMOHungSpan,
 	)
 	defer cancelHungRequest()
