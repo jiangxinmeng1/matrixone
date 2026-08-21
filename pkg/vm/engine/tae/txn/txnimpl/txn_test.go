@@ -33,6 +33,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/wal"
@@ -492,6 +493,172 @@ func TestAppend(t *testing.T) {
 	assert.Equal(t, 3*int(brows), int(tbl.dataTable.tableSpace.Rows()))
 	assert.Equal(t, 3*int(brows), int(tbl.dataTable.tableSpace.index.Count()))
 	assert.NoError(t, txn.Commit(context.Background()))
+}
+
+func TestConcurrentFreezeAppendReservations(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	ctx := context.Background()
+	dir := testutils.InitTestEnv(ModuleName, t)
+	c, mgr, driver := initTestContext(ctx, t, dir)
+	defer driver.Close()
+	defer c.Close()
+	defer mgr.Stop()
+
+	schema := catalog.MockSchemaAll(3, 1)
+	schema.Extra.BlockMaxRows = 10000
+	setup, err := mgr.StartTxn(nil)
+	require.NoError(t, err)
+	db, err := setup.CreateDatabase("db", "", "")
+	require.NoError(t, err)
+	rel, err := db.CreateRelation(schema)
+	require.NoError(t, err)
+	tableEntry := rel.GetMeta().(*catalog.TableEntry)
+	require.NoError(t, setup.Commit(ctx))
+
+	const txnCount = 8
+	const rowsPerTxn = 16
+	allRows := catalog.MockBatch(schema, txnCount*rowsPerTxn)
+	defer allRows.Close()
+	batches := allRows.Split(txnCount)
+	txns := make([]txnif.AsyncTxn, txnCount)
+	for i := range txns {
+		txns[i], err = mgr.StartTxn(nil)
+		require.NoError(t, err)
+		txnDB, err := txns[i].GetDatabase("db")
+		require.NoError(t, err)
+		txnRel, err := txnDB.GetRelationByName(schema.Name)
+		require.NoError(t, err)
+		require.NoError(t, txnRel.Append(ctx, batches[i]))
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, txnCount)
+	var wg sync.WaitGroup
+	for _, txn := range txns {
+		wg.Add(1)
+		go func(txn txnif.AsyncTxn) {
+			defer wg.Done()
+			<-start
+			errs <- txn.Commit(ctx)
+		}(txn)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.Equal(t, uint64(txnCount*rowsPerTxn), tableEntry.GetRows())
+
+	readTxn, err := mgr.StartTxn(nil)
+	require.NoError(t, err)
+	readDB, err := readTxn.GetDatabase("db")
+	require.NoError(t, err)
+	readRel, err := readDB.GetRelationByName(schema.Name)
+	require.NoError(t, err)
+	pkIdx := schema.GetSingleSortKeyIdx()
+	for row := 0; row < allRows.Length(); row++ {
+		pk := allRows.Vecs[pkIdx].Get(row)
+		value, isNull, err := readRel.GetValueByFilter(ctx, handle.NewEQFilter(pk), pkIdx)
+		require.NoError(t, err)
+		require.False(t, isNull)
+		require.Equal(t, pk, value)
+	}
+	require.NoError(t, readTxn.Commit(ctx))
+}
+
+func TestConcurrentDedupSamePK(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	ctx := context.Background()
+	dir := testutils.InitTestEnv(ModuleName, t)
+	c, mgr, driver := initTestContext(ctx, t, dir)
+	defer driver.Close()
+	defer c.Close()
+	defer mgr.Stop()
+
+	schema := catalog.MockSchemaAll(3, 1)
+	schema.Extra.BlockMaxRows = 10000
+	setup, err := mgr.StartTxn(nil)
+	require.NoError(t, err)
+	db, err := setup.CreateDatabase("db", "", "")
+	require.NoError(t, err)
+	rel, err := db.CreateRelation(schema)
+	require.NoError(t, err)
+	tableEntry := rel.GetMeta().(*catalog.TableEntry)
+	require.NoError(t, setup.Commit(ctx))
+
+	const txnCount = 16
+	txns := make([]txnif.AsyncTxn, txnCount)
+	batches := make([]*containers.Batch, txnCount)
+	for i := range txns {
+		txns[i], err = mgr.StartTxn(nil)
+		require.NoError(t, err)
+		txnDB, err := txns[i].GetDatabase("db")
+		require.NoError(t, err)
+		txnRel, err := txnDB.GetRelationByName(schema.Name)
+		require.NoError(t, err)
+		// Offset zero makes every batch contain the same primary key.
+		batches[i] = containers.MockBatchWithAttrsAndOffset(schema.Types(), schema.Attrs(), 1, 0)
+		require.NoError(t, txnRel.Append(ctx, batches[i]))
+	}
+	defer func() {
+		for _, bat := range batches {
+			bat.Close()
+		}
+	}()
+
+	start := make(chan struct{})
+	errs := make(chan error, txnCount)
+	var wg sync.WaitGroup
+	for _, txn := range txns {
+		wg.Add(1)
+		go func(txn txnif.AsyncTxn) {
+			defer wg.Done()
+			<-start
+			errs <- txn.Commit(ctx)
+		}(txn)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	successes := 0
+	failures := 0
+	duplicates := 0
+	wwConflicts := 0
+	otherFailures := 0
+	for err := range errs {
+		if err == nil {
+			successes++
+		} else {
+			failures++
+			switch {
+			case moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry):
+				duplicates++
+			case moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict):
+				wwConflicts++
+			default:
+				otherFailures++
+				t.Logf("unexpected commit error: %v", err)
+			}
+		}
+	}
+	t.Logf(
+		"same-PK concurrent commit: successes=%d failures=%d duplicates=%d ww-conflicts=%d other=%d rows=%d",
+		successes, failures, duplicates, wwConflicts, otherFailures, tableEntry.GetRows(),
+	)
+	it := tableEntry.MakeDataObjectIt()
+	defer it.Release()
+	for ok := it.First(); ok; ok = it.Next() {
+		obj := it.Item()
+		rows, err := obj.GetObjectData().Rows()
+		require.NoError(t, err)
+		t.Logf("data object: id=%s physical-rows=%d", obj.ID().String(), rows)
+	}
+	t.Logf("data object count: %d", tableEntry.ObjectCnt(false))
+	require.Equal(t, 1, successes)
+	require.Equal(t, txnCount-1, failures)
+	require.Equal(t, uint64(1), tableEntry.GetRows())
 }
 
 func TestIndex(t *testing.T) {
@@ -1260,240 +1427,6 @@ func TestDedup1(t *testing.T) {
 	}
 	t.Log(c.SimplePPString(common.PPL1))
 }
-func TestCreateAppendableObjectWithOptions(t *testing.T) {
-	defer testutils.AfterTest(t)()
-	testutils.EnsureNoLeak(t)
-
-	ctx := context.Background()
-	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(ctx, t, dir)
-	defer driver.Close()
-	defer c.Close()
-	defer mgr.Stop()
-
-	schema := catalog.MockSchema(1, 0)
-	txn, err := mgr.StartTxn(nil)
-	assert.NoError(t, err)
-	db, err := txn.CreateDatabase("db", "", "")
-	assert.NoError(t, err)
-	_, err = db.CreateRelation(schema)
-	assert.NoError(t, err)
-	assert.NoError(t, txn.Commit(ctx))
-
-	txn, err = mgr.StartTxn(nil)
-	assert.NoError(t, err)
-	db, err = txn.GetDatabase("db")
-	assert.NoError(t, err)
-	rel, err := db.GetRelationByName(schema.Name)
-	assert.NoError(t, err)
-
-	id := objectio.NewObjectid()
-	stats := objectio.NewObjectStatsWithObjectID(&id, true, false, false)
-	obj, err := rel.CreateObjectWithOpt(false, &objectio.CreateObjOpt{Stats: stats})
-	assert.NoError(t, err)
-	assert.True(t, obj.GetMeta().(*catalog.ObjectEntry).IsAppendable())
-	assert.Equal(t, id, *obj.GetID())
-
-	store := txn.GetStore().(*txnStore)
-	txnDB, err := store.getOrSetDB(db.GetID())
-	assert.NoError(t, err)
-	txnTable, err := txnDB.getOrSetTable(rel.ID())
-	assert.NoError(t, err)
-	assert.Zero(t, txnTable.txnEntries.Len())
-	assert.NoError(t, txn.Commit(ctx))
-
-	txn, err = mgr.StartTxn(nil)
-	assert.NoError(t, err)
-	db, err = txn.GetDatabase("db")
-	assert.NoError(t, err)
-	rel, err = db.GetRelationByName(schema.Name)
-	assert.NoError(t, err)
-	_, err = rel.GetObject(&id, false)
-	assert.NoError(t, err)
-	assert.NoError(t, txn.Commit(ctx))
-}
-
-func TestCreateAppendableObjectWithOptionsRejectsInvalidOptions(t *testing.T) {
-	defer testutils.AfterTest(t)()
-	testutils.EnsureNoLeak(t)
-
-	ctx := context.Background()
-	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(ctx, t, dir)
-	defer driver.Close()
-	defer c.Close()
-	defer mgr.Stop()
-
-	txn, err := mgr.StartTxn(nil)
-	assert.NoError(t, err)
-	db, err := txn.CreateDatabase("db", "", "")
-	assert.NoError(t, err)
-	rel, err := db.CreateRelation(catalog.MockSchema(1, 0))
-	assert.NoError(t, err)
-
-	_, err = rel.CreateObjectWithOpt(false, nil)
-	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), err)
-
-	_, err = rel.CreateObjectWithOpt(false, &objectio.CreateObjOpt{})
-	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), err)
-
-	id := objectio.NewObjectid()
-	stats := objectio.NewObjectStatsWithObjectID(&id, false, false, false)
-	_, err = rel.CreateObjectWithOpt(false, &objectio.CreateObjOpt{Stats: stats})
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "only supports appendable object")
-	assert.NoError(t, txn.Rollback(ctx))
-}
-
-func TestCreateAppendableObjectWithOptionsErrors(t *testing.T) {
-	defer testutils.AfterTest(t)()
-	testutils.EnsureNoLeak(t)
-
-	ctx := context.Background()
-	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(ctx, t, dir)
-	defer driver.Close()
-	defer c.Close()
-	defer mgr.Stop()
-
-	txn, err := mgr.StartTxn(nil)
-	assert.NoError(t, err)
-	db, err := txn.CreateDatabase("db", "", "")
-	assert.NoError(t, err)
-	rel, err := db.CreateRelation(catalog.MockSchema(1, 0))
-	assert.NoError(t, err)
-
-	store := txn.GetStore().(*txnStore)
-	newOpt := func() *objectio.CreateObjOpt {
-		id := objectio.NewObjectid()
-		return &objectio.CreateObjOpt{
-			Stats: objectio.NewObjectStatsWithObjectID(&id, true, false, false),
-		}
-	}
-
-	_, err = store.CreateObjectWithOpt(db.GetID()+1, rel.ID(), false, newOpt())
-	assert.Error(t, err)
-
-	txnDB, err := store.getOrSetDB(db.GetID())
-	assert.NoError(t, err)
-	_, err = store.CreateObjectWithOpt(db.GetID(), rel.ID(), false, nil)
-	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), err)
-	_, err = txnDB.CreateObjectWithOpt(rel.ID(), nil, false)
-	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), err)
-	_, err = txnDB.CreateObjectWithOpt(rel.ID()+1, newOpt(), false)
-	assert.Error(t, err)
-
-	store.isOffline = true
-	_, err = store.CreateObjectWithOpt(db.GetID(), rel.ID(), false, newOpt())
-	assert.Error(t, err)
-	_, err = txnDB.CreateObjectWithOpt(rel.ID(), newOpt(), false)
-	assert.Error(t, err)
-	store.isOffline = false
-	assert.NoError(t, txn.Rollback(ctx))
-}
-
-type replayAObjectCreateRecorder struct {
-	created []replayAObjectCreateRecord
-}
-
-type replayAObjectCreateRecord struct {
-	id          common.ID
-	isTombstone bool
-	ts          types.TS
-}
-
-func (*replayAObjectCreateRecorder) OnTimeStamp(types.TS) {}
-
-func (r *replayAObjectCreateRecorder) RecordReplayAObjectCreate(
-	id *common.ID,
-	isTombstone bool,
-	ts types.TS,
-) {
-	r.created = append(r.created, replayAObjectCreateRecord{*id, isTombstone, ts})
-}
-
-func TestEnsureReplayAObject(t *testing.T) {
-	defer testutils.AfterTest(t)()
-	testutils.EnsureNoLeak(t)
-
-	ctx := context.Background()
-	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(ctx, t, dir)
-	defer driver.Close()
-	defer c.Close()
-	defer mgr.Stop()
-
-	txn, err := mgr.StartTxn(nil)
-	assert.NoError(t, err)
-	db, err := txn.CreateDatabase("db", "", "")
-	assert.NoError(t, err)
-	rel, err := db.CreateRelation(catalog.MockSchema(1, 0))
-	assert.NoError(t, err)
-	assert.NoError(t, txn.Commit(ctx))
-
-	database, err := c.GetDatabaseByID(db.GetID())
-	assert.NoError(t, err)
-	table, err := database.GetTableEntryByID(rel.ID())
-	assert.NoError(t, err)
-	id := table.AsCommonID()
-	objectID := objectio.NewObjectid()
-	id.SetObjectID(&objectID)
-
-	createTS := mgr.Now()
-	recorder := new(replayAObjectCreateRecorder)
-	store := &replayTxnStore{catalog: c}
-	obj, created, err := store.ensureReplayAObject(id, false, createTS, recorder)
-	assert.NoError(t, err)
-	assert.True(t, created)
-	assert.True(t, obj.IsAppendable())
-	assert.Equal(t, createTS, obj.GetCreatedAt())
-	assert.Len(t, recorder.created, 1)
-	assert.Equal(t, *id, recorder.created[0].id)
-	assert.Equal(t, createTS, recorder.created[0].ts)
-
-	obj, created, err = store.ensureReplayAObject(id, false, mgr.Now(), recorder)
-	assert.NoError(t, err)
-	assert.False(t, created)
-	assert.True(t, obj.IsAppendable())
-	assert.Len(t, recorder.created, 1)
-
-	tombstoneID := table.AsCommonID()
-	objectID = objectio.NewObjectid()
-	tombstoneID.SetObjectID(&objectID)
-	obj, created, err = store.ensureReplayAObject(tombstoneID, true, mgr.Now(), nil)
-	assert.NoError(t, err)
-	assert.True(t, created)
-	assert.True(t, obj.IsTombstone)
-
-	missingDB := *id
-	missingDB.DbID++
-	_, _, err = store.ensureReplayAObject(&missingDB, false, mgr.Now(), recorder)
-	assert.Error(t, err)
-
-	missingTable := *id
-	missingTable.TableID++
-	_, _, err = store.ensureReplayAObject(&missingTable, false, mgr.Now(), recorder)
-	assert.Error(t, err)
-}
-
-func TestReplayAppendNodeCreateTS(t *testing.T) {
-	prepareTS := types.BuildTS(10, 0)
-	commitTS := types.BuildTS(20, 0)
-	node := updates.NewEmptyAppendNode()
-	node.TxnMVCCNode.Prepare = prepareTS
-	node.TxnMVCCNode.End = commitTS
-	assert.Equal(t, commitTS, replayAppendNodeCreateTS(node))
-
-	txn := txnbase.NewTxn(nil, &txnbase.NoopTxnStore{}, []byte("txn"), prepareTS, prepareTS)
-	assert.NoError(t, txn.SetCommitTS(types.BuildTS(30, 0)))
-	node.TxnMVCCNode.Txn = txn
-	assert.Equal(t, types.BuildTS(30, 0), replayAppendNodeCreateTS(node))
-
-	node.TxnMVCCNode.Txn = nil
-	node.TxnMVCCNode.End = types.TS{}
-	assert.Equal(t, prepareTS, replayAppendNodeCreateTS(node))
-}
-
 func TestCreateAppendableObjectWithOptions(t *testing.T) {
 	defer testutils.AfterTest(t)()
 	testutils.EnsureNoLeak(t)

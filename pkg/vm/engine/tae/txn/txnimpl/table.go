@@ -113,9 +113,10 @@ type txnTable struct {
 	txnEntries  *txnEntries
 	csnStart    uint32
 
-	dataTable      *baseTable
-	tombstoneTable *baseTable
-	transferedTS   types.TS
+	dataTable       *baseTable
+	tombstoneTable  *baseTable
+	transferedTS    types.TS
+	transferChanged bool
 
 	// Before publication, a sink retains exact object references until delete
 	// succeeds. After publication, the table retains exact object names until
@@ -241,6 +242,9 @@ func (tbl *txnTable) PrePreareTransfer(
 ) (err error) {
 	if debugSkipFreezePhaseTransfer.Load() && phase == txnif.FreezePhase {
 		return
+	}
+	if phase == txnif.PrePreparePhase {
+		tbl.transferChanged = false
 	}
 	err = tbl.TransferDeletes(ctx, ts, phase)
 	tbl.transferedTS = ts
@@ -594,6 +598,9 @@ func (tbl *txnTable) TransferDeletes(
 	}
 	if transferd.IsEmpty() {
 		return
+	}
+	if phase == txnif.PrePreparePhase {
+		tbl.transferChanged = true
 	}
 	for i, attr := range deletes.Attrs {
 		// Skip the rowid column.
@@ -1719,6 +1726,25 @@ func (tbl *txnTable) ApplyAppend() (err error) {
 	return
 }
 
+func (tbl *txnTable) FreezeAppend() (err error) {
+	if tbl.dataTable.tableSpace != nil {
+		if err = tbl.dataTable.tableSpace.FreezeApply(); err != nil {
+			return err
+		}
+	}
+	if tbl.tombstoneTable != nil && tbl.tombstoneTable.tableSpace != nil {
+		err = tbl.tombstoneTable.tableSpace.FreezeApply()
+	}
+	return err
+}
+
+func (tbl *txnTable) ReapplyTransferredTombstones() error {
+	if !tbl.transferChanged || tbl.tombstoneTable == nil || tbl.tombstoneTable.tableSpace == nil {
+		return nil
+	}
+	return tbl.tombstoneTable.tableSpace.ReapplyFrozen()
+}
+
 func (tbl *txnTable) PrePrepare() (err error) {
 	err = tbl.dataTable.PrePrepare()
 	if err != nil {
@@ -1986,7 +2012,9 @@ func (tbl *txnTable) DeleteByPhyAddrKeys(
 		anode.isMergeCompact = true
 		if tbl.store.txn.GetTxnState(false) != txnif.TxnStateActive {
 			startOffset := anode.data.Length() - deleteBatch.Length()
-			tbl.tombstoneTable.tableSpace.prepareApplyANode(anode, uint32(startOffset))
+			if err = tbl.tombstoneTable.tableSpace.prepareApplyANode(anode, uint32(startOffset)); err != nil {
+				return
+			}
 		}
 	}
 	rowIDs := vector.MustFixedColNoTypeCheck[types.Rowid](rowIDVec.GetDownstreamVector())
