@@ -1288,7 +1288,11 @@ func (tbl *txnTable) GetByFilter(
 	return
 }
 
-func (tbl *txnTable) waitTombstoneRowsCommittedBefore(ts types.TS) (waited bool) {
+func (tbl *txnTable) waitTombstoneRowsCommittedBefore(
+	ts types.TS,
+	rowIDs containers.Vector,
+	rowIDsZM index.ZM,
+) (waited bool) {
 	// Resolve catalog-level creation/deletion first. The per-object wait below
 	// handles row AppendNodes inside already visible appendable objects.
 	tbl.entry.WaitTombstoneObjectCommitted(ts)
@@ -1303,7 +1307,7 @@ func (tbl *txnTable) waitTombstoneRowsCommittedBefore(ts types.TS) (waited bool)
 		if objData == nil {
 			panic(fmt.Sprintf("logic error, object %v", obj.StringWithLevel(3)))
 		}
-		if objData.WaitAppendCommittingBefore(ts, tbl.store.txn) {
+		if objData.WaitAppendCommittingBefore(ts, tbl.store.txn, rowIDs, rowIDsZM) {
 			waited = true
 		}
 	}
@@ -1533,7 +1537,7 @@ func (tbl *txnTable) findDeletes(
 	// successful delete is visible to that snapshot. After the wait, Contains
 	// checks the AppendNode again. A committed delete participates in the lookup;
 	// an aborted delete has IsAborted set by ApplyRollback and is ignored.
-	tbl.waitTombstoneRowsCommittedBefore(to)
+	tbl.waitTombstoneRowsCommittedBefore(to, rowIDs, keysZM)
 
 retryScan:
 	for {
@@ -1566,7 +1570,7 @@ retryScan:
 		it.Release()
 		if err != nil {
 			if moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict) &&
-				tbl.waitTombstoneRowsCommittedBefore(to) {
+				tbl.waitTombstoneRowsCommittedBefore(to, rowIDs, keysZM) {
 				// A merge/flush transaction may attach transfer tombstones
 				// after the pre-scan wait. It has now reached a terminal state;
 				// retry to distinguish its commit from rollback. If no eligible
