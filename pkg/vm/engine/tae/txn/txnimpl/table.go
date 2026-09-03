@@ -353,6 +353,11 @@ func (tbl *txnTable) TransferDeletes(
 		return
 	}
 	id := tbl.entry.AsCommonID()
+	// Transfer covers the inclusive upper fence ts, while the conflict checker
+	// intentionally tests whether an object was deleted strictly before its
+	// argument. Use the successor so an object deleted exactly at ts is waited
+	// for and transferred as well.
+	conflictTS := ts.Next()
 	var softDeleteObjects []*catalog.ObjectEntry
 	if len(tbl.tombstoneTable.tableSpace.stats) != 0 {
 		tGetSoftdeleteObjects := time.Now()
@@ -564,7 +569,7 @@ func (tbl *txnTable) TransferDeletes(
 		// if deleted, try to transfer the delete node
 		if err = tbl.store.warChecker.checkOne(
 			id,
-			ts,
+			conflictTS,
 			phase == txnif.PrePreparePhase,
 		); err == nil {
 			continue
@@ -586,7 +591,7 @@ func (tbl *txnTable) TransferDeletes(
 		// nil: transferred successfully
 		// ErrTxnRWConflict: the target block was also be compacted
 		// ErrTxnWWConflict: w-w error
-		if _, err = tbl.TransferDeleteRows(id, rowOffset, pk, pkType, phase, ts); err != nil {
+		if _, err = tbl.TransferDeleteRows(id, rowOffset, pk, pkType, phase, conflictTS); err != nil {
 			return
 		}
 		// TransferDeleteRows may append to the same anode, which can
