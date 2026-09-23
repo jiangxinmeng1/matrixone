@@ -57,6 +57,21 @@ const (
 	TransferSinkerMemorySizeThreshold = common.Const1MBytes * 50
 )
 
+func observePrePrepareDedupStep(isTombstone bool, step string, start time.Time) {
+	observePrePrepareDedupStepDuration(isTombstone, step, time.Since(start))
+}
+
+func observePrePrepareDedupStepDuration(isTombstone bool, step string, duration time.Duration) {
+	if duration <= 0 {
+		return
+	}
+	typ := "data"
+	if isTombstone {
+		typ = "tombstone"
+	}
+	v2.TxnTNPrePrepareDeduplicateStepDurationHistogram.WithLabelValues(typ, step).Observe(duration.Seconds())
+}
+
 // debugSkipFreezePhaseTransfer is a test-only flag. When enabled,
 // TransferDeletes is skipped during the Freeze phase so that the
 // PrePrepare phase is the only transfer pass. This makes vector
@@ -1255,24 +1270,24 @@ func (tbl *txnTable) GetByFilter(
 	pks := tbl.store.rt.VectorPool.Small.GetVector(pkType)
 	defer pks.Close()
 	pks.Append(filter.Val, false)
-	rowIDs, err := tbl.dataTable.getRowsByPK(ctx, pks)
+	candidates, err := tbl.dataTable.getRowsByPK(ctx, pks)
 	if err != nil && !moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict) {
 		return
 	}
+	defer candidates.Close()
+	if candidates.HasCandidate() {
+		err = tbl.findDeletesForCandidates(
+			tbl.store.ctx,
+			candidates,
+			types.TS{},
+			tbl.store.txn.GetStartTS(),
+		)
+		if err != nil && !moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict) {
+			return
+		}
+	}
+	rowIDs := candidates.Merge(tbl.store.rt.VectorPool.Small)
 	defer rowIDs.Close()
-	if rowIDs.IsNull(0) {
-		err = moerr.NewNotFoundNoCtx()
-		return
-	}
-	err = tbl.findDeletes(
-		tbl.store.ctx,
-		rowIDs,
-		types.TS{},
-		tbl.store.txn.GetStartTS(),
-	)
-	if err != nil && !moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict) {
-		return
-	}
 	if rowIDs.IsNull(0) {
 		err = moerr.NewNotFoundNoCtx()
 		return
@@ -1417,12 +1432,14 @@ func (tbl *txnTable) PrePrepareDedup(ctx context.Context, isTombstone bool, phas
 	var zm index.ZM
 	dedupType := tbl.store.txn.GetDedupType()
 	if !dedupType.SkipSourcePersisted() {
+		stepStart := time.Now()
 		for _, stats := range baseTable.tableSpace.stats {
 			err = tbl.DoPrecommitDedupByNode(ctx, stats, isTombstone)
 			if err != nil {
 				return
 			}
 		}
+		observePrePrepareDedupStep(isTombstone, "source_persisted", stepStart)
 	}
 
 	// DoPrecommitDedupByPK checks for data committed by other transactions
@@ -1438,10 +1455,13 @@ func (tbl *txnTable) PrePrepareDedup(ctx context.Context, isTombstone bool, phas
 	}
 	node := baseTable.tableSpace.node
 	pkColPos := baseTable.schema.GetSingleSortKeyIdx()
+	stepStart := time.Now()
 	pkVec, err := node.WindowColumn(0, node.Rows(), pkColPos)
 	if err != nil {
 		return err
 	}
+	observePrePrepareDedupStep(isTombstone, "build_pk_vector", stepStart)
+	stepStart = time.Now()
 	if zm.Valid() {
 		zm.ResetMinMax()
 	} else {
@@ -1452,10 +1472,13 @@ func (tbl *txnTable) PrePrepareDedup(ctx context.Context, isTombstone bool, phas
 		pkVec.Close()
 		return err
 	}
+	observePrePrepareDedupStep(isTombstone, "build_pk_zonemap", stepStart)
+	stepStart = time.Now()
 	if err = tbl.DoPrecommitDedupByPK(pkVec, zm, isTombstone, phase, ts); err != nil {
 		pkVec.Close()
 		return err
 	}
+	observePrePrepareDedupStep(isTombstone, "pk_dedup", stepStart)
 	pkVec.Close()
 	tbl.dedupTS = ts
 	return
@@ -1471,21 +1494,22 @@ func (tbl *txnTable) DedupSnapByPK(
 ) (err error) {
 	r := trace.StartRegion(ctx, "DedupSnapByPK")
 	defer r.End()
-	var rowIDs containers.Vector
-	rowIDs, err = tbl.getBaseTable(isTombstone).getRowsByPK(ctx, keys)
+	candidates, err := tbl.getBaseTable(isTombstone).getRowsByPK(ctx, keys)
 	if err != nil {
 		logutil.Errorf("getRowsByPK failed, %v", err)
 		return
 	}
-	defer rowIDs.Close()
+	defer candidates.Close()
 	from, to := types.TS{}, tbl.store.txn.GetStartTS()
-	if !isTombstone {
-		err = tbl.findDeletes(ctx, rowIDs, from, to)
+	if !isTombstone && candidates.HasCandidate() {
+		err = tbl.findDeletesForCandidates(ctx, candidates, from, to)
 		if err != nil {
 			logutil.Errorf("getRowsByPK failed 2, %v", err)
 			return
 		}
 	}
+	rowIDs := candidates.Merge(tbl.store.rt.VectorPool.Small)
+	defer rowIDs.Close()
 	for i := 0; i < rowIDs.Length(); i++ {
 		colName := tbl.getBaseTable(isTombstone).schema.GetPrimaryKey().Name
 		if !rowIDs.IsNull(i) {
@@ -1506,6 +1530,47 @@ func (tbl *txnTable) DedupSnapByPK(
 		}
 	}
 	return
+}
+
+func (tbl *txnTable) findDeletesForCandidates(
+	ctx context.Context,
+	candidates *duplicatedRowIDs,
+	from, to types.TS,
+) error {
+	length := candidates.appendable.Length()
+	combined := tbl.store.rt.VectorPool.Small.GetVector(&objectio.RowidType)
+	defer combined.Close()
+	for i := 0; i < length; i++ {
+		if candidates.appendable.IsNull(i) {
+			combined.Append(nil, true)
+		} else {
+			combined.Append(vector.GetFixedAtNoTypeCheck[types.Rowid](candidates.appendable.GetDownstreamVector(), i), false)
+		}
+	}
+	for i := 0; i < length; i++ {
+		if candidates.nonAppendable.IsNull(i) {
+			combined.Append(nil, true)
+		} else {
+			combined.Append(vector.GetFixedAtNoTypeCheck[types.Rowid](candidates.nonAppendable.GetDownstreamVector(), i), false)
+		}
+	}
+	if err := tbl.findDeletes(ctx, combined, from, to); err != nil {
+		return err
+	}
+	for i := 0; i < length; i++ {
+		if combined.IsNull(i) {
+			containers.UpdateValue(candidates.appendable.GetDownstreamVector(), uint32(i), nil, true, common.WorkspaceAllocator)
+		} else {
+			containers.UpdateValue(candidates.appendable.GetDownstreamVector(), uint32(i), vector.GetFixedAtNoTypeCheck[types.Rowid](combined.GetDownstreamVector(), i), false, common.WorkspaceAllocator)
+		}
+		idx := i + length
+		if combined.IsNull(idx) {
+			containers.UpdateValue(candidates.nonAppendable.GetDownstreamVector(), uint32(i), nil, true, common.WorkspaceAllocator)
+		} else {
+			containers.UpdateValue(candidates.nonAppendable.GetDownstreamVector(), uint32(i), vector.GetFixedAtNoTypeCheck[types.Rowid](combined.GetDownstreamVector(), idx), false, common.WorkspaceAllocator)
+		}
+	}
+	return nil
 }
 
 /*
@@ -1548,7 +1613,8 @@ retryScan:
 	for {
 		tbl.entry.WaitTombstoneObjectCommitted(to)
 		snapshot := tbl.entry.MakeTombstoneObjectSnapshot()
-		err = foreachIncrementalObject(snapshot, from, to, func(obj *catalog.ObjectEntry) error {
+		var scanStats incrementalObjectScanStats
+		scanStats, err = foreachIncrementalObjectWithStats(snapshot, true, from, to, tbl.entry.ID, func(obj *catalog.ObjectEntry) error {
 			objData := obj.GetObjectData()
 			if objData == nil {
 				panic(fmt.Sprintf("logic error, object %v", obj.StringWithLevel(3)))
@@ -1572,6 +1638,7 @@ retryScan:
 				common.WorkspaceAllocator,
 			)
 		})
+		observeIncrementalObjectScanStats(true, scanStats)
 		if err != nil {
 			if moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict) &&
 				tbl.waitTombstoneRowsCommittedBefore(to, rowIDs, keysZM) {
@@ -1606,17 +1673,22 @@ func (tbl *txnTable) DoPrecommitDedupByPK(
 			tbl.dedupTS = tbl.store.txn.GetStartTS()
 		}
 		var rowIDs containers.Vector
+		stepStart := time.Now()
 		rowIDs, err = tbl.getBaseTable(isTombstone).incrementalGetRowsByPK(tbl.store.ctx, pks, tbl.dedupTS.Next(), ts, phase == txnif.PrePreparePhase)
+		observePrePrepareDedupStep(isTombstone, "incremental_get_rows", stepStart)
 		if err != nil {
 			return
 		}
 		defer rowIDs.Close()
 		if !isTombstone {
+			stepStart = time.Now()
 			err = tbl.findDeletes(tbl.store.ctx, rowIDs, tbl.dedupTS.Next(), now)
+			observePrePrepareDedupStep(isTombstone, "find_deletes", stepStart)
 			if err != nil {
 				return
 			}
 		}
+		stepStart = time.Now()
 		for i := 0; i < rowIDs.Length(); i++ {
 			var colName string
 			if isTombstone {
@@ -1637,6 +1709,7 @@ func (tbl *txnTable) DoPrecommitDedupByPK(
 				return
 			}
 		}
+		observePrePrepareDedupStep(isTombstone, "check_duplicate_rows", stepStart)
 	})
 	return
 }

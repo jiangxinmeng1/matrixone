@@ -166,6 +166,12 @@ func initTxnMetrics() {
 	registry.MustRegister(TxnLockRPCQueueRejectCounter)
 	registry.MustRegister(txnPKChangeCheckCounter)
 	registry.MustRegister(txnPKMayBeChangedCounter)
+	registry.MustRegister(txnAObjectDedupCounter)
+	registry.MustRegister(TxnAObjectMaxCommitStateGauge)
+	registry.MustRegister(TxnAObjectMaxCommitTableTotalGauge)
+	registry.MustRegister(TxnTNPrePrepareObjectCounter)
+	registry.MustRegister(TxnTNPrePrepareObjectScanCounter)
+	registry.MustRegister(TxnTNPrePrepareObjectBookmarkCounter)
 
 	registry.MustRegister(txnQueueSizeGauge)
 	registry.MustRegister(TxnDeadlockDetectorQueueDepthGauge)
@@ -192,6 +198,8 @@ func initTxnMetrics() {
 
 	registry.MustRegister(txnRangesSelectivityHistogram)
 	registry.MustRegister(txnTNDeduplicateDurationHistogram)
+	registry.MustRegister(TxnTNPrePrepareDeduplicateStepDurationHistogram)
+	registry.MustRegister(TxnTNPrePrepareObjectStepDurationHistogram)
 	registry.MustRegister(TxnTNLogServiceAppendDurationHistogram)
 
 	registry.MustRegister(TxnReaderScannedTotalTombstoneHistogram)
