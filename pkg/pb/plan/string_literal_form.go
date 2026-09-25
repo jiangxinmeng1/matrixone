@@ -388,6 +388,9 @@ type RemoteExpressionFeatures struct {
 	PreparedPrecisionScalar           bool
 	TemporalResultContracts           bool
 	LegacyTemporalResultContracts     bool
+	NormalizedIntervalUnits           bool
+	LegacyIntervalUnits               bool
+	WeekSessionDefault                bool
 }
 
 func (features RemoteExpressionFeatures) Any() bool {
@@ -410,7 +413,10 @@ func (features RemoteExpressionFeatures) Any() bool {
 		features.SpatialDistanceSemantics ||
 		features.PreparedPrecisionScalar ||
 		features.TemporalResultContracts ||
-		features.LegacyTemporalResultContracts
+		features.LegacyTemporalResultContracts ||
+		features.NormalizedIntervalUnits ||
+		features.LegacyIntervalUnits ||
+		features.WeekSessionDefault
 }
 
 func hasPrivateIntegerPrecisionCast(expr *Expr) bool {
@@ -841,6 +847,17 @@ func RequiredRemoteExpressionFeatures(owner any) (features RemoteExpressionFeatu
 			fn := current.GetF()
 			if fn != nil && fn.Func != nil {
 				id, overload := int32(fn.Func.Obj>>32), int32(fn.Func.Obj)
+				// Function IDs live in the function registry, which cannot be
+				// imported here because the planner depends on this package.
+				if id == 189 { // legacy TO_INTERVAL: ambiguous across pre-v97 and v97 binaries
+					features.LegacyIntervalUnits = true
+				}
+				if id == 583 { // TO_INTERVAL_MICROSECOND
+					features.NormalizedIntervalUnits = true
+				}
+				if id == 216 && (overload == 0 || overload == 1) { // one-arg WEEK
+					features.WeekSessionDefault = true
+				}
 				// EXTRACT and string-first ADDTIME/SUBTIME retain their overload
 				// numbers but changed physical result vectors in v97. Observe
 				// both result shapes so incoming legacy plans fail before execution.
