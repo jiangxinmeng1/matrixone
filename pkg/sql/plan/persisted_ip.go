@@ -92,6 +92,9 @@ func RequiredPersistedExpressionProtocolVersion(owner any) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if features.LegacyTemporalResultContracts {
+		return 0, moerr.NewNotSupportedNoCtx("persisted legacy temporal result vector contract requires rebinding")
+	}
 	requiredVersion := int64(0)
 	if features.IPFunctionSemantics {
 		requiredVersion = defines.MORPCVersion72
@@ -114,6 +117,9 @@ func RequiredPersistedExpressionProtocolVersion(owner any) (int64, error) {
 	}
 	if features.SpatialDistanceSemantics && requiredVersion < defines.MORPCVersion90 {
 		requiredVersion = defines.MORPCVersion90
+	}
+	if features.TemporalResultContracts && requiredVersion < defines.MORPCVersion97 {
+		requiredVersion = defines.MORPCVersion97
 	}
 	return requiredVersion, nil
 }
