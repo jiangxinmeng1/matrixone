@@ -41,6 +41,12 @@ func legacySpecialConsumerCheck(id int32, overloads []overload, inputs []types.T
 	case FORMAT:
 		return legacyFormatCheck(overloads[:FormatIntegerPrecisionOverload], inputs), true
 	case MAKEDATE:
+		// Pre-migration persisted MAKEDATE plans used the integer overload for
+		// numeric expressions. The current overload 0 is the native DATE
+		// implementation and must remain reserved for new bindings.
+		if len(inputs) == 2 && inputs[0].IsNumeric() && inputs[1].IsNumeric() {
+			return fixedTypeMatch(overloads[MakeDateIntegerOverload:], inputs), true
+		}
 		return fixedTypeMatch(overloads[:MakeDateIntegerOverload], inputs), true
 	case MAKETIME:
 		return legacyMakeTimeCheck(overloads[:MakeTimeIntegerFloatOverload], inputs), true
