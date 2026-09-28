@@ -488,24 +488,19 @@ func foreachIncrementalObjectWithStats(
 		}
 	}
 	shouldSkipAObject := func(obj *catalog.ObjectEntry) bool {
-		if !obj.IsAppendable() {
-			return false
-		}
-		observeObject(obj, "aobject_candidate")
-		v2.TxnAObjectDedupCandidateCounter.Inc()
 		objData := obj.GetObjectData()
 		maxCommitter, ok := objData.(interface {
 			GetAppendMaxCommitTS() (types.TS, bool)
 		})
 		if !ok {
-			// An appendable catalog entry should normally be backed by an
-			// aobject. Keep the conservative behavior if it is not.
-			v2.TxnAObjectDedupMaxCommitUnavailableCounter.Inc()
-			v2.TxnAObjectDedupScannedCounter.Inc()
-			observeObject(obj, "aobject_max_commit_unavailable")
-			observeObject(obj, "aobject_scanned")
+			// Only an in-memory append object has an append-history max. Do not
+			// use the catalog appendable bit as the gate: it describes the
+			// object's storage kind, while a sealed AObject is no longer
+			// appendable at the data layer but must still be filtered here.
 			return false
 		}
+		observeObject(obj, "aobject_candidate")
+		v2.TxnAObjectDedupCandidateCounter.Inc()
 		maxCommitStart := time.Now()
 		maxCommit, finalized := maxCommitter.GetAppendMaxCommitTS()
 		activeStats.maxCommit += time.Since(maxCommitStart)
