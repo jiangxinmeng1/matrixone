@@ -4900,7 +4900,10 @@ func DateFormat(ivecs []*vector.Vector, result vector.FunctionResultWrapper, pro
 		constNull = null || len(constFmt) == 0
 		if !constNull {
 			constOperator = dateFormatOperator(constFmt)
-			genericDateFormat = constOperator == datetimeFormat
+			// Locale-aware formatting is needed for textual directives. The
+			// locale formatter also handles numeric directives, so keeping this
+			// flag conservative avoids comparing function values in Go.
+			genericDateFormat = true
 		}
 	} else {
 		genericDateFormat = true
@@ -5250,6 +5253,10 @@ var (
 		"Sat",
 	}
 )
+
+func makeDateFormat(ctx context.Context, t types.Datetime, b rune, buf *bytes.Buffer) (bool, error) {
+	return makeDateFormatWithLocale(nil, ctx, t, b, buf)
+}
 
 func makeDateFormatWithLocale(proc *process.Process, _ context.Context, t types.Datetime, b rune, buf *bytes.Buffer) (bool, error) {
 	switch b {
