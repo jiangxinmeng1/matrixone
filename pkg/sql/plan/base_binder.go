@@ -7173,6 +7173,9 @@ func bindFuncExprImplByPlanExpr(
 			}
 			returnType.Scale = fsp
 		}
+		// CTAS and view materialization use Width as the persisted temporal
+		// precision marker. Keep the string TIMEDIFF overload's FSP visible.
+		returnType.Width = returnType.Scale
 
 	case "time":
 		if len(args) == 1 {
