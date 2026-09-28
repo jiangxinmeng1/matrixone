@@ -271,7 +271,7 @@ func TestSpecialIntegerLegacyExecutionIdentities(t *testing.T) {
 		want         string
 	}{
 		{"format", function.FORMAT, 0, []*planpb.Expr{makePlan2StringConstExprWithType("2.5"), makePlan2StringConstExprWithType("0")}, types.T_varchar, "2"},
-		{"makedate", function.MAKEDATE, 0, []*planpb.Expr{makePlan2StringConstExprWithType("2024"), makePlan2StringConstExprWithType("1.9")}, types.T_varchar, "2024-01-01"},
+		{"makedate", function.MAKEDATE, 0, []*planpb.Expr{makePlan2StringConstExprWithType("2024"), makePlan2StringConstExprWithType("1.9")}, types.T_date, "2024-01-01"},
 		{"maketime", function.MAKETIME, 2, []*planpb.Expr{makePlan2Int64ConstExprWithType(12), makePlan2Int64ConstExprWithType(1), makePlan2Int64ConstExprWithType(2)}, types.T_time, "12:01:02"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
