@@ -26,6 +26,12 @@ func TestTxnAObjectMaxCommitStateMetric(t *testing.T) {
 		TxnAObjectMaxCommitStateGauge.WithLabelValues("18364758544493064720", "data", "sealed_waiting")))
 	require.Equal(t, float64(4), testutil.ToFloat64(
 		TxnAObjectMaxCommitStateGauge.WithLabelValues("18364758544493064720", "data", "finalized")))
+	require.Equal(t, float64(1), testutil.ToFloat64(
+		TxnAObjectMaxCommitStateGauge.WithLabelValues("18364758544493064720", "tombstone", "pending")))
+	require.Equal(t, float64(0), testutil.ToFloat64(
+		TxnAObjectMaxCommitStateGauge.WithLabelValues("18364758544493064720", "tombstone", "sealed_waiting")))
+	require.Equal(t, float64(2), testutil.ToFloat64(
+		TxnAObjectMaxCommitStateGauge.WithLabelValues("18364758544493064720", "tombstone", "finalized")))
 	require.Equal(t, beforeTables+1, testutil.ToFloat64(TxnAObjectMaxCommitTableTotalGauge))
 
 	// Removing both list snapshots removes the table from the total while

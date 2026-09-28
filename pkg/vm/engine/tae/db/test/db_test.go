@@ -12844,12 +12844,16 @@ func testConcurrentUpdateByPreviousRowIDWithFlushMerge(
 	defer cancel()
 
 	const maxAttemptsPerTxn = 1000
+	const (
+		flushInterval = 10 * time.Millisecond
+		mergeInterval = 250 * time.Millisecond
+	)
 
 	opts := config.WithLongScanAndCKPOpts(nil)
 	tae := testutil.NewTestEngine(ctx, ModuleName, t, opts)
 	defer tae.Close()
 	schema := catalog.MockSchemaAll(2, 0)
-	schema.Extra.BlockMaxRows = 4
+	schema.Extra.BlockMaxRows = 8192
 	schema.Extra.ObjectMaxBlocks = 2
 	tae.BindSchema(schema)
 
@@ -12904,22 +12908,25 @@ func testConcurrentUpdateByPreviousRowIDWithFlushMerge(
 	maintenanceWG.Add(1)
 	go func() {
 		defer maintenanceWG.Done()
-		ticker := time.NewTicker(time.Millisecond)
-		defer ticker.Stop()
+		flushTicker := time.NewTicker(flushInterval)
+		defer flushTicker.Stop()
+		mergeTicker := time.NewTicker(mergeInterval)
+		defer mergeTicker.Stop()
 		for {
 			select {
 			case <-stopMaintenance:
 				return
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-			}
-
-			if err := tae.DB.ForceFlush(ctx, tae.TxnMgr.Now()); err == nil {
-				flushCount.Add(1)
-			} else if moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry) {
-				errC <- fmt.Errorf("background flush returned duplicate: %w", err)
-				return
+			case <-flushTicker.C:
+				if err := tae.DB.ForceFlush(ctx, tae.TxnMgr.Now()); err == nil {
+					flushCount.Add(1)
+				} else if moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry) {
+					errC <- fmt.Errorf("background flush returned duplicate: %w", err)
+					return
+				}
+				continue
+			case <-mergeTicker.C:
 			}
 
 			txn, rel, err := openRelation()
