@@ -3364,6 +3364,7 @@ func buildTableDefs(stmt *tree.CreateTable, ctx CompilerContext, createTable *pl
 	}
 
 	genColIdx := 0 // tracks the current column's position in allColDefs
+	legacyTimestampDefaultApplied := false
 	for _, item := range stmt.Defs {
 		switch def := item.(type) {
 		case *tree.ColumnTableDef:

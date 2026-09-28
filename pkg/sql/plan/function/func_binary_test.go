@@ -2562,16 +2562,19 @@ func initDateAddTestCase() []tcTemp {
 func TestDoTimeAddRejectsMySQLRangeOverflow(t *testing.T) {
 	max := types.MySQLTimeMax
 
-	got, err := doTimeAdd(max, 1, types.Second)
-	require.Error(t, err)
-	require.Zero(t, got)
-
-	got, err = doTimeAdd(-max, -1, types.Second)
-	require.Error(t, err)
-	require.Zero(t, got)
-
-	got, err = doTimeAdd(max, 0, types.Second)
+	got, overflow, err := doTimeAdd(max, 1, types.Second)
 	require.NoError(t, err)
+	require.True(t, overflow)
+	require.Zero(t, got)
+
+	got, overflow, err = doTimeAdd(-max, -1, types.Second)
+	require.NoError(t, err)
+	require.True(t, overflow)
+	require.Zero(t, got)
+
+	got, overflow, err = doTimeAdd(max, 0, types.Second)
+	require.NoError(t, err)
+	require.False(t, overflow)
 	require.Equal(t, max, got)
 }
 
