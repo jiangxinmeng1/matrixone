@@ -65,6 +65,11 @@ func observePrePrepareDedupStepDuration(isTombstone bool, step string, duration 
 	if duration <= 0 {
 		return
 	}
+	observers, ok := prePrepareDedupStepObservers[step]
+	if ok {
+		observers[boolToInt(isTombstone)].Observe(duration.Seconds())
+		return
+	}
 	typ := "data"
 	if isTombstone {
 		typ = "tombstone"
@@ -1554,7 +1559,7 @@ func (tbl *txnTable) findDeletesForCandidates(
 			combined.Append(vector.GetFixedAtNoTypeCheck[types.Rowid](candidates.nonAppendable.GetDownstreamVector(), i), false)
 		}
 	}
-	if err := tbl.findDeletes(ctx, combined, from, to); err != nil {
+	if err := tbl.findDeletes(ctx, combined, from, to, false); err != nil {
 		return err
 	}
 	for i := 0; i < length; i++ {
@@ -1584,6 +1589,7 @@ func (tbl *txnTable) findDeletes(
 	ctx context.Context,
 	rowIDs containers.Vector,
 	from, to types.TS,
+	collectMetrics bool,
 ) (err error) {
 	pkType := rowIDs.GetType()
 	keysZM := index.NewZM(pkType.Oid, pkType.Scale)
@@ -1614,7 +1620,11 @@ retryScan:
 		tbl.entry.WaitTombstoneObjectCommitted(to)
 		snapshot := tbl.entry.MakeTombstoneObjectSnapshot()
 		var scanStats incrementalObjectScanStats
-		scanStats, err = foreachIncrementalObjectWithStats(snapshot, true, from, to, tbl.entry.ID, func(obj *catalog.ObjectEntry) error {
+		scope := "other"
+		if collectMetrics {
+			scope = "preprepare_find_deletes"
+		}
+		scanStats, err = foreachIncrementalObjectWithStats(snapshot, true, from, to, tbl.entry.ID, scope, func(obj *catalog.ObjectEntry, _ *incrementalObjectScanStats) error {
 			objData := obj.GetObjectData()
 			if objData == nil {
 				panic(fmt.Sprintf("logic error, object %v", obj.StringWithLevel(3)))
@@ -1638,7 +1648,9 @@ retryScan:
 				common.WorkspaceAllocator,
 			)
 		})
-		observeIncrementalObjectScanStats(true, scanStats)
+		if collectMetrics {
+			observeIncrementalObjectScanStats(true, scanStats)
+		}
 		if err != nil {
 			if moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict) &&
 				tbl.waitTombstoneRowsCommittedBefore(to, rowIDs, keysZM) {
@@ -1675,15 +1687,19 @@ func (tbl *txnTable) DoPrecommitDedupByPK(
 		var rowIDs containers.Vector
 		stepStart := time.Now()
 		rowIDs, err = tbl.getBaseTable(isTombstone).incrementalGetRowsByPK(tbl.store.ctx, pks, tbl.dedupTS.Next(), ts, phase == txnif.PrePreparePhase)
-		observePrePrepareDedupStep(isTombstone, "incremental_get_rows", stepStart)
+		if phase == txnif.PrePreparePhase {
+			observePrePrepareDedupStep(isTombstone, "incremental_get_rows", stepStart)
+		}
 		if err != nil {
 			return
 		}
 		defer rowIDs.Close()
 		if !isTombstone {
 			stepStart = time.Now()
-			err = tbl.findDeletes(tbl.store.ctx, rowIDs, tbl.dedupTS.Next(), now)
-			observePrePrepareDedupStep(isTombstone, "find_deletes", stepStart)
+			err = tbl.findDeletes(tbl.store.ctx, rowIDs, tbl.dedupTS.Next(), now, phase == txnif.PrePreparePhase)
+			if phase == txnif.PrePreparePhase {
+				observePrePrepareDedupStep(isTombstone, "find_deletes", stepStart)
+			}
 			if err != nil {
 				return
 			}
@@ -1709,7 +1725,9 @@ func (tbl *txnTable) DoPrecommitDedupByPK(
 				return
 			}
 		}
-		observePrePrepareDedupStep(isTombstone, "check_duplicate_rows", stepStart)
+		if phase == txnif.PrePreparePhase {
+			observePrePrepareDedupStep(isTombstone, "check_duplicate_rows", stepStart)
+		}
 	})
 	return
 }
@@ -1760,13 +1778,13 @@ func (tbl *txnTable) DoPrecommitDedupByNode(ctx context.Context, stats objectio.
 		if tbl.dedupTS.IsEmpty() {
 			tbl.dedupTS = tbl.store.txn.GetStartTS()
 		}
-		rowIDs, err = tbl.getBaseTable(isTombstone).incrementalGetRowsByPK(ctx, pks, tbl.dedupTS.Next(), now, true)
+		rowIDs, err = tbl.getBaseTable(isTombstone).incrementalGetRowsByPK(ctx, pks, tbl.dedupTS.Next(), now, false)
 		if err != nil {
 			return
 		}
 		defer rowIDs.Close()
 		if !isTombstone {
-			err = tbl.findDeletes(ctx, rowIDs, tbl.dedupTS, now)
+			err = tbl.findDeletes(ctx, rowIDs, tbl.dedupTS, now, false)
 		}
 		if err != nil {
 			return

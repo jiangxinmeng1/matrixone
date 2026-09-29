@@ -17,6 +17,7 @@ package txnimpl
 import (
 	"context"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -316,7 +317,9 @@ func foreachIncrementalObject(
 	from, to types.TS,
 	fn func(*catalog.ObjectEntry) error,
 ) error {
-	_, err := foreachIncrementalObjectWithStats(snapshot, false, from, to, 0, fn)
+	_, err := foreachIncrementalObjectWithStats(snapshot, false, from, to, 0, "other", func(obj *catalog.ObjectEntry, _ *incrementalObjectScanStats) error {
+		return fn(obj)
+	})
 	return err
 }
 
@@ -325,14 +328,183 @@ func foreachIncrementalObject(
 // excluding maxCommit; maxCommit is tracked separately, and operation is the
 // object-level GetDuplicatedRows/Contains work.
 type incrementalObjectScanStats struct {
-	scan        time.Duration
-	filter      time.Duration
-	createdAt   time.Duration
-	deletedAt   time.Duration
-	visibleByTS time.Duration
-	groupState  time.Duration
-	maxCommit   time.Duration
-	operation   time.Duration
+	scan                        time.Duration
+	filter                      time.Duration
+	createdAt                   time.Duration
+	deletedAt                   time.Duration
+	visibleByTS                 time.Duration
+	groupState                  time.Duration
+	maxCommit                   time.Duration
+	operation                   time.Duration
+	metrics                     objectScanMetricCounts
+	aobjectCandidate            uint64
+	aobjectScanned              uint64
+	aobjectMaxCommitSkipped     uint64
+	aobjectMaxCommitUnavailable uint64
+}
+
+const (
+	objectScanVisited = iota
+	objectScanCreatedAfterTo
+	objectScanDeletedAtOrBeforeFrom
+	objectScanNotVisibleAtTo
+	objectScanAObjectCandidate
+	objectScanAObjectMaxCommitUnavailable
+	objectScanAObjectMaxCommitSkipped
+	objectScanAObjectScanned
+	objectScanEmptyDroppedSkipped
+	objectScanGetDuplicatedRows
+	objectScanResultCount
+)
+
+var objectScanResultNames = [...]string{
+	"object_list_visited",
+	"created_after_to",
+	"deleted_at_or_before_from",
+	"not_visible_at_to",
+	"aobject_candidate",
+	"aobject_max_commit_unavailable",
+	"aobject_max_commit_skipped",
+	"aobject_scanned",
+	"empty_dropped_skipped",
+	"object_get_duplicated_rows",
+}
+
+const objectStepCount = 9
+
+var objectStepNames = [...]string{
+	"object_list_scan",
+	"object_list_iterator",
+	"object_entry_filter",
+	"object_filter_created_at",
+	"object_filter_deleted_at",
+	"object_filter_visible_by_ts",
+	"object_filter_group_state",
+	"object_max_commit_lookup",
+	"object_operation",
+}
+
+type metricCounter interface {
+	Add(float64)
+}
+
+type metricObserver interface {
+	Observe(float64)
+}
+
+var prePrepareObjectCounters = func() [2][6][objectScanResultCount]metricCounter {
+	var counters [2][6][objectScanResultCount]metricCounter
+	types := [...]string{"data", "tombstone"}
+	for typ := range types {
+		for group := 0; group < 6; group++ {
+			groupName := incrementalObjectGroupName(catalog.ObjectListGroup(group))
+			for result := range objectScanResultNames {
+				counters[typ][group][result] = v2.TxnTNPrePrepareObjectCounter.WithLabelValues(
+					types[typ], groupName, objectScanResultNames[result],
+				)
+			}
+		}
+	}
+	return counters
+}()
+
+var prePrepareObjectStepObservers = func() [2][6][objectStepCount]metricObserver {
+	var observers [2][6][objectStepCount]metricObserver
+	types := [...]string{"data", "tombstone"}
+	for typ := range types {
+		for group := 0; group < 6; group++ {
+			groupName := incrementalObjectGroupName(catalog.ObjectListGroup(group))
+			for step := range objectStepNames {
+				observers[typ][group][step] = v2.TxnTNPrePrepareObjectStepDurationHistogram.WithLabelValues(
+					types[typ], groupName, objectStepNames[step],
+				)
+			}
+		}
+	}
+	return observers
+}()
+
+var prePrepareDedupStepObservers = func() map[string][2]metricObserver {
+	var observers = make(map[string][2]metricObserver)
+	for _, step := range []string{
+		"source_persisted", "build_pk_vector", "build_pk_zonemap", "pk_dedup",
+		"incremental_get_rows", "find_deletes", "check_duplicate_rows",
+		"wait_object_committed", "object_list_scan", "object_entry_filter",
+		"object_filter_created_at", "object_filter_deleted_at",
+		"object_filter_visible_by_ts", "object_filter_group_state",
+		"object_max_commit_lookup", "object_operation",
+	} {
+		observers[step] = [2]metricObserver{
+			v2.TxnTNPrePrepareDeduplicateStepDurationHistogram.WithLabelValues("data", step),
+			v2.TxnTNPrePrepareDeduplicateStepDurationHistogram.WithLabelValues("tombstone", step),
+		}
+	}
+	return observers
+}()
+
+var prePrepareBookmarkCounters = func() [2][4]metricCounter {
+	var counters [2][4]metricCounter
+	types := [...]string{"data", "tombstone"}
+	groups := [...]string{
+		"valid", "invalid", "prefix_skipped", "range_visited",
+	}
+	for typ := range types {
+		for result := range groups {
+			counters[typ][result] = v2.TxnTNPrePrepareObjectBookmarkCounter.WithLabelValues(
+				types[typ], "appendable_create", groups[result],
+			)
+		}
+	}
+	return counters
+}()
+
+var tableScanMetricCache sync.Map
+
+type tableScanMetricSet struct {
+	tableLabel string
+	once       [2][2][6]sync.Once
+	counters   [2][2][6][objectScanResultCount]metricCounter
+}
+
+func (set *tableScanMetricSet) ensure(typ, kind, group int) {
+	set.once[typ][kind][group].Do(func() {
+		types := [...]string{"data", "tombstone"}
+		kinds := [...]string{"aobject", "naobject"}
+		groupName := incrementalObjectGroupName(catalog.ObjectListGroup(group))
+		drop := prePrepareObjectHasDrop(catalog.ObjectListGroup(group))
+		for result := range objectScanResultNames {
+			set.counters[typ][kind][group][result] = v2.TxnTNPrePrepareObjectScanCounter.WithLabelValues(
+				set.tableLabel, types[typ], kinds[kind], drop, groupName,
+				objectScanResultNames[result],
+			)
+		}
+	})
+}
+
+func getTableScanMetricSet(tableID uint64) *tableScanMetricSet {
+	if tableID == 0 {
+		return nil
+	}
+	if value, ok := tableScanMetricCache.Load(tableID); ok {
+		return value.(*tableScanMetricSet)
+	}
+	set := &tableScanMetricSet{tableLabel: strconv.FormatUint(tableID, 10)}
+	actual, _ := tableScanMetricCache.LoadOrStore(tableID, set)
+	return actual.(*tableScanMetricSet)
+}
+
+type objectScanMetricCounts struct {
+	// [aobject/naobject][result]. Keeping these counts local avoids touching
+	// Prometheus label maps for every object in the iterator hot path.
+	counts [2][objectScanResultCount]uint64
+}
+
+func (c *objectScanMetricCounts) add(obj *catalog.ObjectEntry, result int) {
+	kind := 1 // naobject
+	if obj.IsAppendable() {
+		kind = 0
+	}
+	c.counts[kind][result]++
 }
 
 func incrementalObjectGroupName(group catalog.ObjectListGroup) string {
@@ -354,13 +526,6 @@ func incrementalObjectGroupName(group catalog.ObjectListGroup) string {
 	}
 }
 
-func prePrepareObjectKind(obj *catalog.ObjectEntry) string {
-	if obj.IsAppendable() {
-		return "aobject"
-	}
-	return "naobject"
-}
-
 func prePrepareObjectHasDrop(group catalog.ObjectListGroup) string {
 	switch group {
 	case catalog.ObjectListGroupAppendableCreateWithDrop,
@@ -376,25 +541,33 @@ func prePrepareObjectHasDrop(group catalog.ObjectListGroup) string {
 func observePrePrepareObjectScan(
 	tableID uint64,
 	isTombstone bool,
-	obj *catalog.ObjectEntry,
-	result string,
+	group catalog.ObjectListGroup,
+	counts objectScanMetricCounts,
 ) {
-	if tableID == 0 {
-		return
-	}
-	typ := "data"
+	typIndex := 0
 	if isTombstone {
-		typ = "tombstone"
+		typIndex = 1
 	}
-	group := obj.ObjectListGroup()
-	v2.TxnTNPrePrepareObjectScanCounter.WithLabelValues(
-		strconv.FormatUint(tableID, 10),
-		typ,
-		prePrepareObjectKind(obj),
-		prePrepareObjectHasDrop(group),
-		incrementalObjectGroupName(group),
-		result,
-	).Inc()
+	groupIndex := int(group)
+	tableCounters := getTableScanMetricSet(tableID)
+	for kindIndex := range [...]string{"aobject", "naobject"} {
+		for resultIndex, count := range counts.counts[kindIndex] {
+			if count == 0 {
+				continue
+			}
+			prePrepareObjectCounters[typIndex][groupIndex][resultIndex].Add(float64(count))
+			if tableCounters != nil {
+				tableCounters.ensure(typIndex, kindIndex, groupIndex)
+				tableCounters.counters[typIndex][kindIndex][groupIndex][resultIndex].Add(float64(count))
+			}
+		}
+	}
+	if group == catalog.ObjectListGroupAppendableCreate {
+		visited := counts.counts[0][objectScanVisited] + counts.counts[1][objectScanVisited]
+		if visited != 0 {
+			prePrepareBookmarkCounters[typIndex][3].Add(float64(visited))
+		}
+	}
 }
 
 func observeIncrementalObjectScanStats(isTombstone bool, stats incrementalObjectScanStats) {
@@ -421,23 +594,34 @@ func observeIncrementalObjectGroupScanStats(
 	group catalog.ObjectListGroup,
 	stats incrementalObjectScanStats,
 ) {
-	typ := "data"
-	if isTombstone {
-		typ = "tombstone"
+	typIndex := boolToInt(isTombstone)
+	groupIndex := int(group)
+	durations := [...]time.Duration{
+		stats.scan,
+		maxDuration(0, stats.scan-stats.filter-stats.maxCommit-stats.operation),
+		stats.filter,
+		stats.createdAt,
+		stats.deletedAt,
+		stats.visibleByTS,
+		stats.groupState,
+		stats.maxCommit,
+		stats.operation,
 	}
-	groupName := incrementalObjectGroupName(group)
-	observeObjectStep := func(step string, duration time.Duration) {
-		v2.TxnTNPrePrepareObjectStepDurationHistogram.WithLabelValues(typ, groupName, step).Observe(duration.Seconds())
+	for step, duration := range durations {
+		prePrepareObjectStepObservers[typIndex][groupIndex][step].Observe(duration.Seconds())
 	}
-	observeObjectStep("object_list_scan", stats.scan)
-	observeObjectStep("object_list_iterator", maxDuration(0, stats.scan-stats.filter-stats.maxCommit-stats.operation))
-	observeObjectStep("object_entry_filter", stats.filter)
-	observeObjectStep("object_filter_created_at", stats.createdAt)
-	observeObjectStep("object_filter_deleted_at", stats.deletedAt)
-	observeObjectStep("object_filter_visible_by_ts", stats.visibleByTS)
-	observeObjectStep("object_filter_group_state", stats.groupState)
-	observeObjectStep("object_max_commit_lookup", stats.maxCommit)
-	observeObjectStep("object_operation", stats.operation)
+	if stats.aobjectCandidate != 0 {
+		v2.TxnAObjectDedupCandidateCounter.Add(float64(stats.aobjectCandidate))
+	}
+	if stats.aobjectScanned != 0 {
+		v2.TxnAObjectDedupScannedCounter.Add(float64(stats.aobjectScanned))
+	}
+	if stats.aobjectMaxCommitSkipped != 0 {
+		v2.TxnAObjectDedupMaxCommitSkippedCounter.Add(float64(stats.aobjectMaxCommitSkipped))
+	}
+	if stats.aobjectMaxCommitUnavailable != 0 {
+		v2.TxnAObjectDedupMaxCommitUnavailableCounter.Add(float64(stats.aobjectMaxCommitUnavailable))
+	}
 }
 
 func maxDuration(left, right time.Duration) time.Duration {
@@ -452,10 +636,10 @@ func foreachIncrementalObjectWithStats(
 	isTombstone bool,
 	from, to types.TS,
 	tableID uint64,
-	fn func(*catalog.ObjectEntry) error,
+	scope string,
+	fn func(*catalog.ObjectEntry, *incrementalObjectScanStats) error,
 ) (stats incrementalObjectScanStats, err error) {
 	groupStats := make(map[catalog.ObjectListGroup]*incrementalObjectScanStats)
-	groupTypes := make(map[catalog.ObjectListGroup]string)
 	var activeStats *incrementalObjectScanStats
 	getGroupStats := func(group catalog.ObjectListGroup) *incrementalObjectScanStats {
 		if groupStats[group] == nil {
@@ -473,19 +657,8 @@ func foreachIncrementalObjectWithStats(
 		dst.maxCommit += src.maxCommit
 		dst.operation += src.operation
 	}
-	observeObject := func(obj *catalog.ObjectEntry, result string) {
-		observePrePrepareObjectScan(tableID, isTombstone, obj, result)
-		kind := "data"
-		if obj.IsTombstone {
-			kind = "tombstone"
-		}
-		groupTypes[obj.ObjectListGroup()] = kind
-		v2.TxnTNPrePrepareObjectCounter.WithLabelValues(
-			kind, incrementalObjectGroupName(obj.ObjectListGroup()), result).Inc()
-		if result == "object_list_visited" && obj.ObjectListGroup() == catalog.ObjectListGroupAppendableCreate {
-			v2.TxnTNPrePrepareObjectBookmarkCounter.WithLabelValues(
-				kind, incrementalObjectGroupName(obj.ObjectListGroup()), "range_visited").Inc()
-		}
+	observeObject := func(obj *catalog.ObjectEntry, result int) {
+		activeStats.metrics.add(obj, result)
 	}
 	shouldSkipAObject := func(obj *catalog.ObjectEntry) bool {
 		objData := obj.GetObjectData()
@@ -499,37 +672,51 @@ func foreachIncrementalObjectWithStats(
 			// appendable at the data layer but must still be filtered here.
 			return false
 		}
-		observeObject(obj, "aobject_candidate")
-		v2.TxnAObjectDedupCandidateCounter.Inc()
+		observeObject(obj, objectScanAObjectCandidate)
+		activeStats.aobjectCandidate++
 		maxCommitStart := time.Now()
 		maxCommit, finalized := maxCommitter.GetAppendMaxCommitTS()
 		activeStats.maxCommit += time.Since(maxCommitStart)
 		if !finalized {
 			// Unsealed append history has no safe upper bound. It must not be
 			// skipped, even when the currently visible rows look old.
-			v2.TxnAObjectDedupMaxCommitUnavailableCounter.Inc()
-			v2.TxnAObjectDedupScannedCounter.Inc()
-			observeObject(obj, "aobject_max_commit_unavailable")
-			observeObject(obj, "aobject_scanned")
+			activeStats.aobjectMaxCommitUnavailable++
+			activeStats.aobjectScanned++
+			observeObject(obj, objectScanAObjectMaxCommitUnavailable)
+			observeObject(obj, objectScanAObjectScanned)
+			frozen := false
+			if inspectable, ok := objData.(interface{ IsAppendFrozen() bool }); ok {
+				frozen = inspectable.IsAppendFrozen()
+			}
+			logutil.Debugf(
+				"[PrePrepareDedup] aobject max commit unavailable scope=%s table=%d tombstone=%v object=%s created=%s drop=%v catalog_appendable=%v frozen=%v from=%s to=%s",
+				scope,
+				tableID,
+				isTombstone,
+				obj.ID().ShortStringEx(),
+				obj.CreatedAt.ToString(),
+				obj.HasDropCommitted(),
+				obj.IsAppendable(),
+				frozen,
+				from.ToString(),
+				to.ToString())
 			return false
 		}
 		if maxCommit.LT(&from) {
-			v2.TxnAObjectDedupMaxCommitSkippedCounter.Inc()
-			observeObject(obj, "aobject_max_commit_skipped")
+			activeStats.aobjectMaxCommitSkipped++
+			observeObject(obj, objectScanAObjectMaxCommitSkipped)
 			return true
 		}
-		v2.TxnAObjectDedupScannedCounter.Inc()
-		observeObject(obj, "aobject_scanned")
+		activeStats.aobjectScanned++
+		observeObject(obj, objectScanAObjectScanned)
 		return false
 	}
-	recordFilter := func(filterStart time.Time, maxCommitBefore time.Duration, createdAt, deletedAt, visibleByTS time.Duration) {
-		filterElapsed := time.Since(filterStart) - (activeStats.maxCommit - maxCommitBefore)
+	recordFilter := func(entryStart time.Time, maxCommitBefore, operationBefore time.Duration) {
+		filterElapsed := time.Since(entryStart) -
+			(activeStats.maxCommit - maxCommitBefore) -
+			(activeStats.operation - operationBefore)
 		if filterElapsed > 0 {
 			activeStats.filter += filterElapsed
-			groupState := filterElapsed - createdAt - deletedAt - visibleByTS
-			if groupState > 0 {
-				activeStats.groupState += groupState
-			}
 		}
 	}
 	visitCreateGroup := func(group catalog.ObjectListGroup, appendable bool) error {
@@ -541,33 +728,31 @@ func foreachIncrementalObjectWithStats(
 		localStats := getGroupStats(group)
 		activeStats = localStats
 		visitEntry := func(obj *catalog.ObjectEntry) bool {
-			filterStart := time.Now()
+			entryStart := time.Now()
 			maxCommitBefore := activeStats.maxCommit
-			observeObject(obj, "object_list_visited")
-			createdAtStart := time.Now()
+			operationBefore := activeStats.operation
+			observeObject(obj, objectScanVisited)
 			createdAfterTo := obj.CreatedAt.GT(&to)
-			createdAtElapsed := time.Since(createdAtStart)
-			activeStats.createdAt += createdAtElapsed
 			if createdAfterTo {
-				observeObject(obj, "created_after_to")
-				recordFilter(filterStart, maxCommitBefore, createdAtElapsed, 0, 0)
+				observeObject(obj, objectScanCreatedAfterTo)
+				recordFilter(entryStart, maxCommitBefore, operationBefore)
 				return false
 			}
 			if shouldSkipAObject(obj) {
-				recordFilter(filterStart, maxCommitBefore, createdAtElapsed, 0, 0)
+				recordFilter(entryStart, maxCommitBefore, operationBefore)
 				return true
 			}
-			// A create-only group contains serving C entries without a D
-			// counterpart. With CreatedAt <= to established above,
-			// VisibleByTS(to) cannot reject the entry.
-			recordFilter(filterStart, maxCommitBefore, createdAtElapsed, 0, 0)
 			operationStart := time.Now()
-			err = fn(obj)
+			err = fn(obj, activeStats)
 			activeStats.operation += time.Since(operationStart)
+			recordFilter(entryStart, maxCommitBefore, operationBefore)
 			return err == nil
 		}
 		scanStart := time.Now()
-		bookmarkStart, bookmarkValid, bookmarkSkipped := snapshot.CommitBookmarkStartWithCount(group, from)
+		bookmarkStart, bookmarkValid, bookmarkSkipped := (*catalog.ObjectEntry)(nil), false, 0
+		if appendable {
+			bookmarkStart, bookmarkValid, bookmarkSkipped = snapshot.CommitBookmarkStartWithCount(group, from)
+		}
 		if from == txnif.UncommitTS {
 			bookmarkValid = false
 			bookmarkSkipped = 0
@@ -578,15 +763,13 @@ func foreachIncrementalObjectWithStats(
 				kind = "tombstone"
 			}
 			groupName := incrementalObjectGroupName(group)
-			bookmarkResult := "invalid"
+			bookmarkResultIndex := 1
 			if bookmarkValid {
-				bookmarkResult = "valid"
+				bookmarkResultIndex = 0
 			}
-			v2.TxnTNPrePrepareObjectBookmarkCounter.WithLabelValues(
-				kind, groupName, bookmarkResult).Inc()
+			prePrepareBookmarkCounters[boolToInt(isTombstone)][bookmarkResultIndex].Add(1)
 			if bookmarkSkipped > 0 {
-				v2.TxnTNPrePrepareObjectBookmarkCounter.WithLabelValues(
-					kind, groupName, "prefix_skipped").Add(float64(bookmarkSkipped))
+				prePrepareBookmarkCounters[boolToInt(isTombstone)][2].Add(float64(bookmarkSkipped))
 			}
 			startID := "<none>"
 			if bookmarkStart != nil {
@@ -609,7 +792,8 @@ func foreachIncrementalObjectWithStats(
 			snapshot.AscendGroup(group, from, visitEntry)
 		}
 		localStats.scan += time.Since(scanStart)
-		observeIncrementalObjectGroupScanStats(groupTypes[group] == "tombstone", group, *localStats)
+		observePrePrepareObjectScan(tableID, isTombstone, group, localStats.metrics)
+		observeIncrementalObjectGroupScanStats(isTombstone, group, *localStats)
 		mergeStats(&stats, localStats)
 		return err
 	}
@@ -622,48 +806,43 @@ func foreachIncrementalObjectWithStats(
 		activeStats = localStats
 		scanStart := time.Now()
 		visitEntry := func(obj *catalog.ObjectEntry) bool {
-			filterStart := time.Now()
+			entryStart := time.Now()
 			maxCommitBefore := activeStats.maxCommit
-			observeObject(obj, "object_list_visited")
-			deletedAtStart := time.Now()
+			operationBefore := activeStats.operation
+			observeObject(obj, objectScanVisited)
 			deletedAfterFrom := obj.DeletedAt.GT(&from)
-			deletedAtElapsed := time.Since(deletedAtStart)
-			activeStats.deletedAt += deletedAtElapsed
 			// Ascend is inclusive. Drop processing starts strictly after from.
 			if !deletedAfterFrom {
-				observeObject(obj, "deleted_at_or_before_from")
-				recordFilter(filterStart, maxCommitBefore, 0, deletedAtElapsed, 0)
+				observeObject(obj, objectScanDeletedAtOrBeforeFrom)
+				recordFilter(entryStart, maxCommitBefore, operationBefore)
 				return true
 			}
-			createdAtStart := time.Now()
 			createdAfterTo := obj.CreatedAt.GT(&to)
-			createdAtElapsed := time.Since(createdAtStart)
-			activeStats.createdAt += createdAtElapsed
 			if createdAfterTo {
-				observeObject(obj, "created_after_to")
-				recordFilter(filterStart, maxCommitBefore, createdAtElapsed, deletedAtElapsed, 0)
+				observeObject(obj, objectScanCreatedAfterTo)
+				recordFilter(entryStart, maxCommitBefore, operationBefore)
 				return true
 			}
-			visibleStart := time.Now()
 			visible := obj.VisibleByTS(to)
-			visibleElapsed := time.Since(visibleStart)
-			activeStats.visibleByTS += visibleElapsed
 			if !visible {
-				observeObject(obj, "not_visible_at_to")
-				recordFilter(filterStart, maxCommitBefore, createdAtElapsed, deletedAtElapsed, visibleElapsed)
+				observeObject(obj, objectScanNotVisibleAtTo)
+				recordFilter(entryStart, maxCommitBefore, operationBefore)
 				return true
 			}
 			if shouldSkipAObject(obj) {
-				recordFilter(filterStart, maxCommitBefore, createdAtElapsed, deletedAtElapsed, visibleElapsed)
+				recordFilter(entryStart, maxCommitBefore, operationBefore)
 				return true
 			}
-			recordFilter(filterStart, maxCommitBefore, createdAtElapsed, deletedAtElapsed, visibleElapsed)
 			operationStart := time.Now()
-			err = fn(obj)
+			err = fn(obj, activeStats)
 			activeStats.operation += time.Since(operationStart)
+			recordFilter(entryStart, maxCommitBefore, operationBefore)
 			return err == nil
 		}
-		bookmarkStart, bookmarkValid := snapshot.CommitBookmarkStart(group, from)
+		bookmarkStart, bookmarkValid := (*catalog.ObjectEntry)(nil), false
+		if group == catalog.ObjectListGroupAppendableDrop {
+			bookmarkStart, bookmarkValid = snapshot.CommitBookmarkStart(group, from)
+		}
 		if from == txnif.UncommitTS {
 			bookmarkValid = false
 		}
@@ -675,7 +854,8 @@ func foreachIncrementalObjectWithStats(
 			snapshot.AscendGroup(group, from, visitEntry)
 		}
 		localStats.scan += time.Since(scanStart)
-		observeIncrementalObjectGroupScanStats(groupTypes[group] == "tombstone", group, *localStats)
+		observePrePrepareObjectScan(tableID, isTombstone, group, localStats.metrics)
+		observeIncrementalObjectGroupScanStats(isTombstone, group, *localStats)
 		mergeStats(&stats, localStats)
 		return err
 	}
@@ -690,6 +870,13 @@ func foreachIncrementalObjectWithStats(
 	return stats, err
 }
 
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 // incrementalGetRowsByPK checks the inclusive logical interval [from, to].
 // Callers that hold an exclusive dedup watermark must pass watermark.Next().
 func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers.Vector, from, to types.TS, inQueue bool) (rowIDs containers.Vector, err error) {
@@ -702,7 +889,9 @@ func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers
 		tbl.txnTable.entry.WaitDataObjectCommitted(to)
 		snapshot = tbl.txnTable.entry.MakeDataObjectSnapshot()
 	}
-	observePrePrepareDedupStep(tbl.isTombstone, "wait_object_committed", stepStart)
+	if inQueue {
+		observePrePrepareDedupStep(tbl.isTombstone, "wait_object_committed", stepStart)
+	}
 	rowIDs = tbl.txnTable.store.rt.VectorPool.Small.GetVector(&objectio.RowidType)
 	defer func() {
 		// Ownership transfers to the caller only on success. In particular,
@@ -721,22 +910,20 @@ func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers
 	)
 
 	var scanStats incrementalObjectScanStats
-	scanStats, err = foreachIncrementalObjectWithStats(snapshot, tbl.isTombstone, from, to, tbl.txnTable.entry.ID, func(obj *catalog.ObjectEntry) error {
+	scope := "freeze"
+	if inQueue {
+		scope = "preprepare"
+	}
+	scanStats, err = foreachIncrementalObjectWithStats(snapshot, tbl.isTombstone, from, to, tbl.txnTable.entry.ID, scope, func(obj *catalog.ObjectEntry, stats *incrementalObjectScanStats) error {
 		if isEmptyDroppedAppendableObject(obj) {
-			kind := "data"
-			if tbl.isTombstone {
-				kind = "tombstone"
-			}
-			group := obj.ObjectListGroup()
-			groupNames := [...]string{
-				"appendable_create", "appendable_create_with_drop", "appendable_drop",
-				"non_appendable_create", "non_appendable_create_with_drop", "non_appendable_drop",
-			}
-			v2.TxnTNPrePrepareObjectCounter.WithLabelValues(kind, groupNames[group], "empty_dropped_skipped").Inc()
+			// The group counter is emitted once after the group traversal. Keep
+			// this callback allocation-free and only record the local result.
+			// The object is still passed through the normal operation callback,
+			// so use the same per-group metric accumulator as other results.
+			stats.metrics.add(obj, objectScanEmptyDroppedSkipped)
 			return nil
 		}
 		objData := obj.GetObjectData()
-		objectStepStart := time.Now()
 		err := objData.GetDuplicatedRows(
 			ctx,
 			tbl.txnTable.store.txn,
@@ -746,20 +933,12 @@ func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers
 			rowIDs,
 			common.WorkspaceAllocator,
 		)
-		observePrePrepareDedupStep(tbl.isTombstone, "object_get_duplicated_rows", objectStepStart)
-		kind := "data"
-		if tbl.isTombstone {
-			kind = "tombstone"
-		}
-		groupNames := [...]string{
-			"appendable_create", "appendable_create_with_drop", "appendable_drop",
-			"non_appendable_create", "non_appendable_create_with_drop", "non_appendable_drop",
-		}
-		v2.TxnTNPrePrepareObjectCounter.WithLabelValues(
-			kind, groupNames[obj.ObjectListGroup()], "object_get_duplicated_rows").Inc()
+		stats.metrics.add(obj, objectScanGetDuplicatedRows)
 		return err
 	})
-	observeIncrementalObjectScanStats(tbl.isTombstone, scanStats)
+	if inQueue {
+		observeIncrementalObjectScanStats(tbl.isTombstone, scanStats)
+	}
 	if err != nil {
 		return
 	}

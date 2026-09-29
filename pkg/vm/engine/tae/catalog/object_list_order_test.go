@@ -121,6 +121,21 @@ func TestObjectListCopiesOnlyModifiedGroups(t *testing.T) {
 	}
 }
 
+func TestObjectListSnapshotAscendGroupUncommittedStartsAtGroupBeginning(t *testing.T) {
+	list := NewObjectList(false)
+	list.Set(makeObjectListOrderTestEntry(1, ObjectListGroupNonAppendableCreate, 1))
+	list.Set(makeObjectListOrderTestEntry(2, ObjectListGroupNonAppendableCreate, 2))
+
+	snapshot := ObjectListSnapshot{trees: list.loadTrees()}
+	var markers []byte
+	snapshot.AscendGroup(ObjectListGroupNonAppendableCreate, txnif.UncommitTS, func(obj *ObjectEntry) bool {
+		markers = append(markers, obj.ID()[0])
+		return true
+	})
+
+	require.Equal(t, []byte{1, 2}, markers)
+}
+
 func TestObjectListGroupSnapshotsConcurrentMutation(t *testing.T) {
 	list := NewObjectList(false)
 	const (

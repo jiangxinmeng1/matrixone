@@ -48,6 +48,21 @@ func TestObjectListCommitBookmarkPrefix(t *testing.T) {
 	require.Equal(t, 2, skipped)
 }
 
+func TestObjectListDoesNotMaintainBookmarksForNonAppendableObjects(t *testing.T) {
+	list := NewObjectList(false)
+	entry := makeObjectListOrderTestEntry(1, ObjectListGroupNonAppendableCreate, 1)
+	list.Set(entry)
+	list.rebuildCommitBookmarks()
+
+	list.RLock()
+	_, hasAppendMax := list.appendMaxes[*entry.ID()]
+	trees := list.loadTrees()
+	list.RUnlock()
+
+	require.False(t, hasAppendMax)
+	require.Nil(t, trees.bookmarks[ObjectListGroupNonAppendableCreate])
+}
+
 func TestObjectListCommitBookmarkPendingIsUnbounded(t *testing.T) {
 	list := NewObjectList(false)
 	entry := makeObjectListOrderTestEntry(1, ObjectListGroupAppendableCreate, 1)
