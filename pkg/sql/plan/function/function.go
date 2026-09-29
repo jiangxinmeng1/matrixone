@@ -259,6 +259,11 @@ func getFunctionByName(
 	case failedTooManyFunctionMatched:
 		err = moerr.NewInvalidArg(ctx, fmt.Sprintf("too many overloads matched %s", name), args)
 	}
+	if err == nil && r.fid == MAKEDATE && LegacySpecialConsumers(ctx) && r.overloadId == 0 {
+		// Persisted 4.2 MAKEDATE overload 0 produced VARCHAR. Keep that
+		// metadata when validating legacy table-dump expressions.
+		r.retType = types.T_varchar.ToType()
+	}
 	if err == nil {
 		r.applyDivPrecisionIncrement(ctx, args)
 	}
