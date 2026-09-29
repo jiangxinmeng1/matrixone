@@ -35,6 +35,15 @@ func TestTemporalLocaleResolution(t *testing.T) {
 	require.Equal(t, "déc", localizedMonthAbbrev(proc, 12))
 }
 
+func TestTemporalLocaleResolutionFromRemoteSessionSnapshot(t *testing.T) {
+	proc := testutil.NewProcess(t)
+	proc.SetResolveVariableFunc(nil)
+	proc.GetSessionInfo().LCTimeNames = "fr_FR"
+
+	require.Equal(t, "dimanche", localizedWeekday(proc, 0))
+	require.Equal(t, "décembre", localizedMonth(proc, 12))
+}
+
 func TestTemporalLocaleFallbackAndBounds(t *testing.T) {
 	require.Equal(t, "Sunday", localizedWeekday(nil, 0))
 	require.Equal(t, "", localizedWeekday(nil, -1))

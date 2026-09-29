@@ -59,12 +59,17 @@ var temporalLocales = map[string]temporalLocale{
 
 func temporalLocaleForProcess(proc *process.Process) temporalLocale {
 	name := "en_US"
+	resolved := false
 	if proc != nil && proc.GetResolveVariableFunc() != nil {
 		if value, err := proc.GetResolveVariableFunc()("lc_time_names", true, false); err == nil {
 			if s, ok := value.(string); ok && strings.TrimSpace(s) != "" {
 				name = s
+				resolved = true
 			}
 		}
+	}
+	if !resolved && proc != nil && proc.GetSessionInfo() != nil && proc.GetSessionInfo().LCTimeNames != "" {
+		name = proc.GetSessionInfo().LCTimeNames
 	}
 	if locale, ok := temporalLocales[name]; ok {
 		return locale
