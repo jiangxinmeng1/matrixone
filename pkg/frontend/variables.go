@@ -4638,7 +4638,7 @@ func inferUserDefinedVarType(value interface{}) planpb.Type {
 	case []int8:
 		return planpb.Type{Id: int32(types.T_array_int8), Width: int32(len(v))}
 	case nil:
-		oid = types.T_text
+		oid = types.T_any
 	default:
 		oid = types.T_text
 	}
