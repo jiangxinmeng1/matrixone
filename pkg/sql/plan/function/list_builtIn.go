@@ -13129,7 +13129,7 @@ var supportedControlBuiltIns = []FuncNew{
 				overloadId: 2,
 				args:       []types.T{types.T_int64, types.T_int64},
 				retType:    func([]types.Type) types.Type { return types.T_date.ToType() },
-				newOp:      func() executeLogicOfOverload { return MakeDate },
+				newOp:      func() executeLogicOfOverload { return makeDateIntegerDate },
 			},
 		},
 	},

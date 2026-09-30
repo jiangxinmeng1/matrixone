@@ -700,7 +700,7 @@ func (builder *QueryBuilder) bindUpdate(stmt *tree.Update, bindCtx *BindContext)
 			continue
 		}
 		if predicate, predicateErr := builder.makeUpdateChangedRowsPredicate(
-			alias, selectNode, selectNodeTag, changedRowsOldColName2Idx, changedRowsNewColName2Idx, true); predicateErr != nil {
+			alias, selectNode, selectNodeTag, changedRowsOldColName2Idx, changedRowsNewColName2Idx, false); predicateErr != nil {
 			return 0, predicateErr
 		} else if predicate != nil {
 			changedPredicates[alias] = predicate
