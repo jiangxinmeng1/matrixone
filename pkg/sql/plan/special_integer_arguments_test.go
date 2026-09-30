@@ -33,7 +33,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func specialIntegerResultString(result *vector.Vector, row uint64) string {
+func specialIntegerResultString(result *vector.Vector, row int) string {
 	if result.GetType().Oid == types.T_date {
 		return vector.GetFixedAtWithTypeCheck[types.Date](result, row).String()
 	}
