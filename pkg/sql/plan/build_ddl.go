@@ -3364,7 +3364,10 @@ func buildTableDefs(stmt *tree.CreateTable, ctx CompilerContext, createTable *pl
 	}
 
 	genColIdx := 0 // tracks the current column's position in allColDefs
-	legacyTimestampDefaultApplied := false
+	// The legacy implicit-TIMESTAMP exception belongs to the first TIMESTAMP
+	// definition, even when that column has an explicit NULL, DEFAULT, or
+	// ON UPDATE clause. Do not consume the exception only after synthesis.
+	legacyTimestampFirstSeen := false
 	for _, item := range stmt.Defs {
 		switch def := item.(type) {
 		case *tree.ColumnTableDef:
@@ -3375,6 +3378,10 @@ func buildTableDefs(stmt *tree.CreateTable, ctx CompilerContext, createTable *pl
 			colType.Charset = uint32(types.CharsetType(types.T(colType.Id)))
 			if err = applyDefaultAndColumnAttributesToType(ctx.GetContext(), &colType, tableCharset, def.Attributes); err != nil {
 				return err
+			}
+			firstLegacyTimestamp := types.T(colType.Id) == types.T_timestamp && !legacyTimestampFirstSeen
+			if firstLegacyTimestamp {
+				legacyTimestampFirstSeen = true
 			}
 			if colType.Id == int32(types.T_char) || colType.Id == int32(types.T_varchar) ||
 				colType.Id == int32(types.T_binary) || colType.Id == int32(types.T_varbinary) {
@@ -3510,10 +3517,17 @@ func buildTableDefs(stmt *tree.CreateTable, ctx CompilerContext, createTable *pl
 				if preserved != nil && preserved.defaultExpr != nil {
 					defaultValue = proto.Clone(preserved.defaultExpr).(*plan.Default)
 				} else {
-					legacyImplicit := !legacyTimestampDefaultApplied &&
-						types.T(colType.Id) == types.T_timestamp &&
+					explicitOnUpdate := false
+					for _, attr := range def.Attributes {
+						if _, ok := attr.(*tree.AttributeOnUpdate); ok {
+							explicitOnUpdate = true
+							break
+						}
+					}
+					legacyImplicit := firstLegacyTimestamp &&
 						!hasExplicitNullableAttribute(def) &&
 						!hasExplicitDefaultAttribute(def) &&
+						!explicitOnUpdate &&
 						legacyImplicitTimestampDefaults(ctx)
 					if legacyImplicit {
 						defaultValue, err = buildImplicitCurrentTimestampDefault(colType, ctx.GetProcess())
@@ -3525,7 +3539,6 @@ func buildTableDefs(stmt *tree.CreateTable, ctx CompilerContext, createTable *pl
 							return implicitErr
 						}
 						onUpdateExpr = &plan.OnUpdate{Expr: implicitExpr, OriginString: "CURRENT_TIMESTAMP()"}
-						legacyTimestampDefaultApplied = true
 					} else {
 						defaultValue, err = buildDefaultExprWithColumns(ddlExpressionContext(ctx, ctx.GetProcess().Ctx), def, colType, ctx.GetProcess(), allColDefs)
 					}

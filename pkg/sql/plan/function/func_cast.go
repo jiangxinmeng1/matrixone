@@ -4653,7 +4653,7 @@ func datetimeToTimestamp(
 			}
 		} else {
 			if v.IsNonexistentLocalTime(zone) {
-				if isStrictSqlMode(proc) {
+				if isStrictSqlMode(proc) && !statementIgnore(proc) {
 					return moerr.NewInvalidInputNoCtxf("nonexistent local time: %s", v.String2(6))
 				}
 				appendTemporalAssignmentConversionWarning(proc, "timestamp", v.String2(6))
@@ -8844,6 +8844,28 @@ func strToDate(proc *process.Process,
 	return nil
 }
 
+// truncateTemporalFractionForParse removes digits beyond the engine's
+// microsecond representation before parsing. Parsing at scale 6 can round
+// the seventh digit and carry into the next second; that carry cannot be
+// undone by a later truncation to the target scale.
+func truncateTemporalFractionForParse(s string) (string, error) {
+	dot := strings.IndexByte(s, '.')
+	if dot < 0 {
+		return s, nil
+	}
+	end := dot + 1
+	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+		end++
+	}
+	if end == dot+1 || end != len(s) {
+		return s, moerr.NewInvalidInputNoCtxf("invalid temporal value %s", s)
+	}
+	if end-dot-1 <= 6 {
+		return s, nil
+	}
+	return s[:dot+1+6], nil
+}
+
 func strToTime(
 	proc *process.Process, from vector.FunctionParameterWrapper[types.Varlena],
 	to *vector.FunctionResult[types.Time], length int, selectList *FunctionSelectList, mode castMode) error {
@@ -8886,8 +8908,14 @@ func strToTime(
 		} else {
 			s := convertByteSliceToString(v)
 			parseScale := totype.Scale
-			if truncateFractional && parseScale < 6 {
-				parseScale = 6
+			if truncateFractional {
+				if parseScale < 6 {
+					parseScale = 6
+				}
+				s, err = truncateTemporalFractionForParse(s)
+				if err != nil {
+					return err
+				}
 			}
 			val, err := types.ParseTime(s, parseScale)
 			if err != nil {
@@ -9033,8 +9061,14 @@ func strToDatetime(proc *process.Process,
 		} else {
 			s := convertByteSliceToString(v)
 			parseScale := totype.Scale
-			if truncateFractional && parseScale < 6 {
-				parseScale = 6
+			if truncateFractional {
+				if parseScale < 6 {
+					parseScale = 6
+				}
+				s, err = truncateTemporalFractionForParse(s)
+				if err != nil {
+					return err
+				}
 			}
 			val, err := types.ParseDatetime(s, parseScale)
 			if err != nil {
@@ -9113,8 +9147,14 @@ func strToTimestamp(proc *process.Process,
 		} else {
 			s := convertByteSliceToString(v)
 			parseScale := totype.Scale
-			if truncateFractional && parseScale < 6 {
-				parseScale = 6
+			if truncateFractional {
+				if parseScale < 6 {
+					parseScale = 6
+				}
+				s, err = truncateTemporalFractionForParse(s)
+				if err != nil {
+					return err
+				}
 			}
 			parsed, err := types.ParseDatetime(s, parseScale)
 			if err != nil {
@@ -9131,7 +9171,7 @@ func strToTimestamp(proc *process.Process,
 				parsed = parsed.TruncateToScaleWithoutRounding(totype.Scale)
 			}
 			if parsed.IsNonexistentLocalTime(zone) {
-				if isStrictSqlMode(proc) {
+				if isStrictSqlMode(proc) && mode != castModeAssignmentIgnore && !statementIgnore(proc) {
 					return moerr.NewInvalidInputNoCtxf("nonexistent local time: %s", s)
 				}
 				appendTemporalAssignmentConversionWarning(proc, "timestamp", s)

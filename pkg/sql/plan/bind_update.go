@@ -269,6 +269,12 @@ func (builder *QueryBuilder) appendSequentialSingleTableUpdateAssignments(
 		}
 
 		column := tableDef.Cols[columnIndex]
+		if isNullAstExpr(astExpr) && isLegacyImplicitTimestampColumn(builder.compCtx, column) {
+			rhs, err = getDefaultExpr(builder.GetContext(), column)
+			if err != nil {
+				return 0, nil, 0, err
+			}
+		}
 		if isDefaultValExpr(rhs) {
 			rhs, err = getDefaultExprForAssignment(builder.GetContext(), column, builder.compCtx.GetProcess(), ignore)
 			if err != nil {
@@ -680,9 +686,21 @@ func (builder *QueryBuilder) bindUpdate(stmt *tree.Update, bindCtx *BindContext)
 	changedRowsOldColName2Idx := maps.Clone(oldColName2Idx)
 	changedRowsNewColName2Idx := maps.Clone(newColName2Idx)
 	changedPredicates := make(map[string]*plan.Expr)
-	for _, alias := range dmlCtx.aliases {
+	for aliasIdx, alias := range dmlCtx.aliases {
+		hasAutomaticColumn := false
+		if aliasIdx < len(dmlCtx.tableDefs) {
+			for _, col := range dmlCtx.tableDefs[aliasIdx].Cols {
+				if col.OnUpdate != nil {
+					hasAutomaticColumn = true
+					break
+				}
+			}
+		}
+		if !hasAutomaticColumn {
+			continue
+		}
 		if predicate, predicateErr := builder.makeUpdateChangedRowsPredicate(
-			alias, selectNode, selectNodeTag, changedRowsOldColName2Idx, changedRowsNewColName2Idx, false); predicateErr != nil {
+			alias, selectNode, selectNodeTag, changedRowsOldColName2Idx, changedRowsNewColName2Idx, true); predicateErr != nil {
 			return 0, predicateErr
 		} else if predicate != nil {
 			changedPredicates[alias] = predicate

@@ -651,10 +651,10 @@ func TestUnixTimestampTypedTimestampDecimalNulls(t *testing.T) {
 	require.True(t, succeed, info)
 }
 
-func TestUnixTimestampNoArgReturnsCurrentMicrosecond(t *testing.T) {
+func TestUnixTimestampNoArgReturnsIntegerSeconds(t *testing.T) {
 	proc := testutil.NewProcess(t)
 	proc.Base.UnixTime = 1704067200123456000
-	result := vector.NewFunctionResultWrapper(types.New(types.T_decimal128, 38, 6), proc.Mp())
+	result := vector.NewFunctionResultWrapper(types.T_int64.ToType(), proc.Mp())
 	defer result.Free()
 	require.NoError(t, result.PreExtendAndReset(1))
 
@@ -662,9 +662,8 @@ func TestUnixTimestampNoArgReturnsCurrentMicrosecond(t *testing.T) {
 
 	vec := result.GetResultVector()
 	require.False(t, vec.IsNull(0))
-	got := vector.MustFixedColNoTypeCheck[types.Decimal128](vec)[0]
-	want, err := types.ParseDecimal128("1704067200.123456", 38, 6)
-	require.NoError(t, err)
+	got := vector.MustFixedColNoTypeCheck[int64](vec)[0]
+	want := int64(1704067200)
 	require.Equal(t, want, got)
 }
 

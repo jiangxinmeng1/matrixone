@@ -2825,13 +2825,12 @@ func unswapUUIDTimeParts(u types.Uuid) types.Uuid {
 
 func builtInUnixTimestamp(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
 	if len(parameters) == 0 {
-		rs := vector.MustFunctionResult[types.Decimal128](result)
+		rs := vector.MustFunctionResult[int64](result)
 		// The executor stores the query timestamp here, including the session
 		// timestamp override. Do not read the wall clock again.
-		// Keep the fractional part: the no-argument form is evaluated against
-		// the query timestamp and has the same microsecond precision as
-		// UNIX_TIMESTAMP(timestamp(6)).
-		val := types.Decimal128{B0_63: uint64(proc.GetUnixTime() / int64(time.Microsecond))}
+		// The no-argument form is integer seconds. Fractional precision belongs
+		// to the timestamp argument overload.
+		val := proc.GetUnixTime() / int64(time.Second)
 		for i := uint64(0); i < uint64(length); i++ {
 			if err := rs.Append(val, false); err != nil {
 				return err

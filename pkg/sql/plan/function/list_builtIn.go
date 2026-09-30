@@ -12023,7 +12023,7 @@ var supportedDateAndTimeBuiltIns = []FuncNew{
 				volatile:   true,
 				args:       []types.T{},
 				retType: func(parameters []types.Type) types.Type {
-					return types.New(types.T_decimal128, 38, 6)
+					return types.T_int64.ToType()
 				},
 				newOp: func() executeLogicOfOverload {
 					return builtInUnixTimestamp
@@ -13067,16 +13067,14 @@ var supportedControlBuiltIns = []FuncNew{
 		layout:            STANDARD_FUNCTION,
 		checkFn:           fixedTypeMatch,
 		integerParameters: []integerParameter{{position: 0, target: types.T_int64}, {position: 1, target: types.T_int64}},
-		bindingOverloads:  []int{1},
+		bindingOverloads:  []int{2},
 		Overloads: []overload{
 			{
 				overloadId: 0,
 				args:       []types.T{types.T_varchar, types.T_varchar},
-				retType: func(parameters []types.Type) types.Type {
-					return types.T_date.ToType()
-				},
+				retType:    func([]types.Type) types.Type { return types.T_varchar.ToType() },
 				newOp: func() executeLogicOfOverload {
-					return MakeDate
+					return MakeDateString
 				},
 			},
 			{
@@ -13084,6 +13082,12 @@ var supportedControlBuiltIns = []FuncNew{
 				args:       []types.T{types.T_int64, types.T_int64},
 				retType:    func([]types.Type) types.Type { return types.T_varchar.ToType() },
 				newOp:      func() executeLogicOfOverload { return makeDateInteger },
+			},
+			{
+				overloadId: 2,
+				args:       []types.T{types.T_int64, types.T_int64},
+				retType:    func([]types.Type) types.Type { return types.T_date.ToType() },
+				newOp:      func() executeLogicOfOverload { return MakeDate },
 			},
 		},
 	},
