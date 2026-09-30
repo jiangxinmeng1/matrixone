@@ -2459,11 +2459,11 @@ func timestampAddTimestampAsDatetime(ivecs []*vector.Vector, result vector.Funct
 		unit, _ := vector.GenerateFunctionFixedTypeParameter[int64](ivecs[unitIndex]).GetValue(0)
 		iTyp = types.IntervalType(unit)
 	}
+	rs := vector.MustFunctionResult[types.Datetime](result)
 	scale := max(rs.GetType().Scale, ivecs[timestampIndex].GetType().Scale)
 	if iTyp == types.MicroSecond {
 		scale = 6
 	}
-	rs := vector.MustFunctionResult[types.Datetime](result)
 	rs.TempSetType(types.New(types.T_datetime, scale, scale))
 	result.UseOptFunctionParamFrame(2)
 	p1 := vector.OptGetParamFromWrapper[types.Timestamp](rs, 0, ivecs[timestampIndex])
