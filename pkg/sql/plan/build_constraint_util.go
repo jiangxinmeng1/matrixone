@@ -2206,14 +2206,16 @@ func buildValueScan(
 				// Keep legacy implicit TIMESTAMP NULL semantics consistent with
 				// the main INSERT value-scan path. This must run before the
 				// literal fast path, which otherwise materializes a NULL value.
-				if isNullAstExpr(r[i]) && isLegacyImplicitTimestampColumn(builder.compCtx, col) {
-					defExpr, err = getDefaultExpr(builder.GetContext(), col)
+				if isNullAstExpr(r[i]) {
+					defExpr, err = buildLegacyTimestampNullAssignment(builder.compCtx, col)
 					if err != nil {
 						return nil, err
 					}
-					hasLocalDefaultRefs = hasLocalDefaultRefs || exprHasLocalColumnRef(defExpr)
-					rowsetData.Cols[i].Data = append(rowsetData.Cols[i].Data, &plan.RowsetExpr{Expr: defExpr})
-					continue
+					if defExpr != nil {
+						hasLocalDefaultRefs = hasLocalDefaultRefs || exprHasLocalColumnRef(defExpr)
+						rowsetData.Cols[i].Data = append(rowsetData.Cols[i].Data, &plan.RowsetExpr{Expr: defExpr})
+						continue
+					}
 				}
 				if nv, ok := r[i].(*tree.NumVal); ok && builder.isInsertIgnore {
 					expr, handled, err := makeInsertIgnoreMySQLSpecialTypeConstExpr(builder.GetContext(), nv, col.Typ)

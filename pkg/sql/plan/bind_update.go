@@ -269,10 +269,11 @@ func (builder *QueryBuilder) appendSequentialSingleTableUpdateAssignments(
 		}
 
 		column := tableDef.Cols[columnIndex]
-		if isNullAstExpr(astExpr) && isLegacyImplicitTimestampColumn(builder.compCtx, column) {
-			rhs, err = getDefaultExpr(builder.GetContext(), column)
-			if err != nil {
-				return 0, nil, 0, err
+		if isNullAstExpr(astExpr) {
+			if legacyExpr, legacyErr := buildLegacyTimestampNullAssignment(builder.compCtx, column); legacyErr != nil {
+				return 0, nil, 0, legacyErr
+			} else if legacyExpr != nil {
+				rhs = legacyExpr
 			}
 		}
 		if isDefaultValExpr(rhs) {
@@ -301,6 +302,10 @@ func (builder *QueryBuilder) appendSequentialSingleTableUpdateAssignments(
 			if err != nil {
 				return 0, nil, 0, err
 			}
+		}
+		rhs, err = wrapLegacyTimestampAssignment(builder.compCtx, column, rhs)
+		if err != nil {
+			return 0, nil, 0, err
 		}
 		if isEnumPlanType(&column.Typ) {
 			rhs, err = funcCastForEnumType(builder.GetContext(), rhs, column.Typ)
@@ -448,9 +453,13 @@ func (builder *QueryBuilder) bindUpdate(stmt *tree.Update, bindCtx *BindContext)
 	// MySQL guarantees left-to-right evaluation only for single-table UPDATE.
 	// Keep the existing simultaneous projection path for multi-target and UPDATE
 	// FROM statements, whose assignment order is not guaranteed by MySQL.
+	hasOnUpdateColumn := len(dmlCtx.tableDefs) == 1 && len(dmlCtx.tableDefs[0].Cols) > 0 &&
+		slices.IndexFunc(dmlCtx.tableDefs[0].Cols, func(col *plan.ColDef) bool {
+			return col != nil && col.OnUpdate != nil && col.OnUpdate.Expr != nil
+		}) >= 0
 	sequentialAssignments := !updateHasMultipleSourceTables(stmt) && len(dmlCtx.tableDefs) == 1 &&
-		len(dmlCtx.updateAssignments) == 1 && len(dmlCtx.updateAssignments[0]) > 1 &&
-		stmt.From == nil
+		len(dmlCtx.updateAssignments) == 1 &&
+		(len(dmlCtx.updateAssignments[0]) > 1 || hasOnUpdateColumn) && stmt.From == nil
 	sequentialExprs := make([][]UpdateAssignment, len(dmlCtx.aliases))
 
 	for i, alias := range dmlCtx.aliases {
@@ -733,6 +742,10 @@ func (builder *QueryBuilder) bindUpdate(stmt *tree.Update, bindCtx *BindContext)
 					if err != nil {
 						return 0, err
 					}
+				}
+				updateExpr, err = wrapLegacyTimestampAssignment(builder.compCtx, col, updateExpr)
+				if err != nil {
+					return 0, err
 				}
 				if !col.Typ.AutoIncr && !guardTargetAssignmentEvaluation {
 					err = checkNotNull(builder.GetContext(), updateExpr, tableDef, col)

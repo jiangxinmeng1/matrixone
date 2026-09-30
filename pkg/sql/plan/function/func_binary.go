@@ -2459,7 +2459,7 @@ func timestampAddTimestampAsDatetime(ivecs []*vector.Vector, result vector.Funct
 		unit, _ := vector.GenerateFunctionFixedTypeParameter[int64](ivecs[unitIndex]).GetValue(0)
 		iTyp = types.IntervalType(unit)
 	}
-	scale := ivecs[timestampIndex].GetType().Scale
+	scale := max(rs.GetType().Scale, ivecs[timestampIndex].GetType().Scale)
 	if iTyp == types.MicroSecond {
 		scale = 6
 	}
@@ -2487,13 +2487,10 @@ func timestampAddTimestampAsDatetime(ivecs []*vector.Vector, result vector.Funct
 			}
 			continue
 		}
-		var value types.Timestamp
-		var err error
-		if subtract {
-			value, err = doTimestampSub(loc, ts, interval, iTyp)
-		} else {
-			value, err = doTimestampAdd(loc, ts, interval, iTyp)
-		}
+		// DATETIME results are local wall-clock values. Keep the calculation in
+		// the DATETIME domain so valid pre-1970 results are not rejected by the
+		// TIMESTAMP epoch bound.
+		value, err := doCalendarInterval(ts.ToDatetime(loc), interval, iTyp, subtract)
 		if err != nil {
 			if isDatetimeOverflowMaxError(err) {
 				if err := rs.Append(types.ZeroDatetime, true); err != nil {
@@ -2503,7 +2500,7 @@ func timestampAddTimestampAsDatetime(ivecs []*vector.Vector, result vector.Funct
 			}
 			return err
 		}
-		if err := rs.Append(value.ToDatetime(loc), false); err != nil {
+		if err := rs.Append(value, false); err != nil {
 			return err
 		}
 	}
@@ -4311,7 +4308,7 @@ func addTimeToTimestamp(ivecs []*vector.Vector, result vector.FunctionResultWrap
 		if loc == nil {
 			loc = time.Local
 		}
-		scale := ivecs[0].GetType().Scale
+		scale := max(rs.GetType().Scale, ivecs[0].GetType().Scale)
 		if scale2 := int32(ivecs[1].GetType().Scale); scale2 > scale {
 			scale = scale2
 		}
@@ -4327,15 +4324,18 @@ func addTimeToTimestamp(ivecs []*vector.Vector, result vector.FunctionResultWrap
 				}
 				continue
 			}
-			time2, err := types.ParseTime(functionUtil.QuickBytesToStr(time2Str), scale)
+			time2, err := parseTimeOperand(functionUtil.QuickBytesToStr(time2Str), scale)
 			if err != nil {
 				if err := rs.Append(types.ZeroDatetime, true); err != nil {
 					return err
 				}
 				continue
 			}
-			resultDt := types.Datetime(int64(ts.ToDatetime(loc)) + int64(time2))
-			if err := rs.Append(resultDt, false); err != nil {
+			resultDt, overflow := datetimeArithmeticResult(ts.ToDatetime(loc), time2, false)
+			if overflow {
+				appendTimeIntervalOverflowWarning(proc)
+			}
+			if err := rs.Append(resultDt, overflow); err != nil {
 				return err
 			}
 		}
@@ -4716,7 +4716,7 @@ func subTimeFromTimestamp(ivecs []*vector.Vector, result vector.FunctionResultWr
 		if loc == nil {
 			loc = time.Local
 		}
-		scale := ivecs[0].GetType().Scale
+		scale := max(rs.GetType().Scale, ivecs[0].GetType().Scale)
 		if scale2 := int32(ivecs[1].GetType().Scale); scale2 > scale {
 			scale = scale2
 		}
@@ -4732,15 +4732,18 @@ func subTimeFromTimestamp(ivecs []*vector.Vector, result vector.FunctionResultWr
 				}
 				continue
 			}
-			time2, err := types.ParseTime(functionUtil.QuickBytesToStr(time2Str), scale)
+			time2, err := parseTimeOperand(functionUtil.QuickBytesToStr(time2Str), scale)
 			if err != nil {
 				if err := rs.Append(types.ZeroDatetime, true); err != nil {
 					return err
 				}
 				continue
 			}
-			resultDt := types.Datetime(int64(ts.ToDatetime(loc)) - int64(time2))
-			if err := rs.Append(resultDt, false); err != nil {
+			resultDt, overflow := datetimeArithmeticResult(ts.ToDatetime(loc), time2, true)
+			if overflow {
+				appendTimeIntervalOverflowWarning(proc)
+			}
+			if err := rs.Append(resultDt, overflow); err != nil {
 				return err
 			}
 		}

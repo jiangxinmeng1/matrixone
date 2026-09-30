@@ -735,6 +735,38 @@ func isLegacyImplicitTimestampColumn(ctx CompilerContext, col *plan.ColDef) bool
 		col.Default != nil && !col.Default.NullAbility
 }
 
+// buildLegacyTimestampNullAssignment implements the legacy MySQL assignment
+// rule. NULL assigned to a non-nullable TIMESTAMP is the current timestamp;
+// it is not the column's literal DEFAULT value. Keep this policy at the DML
+// assignment boundary so INSERT, UPDATE and duplicate-key UPDATE agree.
+func buildLegacyTimestampNullAssignment(ctx CompilerContext, col *plan.ColDef) (*plan.Expr, error) {
+	if !isLegacyImplicitTimestampColumn(ctx, col) {
+		return nil, nil
+	}
+	return buildImplicitCurrentTimestampExpr(col.Typ, ctx.GetProcess())
+}
+
+// wrapLegacyTimestampAssignment applies the same rule to runtime NULLs (for
+// example a source-column or prepared parameter), which cannot be recognized
+// from the AST. The expression is evaluated once by the IF and then passed
+// through the ordinary assignment cast.
+func wrapLegacyTimestampAssignment(ctx CompilerContext, col *plan.ColDef, expr *plan.Expr) (*plan.Expr, error) {
+	if !isLegacyImplicitTimestampColumn(ctx, col) || expr == nil {
+		return expr, nil
+	}
+	nullExpr, err := BindFuncExprImplByPlanExpr(ctx.GetContext(), "isnull", []*plan.Expr{DeepCopyExpr(expr)})
+	if err != nil {
+		return nil, err
+	}
+	currentExpr, err := buildImplicitCurrentTimestampExpr(col.Typ, ctx.GetProcess())
+	if err != nil {
+		return nil, err
+	}
+	return BindFuncExprImplByPlanExpr(ctx.GetContext(), "if", []*plan.Expr{
+		nullExpr, currentExpr, DeepCopyExpr(expr),
+	})
+}
+
 // buildDefaultExprWithColumns is the scoped form of buildDefaultExpr.  The
 // unscoped form remains for call sites that bind an expression which is not a
 // table-row default (for example internal compatibility expressions).

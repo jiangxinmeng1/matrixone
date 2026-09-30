@@ -8950,25 +8950,27 @@ func strToDate(proc *process.Process,
 }
 
 // truncateTemporalFractionForParse removes digits beyond the engine's
-// microsecond representation before parsing. Parsing at scale 6 can round
-// the seventh digit and carry into the next second; that carry cannot be
-// undone by a later truncation to the target scale.
-func truncateTemporalFractionForParse(s string) (string, error) {
+// microsecond representation before parsing. Invalid syntax is returned
+// unchanged so the shared temporal parser remains the owner of grammar and
+// assignment/IGNORE diagnostics. Trimming here preserves ParseDatetime's
+// accepted trailing whitespace while still preventing scale-6 rounding.
+func truncateTemporalFractionForParse(s string) string {
+	s = strings.TrimSpace(s)
 	dot := strings.IndexByte(s, '.')
 	if dot < 0 {
-		return s, nil
+		return s
 	}
 	end := dot + 1
 	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
 		end++
 	}
 	if end == dot+1 || end != len(s) {
-		return s, moerr.NewInvalidInputNoCtxf("invalid temporal value %s", s)
+		return s
 	}
 	if end-dot-1 <= 6 {
-		return s, nil
+		return s
 	}
-	return s[:dot+1+6], nil
+	return s[:dot+1+6]
 }
 
 func strToTime(
@@ -9017,10 +9019,7 @@ func strToTime(
 				if parseScale < 6 {
 					parseScale = 6
 				}
-				s, err = truncateTemporalFractionForParse(s)
-				if err != nil {
-					return err
-				}
+				s = truncateTemporalFractionForParse(s)
 			}
 			val, err := types.ParseTime(s, parseScale)
 			if err != nil {
@@ -9170,10 +9169,7 @@ func strToDatetime(proc *process.Process,
 				if parseScale < 6 {
 					parseScale = 6
 				}
-				s, err = truncateTemporalFractionForParse(s)
-				if err != nil {
-					return err
-				}
+				s = truncateTemporalFractionForParse(s)
 			}
 			val, err := types.ParseDatetime(s, parseScale)
 			if err != nil {
@@ -9256,10 +9252,7 @@ func strToTimestamp(proc *process.Process,
 				if parseScale < 6 {
 					parseScale = 6
 				}
-				s, err = truncateTemporalFractionForParse(s)
-				if err != nil {
-					return err
-				}
+				s = truncateTemporalFractionForParse(s)
 			}
 			parsed, err := types.ParseDatetime(s, parseScale)
 			if err != nil {
