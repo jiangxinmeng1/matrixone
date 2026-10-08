@@ -16,6 +16,7 @@ package plan
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect/mysql"
@@ -119,7 +120,7 @@ func TestCTASGroupingExtensionsSurviveInternalReparse(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			mock := NewMockOptimizer(false)
+			mock := NewMockOptimizer(false, newPlanTestProcess(t))
 			ctx := mock.CurrentContext()
 			stmt, err := mysql.ParseOne(ctx.GetContext(), test.sql, 1)
 			require.NoError(t, err)
@@ -165,7 +166,7 @@ func TestCTASFullTextPatternSurvivesInternalReparse(t *testing.T) {
 	// the session-mode parse understood it).
 	buildWithMode := func(t *testing.T, mode string) (generated string, want string) {
 		t.Helper()
-		mock := NewMockOptimizer(false)
+		mock := NewMockOptimizer(false, newPlanTestProcess(t))
 		mock.ctxt.SetSqlModeOverride(mode)
 		ctx := mock.CurrentContext()
 		stmts, err := mysql.ParseWithSQLMode(ctx.GetContext(), sql, 1, mode)
@@ -208,4 +209,24 @@ func TestCTASFullTextPatternSurvivesInternalReparse(t *testing.T) {
 		require.Equal(t, "a\nb", want)
 		require.Equal(t, want, executorPattern(t, generated))
 	})
+}
+
+func TestCTASConflictModifiersGenerateDML(t *testing.T) {
+	for _, tc := range []struct {
+		name, modifier, prefix string
+	}{
+		{"ignore", "IGNORE", "insert ignore into"},
+		{"replace", "REPLACE", "replace into"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := NewMockOptimizer(false, newPlanTestProcess(t))
+			ctx := mock.CurrentContext()
+			stmt, err := mysql.ParseOne(ctx.GetContext(), "CREATE TABLE t "+tc.modifier+" AS SELECT 1", 1)
+			require.NoError(t, err)
+			t.Cleanup(stmt.Free)
+			logicPlan, err := BuildPlan(ctx, stmt, false)
+			require.NoError(t, err)
+			require.True(t, strings.HasPrefix(logicPlan.GetDdl().GetCreateTable().GetCreateAsSelectSql(), tc.prefix))
+		})
+	}
 }

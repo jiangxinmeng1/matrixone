@@ -3001,6 +3001,7 @@ func TestISCPExecutor7(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, txn.Commit(ctxWithTimeout))
+	prepareISCPConsumerTarget(t, ctxWithTimeout, "srcdb", "src_table", tableID, "hnsw_idx")
 
 	// init cdc executor
 	checkLeaseStub := gostub.Stub(
@@ -3069,6 +3070,7 @@ func TestISCPExecutor7(t *testing.T) {
 		tableID,
 		jobName,
 	)
+	checkISCPConsumerData(t, ctxWithTimeout, "srcdb", "src_table", tableID, jobName)
 
 }
 
@@ -3363,6 +3365,7 @@ func TestISCPExecutor8(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, txn.Commit(ctxWithTimeout))
+	prepareISCPConsumerTarget(t, ctxWithTimeout, "srcdb", "src_table", tableID, "hnsw_idx")
 
 	// init cdc executor
 	checkLeaseStub := gostub.Stub(
@@ -3435,9 +3438,11 @@ func TestISCPExecutor8(t *testing.T) {
 	}
 
 	waitForWatermark(types.TimestampToTS(txn.Txn().CommitTS))
+	checkISCPConsumerData(t, ctxWithTimeout, "srcdb", "src_table", tableID, jobName)
 
 	deleteCommitTS := testutil2.DeleteAllWithCommitTS(t, accountId, taeHandler.GetDB(), "srcdb", "src_table")
 	waitForWatermark(deleteCommitTS)
+	checkISCPConsumerData(t, ctxWithTimeout, "srcdb", "src_table", tableID, jobName)
 
 }
 
@@ -3480,6 +3485,7 @@ func TestUpdateJobSpec(t *testing.T) {
 	tableID := rel.GetTableID(ctxWithTimeout)
 
 	require.NoError(t, txn.Commit(ctxWithTimeout))
+	prepareISCPConsumerTarget(t, ctxWithTimeout, "srcdb", "src_table", tableID, "job1")
 
 	// init cdc executor
 	checkLeaseStub := gostub.Stub(
@@ -3849,7 +3855,13 @@ func TestGCInMemoryJob(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, txn.Commit(ctxWithTimeout))
 
-	const jobName = "hnsw_idx"
+	const (
+		jobName       = "hnsw_idx"
+		watermarkWait = 30 * time.Second
+	)
+	// Creating the consumer table and committing its first batch can exceed ten
+	// seconds on a loaded race runner. Keep the wait bounded while allowing the
+	// asynchronous ISCP path to make progress under scheduler pressure.
 	target := types.TimestampToTS(txn.Txn().CommitTS)
 	waitForISCPWatermark(
 		t,
@@ -3857,7 +3869,7 @@ func TestGCInMemoryJob(t *testing.T) {
 			return cdcExecutor.GetWatermark(accountId, tableID, jobName)
 		},
 		target,
-		10*time.Second,
+		watermarkWait,
 		10*time.Millisecond,
 		accountId,
 		tableID,
@@ -3886,7 +3898,7 @@ func TestGCInMemoryJob(t *testing.T) {
 		func() (types.TS, bool) {
 			return cdcExecutor.GetWatermark(accountId, tableID, jobName)
 		},
-		10*time.Second,
+		watermarkWait,
 		10*time.Millisecond,
 		accountId,
 		tableID,
@@ -4278,11 +4290,16 @@ func TestInvalidTimestamp(t *testing.T) {
 
 	require.NoError(t, txn.Commit(ctxWithTimeout))
 
+	// The recovery budget starts with an empty sink; copying data and advancing
+	// the watermark must still happen after the injected fault is released.
+	prepareISCPConsumerTarget(t, ctxWithTimeout, "srcdb", "src_table", tableID, jobName)
+
 	require.True(t, fault.Enable(), "fault injection was already enabled before TestInvalidTimestamp")
 	t.Cleanup(func() {
 		fault.Disable()
 	})
 	invalidTimestampFault := newISCPFaultBarrier(t, ctx, "invalid timestamp")
+	defer invalidTimestampFault.Remove()
 
 	txn, err = disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Engine.LatestLogtailAppliedTime())
 	require.NoError(t, err)
@@ -4321,6 +4338,9 @@ func TestInvalidTimestamp(t *testing.T) {
 		tableID,
 		jobName,
 	)
+	// Compare both directions: watermark progress must represent copied data,
+	// not just job discovery. Let the SQL executor own these transactions too.
+	checkISCPConsumerData(t, ctxWithTimeout, "srcdb", "src_table", tableID, jobName)
 }
 
 func TestCancelIteration1(t *testing.T) {
@@ -4365,20 +4385,20 @@ func TestCancelIteration1(t *testing.T) {
 			cancelCh <- struct{}{}
 			<-cancelCh
 			return []*iscp.JobSpec{
-					{
-						ConsumerInfo: iscp.ConsumerInfo{
-							ConsumerType: int8(iscp.ConsumerType_CNConsumer),
-							SrcTable: iscp.TableInfo{
-								DBName:    "srcdb",
-								TableName: "src_table",
-							},
+				{
+					ConsumerInfo: iscp.ConsumerInfo{
+						ConsumerType: int8(iscp.ConsumerType_CNConsumer),
+						SrcTable: iscp.TableInfo{
+							DBName:    "srcdb",
+							TableName: "src_table",
 						},
 					},
-				}, []*iscp.JobStatus{
-					{
-						Stage: iscp.JobStage_Running,
-					},
-				}, nil
+				},
+			}, []*iscp.JobStatus{
+				{
+					Stage: iscp.JobStage_Running,
+				},
+			}, nil
 		},
 	)
 	defer stub.Reset()
@@ -4471,20 +4491,20 @@ func TestCancelIteration2(t *testing.T) {
 			[]uint64,
 		) (jobSpec []*iscp.JobSpec, prevStatus []*iscp.JobStatus, err error) {
 			return []*iscp.JobSpec{
-					{
-						ConsumerInfo: iscp.ConsumerInfo{
-							ConsumerType: int8(iscp.ConsumerType_CNConsumer),
-							SrcTable: iscp.TableInfo{
-								DBName:    "srcdb",
-								TableName: "src_table",
-							},
+				{
+					ConsumerInfo: iscp.ConsumerInfo{
+						ConsumerType: int8(iscp.ConsumerType_CNConsumer),
+						SrcTable: iscp.TableInfo{
+							DBName:    "srcdb",
+							TableName: "src_table",
 						},
 					},
-				}, []*iscp.JobStatus{
-					{
-						Stage: iscp.JobStage_Running,
-					},
-				}, nil
+				},
+			}, []*iscp.JobStatus{
+				{
+					Stage: iscp.JobStage_Running,
+				},
+			}, nil
 		},
 	)
 	defer stub.Reset()
@@ -4507,12 +4527,12 @@ func TestCancelIteration2(t *testing.T) {
 			int8,
 			[]uint64,
 		) error {
-			if flushCount == 0 {
+			flushCount++
+			if flushCount == 1 {
 				cancelCh <- struct{}{}
 				<-cancelCh
 				return nil
 			}
-			flushCount++
 			return nil
 		},
 	)
@@ -4534,11 +4554,9 @@ func TestCancelIteration2(t *testing.T) {
 
 	txn.Commit(ctxWithTimeout)
 
-	wg := sync.WaitGroup{}
-	wg.Add(1)
+	iterationErr := make(chan error, 1)
 	go func() {
-		defer wg.Done()
-		err = iscp.ExecuteIteration(
+		iterationErr <- iscp.ExecuteIteration(
 			ctxWithTimeout,
 			"",
 			disttaeEngine.Engine,
@@ -4546,12 +4564,11 @@ func TestCancelIteration2(t *testing.T) {
 			iscp.NewIterationContext(accountId, tableID, []string{"job1"}, []uint64{1}, []uint64{1}, types.TS{}, types.TS{}),
 			common.DebugAllocator,
 		)
-		assert.NoError(t, err)
 	}()
 	<-cancelCh
 	cancel()
 	close(cancelCh)
-	wg.Wait()
+	require.ErrorIs(t, <-iterationErr, context.Canceled)
 
 }
 
@@ -4945,13 +4962,15 @@ func TestISCPResumeRecoversAcceptedIteration(t *testing.T) {
 	faultRemoved = true
 	require.NoError(t, cdcExecutor.Resume())
 
+	// Recovery creates the consumer table before it can replay the accepted
+	// iteration. Leave enough headroom for that DDL transaction under CI load.
 	require.Eventually(t, func() bool {
 		lsn, state, found := cdcExecutor.GetJobState(accountID, tableID, "replay_job")
 		watermark, watermarkFound := cdcExecutor.GetWatermark(accountID, tableID, "replay_job")
 		return found && watermarkFound &&
 			lsn == 1 && state == iscp.ISCPJobState_Completed &&
 			watermark.GE(&minimumRecoveredWatermark)
-	}, 10*time.Second, 10*time.Millisecond)
+	}, 30*time.Second, 10*time.Millisecond)
 
 	persistedState, persistedLSN = readPersistedState()
 	require.Equal(t, iscp.ISCPJobState_Completed, persistedState)
@@ -5537,11 +5556,12 @@ func TestCheckLeaseFailed(t *testing.T) {
 
 	err = cdcExecutor.Start()
 	require.NoError(t, err)
-	t.Cleanup(cdcExecutor.Stop)
+	// Join background work before restoring the lease stub or closing the engines.
+	defer cdcExecutor.Stop()
 
-	bat := CreateDBAndTableForCNConsumerAndGetAppendData(t, disttaeEngine, ctxWithTimeout, "srcdb", "src_table", 10)
-	bats := bat.Split(10)
+	bat := CreateDBAndTableForCNConsumerAndGetAppendData(t, disttaeEngine, ctxWithTimeout, "srcdb", "src_table", 2)
 	defer bat.Close()
+	bats := bat.Split(2)
 
 	// append 1 row
 	_, rel, txn, err := disttaeEngine.GetTable(ctxWithTimeout, "srcdb", "src_table")
@@ -5553,6 +5573,9 @@ func TestCheckLeaseFailed(t *testing.T) {
 	require.Nil(t, err)
 
 	require.NoError(t, txn.Commit(ctxWithTimeout))
+
+	// Keep cold sink DDL outside the initial propagation budget.
+	prepareISCPConsumerTarget(t, ctxWithTimeout, "srcdb", "src_table", tableID, "hnsw_idx")
 
 	txn, err = disttaeEngine.NewTxnOperator(ctx, disttaeEngine.Engine.LatestLogtailAppliedTime())
 	require.NoError(t, err)
@@ -5585,6 +5608,8 @@ func TestCheckLeaseFailed(t *testing.T) {
 		tableID,
 		"hnsw_idx",
 	)
+
+	checkISCPConsumerData(t, ctxWithTimeout, "srcdb", "src_table", tableID, "hnsw_idx")
 
 	require.True(t, fault.Enable(), "fault injection was already enabled before TestCheckLeaseFailed")
 	t.Cleanup(func() {

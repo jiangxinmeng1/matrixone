@@ -121,6 +121,37 @@ func appendPrepareEntryFromNode(node *AppendNode) appendPrepareEntry {
 	}
 }
 
+// AppendNodeDebugInfo is a read-only snapshot used by concurrency diagnostics.
+type AppendNodeDebugInfo struct {
+	Start     types.TS
+	Prepare   types.TS
+	End       types.TS
+	StartRow  uint32
+	MaxRow    uint32
+	Aborted   bool
+	Committed bool
+	Tombstone bool
+}
+
+func (n *AppendMVCCHandle) DebugAppendNodes() []AppendNodeDebugInfo {
+	n.RLock()
+	defer n.RUnlock()
+	infos := make([]AppendNodeDebugInfo, 0, len(n.rows))
+	for _, node := range n.rows {
+		infos = append(infos, AppendNodeDebugInfo{
+			Start:     node.Start,
+			Prepare:   node.Prepare,
+			End:       node.End,
+			StartRow:  node.startRow,
+			MaxRow:    node.maxRow,
+			Aborted:   node.IsAborted(),
+			Committed: node.IsCommitted(),
+			Tombstone: node.IsTombstone(),
+		})
+	}
+	return infos
+}
+
 func NewAppendMVCCHandle(meta *catalog.ObjectEntry) *AppendMVCCHandle {
 	node := &AppendMVCCHandle{
 		RWMutex:               &sync.RWMutex{},

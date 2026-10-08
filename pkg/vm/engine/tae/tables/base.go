@@ -216,6 +216,10 @@ func (obj *baseObject) WaitAppendCommittingBefore(
 	return len(txns) != 0
 }
 
+func (obj *baseObject) DebugAppendNodes() []updates.AppendNodeDebugInfo {
+	return obj.appendMVCC.DebugAppendNodes()
+}
+
 func (obj *baseObject) GetFs() fileservice.FileService { return obj.rt.Fs }
 func (obj *baseObject) GetID() *common.ID              { return obj.meta.Load().AsCommonID() }
 

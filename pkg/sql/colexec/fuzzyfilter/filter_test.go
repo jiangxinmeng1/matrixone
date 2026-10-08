@@ -139,11 +139,10 @@ func setProcForTest(fuzzyFilter *FuzzyFilter, proc *process.Process, typs []type
 }
 
 func TestString(t *testing.T) {
-	for _, tc := range makeTestCases(t) {
-		buf := new(bytes.Buffer)
-		tc.arg.String(buf)
-		require.Equal(t, "fuzzy_filter: fuzzy check duplicate constraint", buf.String())
-	}
+	var buf bytes.Buffer
+	arg := &FuzzyFilter{}
+	arg.String(&buf)
+	require.Equal(t, "fuzzy_filter: fuzzy check duplicate constraint", buf.String())
 }
 
 func TestPrepare(t *testing.T) {
@@ -237,6 +236,7 @@ func TestRuntimeFilterContract(t *testing.T) {
 		decoded := vector.NewVec(types.T_any.ToType())
 		require.NoError(t, decoded.UnmarshalBinary(runtimeFilter.Data))
 		require.Equal(t, runtimeFilter.Card, int32(decoded.Length()))
+		require.True(t, decoded.GetSorted())
 		require.Equal(t, []int32{3, 7},
 			vector.MustFixedColWithTypeCheck[int32](decoded))
 

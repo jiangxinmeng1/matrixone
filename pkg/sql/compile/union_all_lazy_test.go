@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	planpb "github.com/matrixorigin/matrixone/pkg/pb/plan"
@@ -28,11 +29,13 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/merge"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/output"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/unionall"
+	"github.com/matrixorigin/matrixone/pkg/sql/internal/materialized"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect/mysql"
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
 	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
+	"github.com/matrixorigin/matrixone/pkg/vm/message"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 	"github.com/stretchr/testify/require"
 )
@@ -135,6 +138,47 @@ func TestCompileUnionAllBuildsLazyBranchScopesWithDemand(t *testing.T) {
 	require.Equal(t, int32(0), mergeOp.StartIDX)
 	require.Equal(t, int32(1), mergeOp.EndIDX)
 
+	freeLazyUnionAllTestScope(c, root)
+}
+
+func TestLazyUnionAllLimitReleasesUnstartedMaterializedReader(t *testing.T) {
+	c := newLazyUnionAllTestCompile(t)
+	source := materialized.NewSource(2)
+	require.NoError(t, source.Begin(c.proc.Mp()))
+	input := newLazyUnionAllInt8Batch(c, 7)
+	for range 4 {
+		require.NoError(t, source.Append(input))
+	}
+	source.Finish(nil)
+	require.Positive(t, source.CurrentBytes())
+
+	newReader := func(readerID int) *Scope {
+		reader := merge.NewArgument().WithSinkScan(true)
+		reader.MaterializedSource = source
+		reader.MaterializedReaderID = readerID
+		return newLazyUnionAllLeaf(c, reader)
+	}
+	root := c.compileUnionAll(
+		&planpb.Node{}, []*Scope{newReader(0)}, []*Scope{newReader(1)}, true,
+	)[0]
+	root = c.compileLimit(&planpb.Node{
+		Limit: plan2.MakePlan2Uint64ConstExprWithType(1),
+	}, []*Scope{root})[0]
+	c.scopes = []*Scope{root}
+	c.InitPipelineContextToExecuteQuery()
+
+	// Four retained batches exceed the ordinary two-reader broadcast spool's
+	// two slots. LIMIT starts only reader 0; scope teardown must also release
+	// reader 1 even though its branch pipeline was never submitted.
+	require.NoError(t, root.MergeRun(c))
+	require.Zero(t, source.CurrentBytes())
+	require.NoError(t, source.Begin(c.proc.Mp()),
+		"all producer and reader owners must be retired before prepared reuse")
+	source.Finish(nil)
+	source.ReleaseReader(0)
+	source.ReleaseReader(1)
+
+	input.Clean(c.proc.Mp())
 	freeLazyUnionAllTestScope(c, root)
 }
 
@@ -263,8 +307,86 @@ func TestCompilePlanScopeKeepsNestedUnionAllConcurrentWithoutLimit(t *testing.T)
 	freeLazyUnionAllTestScope(c, outer)
 }
 
+func TestCompileParallelUnionAllInputPreservesNestedBranches(t *testing.T) {
+	c := newLazyUnionAllTestCompile(t)
+	c.execType = plan2.ExecTypeAP_ONECN
+	nodes := nestedUnionAllPlanNodes(false)
+
+	scopes, err := c.compileParallelUnionAllInput(0, int32(len(nodes)-1), nodes)
+	require.NoError(t, err)
+	require.Len(t, scopes, 3)
+	for i, branch := range scopes {
+		require.False(t, branch.LazyPreScopes)
+		require.Empty(t, branch.PreScopes)
+		unionMarkers := 0
+		require.NoError(t, vm.HandleAllOp(branch.RootOp, func(_ vm.Operator, op vm.Operator) error {
+			if _, ok := op.(*unionall.UnionAll); ok {
+				unionMarkers++
+			}
+			return nil
+		}))
+		if i < 2 {
+			require.Equal(t, 2, unionMarkers)
+		} else {
+			require.Equal(t, 1, unionMarkers)
+		}
+		branch.FreeOperator(c)
+		branch.release()
+	}
+	c.proc.Free()
+}
+
+func TestCompileParallelUnionAllInputKeepsTPSingleScope(t *testing.T) {
+	c := newLazyUnionAllTestCompile(t)
+	c.execType = plan2.ExecTypeTP
+	var scopes []*Scope
+	t.Cleanup(func() {
+		for _, scope := range scopes {
+			scope.FreeOperator(c)
+			scope.release()
+		}
+		c.proc.Free()
+	})
+	nodes := nestedUnionAllPlanNodes(false)
+	var err error
+	scopes, err = c.compileParallelUnionAllInput(0, int32(len(nodes)-1), nodes)
+	require.NoError(t, err)
+	require.Len(t, scopes, 1)
+	require.Len(t, scopes[0].PreScopes, 2)
+	require.Len(t, scopes[0].PreScopes[0].PreScopes, 2)
+}
+
+func TestParallelUnionAllInputRequiresPureConcatenation(t *testing.T) {
+	newUnion := func() *planpb.Node {
+		return &planpb.Node{
+			NodeType: planpb.Node_UNION_ALL,
+			Children: []int32{0, 1},
+		}
+	}
+	require.True(t, canPreserveParallelUnionAllBranches(newUnion()))
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*planpb.Node)
+	}{
+		{"limit", func(node *planpb.Node) { node.Limit = plan2.MakePlan2Uint64ConstExprWithType(1) }},
+		{"offset", func(node *planpb.Node) { node.Offset = plan2.MakePlan2Uint64ConstExprWithType(1) }},
+		{"order", func(node *planpb.Node) { node.OrderBy = []*planpb.OrderBySpec{{}} }},
+		{"filter", func(node *planpb.Node) { node.FilterList = []*planpb.Expr{plan2.MakePlan2BoolConstExprWithType(true)} }},
+		{"barrier", func(node *planpb.Node) { node.FilterIsBarrier = true }},
+		{"wrong node type", func(node *planpb.Node) { node.NodeType = planpb.Node_UNION }},
+		{"missing branch", func(node *planpb.Node) { node.Children = node.Children[:1] }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			node := newUnion()
+			test.mutate(node)
+			require.False(t, canPreserveParallelUnionAllBranches(node))
+		})
+	}
+}
+
 func TestScalarUnionAllRunsBranchesInStatementOrder(t *testing.T) {
-	compilerCtx := plan2.NewMockCompilerContext(true)
+	compilerCtx := plan2.NewMockCompilerContext(true, newPlanTestProcess(t))
 	statements, err := mysql.Parse(
 		compilerCtx.GetContext(),
 		"SELECT 3 UNION ALL SELECT 1 UNION ALL SELECT 2",
@@ -330,6 +452,49 @@ func TestScalarUnionAllRunsBranchesInStatementOrder(t *testing.T) {
 	require.Equal(t, []int64{3, 1, 2}, got)
 
 	freeLazyUnionAllTestScope(c, root)
+}
+
+func TestUnionNestedTopClearsAllocationOwners(t *testing.T) {
+	compilerCtx := plan2.NewMockCompilerContext(true, newPlanTestProcess(t))
+	statements, err := mysql.Parse(compilerCtx.GetContext(),
+		"select count(*), cast(sum(x) as signed) from ((select 1 x union select 1+0 union select 2 order by x limit 2) union select 3 union select 4) u", 1)
+	require.NoError(t, err)
+	logicPlan, err := plan2.BuildPlan(compilerCtx, statements[0], false)
+	require.NoError(t, err)
+	c := newLazyUnionAllTestCompile(t)
+	c.isPrepare = false
+	c.pn = logicPlan
+	c.MessageBoard = message.NewMessageBoard()
+	t.Cleanup(func() {
+		c.FreeOperator()
+		_ = c.finishAllocationAccountAttempt()
+		for _, scope := range c.scopes {
+			scope.release()
+		}
+		c.proc.Free()
+	})
+	query := logicPlan.GetQuery()
+	c.anal.qry = query
+	c.scopes, err = c.compilePlanScope(0, query.Steps[0], query.Nodes)
+	require.NoError(t, err)
+	require.Len(t, c.scopes, 1)
+	var got []int64
+	c.scopes[0].setRootOperator(output.NewArgument().WithFunc(func(bat *batch.Batch, _ *perfcounter.CounterSet) error {
+		if bat != nil {
+			for _, vec := range bat.Vecs {
+				got = append(got, vector.GetFixedAtWithTypeCheck[int64](vec, 0))
+			}
+		}
+		return nil
+	}))
+	c.InitPipelineContextToExecuteQuery()
+	require.NoError(t, c.scopes[0].InitAllDataSource(c))
+	require.NoError(t, c.ensureAllocationAccountLifecycle(func(mpool.AllocationAccountTerminalSnapshot) {}))
+	_, err = c.beginAllocationAccountAttempt()
+	require.NoError(t, err)
+	require.NoError(t, c.scopes[0].MergeRun(c))
+	require.NoError(t, c.finishAllocationAccountAttempt())
+	require.Equal(t, []int64{4, 10}, got)
 }
 
 func TestScalarUnionAllInsideJoinKeepsConcurrentTopology(t *testing.T) {

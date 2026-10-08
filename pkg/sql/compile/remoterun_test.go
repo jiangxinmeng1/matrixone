@@ -68,6 +68,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/mergerecursive"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/mergetop"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/minus"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec/minusall"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/mongoscan"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/multi_update"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/offset"
@@ -83,8 +84,10 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/runtimefilter"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/shuffle"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/table_function"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec/table_scan"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/top"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/value_scan"
+	sqlmongodb "github.com/matrixorigin/matrixone/pkg/sql/mongodb"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan"
 	planfunction "github.com/matrixorigin/matrixone/pkg/sql/plan/function"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
@@ -200,6 +203,58 @@ func Test_refactorScope(t *testing.T) {
 	require.Equal(t, vm.GetLeafOpParent(nil, rs.RootOp).GetOperatorBase().Idx, -1)
 }
 
+func TestRemoteOrderedTopWriteBackPreservesDOPBoundary(t *testing.T) {
+	for _, ordered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ordered=%t", ordered), func(t *testing.T) {
+			c := newMergeTopFallbackTestCompile(t)
+			defer c.proc.Free()
+			limitExpr := plan.MakePlan2Uint64ConstExprWithType(20_000)
+			orderBy := []*planpb.OrderBySpec{{Expr: &planpb.Expr{
+				Expr: &planpb.Expr_Col{Col: &planpb.ColRef{ColPos: 0}},
+				Typ:  planpb.Type{Id: int32(types.T_int64)},
+			}}}
+			localTop := top.NewArgument().WithLimit(limitExpr).WithFs(orderBy)
+			localTop.OrderedOutput = ordered
+			localTop.AppendChild(table_scan.NewArgument())
+			source := &Scope{
+				Magic: Remote, NodeInfo: engine.Node{Mcpu: 4},
+				Proc: c.proc.NewNoContextChildProc(0), RootOp: localTop,
+			}
+			defer source.release()
+			data, err := encodeRemoteScope(source, c.proc)
+			require.NoError(t, err)
+			decoded, err := decodeScope(data, c.proc, true, nil)
+			require.NoError(t, err)
+			writeBack := appendWriteBackOperator(c, decoded)
+			defer writeBack.release()
+			decoded.Proc.BuildPipelineContext(c.proc.Ctx)
+			defer decoded.Proc.Cancel(nil)
+			reg := writeBack.Proc.Reg.MergeReceivers[0]
+			require.Equal(t, ordered, reg.OrderedStream)
+			gather, workers := newParallelScope(decoded)
+			require.Len(t, workers, 4)
+			if ordered {
+				require.Equal(t, 1, reg.NilBatchCnt)
+				require.Equal(t, Merge, gather.Magic)
+				out, ok := gather.RootOp.(*connector.Connector)
+				require.True(t, ok)
+				require.Same(t, reg, out.Reg)
+				merged, ok := out.GetChildren(0).(*mergetop.MergeTop)
+				require.True(t, ok)
+				require.True(t, merged.OrderedStreams)
+				for i, worker := range workers {
+					workerOut := worker.RootOp.(*connector.Connector)
+					require.NotSame(t, reg, workerOut.Reg)
+					require.Same(t, gather.Proc.Reg.MergeReceivers[i], workerOut.Reg)
+					require.True(t, workerOut.Reg.OrderedStream)
+				}
+			} else {
+				require.Equal(t, Normal, gather.Magic)
+			}
+		})
+	}
+}
+
 func Test_convertPipelineUuid(t *testing.T) {
 	id, _ := uuid.NewV7()
 	p := &pipeline.Pipeline{
@@ -254,6 +309,7 @@ func Test_convertToPipelineInstruction(t *testing.T) {
 		&intersect.Intersect{},
 		&minus.Minus{},
 		&intersectall.IntersectAll{},
+		&minusall.MinusAll{},
 		&merge.Merge{},
 		&mergerecursive.MergeRecursive{},
 		&group.MergeGroup{},
@@ -329,6 +385,7 @@ func Test_convertToVmInstruction(t *testing.T) {
 		{Op: int32(vm.Intersect), SetOp: &pipeline.SetOp{}},
 		{Op: int32(vm.IntersectAll), SetOp: &pipeline.SetOp{}},
 		{Op: int32(vm.Minus), SetOp: &pipeline.SetOp{}},
+		{Op: int32(vm.MinusAll), SetOp: &pipeline.SetOp{}},
 		{Op: int32(vm.Connector), Connect: &pipeline.Connector{}},
 		{Op: int32(vm.Merge), Merge: &pipeline.Merge{}},
 		{Op: int32(vm.MergeRecursive)},
@@ -348,6 +405,95 @@ func Test_convertToVmInstruction(t *testing.T) {
 		_, err := convertToVmOperator(instruction, ctx, nil)
 		require.Nil(t, err)
 	}
+}
+
+func TestStringShuffleHashRemoteWireContract(t *testing.T) {
+	proc := testutil.NewProcess(t)
+	arg := shuffle.NewArgument()
+	t.Cleanup(arg.Release)
+	arg.ShuffleType = int32(planpb.ShuffleType_Hash)
+	arg.StringHashKey = true
+
+	proc.SetStringShuffleHashAlgorithm(process.StringShuffleHashLegacy)
+	_, legacyInstruction, err := convertToPipelineInstruction(
+		arg, proc, &scopeContext{}, 1)
+	require.NoError(t, err)
+	require.Equal(t, int32(vm.Shuffle), legacyInstruction.Op)
+
+	proc.SetStringShuffleHashAlgorithm(process.StringShuffleHashComplete)
+	_, stableInstruction, err := convertToPipelineInstruction(
+		arg, proc, &scopeContext{}, 1)
+	require.NoError(t, err)
+	require.Equal(t, int32(vm.ShuffleStable), stableInstruction.Op)
+	require.NotEqual(t, legacyInstruction.Op, stableInstruction.Op)
+
+	// Range ownership is unchanged by the complete string hash contract and
+	// must not reject an older receiver unnecessarily.
+	arg.ShuffleType = int32(planpb.ShuffleType_Range)
+	_, rangeInstruction, err := convertToPipelineInstruction(
+		arg, proc, &scopeContext{}, 1)
+	require.NoError(t, err)
+	require.Equal(t, int32(vm.Shuffle), rangeInstruction.Op)
+
+	arg.ShuffleType = int32(planpb.ShuffleType_Hash)
+	arg.StringHashKey = false
+	_, numericHashInstruction, err := convertToPipelineInstruction(
+		arg, proc, &scopeContext{}, 1)
+	require.NoError(t, err)
+	require.Equal(t, int32(vm.Shuffle), numericHashInstruction.Op)
+
+	encodePipeline := func(t *testing.T, instruction *pipeline.Instruction) []byte {
+		t.Helper()
+		data, err := (&pipeline.Pipeline{
+			PipelineType:    pipeline.Pipeline_Normal,
+			InstructionList: []*pipeline.Instruction{instruction},
+		}).Marshal()
+		require.NoError(t, err)
+		return data
+	}
+	legacyData := encodePipeline(t, legacyInstruction)
+	stableData := encodePipeline(t, stableInstruction)
+	rangeData := encodePipeline(t, rangeInstruction)
+	numericHashData := encodePipeline(t, numericHashInstruction)
+
+	decode := func(algorithm process.StringShuffleHashAlgorithm, data []byte) (*Scope, error) {
+		receiverProc := testutil.NewProcess(t)
+		receiverProc.SetStringShuffleHashAlgorithm(algorithm)
+		return decodeScope(data, receiverProc, true, nil)
+	}
+
+	legacyScope, err := decode(process.StringShuffleHashLegacy, legacyData)
+	require.NoError(t, err)
+	require.IsType(t, &shuffle.Shuffle{}, legacyScope.RootOp)
+	legacyScope.release()
+
+	stableScope, err := decode(process.StringShuffleHashComplete, stableData)
+	require.NoError(t, err)
+	require.IsType(t, &shuffle.Shuffle{}, stableScope.RootOp)
+	require.True(t, stableScope.RootOp.(*shuffle.Shuffle).StringHashKey)
+	stableScope.release()
+	rangeScope, err := decode(process.StringShuffleHashComplete, rangeData)
+	require.NoError(t, err)
+	require.IsType(t, &shuffle.Shuffle{}, rangeScope.RootOp)
+	rangeScope.release()
+	numericHashScope, err := decode(process.StringShuffleHashComplete, numericHashData)
+	require.NoError(t, err)
+	require.IsType(t, &shuffle.Shuffle{}, numericHashScope.RootOp)
+	require.False(t, numericHashScope.RootOp.(*shuffle.Shuffle).StringHashKey)
+	numericHashScope.release()
+
+	_, err = decode(process.StringShuffleHashLegacy, stableData)
+	require.ErrorContains(t, err,
+		"string shuffle hash algorithm mismatch: pipeline=1 process=0")
+	_, err = decode(process.StringShuffleHashComplete, legacyData)
+	require.ErrorContains(t, err,
+		"string shuffle hash algorithm mismatch: pipeline=0 process=1")
+	invalidStableRange := *rangeInstruction
+	invalidStableRange.Op = int32(vm.ShuffleStable)
+	_, err = decode(process.StringShuffleHashComplete,
+		encodePipeline(t, &invalidStableRange))
+	require.ErrorContains(t, err,
+		"complete string shuffle hash marker requires a string-key hash shuffle")
 }
 
 func TestRemoteRunOperatorCodecRoundTrip(t *testing.T) {
@@ -415,10 +561,23 @@ func TestRemoteRunOperatorCodecRoundTrip(t *testing.T) {
 	})
 
 	t.Run("IntersectAll", func(t *testing.T) {
-		restored := roundTrip(t, &intersectall.IntersectAll{})
+		keyExpr := plan.MakePlan2Int64ConstExprWithType(7)
+		original := &intersectall.IntersectAll{KeyExprs: []*planpb.Expr{keyExpr}}
+		restored := roundTrip(t, original)
 		defer restored.Release()
 		require.IsType(t, &intersectall.IntersectAll{}, restored)
 		require.Equal(t, vm.IntersectAll, restored.OpType())
+		require.Equal(t, original.KeyExprs, restored.(*intersectall.IntersectAll).KeyExprs)
+	})
+
+	t.Run("MinusAll", func(t *testing.T) {
+		keyExpr := plan.MakePlan2Int64ConstExprWithType(8)
+		original := &minusall.MinusAll{KeyExprs: []*planpb.Expr{keyExpr}}
+		restored := roundTrip(t, original)
+		defer restored.Release()
+		require.IsType(t, &minusall.MinusAll{}, restored)
+		require.Equal(t, vm.MinusAll, restored.OpType())
+		require.Equal(t, original.KeyExprs, restored.(*minusall.MinusAll).KeyExprs)
 	})
 
 	t.Run("Order", func(t *testing.T) {
@@ -436,12 +595,66 @@ func TestRemoteRunOperatorCodecRoundTrip(t *testing.T) {
 		require.True(t, ownsAllocation)
 	})
 
-	t.Run("GroupByHashKey", func(t *testing.T) {
+	t.Run("TopOrderedOutput", func(t *testing.T) {
+		original := top.NewArgument().
+			WithLimit(plan.MakePlan2Uint64ConstExprWithType(17)).
+			WithFs([]*planpb.OrderBySpec{{
+				Expr: &planpb.Expr{
+					Expr: &planpb.Expr_Col{Col: &planpb.ColRef{ColPos: 0}},
+					Typ:  planpb.Type{Id: int32(types.T_int64)},
+				},
+			}}).
+			WithOrderedOutput()
+		restored := roundTrip(t, original)
+		defer restored.Release()
+		restoredTop, ok := restored.(*top.Top)
+		require.True(t, ok)
+		require.True(t, restoredTop.OrderedOutput)
+		require.Equal(t, original.Limit, restoredTop.Limit)
+		require.Equal(t, original.Fs, restoredTop.Fs)
+	})
+
+	t.Run("MergeTopOrderedStreams", func(t *testing.T) {
+		original := mergetop.NewArgument().
+			WithLimit(plan.MakePlan2Uint64ConstExprWithType(17)).
+			WithFs([]*planpb.OrderBySpec{{
+				Expr: &planpb.Expr{
+					Expr: &planpb.Expr_Col{Col: &planpb.ColRef{ColPos: 0}},
+					Typ:  planpb.Type{Id: int32(types.T_int64)},
+				},
+			}}).
+			WithOrderedStreams()
+		restored := roundTrip(t, original)
+		defer restored.Release()
+		restoredMergeTop, ok := restored.(*mergetop.MergeTop)
+		require.True(t, ok)
+		require.True(t, restoredMergeTop.OrderedStreams)
+		require.Equal(t, original.Limit, restoredMergeTop.Limit)
+		require.Equal(t, original.Fs, restoredMergeTop.Fs)
+	})
+
+	t.Run("GroupMetadata", func(t *testing.T) {
 		original := group.NewArgument()
 		original.GroupByHashKey = []int32{0, 2}
+		original.DynamicGrouping = true
 		restored := roundTrip(t, original)
 		defer restored.Release()
 		require.Equal(t, original.GroupByHashKey, restored.(*group.Group).GroupByHashKey)
+		require.True(t, restored.(*group.Group).DynamicGrouping)
+	})
+
+	t.Run("GroupingSetProjectionMetadata", func(t *testing.T) {
+		original := projection.NewArgument()
+		original.ProjectList = []*planpb.Expr{plan.MakePlan2Int64ConstExprWithType(1)}
+		original.GroupingFlags = []bool{true, true, true, false, false, false}
+		original.GroupingSetCount = 3
+		restored := roundTrip(t, original)
+		defer restored.Release()
+		restoredProjection, ok := restored.(*projection.Projection)
+		require.True(t, ok)
+		require.Equal(t, original.ProjectList, restoredProjection.ProjectList)
+		require.Equal(t, original.GroupingFlags, restoredProjection.GroupingFlags)
+		require.Equal(t, original.GroupingSetCount, restoredProjection.GroupingSetCount)
 	})
 
 	t.Run("MergeGroupByHashKey", func(t *testing.T) {
@@ -450,6 +663,29 @@ func TestRemoteRunOperatorCodecRoundTrip(t *testing.T) {
 		restored := roundTrip(t, original)
 		defer restored.Release()
 		require.Equal(t, original.GroupByHashKey, restored.(*group.MergeGroup).GroupByHashKey)
+	})
+
+	t.Run("MergeGroupGroupingSetMetadata", func(t *testing.T) {
+		original := group.NewArgumentMergeGroup()
+		original.GroupingAware = true
+		original.GroupByTypes = []types.Type{types.T_varchar.ToType(), types.T_int64.ToType()}
+		original.EmptyGroupingSetIDs = []int64{1, 3}
+		restored := roundTrip(t, original)
+		defer restored.Release()
+		require.True(t, restored.(*group.MergeGroup).GroupingAware)
+		require.Equal(t, original.GroupByTypes, restored.(*group.MergeGroup).GroupByTypes)
+		require.Equal(t, original.EmptyGroupingSetIDs, restored.(*group.MergeGroup).EmptyGroupingSetIDs)
+	})
+
+	t.Run("MergeGroupLegacyEmptyGroupingSetMetadata", func(t *testing.T) {
+		original := group.NewArgumentMergeGroup()
+		original.GroupingAware = true
+		original.GroupByTypes = []types.Type{types.T_int32.ToType()}
+		original.EmptyGroupingSet = true
+		restored := roundTrip(t, original)
+		defer restored.Release()
+		require.True(t, restored.(*group.MergeGroup).EmptyGroupingSet)
+		require.Equal(t, original.GroupByTypes, restored.(*group.MergeGroup).GroupByTypes)
 	})
 
 	t.Run("SharedTableLock", func(t *testing.T) {
@@ -482,6 +718,161 @@ func TestRemoteRunOperatorCodecRoundTrip(t *testing.T) {
 		require.False(t, targets[0].LockTable)
 		require.Equal(t, lockpb.LockMode_Shared, targets[0].Mode)
 	})
+}
+
+func TestRestoreMinusAllBinaryRemoteShape(t *testing.T) {
+	left := merge.NewArgument()
+	right := merge.NewArgument()
+	right.AppendChild(left)
+	scope := &Scope{RootOp: right}
+	op := minusall.NewArgument()
+
+	require.NoError(t, scope.restoreBinarySetChildren(op))
+	require.Same(t, op, scope.RootOp)
+	require.Equal(t, 2, op.GetOperatorBase().NumChildren())
+	require.Same(t, left, op.GetOperatorBase().GetChildren(0))
+	require.Same(t, right, op.GetOperatorBase().GetChildren(1))
+	require.Zero(t, right.GetOperatorBase().NumChildren())
+
+	op.GetOperatorBase().ResetChildren()
+	op.Release()
+	left.Release()
+	right.Release()
+}
+
+func TestRestoreMinusAllRejectsLinearShapeWithoutTwoMerges(t *testing.T) {
+	scope := &Scope{RootOp: merge.NewArgument()}
+	defer scope.RootOp.Release()
+	op := minusall.NewArgument()
+	defer op.Release()
+
+	require.ErrorContains(t, scope.restoreBinarySetChildren(op), "right input")
+}
+
+func TestRemoteRunOrderedPipelineEdgeRoundTrip(t *testing.T) {
+	proc := testutil.NewProcess(t)
+	rt := moruntime.ServiceRuntime(proc.GetService())
+	oldVersion, hadVersion := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+	t.Cleanup(func() {
+		if hadVersion {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, oldVersion)
+		} else {
+			rt.CompareAndDeleteGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+		}
+	})
+	scope := &Scope{
+		Magic:  Remote,
+		Proc:   proc.NewNoContextChildProc(2),
+		RootOp: mergetop.NewArgument().WithOrderedStreams(),
+	}
+	scope.Proc.Reg.MergeReceivers[0].ResetForReuse(1, 1)
+	scope.Proc.Reg.MergeReceivers[0].OrderedStream = true
+	scope.Proc.Reg.MergeReceivers[1].ResetForReuse(3, 2)
+
+	data, err := encodeRemoteScope(scope, proc)
+	require.NoError(t, err)
+	wire := new(pipeline.Pipeline)
+	require.NoError(t, wire.Unmarshal(data))
+	require.Equal(t, []bool{true}, wire.OrderedStream,
+		"trailing unordered receivers should retain the legacy zero-value wire representation")
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion52)
+	_, err = encodeRemoteScope(scope, proc)
+	require.ErrorContains(t, err, "requires MORPC protocol version 53")
+	_, err = decodeScope(data, proc, true, nil)
+	require.ErrorContains(t, err, "requires MORPC protocol version 53")
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+	restored, err := decodeScope(data, proc, true, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		restored.release()
+		scope.release()
+		proc.Free()
+	})
+
+	require.Len(t, restored.Proc.Reg.MergeReceivers, 2)
+	require.True(t, restored.Proc.Reg.MergeReceivers[0].OrderedStream)
+	require.False(t, restored.Proc.Reg.MergeReceivers[1].OrderedStream)
+	require.Equal(t, 1, cap(restored.Proc.Reg.MergeReceivers[0].Ch2))
+	require.Equal(t, 1, restored.Proc.Reg.MergeReceivers[0].NilBatchCnt)
+	require.Equal(t, 3, cap(restored.Proc.Reg.MergeReceivers[1].Ch2))
+	require.Equal(t, 2, restored.Proc.Reg.MergeReceivers[1].NilBatchCnt)
+	restoredTop, ok := restored.RootOp.(*mergetop.MergeTop)
+	require.True(t, ok)
+	require.True(t, restoredTop.OrderedStreams)
+}
+
+func TestRemoteRunOrderedMergeTopHierarchyRoundTrip(t *testing.T) {
+	nodes := engine.Nodes{
+		{Id: "cn-local", Addr: "cn-local:6001", Mcpu: 2},
+		{Id: "cn-remote", Addr: "cn-remote:6001", Mcpu: 2},
+	}
+	c := newCompileForShuffleJoinTest(t, nodes)
+	rt := moruntime.ServiceRuntime(c.proc.GetService())
+	oldVersion, hadVersion := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+	t.Cleanup(func() {
+		if hadVersion {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, oldVersion)
+		} else {
+			rt.CompareAndDeleteGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+		}
+	})
+
+	limitExpr := plan.MakePlan2Uint64ConstExprWithType(20_000)
+	orderBy := []*planpb.OrderBySpec{{Expr: &planpb.Expr{
+		Expr: &planpb.Expr_Col{Col: &planpb.ColRef{ColPos: 0}},
+		Typ:  planpb.Type{Id: int32(types.T_int64)},
+	}}}
+	node := &planpb.Node{Limit: limitExpr, OrderBy: orderBy}
+	inputs := []*Scope{
+		newRemoteMergeInputForTest(c, nodes[1], 0),
+		newRemoteMergeInputForTest(c, nodes[1], 0),
+	}
+	inputs[0].NodeInfo.Mcpu = 2
+	for _, input := range inputs {
+		input.setRootOperator(top.NewArgument().
+			WithLimit(limitExpr).
+			WithFs(orderBy).
+			WithOrderedOutput())
+	}
+	group := c.newMergeTopScopeByCN(node, limitExpr, inputs, nodes[1])
+
+	data, err := encodeRemoteScope(group, c.proc)
+	require.NoError(t, err)
+	restored, err := decodeScope(data, c.proc, true, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		restored.release()
+		group.release()
+		c.proc.Free()
+	})
+
+	require.Len(t, restored.PreScopes, 2)
+	require.Len(t, restored.Proc.Reg.MergeReceivers, 2)
+	restoredTop, ok := restored.RootOp.(*mergetop.MergeTop)
+	require.True(t, ok)
+	require.True(t, restoredTop.OrderedStreams)
+	for i, input := range restored.PreScopes {
+		out, ok := input.RootOp.(*connector.Connector)
+		require.True(t, ok)
+		require.Same(t, restored.Proc.Reg.MergeReceivers[i], out.Reg)
+		require.True(t, out.Reg.OrderedStream)
+		localTop, ok := out.GetOperatorBase().GetChildren(0).(*top.Top)
+		require.True(t, ok)
+		require.True(t, localTop.OrderedOutput)
+	}
+
+	restored.PreScopes[0].Proc.Ctx = context.Background()
+	ordered, workers := newParallelScope(restored.PreScopes[0])
+	require.Equal(t, Merge, ordered.Magic)
+	require.True(t, ordered.ConcurrentPreScopes)
+	require.Len(t, workers, 2)
+	orderedOut, ok := ordered.RootOp.(*connector.Connector)
+	require.True(t, ok)
+	gatherTop, ok := orderedOut.GetOperatorBase().GetChildren(0).(*mergetop.MergeTop)
+	require.True(t, ok)
+	require.True(t, gatherTop.OrderedStreams)
 }
 
 func TestTargetAwareUpdateRemoteProtocolValidation(t *testing.T) {
@@ -629,12 +1020,36 @@ func TestRemoteAutoIncrementStatementLastInsertIDProtocolValidation(t *testing.T
 	})
 
 	autoPreInsert := &preinsert.PreInsert{HasAutoCol: true}
+	orderedPreInsert := &preinsert.PreInsert{
+		HasAutoCol:                  true,
+		TrackAutoIncrementGenerated: true,
+	}
+	orderedPreInsertUnique := &preinsertunique.PreInsertUnique{
+		PreInsertCtx: &planpb.PreInsertUkCtx{AutoIncrementReorder: true},
+	}
 	ordinaryPreInsert := &preinsert.PreInsert{}
 	autoPipeline := &pipeline.Pipeline{Children: []*pipeline.Pipeline{{
 		InstructionList: []*pipeline.Instruction{{
 			Op:        int32(vm.PreInsert),
 			PreInsert: &pipeline.PreInsert{HasAutoCol: true},
 		}},
+	}}}
+	orderedPipeline := &pipeline.Pipeline{Children: []*pipeline.Pipeline{{
+		InstructionList: []*pipeline.Instruction{
+			{
+				Op: int32(vm.PreInsert),
+				PreInsert: &pipeline.PreInsert{
+					HasAutoCol:                  true,
+					TrackAutoIncrementGenerated: true,
+				},
+			},
+			{
+				Op: int32(vm.PreInsertUnique),
+				PreInsertUnique: &pipeline.PreInsertUnique{
+					PreInsertUkCtx: &planpb.PreInsertUkCtx{AutoIncrementReorder: true},
+				},
+			},
+		},
 	}}}
 
 	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion25)
@@ -660,6 +1075,35 @@ func TestRemoteAutoIncrementStatementLastInsertIDProtocolValidation(t *testing.T
 	decoded, err := decodeScope(encodedPipeline, proc, true, nil)
 	require.NoError(t, err)
 	decoded.release()
+
+	proc.Base.SessionInfo.AutoIncrementIncrement = 3
+	proc.Base.SessionInfo.AutoIncrementOffset = 2
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion55)
+	_, _, err = convertToPipelineInstruction(autoPreInsert, proc, ctx, 1)
+	require.ErrorContains(t, err, "requires MORPC protocol version 56")
+	require.ErrorContains(t,
+		validateRemoteStatementLastInsertIDPipelineProtocol(proc, autoPipeline),
+		"requires MORPC protocol version 56")
+
+	// New wire metadata is not optional merely because the session happens to
+	// use the default 1/1 series. An older receiver would silently drop these
+	// fields and execute the old, incorrect positional semantics.
+	proc.Base.SessionInfo.AutoIncrementIncrement = 1
+	proc.Base.SessionInfo.AutoIncrementOffset = 1
+	_, _, err = convertToPipelineInstruction(orderedPreInsert, proc, ctx, 1)
+	require.ErrorContains(t, err, "requires MORPC protocol version 56")
+	_, _, err = convertToPipelineInstruction(orderedPreInsertUnique, proc, ctx, 1)
+	require.ErrorContains(t, err, "requires MORPC protocol version 56")
+	require.ErrorContains(t,
+		validateRemoteStatementLastInsertIDPipelineProtocol(proc, orderedPipeline),
+		"requires MORPC protocol version 56")
+
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion56)
+	_, instruction, err = convertToPipelineInstruction(autoPreInsert, proc, ctx, 1)
+	require.NoError(t, err)
+	require.True(t, instruction.PreInsert.HasAutoCol)
+	require.NoError(t,
+		validateRemoteStatementLastInsertIDPipelineProtocol(proc, autoPipeline))
 }
 
 func TestChangedRowsUpdateRemoteProtocolValidation(t *testing.T) {
@@ -875,6 +1319,529 @@ func TestCrossDomainStringLiteralRemoteProtocolValidation(t *testing.T) {
 	require.ErrorContains(t, err, "requires MORPC protocol version 23")
 }
 
+func TestPrepareRemoteRunSendingDataRejectsPrePadSpaceProtocol(t *testing.T) {
+	newProc := func(sqlMode string) *process.Process {
+		proc := newResolveVariableProcess(t, sqlMode)
+		proc.Ctx = context.WithValue(proc.Ctx, defines.TenantIDKey{}, uint32(0))
+		proc.Base.TxnOperator = fakeTxnOperator{}
+		proc.Base.SessionInfo.TimeZone = time.UTC
+		return proc
+	}
+	makeScope := func(proc *process.Process, expression *planpb.Expr) *Scope {
+		return &Scope{
+			Magic:  Remote,
+			Proc:   proc,
+			RootOp: value_scan.NewArgument(),
+			Plan: &planpb.Plan{Plan: &planpb.Plan_Query{Query: &planpb.Query{
+				Steps: []int32{0}, Nodes: []*planpb.Node{{NodeId: 0, ProjectList: []*planpb.Expr{expression}}},
+			}}},
+		}
+	}
+	padSpaceCast := &planpb.Expr{
+		Typ: planpb.Type{Id: int32(types.T_varchar)},
+		Expr: &planpb.Expr_F{F: &planpb.Function{
+			Func: &planpb.ObjectRef{
+				Obj:     planfunction.EncodeOverloadID(planfunction.CAST, 3),
+				ObjName: "cast",
+			},
+			Args: []*planpb.Expr{plan.MakePlan2StringConstExprWithType("MO", false)},
+		}},
+	}
+	ordinaryValue := plan.MakePlan2StringConstExprWithType("MO", false)
+
+	for _, tc := range []struct {
+		name       string
+		sqlMode    string
+		expression *planpb.Expr
+	}{
+		{
+			name:       "PAD SPACE cast",
+			expression: padSpaceCast,
+		},
+		{
+			name:       "enabled mode",
+			sqlMode:    "PAD_CHAR_TO_FULL_LENGTH",
+			expression: ordinaryValue,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proc := newProc(tc.sqlMode)
+			scope := makeScope(proc, tc.expression)
+			rt := moruntime.ServiceRuntime(proc.GetService())
+			oldVersion, hadVersion := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+			t.Cleanup(func() {
+				if hadVersion {
+					rt.SetGlobalVariables(moruntime.MOProtocolVersion, oldVersion)
+				} else {
+					rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+				}
+			})
+
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion39)
+			_, _, _, _, err := prepareRemoteRunSendingData("", scope, proc, nil, uuid.Nil)
+			require.ErrorContains(t, err, "PAD SPACE remote execution requires MORPC protocol version 40")
+			require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported))
+
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion40)
+			_, _, _, _, err = prepareRemoteRunSendingData("", scope, proc, nil, uuid.Nil)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestRemoteExpressionProtocolValidation(t *testing.T) {
+	require.GreaterOrEqual(t, defines.MORPCLatestVersion, defines.MORPCVersion36,
+		"the v36 remote-expression capability must remain available after later protocol increments")
+
+	proc := testutil.NewProcess(t)
+	proc.Ctx = context.WithValue(proc.Ctx, defines.TenantIDKey{}, uint32(0))
+	proc.Base.TxnOperator = fakeTxnOperator{}
+	proc.Base.SessionInfo.TimeZone = time.UTC
+	rt := moruntime.ServiceRuntime(proc.GetService())
+	oldVersion, hadVersion := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+	t.Cleanup(func() {
+		if hadVersion {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, oldVersion)
+		} else {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+		}
+	})
+
+	cast := func(charset uint32) *planpb.Expr {
+		text := &planpb.Expr{
+			Typ:  planpb.Type{Id: int32(types.T_text)},
+			Expr: &planpb.Expr_Lit{Lit: &planpb.Literal{Value: &planpb.Literal_Sval{Sval: "12.5tail"}}},
+		}
+		return &planpb.Expr{
+			Typ: planpb.Type{Id: int32(types.T_decimal64), Width: 4, Scale: 2, Charset: charset},
+			Expr: &planpb.Expr_F{F: &planpb.Function{
+				Func: &planpb.ObjectRef{ObjName: "cast"},
+				Args: []*planpb.Expr{text},
+			}},
+		}
+	}
+	comparisonParam := func(pos int32) *planpb.Expr {
+		return &planpb.Expr{
+			Typ: planpb.Type{Id: int32(types.T_json)},
+			Expr: &planpb.Expr_F{F: &planpb.Function{
+				Func: &planpb.ObjectRef{
+					Obj:     int64(577) << 32,
+					ObjName: "__mo_json_comparison_param",
+				},
+				Args: []*planpb.Expr{{
+					Typ:  planpb.Type{Id: int32(types.T_text)},
+					Expr: &planpb.Expr_P{P: &planpb.ParamRef{Pos: pos}},
+				}},
+			}},
+		}
+	}
+	mixedJSONBooleanEquality := func(functionID int32, jsonOnLeft bool) *planpb.Expr {
+		jsonOperand := &planpb.Expr{
+			Typ:  planpb.Type{Id: int32(types.T_json)},
+			Expr: &planpb.Expr_Col{Col: &planpb.ColRef{ColPos: 0}},
+		}
+		booleanOperand := &planpb.Expr{
+			Typ:  planpb.Type{Id: int32(types.T_bool)},
+			Expr: &planpb.Expr_Col{Col: &planpb.ColRef{ColPos: 1}},
+		}
+		args := []*planpb.Expr{jsonOperand, booleanOperand}
+		if !jsonOnLeft {
+			args[0], args[1] = args[1], args[0]
+		}
+		return &planpb.Expr{
+			Typ: planpb.Type{Id: int32(types.T_bool)},
+			Expr: &planpb.Expr_F{F: &planpb.Function{
+				Func: &planpb.ObjectRef{Obj: int64(functionID) << 32},
+				Args: args,
+			}},
+		}
+	}
+	makeScope := func(expressions ...*planpb.Expr) *Scope {
+		return &Scope{
+			Magic:  Remote,
+			Proc:   proc,
+			RootOp: value_scan.NewArgument(),
+			Plan: &planpb.Plan{Plan: &planpb.Plan_Query{Query: &planpb.Query{
+				Steps: []int32{0}, Nodes: []*planpb.Node{{NodeId: 0, ProjectList: expressions}},
+			}}},
+		}
+	}
+	makeFormatExpr := func(firstType types.Type, withLocale bool) *planpb.Expr {
+		args := []*planpb.Expr{{
+			Typ:  planpb.Type{Id: int32(firstType.Oid), Width: firstType.Width, Scale: firstType.Scale},
+			Expr: &planpb.Expr_Col{Col: &planpb.ColRef{ColPos: 0}},
+		}, {
+			Typ:  planpb.Type{Id: int32(types.T_varchar)},
+			Expr: &planpb.Expr_Col{Col: &planpb.ColRef{ColPos: 1}},
+		}}
+		if withLocale {
+			args = append(args, &planpb.Expr{
+				Typ:  planpb.Type{Id: int32(types.T_varchar)},
+				Expr: &planpb.Expr_Col{Col: &planpb.ColRef{ColPos: 2}},
+			})
+		}
+		// Pin the historical v59 physical signature. New bindings use INT64
+		// precision and have an independent v98 protocol test.
+		return &planpb.Expr{
+			Typ: planpb.Type{Id: int32(types.T_varchar)},
+			Expr: &planpb.Expr_F{F: &planpb.Function{
+				Func: &planpb.ObjectRef{Obj: planfunction.EncodeOverloadID(planfunction.FORMAT, int32(len(args)-2)), ObjName: "format"},
+				Args: args,
+			}},
+		}
+	}
+	makeConversionExpr := func(functionID, overload int32, name string, firstType types.Type) *planpb.Expr {
+		first := &planpb.Expr{
+			Typ:  planpb.Type{Id: int32(firstType.Oid), Width: firstType.Width, Scale: firstType.Scale},
+			Expr: &planpb.Expr_Col{Col: &planpb.ColRef{ColPos: 0}},
+		}
+		args := []*planpb.Expr{first}
+		if name == "conv" {
+			// This suite isolates the v64 first-argument contract. Row-dependent
+			// bases were never executable by v64 and have a separate v65 fence.
+			args = append(args,
+				&planpb.Expr{
+					Typ:  planpb.Type{Id: int32(types.T_int64)},
+					Expr: &planpb.Expr_Lit{Lit: &planpb.Literal{Value: &planpb.Literal_I64Val{I64Val: 16}}},
+				},
+				&planpb.Expr{
+					Typ:  planpb.Type{Id: int32(types.T_int64)},
+					Expr: &planpb.Expr_Lit{Lit: &planpb.Literal{Value: &planpb.Literal_I64Val{I64Val: 10}}},
+				},
+			)
+		}
+		return &planpb.Expr{
+			Typ: planpb.Type{Id: int32(types.T_varchar)},
+			Expr: &planpb.Expr_F{F: &planpb.Function{
+				Func: &planpb.ObjectRef{
+					Obj:     int64(functionID)<<32 | int64(overload),
+					ObjName: name,
+				},
+				Args: args,
+			}},
+		}
+	}
+	t.Run("instruction expression owner", func(t *testing.T) {
+		remotePipeline := &pipeline.Pipeline{
+			InstructionList: []*pipeline.Instruction{{
+				ProjectList: []*planpb.Expr{comparisonParam(0), comparisonParam(1)},
+			}},
+		}
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion35)
+		err := validateRemoteExpressionPipelineProtocol(proc, remotePipeline)
+		require.ErrorContains(t, err, "prepared JSON comparison parameters require MORPC protocol version 36")
+		require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported))
+
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion36)
+		require.NoError(t, validateRemoteExpressionPipelineProtocol(proc, remotePipeline))
+	})
+
+	t.Run("typed BIN/CONV sender and receiver boundary", func(t *testing.T) {
+		cases := []struct {
+			name       string
+			functionID int32
+			overload   int32
+			function   string
+			inputType  types.Type
+		}{
+			{name: "typed CONV integer", functionID: planfunction.CONV, overload: 3, function: "conv", inputType: types.T_int64.ToType()},
+			{name: "typed CONV decimal on legacy overload", functionID: planfunction.CONV, overload: 0, function: "conv", inputType: types.T_decimal64.ToType()},
+			{name: "dynamic CONV", functionID: planfunction.CONV, overload: 13, function: "conv", inputType: types.T_any.ToType()},
+			{name: "typed BIN float", functionID: planfunction.BIN, overload: 8, function: "bin", inputType: types.T_float32.ToType()},
+			{name: "dynamic BIN", functionID: planfunction.BIN, overload: 11, function: "bin", inputType: types.T_bool.ToType()},
+		}
+		for _, test := range cases {
+			t.Run(test.name, func(t *testing.T) {
+				expr := makeConversionExpr(test.functionID, test.overload, test.function, test.inputType)
+				remotePipeline := &pipeline.Pipeline{
+					InstructionList: []*pipeline.Instruction{{ProjectList: []*planpb.Expr{expr}}},
+				}
+				scope := makeScope(expr)
+
+				rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion63)
+				err := validateRemoteExpressionPipelineProtocol(proc, remotePipeline)
+				require.ErrorContains(t, err, "typed BIN/CONV execution requires MORPC protocol version 64")
+				require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported))
+				_, _, _, _, err = prepareRemoteRunSendingData("", scope, proc, nil, uuid.Nil)
+				require.ErrorContains(t, err, "typed BIN/CONV execution requires MORPC protocol version 64")
+
+				rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion64)
+				encoded, _, _, _, err := prepareRemoteRunSendingData("", scope, proc, nil, uuid.Nil)
+				require.NoError(t, err)
+				decoded, err := decodeScope(encoded, proc, true, nil)
+				require.NoError(t, err)
+				decoded.release()
+
+				rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion63)
+				decoded, err = decodeScope(encoded, proc, true, nil)
+				require.ErrorContains(t, err, "typed BIN/CONV execution requires MORPC protocol version 64")
+				require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported))
+				require.Nil(t, decoded)
+			})
+		}
+	})
+	t.Run("mixed equality instruction expression owner", func(t *testing.T) {
+		remotePipeline := &pipeline.Pipeline{
+			InstructionList: []*pipeline.Instruction{{
+				ProjectList: []*planpb.Expr{mixedJSONBooleanEquality(0, true)},
+			}},
+		}
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion35)
+		err := validateRemoteExpressionPipelineProtocol(proc, remotePipeline)
+		require.ErrorContains(t, err, "mixed JSON/BOOL equality requires MORPC protocol version 36")
+		require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported))
+
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion36)
+		require.NoError(t, validateRemoteExpressionPipelineProtocol(proc, remotePipeline))
+	})
+	t.Run("typed FORMAT sender and receiver boundary", func(t *testing.T) {
+		for _, test := range []struct {
+			name       string
+			firstType  types.Type
+			withLocale bool
+		}{
+			{name: "exact two args", firstType: types.T_decimal64.ToType()},
+			{name: "approximate two args", firstType: types.T_float64.ToType()},
+			{name: "exact three args", firstType: types.T_int64.ToType(), withLocale: true},
+			{name: "approximate three args", firstType: types.T_float32.ToType(), withLocale: true},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				expr := makeFormatExpr(test.firstType, test.withLocale)
+				remotePipeline := &pipeline.Pipeline{
+					InstructionList: []*pipeline.Instruction{{ProjectList: []*planpb.Expr{expr}}},
+				}
+				scope := makeScope(expr)
+
+				rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion58)
+				err := validateRemoteExpressionPipelineProtocol(proc, remotePipeline)
+				require.ErrorContains(t, err,
+					"typed numeric FORMAT arguments require MORPC protocol version 59")
+				require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported))
+				_, _, _, _, err = prepareRemoteRunSendingData("", scope, proc, nil, uuid.Nil)
+				require.ErrorContains(t, err,
+					"typed numeric FORMAT arguments require MORPC protocol version 59")
+
+				rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion59)
+				require.NoError(t, validateRemoteExpressionPipelineProtocol(proc, remotePipeline))
+
+				encoded, _, _, _, err := prepareRemoteRunSendingData("", scope, proc, nil, uuid.Nil)
+				require.NoError(t, err)
+				decoded, err := decodeScope(encoded, proc, true, nil)
+				require.NoError(t, err)
+				decoded.release()
+
+				rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion58)
+				_, err = decodeScope(encoded, proc, true, nil)
+				require.ErrorContains(t, err,
+					"typed numeric FORMAT arguments require MORPC protocol version 59")
+			})
+		}
+	})
+
+	t.Run("typed FORMAT rejects nil first argument", func(t *testing.T) {
+		badExpr := &planpb.Expr{
+			Typ: planpb.Type{Id: int32(types.T_varchar)},
+			Expr: &planpb.Expr_F{F: &planpb.Function{
+				Func: &planpb.ObjectRef{Obj: int64(262) << 32, ObjName: "format"},
+				Args: []*planpb.Expr{nil, {Typ: planpb.Type{Id: int32(types.T_varchar)}}},
+			}},
+		}
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion59)
+		err := validateRemoteExpressionPipelineProtocol(proc, &pipeline.Pipeline{
+			InstructionList: []*pipeline.Instruction{{ProjectList: []*planpb.Expr{badExpr}}},
+		})
+		require.ErrorContains(t, err, "FORMAT is missing its first argument")
+	})
+
+	tests := make([]struct {
+		name                string
+		expressions         []*planpb.Expr
+		incompatibleVersion int64
+		compatibleVersion   int64
+		errorContains       string
+	}, 0, 10)
+	tests = append(tests, []struct {
+		name                string
+		expressions         []*planpb.Expr
+		incompatibleVersion int64
+		compatibleVersion   int64
+		errorContains       string
+	}{
+		{
+			name:                "ordinary cast",
+			expressions:         []*planpb.Expr{cast(0)},
+			incompatibleVersion: defines.MORPCVersion29,
+			compatibleVersion:   defines.MORPCVersion36,
+		},
+		{
+			name:                "numeric prefix only",
+			expressions:         []*planpb.Expr{cast(255)},
+			incompatibleVersion: defines.MORPCVersion29,
+			compatibleVersion:   defines.MORPCVersion30,
+			errorContains:       "prepared numeric-prefix casts require MORPC protocol version 30",
+		},
+		{
+			name:                "JSON comparison only",
+			expressions:         []*planpb.Expr{comparisonParam(0), comparisonParam(1)},
+			incompatibleVersion: defines.MORPCVersion35,
+			compatibleVersion:   defines.MORPCVersion36,
+			errorContains:       "prepared JSON comparison parameters require MORPC protocol version 36",
+		},
+		{
+			name:                "numeric prefix and JSON comparison",
+			expressions:         []*planpb.Expr{comparisonParam(0), cast(255)},
+			incompatibleVersion: defines.MORPCVersion35,
+			compatibleVersion:   defines.MORPCVersion36,
+			errorContains:       "prepared JSON comparison parameters require MORPC protocol version 36",
+		},
+	}...)
+	for _, functionID := range []int32{0, 1, 406} {
+		for _, jsonOnLeft := range []bool{true, false} {
+			orientation := "json right"
+			if jsonOnLeft {
+				orientation = "json left"
+			}
+			tests = append(tests, struct {
+				name                string
+				expressions         []*planpb.Expr
+				incompatibleVersion int64
+				compatibleVersion   int64
+				errorContains       string
+			}{
+				name:                fmt.Sprintf("mixed equality %d %s", functionID, orientation),
+				expressions:         []*planpb.Expr{mixedJSONBooleanEquality(functionID, jsonOnLeft)},
+				incompatibleVersion: defines.MORPCVersion35,
+				compatibleVersion:   defines.MORPCVersion36,
+				errorContains:       "mixed JSON/BOOL equality requires MORPC protocol version 36",
+			})
+		}
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, test.incompatibleVersion)
+			incompatibleData, _, _, _, err := prepareRemoteRunSendingData(
+				"", makeScope(test.expressions...), proc, nil, uuid.Nil)
+			if test.errorContains != "" {
+				require.ErrorContains(t, err, test.errorContains)
+				require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported))
+			} else {
+				require.NoError(t, err)
+				decoded, decodeErr := decodeScope(incompatibleData, proc, true, nil)
+				require.NoError(t, decodeErr)
+				decoded.release()
+			}
+
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, test.compatibleVersion)
+			compatibleData, _, _, _, err := prepareRemoteRunSendingData(
+				"", makeScope(test.expressions...), proc, nil, uuid.Nil)
+			require.NoError(t, err)
+			decoded, err := decodeScope(compatibleData, proc, true, nil)
+			require.NoError(t, err)
+			decoded.release()
+
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, test.incompatibleVersion)
+			decoded, err = decodeScope(compatibleData, proc, true, nil)
+			if test.errorContains != "" {
+				require.ErrorContains(t, err, test.errorContains)
+				require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported))
+				require.Nil(t, decoded)
+
+				decoded, err = decodeScope(compatibleData, nil, true, nil)
+				require.Error(t, err, "a versioned expression requires a process to resolve protocol support")
+				require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported))
+				require.Nil(t, decoded)
+			} else {
+				require.NoError(t, err)
+				decoded.release()
+			}
+		})
+	}
+
+	t.Run("combined features enforce each minimum", func(t *testing.T) {
+		remotePipeline := &pipeline.Pipeline{
+			Qry: makeScope(comparisonParam(0), cast(255)).Plan,
+		}
+
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion29)
+		err := validateRemoteExpressionPipelineProtocol(proc, remotePipeline)
+		require.ErrorContains(t, err, "prepared numeric-prefix casts require MORPC protocol version 30")
+
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion35)
+		err = validateRemoteExpressionPipelineProtocol(proc, remotePipeline)
+		require.ErrorContains(t, err, "prepared JSON comparison parameters require MORPC protocol version 36")
+
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion36)
+		require.NoError(t, validateRemoteExpressionPipelineProtocol(proc, remotePipeline))
+	})
+}
+
+func TestRemoteASCIIResultProtocolValidation(t *testing.T) {
+	proc := testutil.NewProcess(t)
+	proc.Ctx = context.WithValue(proc.Ctx, defines.TenantIDKey{}, uint32(0))
+	proc.Base.TxnOperator = fakeTxnOperator{}
+	proc.Base.SessionInfo.TimeZone = time.UTC
+	rt := moruntime.ServiceRuntime(proc.GetService())
+	oldVersion, hadVersion := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+	t.Cleanup(func() {
+		if hadVersion {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, oldVersion)
+		} else {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+		}
+	})
+
+	ascii := &planpb.Expr{
+		Typ: planpb.Type{Id: int32(types.T_int32)},
+		Expr: &planpb.Expr_F{F: &planpb.Function{
+			Func: &planpb.ObjectRef{
+				Obj:     int64(planfunction.ASCII) << 32,
+				ObjName: "ascii",
+			},
+			Args: []*planpb.Expr{{
+				Typ:  planpb.Type{Id: int32(types.T_varchar)},
+				Expr: &planpb.Expr_Col{Col: &planpb.ColRef{ColPos: 0}},
+			}},
+		}},
+	}
+	scope := &Scope{
+		Magic:  Remote,
+		Proc:   proc,
+		RootOp: value_scan.NewArgument(),
+		Plan: &planpb.Plan{Plan: &planpb.Plan_Query{Query: &planpb.Query{
+			Steps: []int32{0},
+			Nodes: []*planpb.Node{{NodeId: 0, ProjectList: []*planpb.Expr{ascii}}},
+		}}},
+	}
+
+	const expected = "signed INT ASCII results require MORPC protocol version 65"
+	features, featureErr := planpb.RequiredRemoteExpressionFeatures(&pipeline.Pipeline{
+		InstructionList: []*pipeline.Instruction{{ProjectList: []*planpb.Expr{ascii}}},
+	})
+	require.NoError(t, featureErr)
+	require.True(t, features.ASCIIInt32Result, ascii.String())
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion64)
+	err := validateRemoteExpressionPipelineProtocol(proc, &pipeline.Pipeline{
+		InstructionList: []*pipeline.Instruction{{ProjectList: []*planpb.Expr{ascii}}},
+	})
+	require.ErrorContains(t, err, expected)
+	require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported))
+	_, _, _, _, err = prepareRemoteRunSendingData("", scope, proc, nil, uuid.Nil)
+	require.ErrorContains(t, err, expected)
+
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion65)
+	encoded, _, _, _, err := prepareRemoteRunSendingData("", scope, proc, nil, uuid.Nil)
+	require.NoError(t, err)
+	decoded, err := decodeScope(encoded, proc, true, nil)
+	require.NoError(t, err)
+	decoded.release()
+
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion64)
+	decoded, err = decodeScope(encoded, proc, true, nil)
+	require.ErrorContains(t, err, expected)
+	require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported))
+	require.Nil(t, decoded)
+}
+
 func TestExternalScanParquetRowGroupShardsRoundtrip(t *testing.T) {
 	ctx := &scopeContext{
 		id:     1,
@@ -919,6 +1886,236 @@ func TestExternalScanParquetRowGroupShardsRoundtrip(t *testing.T) {
 	restoredExternal := restored.(*external.External)
 	require.Equal(t, shards, restoredExternal.Es.ParquetRowGroupShards)
 	require.True(t, restoredExternal.Es.StrictSqlMode)
+}
+
+func TestExternalScanParquetWholeFileFanoutRoundtrip(t *testing.T) {
+	ctx := &scopeContext{
+		id:     1,
+		root:   &scopeContext{},
+		parent: &scopeContext{},
+	}
+	proc := &process.Process{}
+	proc.Base = &process.BaseProcess{}
+
+	op := external.NewArgument().WithEs(
+		&external.ExternalParam{
+			ExParamConst: external.ExParamConst{
+				FileList:               []string{"s3://bucket/part.parquet"},
+				FileSize:               []int64{8192},
+				FileOffsetTotal:        []*pipeline.FileOffset{{Offset: []int64{0, -1}}},
+				ParquetWholeFileFanout: true,
+			},
+			ExParam: external.ExParam{
+				Fileparam: &external.ExFileparam{},
+				Filter:    &external.FilterParam{},
+			},
+		},
+	)
+
+	_, pipeInstr, err := convertToPipelineInstruction(op, proc, ctx, 1)
+	require.NoError(t, err)
+	require.True(t, pipeInstr.ExternalScan.ParquetWholeFileFanout)
+
+	restored, err := convertToVmOperator(pipeInstr, ctx, nil)
+	require.NoError(t, err)
+	restoredExternal := restored.(*external.External)
+	require.True(t, restoredExternal.Es.ParquetWholeFileFanout)
+	require.Empty(t, restoredExternal.Es.ParquetRowGroupShards)
+}
+
+func TestParquetWholeFileFanoutRemoteProtocolValidationAtSendAndReceiveBoundaries(t *testing.T) {
+	proc := testutil.NewProcess(t)
+	rt := moruntime.ServiceRuntime(proc.GetService())
+	previous, hadPrevious := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+	t.Cleanup(func() {
+		if hadPrevious {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, previous)
+		} else {
+			rt.CompareAndDeleteGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion44)
+		}
+	})
+
+	scope := &Scope{Proc: proc, RootOp: external.NewArgument().WithEs(
+		&external.ExternalParam{
+			ExParamConst: external.ExParamConst{ParquetWholeFileFanout: true},
+			ExParam:      external.ExParam{Fileparam: &external.ExFileparam{}, Filter: &external.FilterParam{}},
+		},
+	)}
+
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion45)
+	data, err := encodeRemoteScope(scope, proc)
+	require.NoError(t, err)
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion44)
+	_, err = encodeRemoteScope(scope, proc)
+	require.ErrorContains(t, err, "MORPC protocol version 45")
+	_, err = decodeScope(data, proc, true, nil)
+	require.ErrorContains(t, err, "MORPC protocol version 45")
+}
+
+func TestGroupingSetRemoteProtocolValidationAtSendAndReceiveBoundaries(t *testing.T) {
+	proc := testutil.NewProcess(t)
+	rt := moruntime.ServiceRuntime(proc.GetService())
+	previous, hadPrevious := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+	t.Cleanup(func() {
+		if hadPrevious {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, previous)
+		} else {
+			rt.CompareAndDeleteGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion45)
+		}
+	})
+
+	projectionOp := projection.NewArgument()
+	projectionOp.GroupingFlags = []bool{true, false}
+	projectionOp.GroupingSetCount = 2
+	groupOp := group.NewArgument()
+	groupOp.DynamicGrouping = true
+	mergeGroupOp := group.NewArgumentMergeGroup()
+	mergeGroupOp.GroupingAware = true
+	legacyEmptyMergeGroupOp := group.NewArgumentMergeGroup()
+	legacyEmptyMergeGroupOp.EmptyGroupingSet = true
+	dynamicEmptyMergeGroupOp := group.NewArgumentMergeGroup()
+	dynamicEmptyMergeGroupOp.EmptyGroupingSetIDs = []int64{1}
+
+	for _, test := range []struct {
+		name string
+		op   vm.Operator
+	}{
+		{name: "projection", op: projectionOp},
+		{name: "group", op: groupOp},
+		{name: "merge group", op: mergeGroupOp},
+		{name: "legacy empty merge group", op: legacyEmptyMergeGroupOp},
+		{name: "dynamic empty merge group", op: dynamicEmptyMergeGroupOp},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scope := &Scope{Proc: proc, RootOp: test.op}
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion49)
+			data, err := encodeRemoteScope(scope, proc)
+			require.NoError(t, err)
+
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion48)
+			_, err = encodeRemoteScope(scope, proc)
+			require.ErrorContains(t, err, "MORPC protocol version 49")
+			_, err = decodeScope(data, proc, true, nil)
+			require.ErrorContains(t, err, "MORPC protocol version 49")
+		})
+	}
+}
+
+func TestGroupingSetRemoteProtocolValidationRecursesAndIgnoresLegacyGrouping(t *testing.T) {
+	proc := testutil.NewProcess(t)
+	rt := moruntime.ServiceRuntime(proc.GetService())
+	previous, hadPrevious := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+	t.Cleanup(func() {
+		if hadPrevious {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, previous)
+		} else {
+			rt.CompareAndDeleteGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion52)
+		}
+	})
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion48)
+
+	legacy := &pipeline.Pipeline{InstructionList: []*pipeline.Instruction{{
+		Agg: &pipeline.Group{GroupingFlag: []bool{true, false}},
+	}}}
+	require.NoError(t, validateRemoteGroupingSetPipelineProtocol(proc, legacy))
+
+	nested := &pipeline.Pipeline{Children: []*pipeline.Pipeline{{
+		InstructionList: []*pipeline.Instruction{{ProjectionGroupingSetCount: 2}},
+	}}}
+	require.ErrorContains(t,
+		validateRemoteGroupingSetPipelineProtocol(proc, nested),
+		"MORPC protocol version 49")
+
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion49)
+	require.NoError(t, validateRemoteGroupingSetPipelineProtocol(proc, nested))
+}
+
+func TestArrowLoadRemoteProtocolValidationAtSendAndReceiveBoundaries(t *testing.T) {
+	proc := testutil.NewProcess(t)
+	rt := moruntime.ServiceRuntime(proc.GetService())
+	previous, hadPrevious := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+	t.Cleanup(func() {
+		if hadPrevious {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, previous)
+		} else {
+			rt.CompareAndDeleteGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion57)
+		}
+	})
+
+	scope := &Scope{Proc: proc, RootOp: external.NewArgument().WithEs(
+		&external.ExternalParam{
+			ExParamConst: external.ExParamConst{
+				ArrowExecutionScope:       pipeline.ArrowExecutionScope_ArrowLoadData,
+				ArrowDistributedExecution: true,
+			},
+			ExParam: external.ExParam{Fileparam: &external.ExFileparam{}, Filter: &external.FilterParam{}},
+		},
+	)}
+
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion57)
+	data, err := encodeRemoteScope(scope, proc)
+	require.NoError(t, err)
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion56)
+	_, err = encodeRemoteScope(scope, proc)
+	require.ErrorContains(t, err, "MORPC protocol version 57")
+	_, err = decodeScope(data, proc, true, nil)
+	require.ErrorContains(t, err, "MORPC protocol version 57")
+}
+
+func TestExternalScanArrowRuntimeRoundtrip(t *testing.T) {
+	ctx := &scopeContext{id: 1, root: &scopeContext{}, parent: &scopeContext{}}
+	proc := &process.Process{Base: &process.BaseProcess{}}
+	identities := []*pipeline.ArrowObjectIdentity{{
+		FileIndex: 1, VersionId: "version-7", Etag: "etag-7", Size: 8192,
+		LastModifiedUnixNano: 1234,
+	}}
+	shards := []*pipeline.ArrowRecordBatchShard{{
+		FileIndex: 1, RecordBatchStart: 2, RecordBatchEnd: 5,
+		RequiredDictionaryBlockIndices: []int32{0, 3},
+		EstimatedRows:                  100, EstimatedWireBytes: 4096,
+	}}
+	fingerprint := []byte("01234567890123456789012345678901")
+	op := external.NewArgument().WithEs(&external.ExternalParam{
+		ExParamConst: external.ExParamConst{
+			ArrowExecutionScope:        pipeline.ArrowExecutionScope_ArrowLoadData,
+			ArrowForceMaterialize:      true,
+			ArrowDistributedExecution:  true,
+			ArrowObjectIdentities:      identities,
+			ArrowRecordBatchShards:     shards,
+			ArrowSchemaFingerprint:     fingerprint,
+			ArrowConversionPlanVersion: arrowConversionPlanVersion,
+			FileList:                   []string{"s3://bucket/part.arrow"},
+			FileSize:                   []int64{8192},
+			FileOffsetTotal:            []*pipeline.FileOffset{{Offset: []int64{0, -1}}},
+		},
+		ExParam: external.ExParam{Fileparam: &external.ExFileparam{}, Filter: &external.FilterParam{}},
+	})
+
+	_, instruction, err := convertToPipelineInstruction(op, proc, ctx, 1)
+	require.NoError(t, err)
+	require.Equal(t, pipeline.ArrowExecutionScope_ArrowLoadData, instruction.ExternalScan.ArrowExecutionScope)
+	require.True(t, instruction.ExternalScan.ArrowForceMaterialize)
+	require.True(t, instruction.ExternalScan.ArrowDistributedExecution)
+	require.Equal(t, identities, instruction.ExternalScan.ArrowObjectIdentities)
+	require.Equal(t, shards, instruction.ExternalScan.ArrowRecordBatchShards)
+	require.Equal(t, fingerprint, instruction.ExternalScan.ArrowSchemaFingerprint)
+	require.Equal(t, arrowConversionPlanVersion, instruction.ExternalScan.ArrowConversionPlanVersion)
+
+	wire, err := instruction.Marshal()
+	require.NoError(t, err)
+	wireInstruction := new(pipeline.Instruction)
+	require.NoError(t, wireInstruction.Unmarshal(wire))
+
+	restored, err := convertToVmOperator(wireInstruction, ctx, nil)
+	require.NoError(t, err)
+	restoredExternal := restored.(*external.External)
+	require.Equal(t, pipeline.ArrowExecutionScope_ArrowLoadData, restoredExternal.Es.ArrowExecutionScope)
+	require.True(t, restoredExternal.Es.ArrowForceMaterialize)
+	require.True(t, restoredExternal.Es.ArrowDistributedExecution)
+	require.Equal(t, identities, restoredExternal.Es.ArrowObjectIdentities)
+	require.Equal(t, shards, restoredExternal.Es.ArrowRecordBatchShards)
+	require.Equal(t, fingerprint, restoredExternal.Es.ArrowSchemaFingerprint)
+	require.Equal(t, arrowConversionPlanVersion, restoredExternal.Es.ArrowConversionPlanVersion)
 }
 
 func TestExternalScanIcebergRuntimeRoundtrip(t *testing.T) {
@@ -1081,6 +2278,58 @@ func Test_DMLOperatorSerializationRoundtrip(t *testing.T) {
 		}
 	})
 
+	t.Run("ODKU metadata rejects mixed-version remote execution", func(t *testing.T) {
+		op := &dedupjoin.DedupJoin{
+			Conditions:          [][]*plan.Expr{nil, nil},
+			HasODKUAffectedRows: true,
+		}
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+		_, instruction, err := convertToPipelineInstruction(op, proc, ctx, 1)
+		require.NoError(t, err)
+		data, err := (&pipeline.Pipeline{InstructionList: []*pipeline.Instruction{instruction}}).Marshal()
+		require.NoError(t, err)
+
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion49)
+		_, _, err = convertToPipelineInstruction(op, proc, ctx, 1)
+		require.ErrorContains(t, err, "MORPC protocol version 50")
+		_, err = decodeScope(data, proc, true, nil)
+		require.ErrorContains(t, err, "MORPC protocol version 50")
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+
+		actionOp := &dedupjoin.DedupJoin{
+			Conditions: [][]*plan.Expr{nil, nil}, EmitActionRows: true,
+		}
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+		_, actionInstruction, err := convertToPipelineInstruction(actionOp, proc, ctx, 1)
+		require.NoError(t, err)
+		actionData, err := (&pipeline.Pipeline{InstructionList: []*pipeline.Instruction{actionInstruction}}).Marshal()
+		require.NoError(t, err)
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion50)
+		_, _, err = convertToPipelineInstruction(actionOp, proc, ctx, 1)
+		require.ErrorContains(t, err, "MORPC protocol version 51")
+		_, err = decodeScope(actionData, proc, true, nil)
+		require.ErrorContains(t, err, "MORPC protocol version 51")
+
+		targetOp := &preinsertunique.PreInsertUnique{PreInsertCtx: &planpb.PreInsertUkCtx{
+			OdkuTargetArbitration: true,
+			PkColumn:              0,
+			KeyColumns:            []int32{0, 1},
+			TargetColumns:         []int32{2, 3},
+			OutputColumns:         2,
+		}}
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+		_, targetInstruction, err := convertToPipelineInstruction(targetOp, proc, ctx, 1)
+		require.NoError(t, err)
+		targetData, err := (&pipeline.Pipeline{InstructionList: []*pipeline.Instruction{targetInstruction}}).Marshal()
+		require.NoError(t, err)
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion50)
+		_, _, err = convertToPipelineInstruction(targetOp, proc, ctx, 1)
+		require.ErrorContains(t, err, "MORPC protocol version 51")
+		_, err = decodeScope(targetData, proc, true, nil)
+		require.ErrorContains(t, err, "MORPC protocol version 51")
+		rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+	})
+
 	t.Run("FuzzyFilter_RuntimeFilterPairContract", func(t *testing.T) {
 		probeType := &planpb.Type{
 			Id:    int32(types.T_decimal64),
@@ -1165,6 +2414,7 @@ func Test_DMLOperatorSerializationRoundtrip(t *testing.T) {
 			Tag:                    41,
 			UpperLimit:             128,
 			MatchPrefix:            true,
+			ScalarPredicate:        true,
 			BuildExpr:              buildExpr,
 			KeyEncoding:            planpb.RuntimeFilterKeyEncoding_RUNTIME_FILTER_KEY_SERIAL_FULL_V1,
 			ProbeType:              probeType,
@@ -1198,6 +2448,7 @@ func Test_DMLOperatorSerializationRoundtrip(t *testing.T) {
 		require.Equal(t, []planpb.Type{componentType},
 			restoredOp.RuntimeFilterSpec.GetKeyComponentProbeTypes())
 		require.True(t, restoredOp.RuntimeFilterSpec.GetMatchPrefix())
+		require.True(t, restoredOp.RuntimeFilterSpec.GetScalarPredicate())
 	})
 
 	t.Run("HashBuild_LegacyRuntimeFilterHasNoImplicitContract", func(t *testing.T) {
@@ -1362,7 +2613,7 @@ func Test_DMLOperatorSerializationRoundtrip(t *testing.T) {
 		op.FuncName = "unnest"
 		op.Limit = plan.MakePlan2Uint64ConstExprWithType(4)
 		op.RuntimeFilterSpecs = []*planpb.RuntimeFilterSpec{
-			{Tag: 9, UseMembershipFilter: true},
+			{Tag: 9, UseMembershipFilter: true, MustApply: true},
 		}
 		op.IndexReaderParam = &planpb.IndexReaderParam{
 			Limit:        plan.MakePlan2Uint64ConstExprWithType(4),
@@ -1391,19 +2642,23 @@ func Test_DMLOperatorSerializationRoundtrip(t *testing.T) {
 
 	t.Run("MultiUpdate_PartitionCols", func(t *testing.T) {
 		changedRowsCol := 7
+		affectedRowsWeightCol := 11
+		physicalChangedRowsCol := 12
 		op := &multi_update.MultiUpdate{
 			MultiUpdateCtx: []*multi_update.MultiUpdateCtx{
 				{
-					ObjRef:             &plan.ObjectRef{ObjName: "t1"},
-					TableDef:           &plan.TableDef{Name: "t1"},
-					InsertCols:         []int{0, 1, 2},
-					DeleteCols:         []int{3, 4, 8},
-					PartitionCols:      []int{5, 6},
-					InsertPkColIdx:     1,
-					DedupByTargetRowID: true,
-					TargetUpdateCtxIdx: 0,
-					ChangedRowsCol:     &changedRowsCol,
-					AffectedRowsCols:   []int{9, 10},
+					ObjRef:                 &plan.ObjectRef{ObjName: "t1"},
+					TableDef:               &plan.TableDef{Name: "t1"},
+					InsertCols:             []int{0, 1, 2},
+					DeleteCols:             []int{3, 4, 8},
+					PartitionCols:          []int{5, 6},
+					InsertPkColIdx:         1,
+					DedupByTargetRowID:     true,
+					TargetUpdateCtxIdx:     0,
+					ChangedRowsCol:         &changedRowsCol,
+					AffectedRowsCols:       []int{9, 10},
+					AffectedRowsWeightCol:  &affectedRowsWeightCol,
+					PhysicalChangedRowsCol: &physicalChangedRowsCol,
 				},
 			},
 			Action: multi_update.UpdateWriteTable,
@@ -1424,6 +2679,8 @@ func Test_DMLOperatorSerializationRoundtrip(t *testing.T) {
 		require.NotNil(t, restoredOp.MultiUpdateCtx[0].ChangedRowsCol)
 		require.Equal(t, 7, *restoredOp.MultiUpdateCtx[0].ChangedRowsCol)
 		require.Equal(t, []int{9, 10}, restoredOp.MultiUpdateCtx[0].AffectedRowsCols)
+		require.Equal(t, 11, *restoredOp.MultiUpdateCtx[0].AffectedRowsWeightCol)
+		require.Equal(t, 12, *restoredOp.MultiUpdateCtx[0].PhysicalChangedRowsCol)
 		require.True(t, restoredOp.IsRemote)
 		require.False(t, restoredOp.CountDeleteAffectRows,
 			"CountDeleteAffectRows must stay false when the source op did not set it")
@@ -1515,18 +2772,86 @@ func Test_DMLOperatorSerializationRoundtrip(t *testing.T) {
 		require.Equal(t, int32(9), restoredPreInsert.TargetRowIDCol)
 	})
 
-	t.Run("DedupJoin_DedupBuildKeepLast", func(t *testing.T) {
+	t.Run("DedupJoin_DedupBuildKeepLastAndODKUMetadata", func(t *testing.T) {
 		op := &dedupjoin.DedupJoin{
-			Conditions:         [][]*plan.Expr{nil, nil},
-			DedupBuildKeepLast: true,
+			Conditions:               [][]*plan.Expr{nil, nil},
+			DedupBuildKeepLast:       true,
+			HasODKUAffectedRows:      true,
+			AffectedRowsResultPos:    4,
+			PhysicalChangedResultPos: 5,
+			UpdateCheckColIdxList:    []int32{1, 3},
+			CountFoundRows:           true,
+			EmitActionRows:           true,
+			ActionFinalResultPos:     6,
+			ForeignKeyChecks: []dedupjoin.ODKUForeignKeyCheck{{
+				ColIdxList: []int32{1, 2}, EligibilityResultPos: 7,
+			}},
 		}
 		_, pipeInstr, err := convertToPipelineInstruction(op, proc, ctx, 1)
 		require.NoError(t, err)
 		require.True(t, pipeInstr.DedupJoin.DedupBuildKeepLast)
+		require.True(t, pipeInstr.DedupJoin.HasOdkuAffectedRows)
+		require.Equal(t, int32(4), pipeInstr.DedupJoin.AffectedRowsResultPos)
+		require.Equal(t, int32(5), pipeInstr.DedupJoin.PhysicalChangedRowsResultPos)
+		require.Equal(t, []int32{1, 3}, pipeInstr.DedupJoin.UpdateCheckColIdxList)
+		require.True(t, pipeInstr.DedupJoin.CountFoundRows)
+		require.True(t, pipeInstr.DedupJoin.EmitActionRows)
+		require.Equal(t, int32(6), pipeInstr.DedupJoin.ActionFinalResultPos)
+		require.Equal(t, []int32{1, 2}, pipeInstr.DedupJoin.ForeignKeyChecks[0].ColIdxList)
+		require.Equal(t, int32(7), pipeInstr.DedupJoin.ForeignKeyChecks[0].EligibilityResultPos)
 
-		restored, err := convertToVmOperator(pipeInstr, ctx, nil)
+		wire, err := pipeInstr.Marshal()
 		require.NoError(t, err)
-		require.True(t, restored.(*dedupjoin.DedupJoin).DedupBuildKeepLast)
+		decoded := new(pipeline.Instruction)
+		require.NoError(t, decoded.Unmarshal(wire))
+
+		restored, err := convertToVmOperator(decoded, ctx, nil)
+		require.NoError(t, err)
+		restoredDedup := restored.(*dedupjoin.DedupJoin)
+		require.True(t, restoredDedup.DedupBuildKeepLast)
+		require.True(t, restoredDedup.HasODKUAffectedRows)
+		require.Equal(t, int32(4), restoredDedup.AffectedRowsResultPos)
+		require.Equal(t, int32(5), restoredDedup.PhysicalChangedResultPos)
+		require.Equal(t, []int32{1, 3}, restoredDedup.UpdateCheckColIdxList)
+		require.True(t, restoredDedup.CountFoundRows)
+		require.True(t, restoredDedup.EmitActionRows)
+		require.Equal(t, int32(6), restoredDedup.ActionFinalResultPos)
+		require.Equal(t, []int32{1, 2}, restoredDedup.ForeignKeyChecks[0].ColIdxList)
+		require.Equal(t, int32(7), restoredDedup.ForeignKeyChecks[0].EligibilityResultPos)
+
+		// Constraint eligibility is also required by the compact final-row path:
+		// inserts remain eligible while unrelated updates bypass historical rows.
+		op.EmitActionRows = false
+		_, compactInstr, err := convertToPipelineInstruction(op, proc, ctx, 1)
+		require.NoError(t, err)
+		require.False(t, compactInstr.DedupJoin.EmitActionRows)
+		require.Len(t, compactInstr.DedupJoin.ForeignKeyChecks, 1)
+		compactRestored, err := convertToVmOperator(compactInstr, ctx, nil)
+		require.NoError(t, err)
+		require.False(t, compactRestored.(*dedupjoin.DedupJoin).EmitActionRows)
+		require.Len(t, compactRestored.(*dedupjoin.DedupJoin).ForeignKeyChecks, 1)
+	})
+
+	t.Run("PreInsertUnique_ODKUTargetArbitration", func(t *testing.T) {
+		op := &preinsertunique.PreInsertUnique{PreInsertCtx: &planpb.PreInsertUkCtx{
+			OdkuTargetArbitration: true,
+			PkColumn:              0,
+			KeyColumns:            []int32{0, 1},
+			TargetColumns:         []int32{2, 3},
+			OutputColumns:         2,
+		}}
+		_, pipeInstr, err := convertToPipelineInstruction(op, proc, ctx, 1)
+		require.NoError(t, err)
+		wire, err := pipeInstr.Marshal()
+		require.NoError(t, err)
+		decoded := new(pipeline.Instruction)
+		require.NoError(t, decoded.Unmarshal(wire))
+		restored, err := convertToVmOperator(decoded, ctx, nil)
+		require.NoError(t, err)
+		restoredPreInsert := restored.(*preinsertunique.PreInsertUnique)
+		require.True(t, restoredPreInsert.PreInsertCtx.OdkuTargetArbitration)
+		require.Equal(t, []int32{0, 1}, restoredPreInsert.PreInsertCtx.KeyColumns)
+		require.Equal(t, []int32{2, 3}, restoredPreInsert.PreInsertCtx.TargetColumns)
 	})
 
 	t.Run("MergeOrder_SpillThreshold", func(t *testing.T) {
@@ -1545,6 +2870,30 @@ func Test_DMLOperatorSerializationRoundtrip(t *testing.T) {
 		require.Equal(t, int64(4096), restoredOp.SpillThreshold)
 		require.Len(t, restoredOp.OrderBySpecs, 1)
 		require.Equal(t, planpb.OrderBySpec_DESC, restoredOp.OrderBySpecs[0].Flag)
+	})
+
+	t.Run("HashPartition_AlgorithmAndSpillThreshold", func(t *testing.T) {
+		op := &partition.Partition{
+			Algorithm: planpb.Node_PARTITION_ALGORITHM_HASH,
+			SpillMem:  8192,
+			OrderBySpecs: []*planpb.OrderBySpec{{
+				Expr: &planpb.Expr{Typ: planpb.Type{Id: int32(types.T_int64)}},
+			}},
+		}
+		_, pipeInstr, err := convertToPipelineInstruction(op, proc, ctx, 1)
+		require.NoError(t, err)
+		require.Equal(t, planpb.Node_PARTITION_ALGORITHM_HASH, pipeInstr.PartitionAlgorithm)
+		require.Equal(t, int64(8192), pipeInstr.SpillMem)
+
+		wireBytes, err := pipeInstr.Marshal()
+		require.NoError(t, err)
+		wireInstr := new(pipeline.Instruction)
+		require.NoError(t, wireInstr.Unmarshal(wireBytes))
+		restored, err := convertToVmOperator(wireInstr, ctx, nil)
+		require.NoError(t, err)
+		restoredPartition := restored.(*partition.Partition)
+		require.Equal(t, planpb.Node_PARTITION_ALGORITHM_HASH, restoredPartition.Algorithm)
+		require.Equal(t, int64(8192), restoredPartition.SpillMem)
 	})
 
 	t.Run("HashBuild_SpillThreshold", func(t *testing.T) {
@@ -1787,94 +3136,7 @@ func Test_decodeBatchPreservesPrepareParamKindTransportTrailer(t *testing.T) {
 	decoded.Clean(mp)
 }
 
-func Test_GetProcByUuid(t *testing.T) {
-	_ = colexec.NewServer("")
-
-	{
-		// first get action or deletion just convert the k-v to be `ready to remove` status.
-		// and the next action will remove it.
-		uid, err := uuid.NewV7()
-		require.Nil(t, err)
-
-		receiver := &messageReceiverOnServer{
-			colexecServer: colexec.GetServer(""),
-			connectionCtx: context.TODO(),
-		}
-
-		p0 := &process.Process{}
-		c0 := process.RemotePipelineInformationChannel(make(chan *process.WrapCs))
-		require.NoError(t, colexec.GetServer("").PutProcIntoUuidMap(uid, p0, c0))
-
-		// this action will convert it to be ready-to-remove status.
-		colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
-
-		// A receiver closed before attachment is a terminal protocol state, not
-		// a successful nil attachment.
-		p, c, err := receiver.GetProcByUuid(uid)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "already closed")
-		require.Nil(t, p)
-		require.Nil(t, c)
-
-		colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
-	}
-
-	{
-		// A disconnected notify attempt must exit without poisoning a receiver
-		// UUID that a later attempt can still register.
-		uid, err := uuid.NewV7()
-		require.NoError(t, err)
-		cctx, ccancel := context.WithCancel(context.Background())
-		receiver := &messageReceiverOnServer{
-			colexecServer: colexec.GetServer(""),
-			connectionCtx: cctx,
-			messageCtx:    context.Background(),
-		}
-		ccancel()
-		p, _, err := receiver.GetProcByUuid(uid)
-		require.Error(t, err)
-		require.Nil(t, p)
-
-		ownerCh := make(process.RemotePipelineInformationChannel)
-		require.NoError(t, colexec.GetServer("").PutProcIntoUuidMap(uid, &process.Process{}, ownerCh))
-		colexec.GetServer("").RemoveUuidsOwned([]uuid.UUID{uid}, ownerCh)
-	}
-
-	{
-		// test get succeed.
-		uid, err := uuid.NewV7()
-		require.Nil(t, err)
-
-		receiver := &messageReceiverOnServer{
-			colexecServer: colexec.GetServer(""),
-			connectionCtx: context.TODO(),
-		}
-
-		p0 := &process.Process{}
-		c0 := process.RemotePipelineInformationChannel(make(chan *process.WrapCs))
-		require.NoError(t, colexec.GetServer("").PutProcIntoUuidMap(uid, p0, c0))
-
-		p, c, err := receiver.GetProcByUuid(uid)
-		require.Nil(t, err)
-		require.Equal(t, p0, p)
-		require.Equal(t, c0, c)
-
-		colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
-		colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
-	}
-
-	{
-		// test if receiver done first, put action should return error.
-		colexec.GetServer("").GetProcByUuid(uuid.UUID{}, true)
-		err := colexec.GetServer("").PutProcIntoUuidMap(uuid.UUID{}, nil, nil)
-		require.NotNil(t, err)
-
-		colexec.GetServer("").DeleteUuids([]uuid.UUID{{}})
-		colexec.GetServer("").DeleteUuids([]uuid.UUID{{}})
-	}
-}
-
-func Test_GetProcByUuid_ConcurrentWake(t *testing.T) {
+func TestGetRemoteDispatchReceiverConcurrentWake(t *testing.T) {
 	_ = colexec.NewServer("")
 
 	uid, err := uuid.NewV7()
@@ -1886,7 +3148,7 @@ func Test_GetProcByUuid_ConcurrentWake(t *testing.T) {
 		messageCtx:    context.TODO(),
 	}
 
-	// Start GetProcByUuid in a goroutine BEFORE PutProcIntoUuidMap.
+	// Start the event-driven receiver lookup before registration publication.
 	// This tests the wait-then-wake path: the receiver must block on the
 	// changed channel and wake exactly once when the UUID is inserted.
 	type result struct {
@@ -1896,13 +3158,13 @@ func Test_GetProcByUuid_ConcurrentWake(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		p, c, e := receiver.GetProcByUuid(uid)
+		p, c, _, e := receiver.getRemoteDispatchReceiver(uid, nil)
 		done <- result{p, c, e}
 	}()
 
 	p0 := &process.Process{}
 	c0 := process.RemotePipelineInformationChannel(make(chan *process.WrapCs))
-	require.NoError(t, colexec.GetServer("").PutProcIntoUuidMap(uid, p0, c0))
+	require.NoError(t, colexec.GetServer("").PutProcIntoUuidMapWithTerminal(uid, p0, c0, colexec.NewRemoteReceiverTerminal(nil)))
 
 	select {
 	case r := <-done:
@@ -1910,14 +3172,13 @@ func Test_GetProcByUuid_ConcurrentWake(t *testing.T) {
 		require.Equal(t, p0, r.proc)
 		require.Equal(t, c0, r.ch)
 	case <-time.After(3 * time.Second):
-		t.Fatal("GetProcByUuid did not wake after PutProcIntoUuidMap")
+		t.Fatal("remote receiver lookup did not wake after PutProcIntoUuidMap")
 	}
 
-	colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
-	colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
+	colexec.GetServer("").RemoveUuidsOwned([]uuid.UUID{uid}, c0)
 }
 
-func Test_GetProcByUuid_CancellationDoesNotPoisonLaterRegistration(t *testing.T) {
+func TestGetRemoteDispatchReceiverCancellationDoesNotPoisonLaterRegistration(t *testing.T) {
 	_ = colexec.NewServer("")
 
 	uid, err := uuid.NewV7()
@@ -1938,7 +3199,7 @@ func Test_GetProcByUuid_CancellationDoesNotPoisonLaterRegistration(t *testing.T)
 	}
 	done := make(chan result, 1)
 	go func() {
-		p, ch, lookupErr := receiver.GetProcByUuid(uid)
+		p, ch, _, lookupErr := receiver.getRemoteDispatchReceiver(uid, nil)
 		done <- result{proc: p, ch: ch, err: lookupErr}
 	}()
 	cancelMessage(cancelCause)
@@ -1950,13 +3211,12 @@ func Test_GetProcByUuid_CancellationDoesNotPoisonLaterRegistration(t *testing.T)
 
 	p0 := &process.Process{}
 	c0 := process.RemotePipelineInformationChannel(make(chan *process.WrapCs))
-	require.NoError(t, colexec.GetServer("").PutProcIntoUuidMap(uid, p0, c0))
+	require.NoError(t, colexec.GetServer("").PutProcIntoUuidMapWithTerminal(uid, p0, c0, colexec.NewRemoteReceiverTerminal(nil)))
 
-	colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
-	colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
+	colexec.GetServer("").RemoveUuidsOwned([]uuid.UUID{uid}, c0)
 }
 
-func Test_GetProcByUuid_WaitsPastFormerAdmissionLimitForRegistration(t *testing.T) {
+func TestGetRemoteDispatchReceiverWaitsPastFormerAdmissionLimitForRegistration(t *testing.T) {
 	server := colexec.NewServer("")
 	uid := uuid.Must(uuid.NewV7())
 	messageCtx, cancelMessage := context.WithCancelCause(context.Background())
@@ -1974,7 +3234,7 @@ func Test_GetProcByUuid_WaitsPastFormerAdmissionLimitForRegistration(t *testing.
 	}
 	done := make(chan result, 1)
 	go func() {
-		proc, ch, err := receiver.GetProcByUuid(uid)
+		proc, ch, _, err := receiver.getRemoteDispatchReceiver(uid, nil)
 		done <- result{proc: proc, ch: ch, err: err}
 	}()
 
@@ -1988,224 +3248,95 @@ func Test_GetProcByUuid_WaitsPastFormerAdmissionLimitForRegistration(t *testing.
 
 	ownerProc := &process.Process{}
 	ownerCh := make(process.RemotePipelineInformationChannel)
-	require.NoError(t, server.PutProcIntoUuidMap(uid, ownerProc, ownerCh))
+	require.NoError(t, server.PutProcIntoUuidMapWithTerminal(uid, ownerProc, ownerCh, colexec.NewRemoteReceiverTerminal(nil)))
 	select {
 	case got := <-done:
 		require.NoError(t, got.err)
 		require.Same(t, ownerProc, got.proc)
 		require.Equal(t, ownerCh, got.ch)
 	case <-time.After(time.Second):
-		t.Fatal("GetProcByUuid did not attach after delayed registration")
+		t.Fatal("remote receiver lookup did not attach after delayed registration")
 	}
 	server.RemoveUuidsOwned([]uuid.UUID{uid}, ownerCh)
 }
 
 func TestHandlePrepareDoneNotifyObservesMessageCancellationAfterAttach(t *testing.T) {
-	server := colexec.NewServer("")
-	uid := uuid.Must(uuid.NewV7())
-	messageCtx, cancelMessage := context.WithCancelCause(context.Background())
-	dispatchCtx, cancelDispatch := context.WithCancelCause(context.Background())
-	dispatchProc := &process.Process{
-		Ctx:    dispatchCtx,
-		Cancel: cancelDispatch,
-	}
-	notifyCh := make(process.RemotePipelineInformationChannel, 1)
-	require.NoError(t, server.PutProcIntoUuidMap(uid, dispatchProc, notifyCh))
-	t.Cleanup(func() {
-		server.RemoveUuidsOwned([]uuid.UUID{uid}, notifyCh)
-	})
+	for _, stopBeforeCancel := range []bool{false, true} {
+		t.Run(fmt.Sprint("stop_before_cancel_", stopBeforeCancel), func(t *testing.T) {
 
-	ctrl := gomock.NewController(t)
-	session := mock_morpc.NewMockClientSession(ctrl)
-	session.EXPECT().SessionCtx().Return(context.Background()).AnyTimes()
-	receiver := &messageReceiverOnServer{
-		messageCtx:      messageCtx,
-		connectionCtx:   context.Background(),
-		messageId:       7,
-		messageTyp:      pipeline.Method_PrepareDoneNotifyMessage,
-		messageUuid:     uid,
-		clientSession:   session,
-		colexecServer:   server,
-		streamLifecycle: &pipelineStreamLifecycle{batchFlow: newPipelineBatchFlow(2, 1024)},
-	}
+			server := colexec.NewServer("")
+			uid := uuid.Must(uuid.NewV7())
+			messageCtx, cancelMessage := context.WithCancelCause(context.Background())
+			defer cancelMessage(context.Canceled)
+			dispatchCtx, cancelDispatch := context.WithCancelCause(context.Background())
+			defer cancelDispatch(context.Canceled)
+			dispatchProc := &process.Process{
+				Ctx:    dispatchCtx,
+				Cancel: cancelDispatch,
+			}
+			notifyCh := make(process.RemotePipelineInformationChannel, 1)
+			require.NoError(t, server.PutProcIntoUuidMapWithTerminal(uid, dispatchProc, notifyCh, colexec.NewRemoteReceiverTerminal(dispatchProc.Cancel)))
+			t.Cleanup(func() {
+				server.RemoveUuidsOwned([]uuid.UUID{uid}, notifyCh)
+			})
 
-	done := make(chan error, 1)
-	go func() {
-		done <- handlePipelineMessage(receiver)
-	}()
+			ctrl := gomock.NewController(t)
+			session := mock_morpc.NewMockClientSession(ctrl)
+			session.EXPECT().SessionCtx().Return(context.Background()).AnyTimes()
+			receiver := &messageReceiverOnServer{
+				messageCtx:      messageCtx,
+				connectionCtx:   context.Background(),
+				messageId:       7,
+				messageTyp:      pipeline.Method_PrepareDoneNotifyMessage,
+				messageUuid:     uid,
+				clientSession:   session,
+				colexecServer:   server,
+				streamLifecycle: &pipelineStreamLifecycle{batchFlow: newPipelineBatchFlow(2, 1024)},
+			}
 
-	var attached *process.WrapCs
-	select {
-	case attached = <-notifyCh:
-		require.NotNil(t, attached)
-		require.Equal(t, uid, attached.Uid)
-		require.Equal(t, uint32(2), attached.BatchCredits)
-		require.Equal(t, uint64(1024), attached.ByteCredits)
-		require.NotNil(t, attached.ReserveBatch)
-		require.NotNil(t, attached.RollbackBatch)
-		seq, err := attached.ReserveBatch(context.Background(), 10)
-		require.NoError(t, err)
-		require.Equal(t, uint64(1), seq)
-		attached.RollbackBatch(seq)
-	case <-time.After(time.Second):
-		t.Fatal("prepare-done notify did not attach to the published receiver")
-	}
-
-	cancelCause := moerr.NewInternalErrorNoCtx("notify message canceled after attach")
-	cancelMessage(cancelCause)
-	select {
-	case err := <-done:
-		require.ErrorIs(t, err, cancelCause)
-	case <-time.After(time.Second):
-		t.Fatal("prepare-done notify did not stop after message cancellation")
-	}
-	require.ErrorIs(t, context.Cause(dispatchCtx), cancelCause)
-	server.RemoveRelatedPipeline(session, receiver.messageId)
-}
-
-func Test_TryGetProcByUuid_NotRegisteredYetDoesNotPoisonLaterRegistration(t *testing.T) {
-	_ = colexec.NewServer("")
-
-	uid, err := uuid.NewV7()
-	require.NoError(t, err)
-
-	receiver := &messageReceiverOnServer{
-		colexecServer: colexec.GetServer(""),
-		connectionCtx: context.TODO(),
-		messageCtx:    context.TODO(),
-	}
-
-	p, ch, err := receiver.TryGetProcByUuid(uid)
-	require.Error(t, err)
-	require.True(t, isRemoteDispatchNotRegisteredYetError(err))
-	require.Nil(t, p)
-	require.Nil(t, ch)
-
-	p0 := &process.Process{}
-	c0 := process.RemotePipelineInformationChannel(make(chan *process.WrapCs))
-	require.NoError(t, colexec.GetServer("").PutProcIntoUuidMap(uid, p0, c0))
-
-	colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
-	colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
-}
-
-func Test_TryGetProcByUuid_ReturnsRegisteredProc(t *testing.T) {
-	_ = colexec.NewServer("")
-
-	uid, err := uuid.NewV7()
-	require.NoError(t, err)
-
-	p0 := &process.Process{}
-	c0 := process.RemotePipelineInformationChannel(make(chan *process.WrapCs))
-	require.NoError(t, colexec.GetServer("").PutProcIntoUuidMap(uid, p0, c0))
-	defer colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
-
-	receiver := &messageReceiverOnServer{
-		colexecServer: colexec.GetServer(""),
-		connectionCtx: context.Background(),
-		messageCtx:    context.Background(),
-	}
-
-	p, ch, err := receiver.TryGetProcByUuid(uid)
-	require.NoError(t, err)
-	require.Same(t, p0, p)
-	require.Equal(t, c0, ch)
-}
-
-func Test_TryGetProcByUuid_ClosedRetryDoesNotPoisonLaterRegistration(t *testing.T) {
-	_ = colexec.NewServer("")
-
-	uid, err := uuid.NewV7()
-	require.NoError(t, err)
-
-	connectionCtx, cancelConnection := context.WithCancel(context.Background())
-	cancelConnection()
-	receiver := &messageReceiverOnServer{
-		colexecServer: colexec.GetServer(""),
-		connectionCtx: connectionCtx,
-		messageCtx:    context.Background(),
-	}
-
-	p, ch, err := receiver.TryGetProcByUuid(uid)
-	require.Error(t, err)
-	require.True(t, isRemoteDispatchNotRegisteredYetError(err))
-	require.Nil(t, p)
-	require.Nil(t, ch)
-
-	dispatchProc := &process.Process{}
-	notifyCh := make(chan *process.WrapCs)
-	require.NoError(t, colexec.GetServer("").PutProcIntoUuidMap(uid, dispatchProc, notifyCh))
-
-	nextAttempt := &messageReceiverOnServer{
-		colexecServer: colexec.GetServer(""),
-		connectionCtx: context.Background(),
-		messageCtx:    context.Background(),
-	}
-	p, ch, err = nextAttempt.TryGetProcByUuid(uid)
-	require.NoError(t, err)
-	require.Same(t, dispatchProc, p)
-	require.Equal(t, process.RemotePipelineInformationChannel(notifyCh), ch)
-	colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
-}
-
-func Test_TryGetProcByUuid_CloseVsRegisterInterleavings(t *testing.T) {
-	_ = colexec.NewServer("")
-
-	for _, tc := range []struct {
-		name                    string
-		closeBeforeRegistration bool
-	}{
-		{name: "close before registration", closeBeforeRegistration: true},
-		{name: "registration before close", closeBeforeRegistration: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			uid, err := uuid.NewV7()
-			require.NoError(t, err)
-
-			connectionCtx, closeConnection := context.WithCancel(context.Background())
-			defer closeConnection()
-			lookupDone := make(chan struct{})
-			allowLookup := make(chan struct{})
-			lookupErr := make(chan error, 1)
+			done := make(chan error, 1)
+			handlerDone := make(chan struct{})
 			go func() {
-				if tc.closeBeforeRegistration {
-					<-allowLookup
-				}
-				receiver := &messageReceiverOnServer{
-					colexecServer: colexec.GetServer(""),
-					connectionCtx: connectionCtx,
-					messageCtx:    context.Background(),
-				}
-				_, _, lookupErrValue := receiver.TryGetProcByUuid(uid)
-				lookupErr <- lookupErrValue
-				close(lookupDone)
+				defer close(handlerDone)
+				done <- handlePipelineMessage(receiver)
 			}()
 
-			if tc.closeBeforeRegistration {
-				closeConnection()
-				close(allowLookup)
-			} else {
-				<-lookupDone
+			defer func() { cancelMessage(context.Canceled); <-handlerDone }()
+			var attached *process.WrapCs
+			select {
+			case attached = <-notifyCh:
+				require.NotNil(t, attached)
+				require.Equal(t, uid, attached.Uid)
+				require.Equal(t, uint32(2), attached.BatchCredits)
+				require.Equal(t, uint64(1024), attached.ByteCredits)
+				require.NotNil(t, attached.ReserveBatch)
+				require.NotNil(t, attached.RollbackBatch)
+				seq, err := attached.ReserveBatch(context.Background(), 10)
+				require.NoError(t, err)
+				require.Equal(t, uint64(1), seq)
+				attached.RollbackBatch(seq)
+			case <-time.After(time.Second):
+				t.Fatal("prepare-done notify did not attach to the published receiver")
 			}
-			require.True(t, isRemoteDispatchNotRegisteredYetError(<-lookupErr))
 
-			dispatchProc := &process.Process{}
-			notifyCh := make(process.RemotePipelineInformationChannel)
-			require.NoError(t, colexec.GetServer("").PutProcIntoUuidMap(uid, dispatchProc, notifyCh))
-			if !tc.closeBeforeRegistration {
-				closeConnection()
+			require.NotNil(t, attached.ReceiverStopped)
+			require.False(t, attached.ReceiverStopped())
+			if stopBeforeCancel {
+				receiver.streamLifecycle.batchFlow.stop(context.Canceled)
+				require.True(t, attached.ReceiverStopped())
 			}
+			cancelCause := moerr.NewInternalErrorNoCtx("notify message canceled after attach")
+			cancelMessage(cancelCause)
+			require.False(t, attached.ReceiverStopped())
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, cancelCause)
+			case <-time.After(time.Second):
+				t.Fatal("prepare-done notify did not stop after message cancellation")
+			}
+			require.ErrorIs(t, context.Cause(dispatchCtx), cancelCause)
+			server.RemoveRelatedPipeline(session, receiver.messageId)
 
-			nextAttempt := &messageReceiverOnServer{
-				colexecServer: colexec.GetServer(""),
-				connectionCtx: context.Background(),
-				messageCtx:    context.Background(),
-			}
-			gotProc, gotCh, err := nextAttempt.TryGetProcByUuid(uid)
-			require.NoError(t, err)
-			require.Same(t, dispatchProc, gotProc)
-			require.Equal(t, notifyCh, gotCh)
-			colexec.GetServer("").DeleteUuids([]uuid.UUID{uid})
 		})
 	}
 }
@@ -2264,7 +3395,7 @@ func TestCoordinatorDispatchRegisteredBeforePrepare(t *testing.T) {
 		connectionCtx: context.Background(),
 		messageCtx:    context.Background(),
 	}
-	registeredProc, notifyCh, err := receiver.TryGetProcByUuid(uid)
+	registeredProc, notifyCh, _, err := receiver.getRemoteDispatchReceiver(uid, nil)
 	require.NoError(t, err)
 	require.Same(t, proc, registeredProc)
 	require.NotNil(t, notifyCh)
@@ -2275,7 +3406,6 @@ func TestCoordinatorDispatchRegisteredBeforePrepare(t *testing.T) {
 	remoteReceiver := &process.WrapCs{
 		Uid: uid,
 		Cs:  clientSession,
-		Err: make(chan error, 1),
 	}
 	attached := make(chan struct{})
 	go func() {
@@ -2296,8 +3426,9 @@ func TestCoordinatorDispatchRegisteredBeforePrepare(t *testing.T) {
 		t.Fatal("coordinator dispatch pipeline did not finish")
 	}
 
-	_, _, err = receiver.TryGetProcByUuid(uid)
-	require.True(t, isRemoteDispatchNotRegisteredYetError(err), "runOnce must clean its early registration")
+	_, _, state, waiter, _ := colexec.GetServer("").AttachProcByUuidOrWait(uid)
+	waiter.Close()
+	require.Equal(t, colexec.RemoteReceiverMissing, state, "runOnce must clean its early registration")
 }
 
 func TestRegisterLocalDispatchReceiversNestedAndIdempotent(t *testing.T) {
@@ -2320,8 +3451,9 @@ func TestRegisterLocalDispatchReceiversNestedAndIdempotent(t *testing.T) {
 	require.NoError(t, err)
 	defer second.cleanup()
 
-	registeredProc, _, ok := colexec.GetServer("").GetProcByUuid(uid, false)
-	require.True(t, ok)
+	registeredProc, _, attachState, lookupWaiter, _ := colexec.GetServer("").AttachProcByUuidOrWait(uid)
+	lookupWaiter.Close()
+	require.Equal(t, colexec.RemoteReceiverAttachedNow, attachState)
 	require.Same(t, nestedProc, registeredProc)
 }
 
@@ -2352,11 +3484,13 @@ func TestRegisterLocalDispatchReceiversRegistersRetainedRemoteRootOnly(t *testin
 	registrations, err := registerLocalDispatchReceivers([]*Scope{root}, "local-cn:6002")
 	require.NoError(t, err)
 	defer registrations.cleanup()
-	registeredProc, _, ok := colexec.GetServer("").GetProcByUuid(localUID, false)
-	require.True(t, ok)
+	registeredProc, _, attachState, lookupWaiter, _ := colexec.GetServer("").AttachProcByUuidOrWait(localUID)
+	lookupWaiter.Close()
+	require.Equal(t, colexec.RemoteReceiverAttachedNow, attachState)
 	require.Same(t, remoteProc, registeredProc)
-	registeredProc, notifyCh, ok := colexec.GetServer("").GetProcByUuid(remoteUID, false)
-	require.False(t, ok)
+	registeredProc, notifyCh, attachState, lookupWaiter, _ := colexec.GetServer("").AttachProcByUuidOrWait(remoteUID)
+	lookupWaiter.Close()
+	require.Equal(t, colexec.RemoteReceiverMissing, attachState)
 	require.Nil(t, registeredProc)
 	require.Nil(t, notifyCh)
 }
@@ -2401,8 +3535,9 @@ func TestRegisterLocalDispatchReceiversTraversesRemoteAncestorForNestedLocalRetu
 			registrations, err := registerLocalDispatchReceivers([]*Scope{outerRemote}, "local-cn:6002")
 			require.NoError(t, err)
 			defer registrations.cleanup()
-			registeredProc, _, ok := colexec.GetServer("").GetProcByUuid(uid, false)
-			require.True(t, ok)
+			registeredProc, _, attachState, lookupWaiter, _ := colexec.GetServer("").AttachProcByUuidOrWait(uid)
+			lookupWaiter.Close()
+			require.Equal(t, colexec.RemoteReceiverAttachedNow, attachState)
 			require.Same(t, localProc, registeredProc)
 		})
 	}
@@ -2437,8 +3572,9 @@ func TestRegisterLocalDispatchReceiversSkipsGuaranteedRemoteRunFailures(t *testi
 			registrations, err := registerLocalDispatchReceivers([]*Scope{s}, "local-cn:6002")
 			require.NoError(t, err)
 			defer registrations.cleanup()
-			registeredProc, notifyCh, ok := colexec.GetServer("").GetProcByUuid(uid, false)
-			require.False(t, ok)
+			registeredProc, notifyCh, attachState, lookupWaiter, _ := colexec.GetServer("").AttachProcByUuidOrWait(uid)
+			lookupWaiter.Close()
+			require.Equal(t, colexec.RemoteReceiverMissing, attachState)
 			require.Nil(t, registeredProc)
 			require.Nil(t, notifyCh)
 		})
@@ -2461,8 +3597,9 @@ func TestRegisterRemoteDispatchReceiversUsesOwningScopeProcess(t *testing.T) {
 	registrations, err := registerRemoteDispatchReceivers(root)
 	require.NoError(t, err)
 	defer registrations.cleanup()
-	registeredProc, _, ok := colexec.GetServer("").GetProcByUuid(uid, false)
-	require.True(t, ok)
+	registeredProc, _, attachState, lookupWaiter, _ := colexec.GetServer("").AttachProcByUuidOrWait(uid)
+	lookupWaiter.Close()
+	require.Equal(t, colexec.RemoteReceiverAttachedNow, attachState)
 	require.Same(t, nestedProc, registeredProc)
 }
 
@@ -2473,8 +3610,9 @@ func TestRegisterLocalDispatchReceiversRollsBackEarlierScopes(t *testing.T) {
 	require.NoError(t, err)
 	uid2, err := uuid.NewV7()
 	require.NoError(t, err)
-	colexec.GetServer("").GetProcByUuid(uid2, true)
-	defer colexec.GetServer("").DeleteUuids([]uuid.UUID{uid2})
+	ownerCh := make(process.RemotePipelineInformationChannel)
+	require.NoError(t, colexec.GetServer("").PutProcIntoUuidMapWithTerminal(uid2, &process.Process{}, ownerCh, colexec.NewRemoteReceiverTerminal(nil)))
+	t.Cleanup(func() { colexec.GetServer("").RemoveUuidsOwned([]uuid.UUID{uid2}, ownerCh) })
 
 	proc1 := testutil.NewProcess(t)
 	proc1.BuildPipelineContext(context.Background())
@@ -2495,20 +3633,23 @@ func TestRegisterLocalDispatchReceiversRollsBackEarlierScopes(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, context.Cause(proc1.Ctx), err)
 	require.ErrorIs(t, context.Cause(proc2.Ctx), err)
-	registeredProc, notifyCh, ok := colexec.GetServer("").GetProcByUuid(uid1, false)
-	require.False(t, ok)
+	registeredProc, notifyCh, attachState, lookupWaiter, _ := colexec.GetServer("").AttachProcByUuidOrWait(uid1)
+	lookupWaiter.Close()
+	require.Equal(t, colexec.RemoteReceiverMissing, attachState)
 	require.Nil(t, registeredProc)
 	require.Nil(t, notifyCh)
 
 	registrations, err := registerLocalDispatchReceivers(scopes[:1], "local-cn")
 	require.NoError(t, err, "rollback must clear the dispatch's early-registration state")
-	registeredProc, notifyCh, ok = colexec.GetServer("").GetProcByUuid(uid1, false)
-	require.True(t, ok)
+	registeredProc, notifyCh, attachState, lookupWaiter, _ = colexec.GetServer("").AttachProcByUuidOrWait(uid1)
+	lookupWaiter.Close()
+	require.Equal(t, colexec.RemoteReceiverAttachedNow, attachState)
 	require.Same(t, proc1, registeredProc)
 	require.NotNil(t, notifyCh)
 	registrations.cleanup()
-	registeredProc, notifyCh, ok = colexec.GetServer("").GetProcByUuid(uid1, false)
-	require.False(t, ok)
+	registeredProc, notifyCh, attachState, lookupWaiter, _ = colexec.GetServer("").AttachProcByUuidOrWait(uid1)
+	lookupWaiter.Close()
+	require.Equal(t, colexec.RemoteReceiverMissing, attachState)
 	require.Nil(t, registeredProc)
 	require.Nil(t, notifyCh)
 }
@@ -2532,7 +3673,7 @@ func TestRemoteDispatchRegistrationRollbackReleasesPendingAttach(t *testing.T) {
 		connectionCtx: context.Background(),
 		messageCtx:    context.Background(),
 	}
-	registeredProc, notifyCh, err := receiver.TryGetProcByUuid(uid)
+	registeredProc, notifyCh, _, err := receiver.getRemoteDispatchReceiver(uid, nil)
 	require.NoError(t, err)
 	require.Same(t, proc, registeredProc)
 
@@ -2541,7 +3682,7 @@ func TestRemoteDispatchRegistrationRollbackReleasesPendingAttach(t *testing.T) {
 	go func() {
 		close(started)
 		select {
-		case notifyCh <- &process.WrapCs{Uid: uid, Err: make(chan error, 1)}:
+		case notifyCh <- &process.WrapCs{Uid: uid}:
 			pendingDone <- "attached"
 		case <-proc.Ctx.Done():
 			pendingDone <- "canceled"
@@ -2566,252 +3707,11 @@ func TestRemoteDispatchRegistrationRollbackReleasesPendingAttach(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("registration rollback did not release the pending remote notify")
 	}
-	registeredProc, notifyCh, ok := colexec.GetServer("").GetProcByUuid(uid, false)
-	require.False(t, ok)
+	registeredProc, notifyCh, attachState, lookupWaiter, _ := colexec.GetServer("").AttachProcByUuidOrWait(uid)
+	lookupWaiter.Close()
+	require.Equal(t, colexec.RemoteReceiverMissing, attachState)
 	require.Nil(t, registeredProc)
 	require.Nil(t, notifyCh)
-}
-
-func TestSendNotifyMessageRetriesUntilRemoteDispatchRegistered(t *testing.T) {
-	proc := testutil.NewProcess(t)
-	proc.BuildPipelineContext(context.Background())
-	scopeProc := proc.NewContextChildProc(1)
-
-	uid, err := uuid.NewV7()
-	require.NoError(t, err)
-
-	s := &Scope{
-		Proc: scopeProc,
-		RemoteReceivRegInfos: []RemoteReceivRegInfo{
-			{
-				Idx:      0,
-				Uuid:     uid,
-				FromAddr: "remote-cn",
-			},
-		},
-	}
-
-	var attempts int
-	factory := func(
-		ctx context.Context,
-		sid string,
-		toAddr string,
-		mp *mpool.MPool,
-		analyzeModule *AnalyzeModule,
-	) (*messageSenderOnClient, error) {
-		attempts++
-		receiveCh := make(chan morpc.Message, 2)
-		if attempts == 1 {
-			msg := &pipeline.Message{Sid: pipeline.Status_MessageEnd}
-			msg.SetMoError(ctx, moerr.NewRemoteDispatchNotRegistered(ctx, uid.String()))
-			receiveCh <- msg
-		} else {
-			receiveCh <- makeRemoteBatchMessage(t, batch.NewWithSize(0))
-			receiveCh <- &pipeline.Message{Sid: pipeline.Status_MessageEnd}
-		}
-		return &messageSenderOnClient{
-			ctx:          ctx,
-			mp:           mp,
-			streamSender: &fakeStreamSender{},
-			receiveCh:    receiveCh,
-			safeToClose:  true,
-		}, nil
-	}
-
-	var wg sync.WaitGroup
-	resultCh := make(chan notifyMessageResult, 1)
-	s.sendNotifyMessageWithFactoryAndWait(
-		&wg,
-		resultCh,
-		factory,
-		func(context.Context, int, uuid.UUID) error { return nil },
-	)
-
-	select {
-	case signal := <-scopeProc.Reg.MergeReceivers[0].Ch2:
-		bat, err := signal.Action()
-		require.NoError(t, err)
-		require.NotNil(t, bat)
-		bat.Clean(scopeProc.Mp())
-	case <-time.After(time.Second):
-		t.Fatal("notify retry did not forward the remote batch")
-	}
-
-	select {
-	case result := <-resultCh:
-		result.clean(scopeProc)
-		require.NoError(t, result.err)
-	case <-time.After(time.Second):
-		t.Fatal("notify retry did not finish")
-	}
-
-	wg.Wait()
-	require.Equal(t, 2, attempts)
-}
-
-func TestNotifyMessageRetryDelayIsBoundedAndDeterministic(t *testing.T) {
-	uid := uuid.UUID{
-		0x01, 0x02, 0x03, 0x04,
-		0x05, 0x06, 0x07, 0x08,
-		0x09, 0x0a, 0x0b, 0x0c,
-		0x0d, 0x0e, 0x0f, 0x10,
-	}
-	for _, tc := range []struct {
-		attempt int
-		base    time.Duration
-	}{
-		{attempt: -1, base: notifyMessageRetryInitialInterval},
-		{attempt: 0, base: notifyMessageRetryInitialInterval},
-		{attempt: 1, base: 2 * notifyMessageRetryInitialInterval},
-		{attempt: 2, base: 4 * notifyMessageRetryInitialInterval},
-		{attempt: 20, base: notifyMessageRetryMaxInterval},
-	} {
-		got := notifyMessageRetryDelay(tc.attempt, uid)
-		require.Equal(t, got, notifyMessageRetryDelay(tc.attempt, uid))
-		require.GreaterOrEqual(t, got, tc.base*80/100)
-		require.LessOrEqual(t, got, tc.base*120/100)
-	}
-}
-
-func TestRemoteNotifyRetryAttachesToEmptyDispatchBeforeCompletion(t *testing.T) {
-	colexecServer := colexec.NewServer("")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	proc := testutil.NewProcess(t)
-	proc.BuildPipelineContext(ctx)
-	scopeProc := proc.NewContextChildProc(1)
-
-	uid, err := uuid.NewV7()
-	require.NoError(t, err)
-	s := &Scope{
-		Proc: scopeProc,
-		RemoteReceivRegInfos: []RemoteReceivRegInfo{
-			{Idx: 0, Uuid: uid, FromAddr: "remote-cn"},
-		},
-	}
-
-	firstLookupDone := make(chan struct{})
-	allowFirstResponse := make(chan struct{})
-	var attempts atomic.Int32
-	factory := func(
-		ctx context.Context,
-		sid string,
-		toAddr string,
-		mp *mpool.MPool,
-		analyzeModule *AnalyzeModule,
-	) (*messageSenderOnClient, error) {
-		receiveCh := make(chan morpc.Message, 1)
-		receiver := &messageReceiverOnServer{
-			connectionCtx: ctx,
-			messageCtx:    ctx,
-			colexecServer: colexecServer,
-		}
-		if attempts.Add(1) == 1 {
-			_, _, lookupErr := receiver.TryGetProcByUuid(uid)
-			close(firstLookupDone)
-			if lookupErr == nil {
-				unexpected := errors.New("first remote notify unexpectedly found the registration")
-				cancel()
-				return nil, unexpected
-			}
-			select {
-			case <-allowFirstResponse:
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-			msg := &pipeline.Message{Sid: pipeline.Status_MessageEnd}
-			msg.SetMoError(ctx, lookupErr)
-			receiveCh <- msg
-		} else {
-			dispatchProc, notifyCh, lookupErr := receiver.TryGetProcByUuid(uid)
-			if lookupErr != nil {
-				cancel()
-				return nil, lookupErr
-			}
-			if dispatchProc == nil {
-				unexpected := errors.New("registered remote dispatch returned a nil process")
-				cancel()
-				return nil, unexpected
-			}
-			wrap := &process.WrapCs{Uid: uid, Err: make(chan error, 1)}
-			go func() {
-				select {
-				case notifyCh <- wrap:
-				case <-ctx.Done():
-					return
-				}
-				select {
-				case terminalErr := <-wrap.Err:
-					msg := &pipeline.Message{Sid: pipeline.Status_MessageEnd}
-					if terminalErr != nil {
-						msg.SetMoError(ctx, terminalErr)
-					}
-					receiveCh <- msg
-				case <-ctx.Done():
-				}
-			}()
-		}
-		return &messageSenderOnClient{
-			ctx:          ctx,
-			mp:           mp,
-			streamSender: &fakeStreamSender{},
-			receiveCh:    receiveCh,
-			safeToClose:  true,
-		}, nil
-	}
-
-	var wg sync.WaitGroup
-	resultCh := make(chan notifyMessageResult, 1)
-	s.sendNotifyMessageWithFactoryAndWait(
-		&wg,
-		resultCh,
-		factory,
-		func(context.Context, int, uuid.UUID) error { return nil },
-	)
-	select {
-	case <-firstLookupDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("first remote notify did not observe the absent registration")
-	}
-
-	child := value_scan.NewArgument()
-	defer child.Release()
-	require.NoError(t, child.Prepare(proc))
-	dispatchOp := dispatch.NewArgument()
-	defer dispatchOp.Release()
-	dispatchOp.FuncId = dispatch.SendToAllFunc
-	dispatchOp.RemoteRegs = []colexec.ReceiveInfo{{Uuid: uid}}
-	dispatchOp.AppendChild(child)
-	registration, err := dispatchOp.RegisterRemoteReceiversWithHandle(proc)
-	require.NoError(t, err)
-	require.NotNil(t, registration)
-	defer registration.Cleanup()
-	require.NoError(t, dispatchOp.Prepare(proc))
-	close(allowFirstResponse)
-
-	callResult, err := dispatchOp.Call(proc)
-	require.NoError(t, err)
-	require.Equal(t, vm.ExecStop, callResult.Status)
-	dispatchOp.Reset(proc, false, nil)
-
-	select {
-	case result := <-resultCh:
-		result.clean(scopeProc)
-		require.NoError(t, result.err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("remote notify did not complete after the empty dispatch registered")
-	}
-	select {
-	case signal := <-scopeProc.Reg.MergeReceivers[0].Ch2:
-		bat, signalErr := signal.Action()
-		require.NoError(t, signalErr)
-		require.Nil(t, bat)
-	case <-time.After(5 * time.Second):
-		t.Fatal("remote receiver did not observe the empty dispatch terminal signal")
-	}
-	wg.Wait()
-	require.Equal(t, int32(2), attempts.Load())
 }
 
 func TestSendNotifyMessageWrapperWithNoRemoteReceivers(t *testing.T) {
@@ -2892,14 +3792,14 @@ func TestSendNotifyMessageNormalizesPipelineCancellationCause(t *testing.T) {
 			name:        "query interruption recovers substantive cancellation cause",
 			cancelCause: duplicateErr,
 			factoryErr: func(ctx context.Context) error {
-				return moerr.NewQueryInterrupted(ctx)
+				return ctx.Err()
 			},
 			wantErr: duplicateErr,
 		},
 		{
 			name: "normal query interruption remains secondary",
 			factoryErr: func(ctx context.Context) error {
-				return moerr.NewQueryInterrupted(ctx)
+				return ctx.Err()
 			},
 		},
 		{
@@ -2944,7 +3844,11 @@ func TestSendNotifyMessageNormalizesPipelineCancellationCause(t *testing.T) {
 				require.NotNil(t, cancelQuery)
 				cancelQuery()
 			} else if !tt.keepPipelineActive {
-				scopeProc.Cancel(tt.cancelCause)
+				cause := tt.cancelCause
+				if cause == nil {
+					cause = process.ErrPipelineStopped
+				}
+				scopeProc.Cancel(cause)
 			}
 
 			uid, err := uuid.NewV7()
@@ -3033,7 +3937,7 @@ func TestSendNotifyMessageReportsStreamSendError(t *testing.T) {
 
 	select {
 	case result := <-resultCh:
-		result.clean(scopeProc)
+		result.clean(scopeProc, context.Background())
 		require.ErrorIs(t, result.err, testErr)
 	case <-time.After(time.Second):
 		t.Fatal("notify stream send error did not finish")
@@ -3046,162 +3950,6 @@ func TestSendNotifyMessageReportsStreamSendError(t *testing.T) {
 		t.Fatal("notify stream send error did not send cleanup signal")
 	}
 	wg.Wait()
-}
-
-func TestSendNotifyMessageLegacyRetryStopsAtQueryCancellation(t *testing.T) {
-	proc := testutil.NewProcess(t)
-	queryCtx, cancelQuery := context.WithCancelCause(context.Background())
-	proc.BuildPipelineContext(queryCtx)
-	scopeProc := proc.NewContextChildProc(1)
-
-	uid, err := uuid.NewV7()
-	require.NoError(t, err)
-	s := &Scope{
-		Proc: scopeProc,
-		RemoteReceivRegInfos: []RemoteReceivRegInfo{
-			{Idx: 0, Uuid: uid, FromAddr: "remote-cn"},
-		},
-	}
-
-	factory := func(
-		ctx context.Context,
-		sid string,
-		toAddr string,
-		mp *mpool.MPool,
-		analyzeModule *AnalyzeModule,
-	) (*messageSenderOnClient, error) {
-		receiveCh := make(chan morpc.Message, 1)
-		msg := &pipeline.Message{Sid: pipeline.Status_MessageEnd}
-		msg.SetMoError(ctx, moerr.NewRemoteDispatchNotRegistered(ctx, uid.String()))
-		receiveCh <- msg
-		return &messageSenderOnClient{
-			ctx:          ctx,
-			mp:           mp,
-			streamSender: &fakeStreamSender{},
-			receiveCh:    receiveCh,
-			safeToClose:  true,
-		}, nil
-	}
-
-	retryEntered := make(chan struct{})
-	waitRetry := func(ctx context.Context, _ int, _ uuid.UUID) error {
-		close(retryEntered)
-		<-ctx.Done()
-		return remoteRegistrationContextError(ctx)
-	}
-
-	var wg sync.WaitGroup
-	resultCh := make(chan notifyMessageResult, 1)
-	s.sendNotifyMessageWithFactoryAndWait(&wg, resultCh, factory, waitRetry)
-	<-retryEntered
-	cancelCause := moerr.NewInternalErrorNoCtx("query canceled while waiting for legacy receiver registration")
-	cancelQuery(cancelCause)
-
-	select {
-	case result := <-resultCh:
-		result.clean(scopeProc)
-		require.ErrorIs(t, result.err, cancelCause)
-	case <-time.After(time.Second):
-		t.Fatal("notify retry did not stop after query cancellation")
-	}
-	select {
-	case signal := <-scopeProc.Reg.MergeReceivers[0].Ch2:
-		_, err := signal.Action()
-		require.ErrorIs(t, err, cancelCause)
-	case <-time.After(time.Second):
-		t.Fatal("notify retry cancellation did not send cleanup signal")
-	}
-	wg.Wait()
-}
-
-func TestSendNotifyMessageLegacyRetryWaitsPastFormerAdmissionLimit(t *testing.T) {
-	proc := testutil.NewProcess(t)
-	proc.BuildPipelineContext(context.Background())
-	scopeProc := proc.NewContextChildProc(1)
-	uid := uuid.Must(uuid.NewV7())
-	s := &Scope{
-		Proc: scopeProc,
-		RemoteReceivRegInfos: []RemoteReceivRegInfo{
-			{Idx: 0, Uuid: uid, FromAddr: "remote-cn"},
-		},
-	}
-
-	var attempts atomic.Int32
-	factory := func(
-		ctx context.Context,
-		sid string,
-		toAddr string,
-		mp *mpool.MPool,
-		analyzeModule *AnalyzeModule,
-	) (*messageSenderOnClient, error) {
-		receiveCh := make(chan morpc.Message, 1)
-		msg := &pipeline.Message{Sid: pipeline.Status_MessageEnd}
-		if attempts.Add(1) == 1 {
-			msg.SetMoError(ctx, moerr.NewRemoteDispatchNotRegistered(ctx, uid.String()))
-		}
-		receiveCh <- msg
-		return &messageSenderOnClient{
-			ctx:          ctx,
-			mp:           mp,
-			streamSender: &fakeStreamSender{},
-			receiveCh:    receiveCh,
-			safeToClose:  true,
-		}, nil
-	}
-
-	type retryContextObservation struct {
-		sameQueryContext bool
-		hasDeadline      bool
-	}
-	retryEntered := make(chan retryContextObservation, 1)
-	allowRetry := make(chan struct{})
-	waitRetry := func(ctx context.Context, _ int, _ uuid.UUID) error {
-		_, hasDeadline := ctx.Deadline()
-		retryEntered <- retryContextObservation{
-			sameQueryContext: ctx == scopeProc.Ctx,
-			hasDeadline:      hasDeadline,
-		}
-		select {
-		case <-allowRetry:
-			return nil
-		case <-ctx.Done():
-			return remoteRegistrationContextError(ctx)
-		}
-	}
-
-	var wg sync.WaitGroup
-	resultCh := make(chan notifyMessageResult, 1)
-	s.sendNotifyMessageWithFactoryAndWait(&wg, resultCh, factory, waitRetry)
-	observation := <-retryEntered
-	require.True(t, observation.sameQueryContext)
-	require.False(t, observation.hasDeadline, "legacy retry must use the query lifecycle context directly")
-
-	formerLimit := time.NewTimer(20 * time.Millisecond)
-	defer formerLimit.Stop()
-	select {
-	case result := <-resultCh:
-		result.clean(scopeProc)
-		t.Fatalf("legacy retry returned without lifecycle evidence: %v", result.err)
-	case <-formerLimit.C:
-	}
-	close(allowRetry)
-
-	select {
-	case result := <-resultCh:
-		result.clean(scopeProc)
-		require.NoError(t, result.err)
-	case <-time.After(time.Second):
-		t.Fatal("legacy notify retry did not succeed after delayed registration")
-	}
-	select {
-	case signal := <-scopeProc.Reg.MergeReceivers[0].Ch2:
-		_, err := signal.Action()
-		require.NoError(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("successful legacy retry did not send cleanup signal")
-	}
-	wg.Wait()
-	require.Equal(t, int32(2), attempts.Load())
 }
 
 func TestSendNotifyMessageSuccessfulAttachUsesQueryContext(t *testing.T) {
@@ -3238,22 +3986,13 @@ func TestSendNotifyMessageSuccessfulAttachUsesQueryContext(t *testing.T) {
 		}, nil
 	}
 
-	var waitCalls atomic.Int32
 	var wg sync.WaitGroup
 	resultCh := make(chan notifyMessageResult, 1)
-	s.sendNotifyMessageWithFactoryAndWait(
-		&wg,
-		resultCh,
-		factory,
-		func(context.Context, int, uuid.UUID) error {
-			waitCalls.Add(1)
-			return errors.New("retry wait must not run after successful attach")
-		},
-	)
+	s.sendNotifyMessageWithFactory(&wg, resultCh, factory)
 
 	select {
 	case result := <-resultCh:
-		result.clean(scopeProc)
+		result.clean(scopeProc, context.Background())
 		require.NoError(t, result.err)
 	case <-time.After(time.Second):
 		t.Fatal("successful notify stream did not finish")
@@ -3266,116 +4005,9 @@ func TestSendNotifyMessageSuccessfulAttachUsesQueryContext(t *testing.T) {
 		t.Fatal("successful notify stream did not send its terminal signal")
 	}
 	wg.Wait()
-	require.Zero(t, waitCalls.Load())
 }
 
-func TestSendNotifyMessageStopsRetryWhenQueryContextCanceled(t *testing.T) {
-	proc := testutil.NewProcess(t)
-	queryCtx := proc.Base.GetContextBase().BuildQueryCtx(proc.GetTopContext())
-	proc.BuildPipelineContext(queryCtx)
-	scopeProc := proc.NewContextChildProc(1)
-
-	uid, err := uuid.NewV7()
-	require.NoError(t, err)
-
-	s := &Scope{
-		Proc: scopeProc,
-		RemoteReceivRegInfos: []RemoteReceivRegInfo{
-			{
-				Idx:      0,
-				Uuid:     uid,
-				FromAddr: "remote-cn",
-			},
-		},
-	}
-
-	var attempts atomic.Int32
-	factory := func(
-		ctx context.Context,
-		sid string,
-		toAddr string,
-		mp *mpool.MPool,
-		analyzeModule *AnalyzeModule,
-	) (*messageSenderOnClient, error) {
-		attempts.Add(1)
-		receiveCh := make(chan morpc.Message, 1)
-		msg := &pipeline.Message{Sid: pipeline.Status_MessageEnd}
-		msg.SetMoError(ctx, moerr.NewRemoteDispatchNotRegistered(ctx, uid.String()))
-		receiveCh <- msg
-		return &messageSenderOnClient{
-			ctx:          ctx,
-			mp:           mp,
-			streamSender: &fakeStreamSender{},
-			receiveCh:    receiveCh,
-			safeToClose:  true,
-		}, nil
-	}
-
-	retryEntered := make(chan struct{})
-	waitRetry := func(ctx context.Context, _ int, _ uuid.UUID) error {
-		close(retryEntered)
-		<-ctx.Done()
-		return remoteRegistrationContextError(ctx)
-	}
-
-	var wg sync.WaitGroup
-	resultCh := make(chan notifyMessageResult, 1)
-	s.sendNotifyMessageWithFactoryAndWait(&wg, resultCh, factory, waitRetry)
-	<-retryEntered
-	_, cancelQuery := process.GetQueryCtxFromProc(proc)
-	require.NotNil(t, cancelQuery)
-	cancelQuery()
-
-	select {
-	case result := <-resultCh:
-		result.clean(scopeProc)
-		require.ErrorIs(t, result.err, context.Canceled)
-	case <-time.After(time.Second):
-		t.Fatal("notify retry did not stop after query context cancellation")
-	}
-
-	select {
-	case signal := <-scopeProc.Reg.MergeReceivers[0].Ch2:
-		_, err := signal.Action()
-		require.ErrorIs(t, err, context.Canceled)
-	case <-time.After(time.Second):
-		t.Fatal("notify retry did not send cleanup signal")
-	}
-
-	wg.Wait()
-	require.Equal(t, int32(1), attempts.Load())
-}
-
-func TestCancelConsumedDispatchRegistrationCancelsOwnerProcess(t *testing.T) {
-	_ = colexec.NewServer("")
-
-	uid, err := uuid.NewV7()
-	require.Nil(t, err)
-
-	procCtx, procCancel := context.WithCancelCause(context.Background())
-	dispatchProc := &process.Process{
-		Ctx:    procCtx,
-		Cancel: procCancel,
-	}
-	notifyCh := process.RemotePipelineInformationChannel(make(chan *process.WrapCs))
-	require.NoError(t, colexec.GetServer("").PutProcIntoUuidMap(uid, dispatchProc, notifyCh))
-
-	receiver := &messageReceiverOnServer{
-		messageCtx:    context.Background(),
-		colexecServer: colexec.GetServer(""),
-	}
-	cancelCause := moerr.NewInternalErrorNoCtx("registration abandoned")
-	registeredProc, notifyChannel, state, _ := colexec.GetServer("").AttachProcByUuidOrWait(uid)
-	require.Equal(t, colexec.RemoteReceiverAttachedNow, state)
-	require.Same(t, dispatchProc, registeredProc)
-	require.Equal(t, notifyCh, notifyChannel)
-	receiver.cancelConsumedDispatchRegistration(registeredProc, cancelCause)
-
-	require.ErrorIs(t, context.Cause(procCtx), cancelCause)
-	colexec.GetServer("").RemoveUuidsOwned([]uuid.UUID{uid}, notifyCh)
-}
-
-func TestGetProcByUuidReturnsWhenMessageContextCanceledBeforeRegistration(t *testing.T) {
+func TestGetRemoteDispatchReceiverReturnsWhenMessageContextCanceledBeforeRegistration(t *testing.T) {
 	_ = colexec.NewServer("")
 
 	uid, err := uuid.NewV7()
@@ -3395,7 +4027,7 @@ func TestGetProcByUuidReturnsWhenMessageContextCanceledBeforeRegistration(t *tes
 	}
 	done := make(chan result, 1)
 	go func() {
-		p, c, e := receiver.GetProcByUuid(uid)
+		p, c, _, e := receiver.getRemoteDispatchReceiver(uid, nil)
 		done <- result{proc: p, ch: c, err: e}
 	}()
 
@@ -3407,11 +4039,11 @@ func TestGetProcByUuidReturnsWhenMessageContextCanceledBeforeRegistration(t *tes
 		require.Nil(t, r.proc)
 		require.Nil(t, r.ch)
 	case <-time.After(time.Second):
-		t.Fatal("GetProcByUuid did not return after message context cancellation")
+		t.Fatal("remote receiver lookup did not return after message context cancellation")
 	}
 
 	ownerCh := make(process.RemotePipelineInformationChannel)
-	err = colexec.GetServer("").PutProcIntoUuidMap(uid, &process.Process{}, ownerCh)
+	err = colexec.GetServer("").PutProcIntoUuidMapWithTerminal(uid, &process.Process{}, ownerCh, colexec.NewRemoteReceiverTerminal(nil))
 	require.NoError(t, err)
 	colexec.GetServer("").RemoveUuidsOwned([]uuid.UUID{uid}, ownerCh)
 }
@@ -4083,7 +4715,7 @@ func TestReceiveMessageFromCnServerIfConnector_ReturnsOnBlockedReceiverCancel(t 
 	select {
 	case err := <-done:
 		require.Error(t, err)
-		require.True(t, moerr.IsMoErrCode(err, moerr.ErrQueryInterrupted))
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(time.Second):
 		<-s.RootOp.(*connector.Connector).Reg.Ch2
 		require.Fail(t, "receiveMessageFromCnServerIfConnector did not unblock after cancellation")
@@ -4114,7 +4746,7 @@ func TestReceiveMsgAndForward_ReturnsOnBlockedReceiverCancel(t *testing.T) {
 	select {
 	case err := <-done:
 		require.Error(t, err)
-		require.True(t, moerr.IsMoErrCode(err, moerr.ErrQueryInterrupted))
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(time.Second):
 		<-forwardReg.Ch2
 		require.Fail(t, "receiveMsgAndForward did not unblock after cancellation")
@@ -4522,12 +5154,16 @@ func TestMongoScanPipelineRoundTripContainsNoCredential(t *testing.T) {
 		regs:  make(map[*process.WaitRegister]int32),
 	}
 	ctx.root = ctx
+	querySource := `{"filter":{"meta.pump":"pump-1"}}`
+	query, err := sqlmongodb.ParseUserQuery(t.Context(), querySource)
+	require.NoError(t, err)
 	spec := &planpb.MongoScan{
 		TableId: 33, MappingId: 11, MappingVersion: 4, ConnectionId: 22, ConnectionVersion: 3,
 		Database: "telemetry", Collection: "raw", MaxParallelism: 1,
 		Columns:         []*planpb.MongoColumnMapping{{Name: "pump", Path: "meta.pump", MoType: planpb.Type{Id: int32(types.T_varchar)}}},
 		PushedPredicate: &planpb.MongoPredicate{Op: planpb.MongoPredicateOp_MONGO_PREDICATE_EQUAL, Path: "meta.pump", ValueBson: []byte{3, 0, 0, 0, 10, 0}},
 	}
+	require.NoError(t, sqlmongodb.ApplyUserQueryToPlan(t.Context(), query, spec))
 	original := mongoscan.NewArgument().WithScan(spec)
 	defer original.Release()
 
@@ -4538,6 +5174,7 @@ func TestMongoScanPipelineRoundTripContainsNoCredential(t *testing.T) {
 	for _, forbidden := range []string{"mongodb://", "secret://", "username", "password", "credential", "token"} {
 		require.False(t, bytes.Contains(bytes.ToLower(wire), []byte(forbidden)))
 	}
+	require.False(t, bytes.Contains(wire, []byte(querySource)), "raw __mo_query text must not be transported")
 
 	decoded := new(pipeline.Instruction)
 	require.NoError(t, decoded.Unmarshal(wire))
@@ -4546,6 +5183,46 @@ func TestMongoScanPipelineRoundTripContainsNoCredential(t *testing.T) {
 	restored := restoredOperator.(*mongoscan.MongoScan)
 	defer restored.Release()
 	require.Equal(t, spec, restored.Scan)
+}
+
+func TestMongoScanRemoteProtocolValidationAtSendAndReceiveBoundaries(t *testing.T) {
+	proc := testutil.NewProcess(t)
+	rt := moruntime.ServiceRuntime(proc.GetService())
+	previous, hadPrevious := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+	t.Cleanup(func() {
+		if hadPrevious {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, previous)
+		} else {
+			rt.CompareAndDeleteGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion39)
+		}
+	})
+
+	query, err := sqlmongodb.ParseUserQuery(t.Context(), `{"filter":{"value":1}}`)
+	require.NoError(t, err)
+	explicitQuery := &planpb.MongoScan{MaxParallelism: 1}
+	require.NoError(t, sqlmongodb.ApplyUserQueryToPlan(t.Context(), query, explicitQuery))
+
+	for name, spec := range map[string]*planpb.MongoScan{
+		"explicit query":       explicitQuery,
+		"query column carrier": {MaxParallelism: 1, IncludeQueryColumn: true},
+		"pruned empty result":  {MaxParallelism: 1, EmptyResult: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			scope := &Scope{Proc: proc, RootOp: mongoscan.NewArgument().WithScan(spec)}
+
+			// A statement can compile while v44 is live, then encounter a rollback
+			// before remote encoding. The sender must not serialize a payload that an
+			// older receiver would silently interpret as a legacy Find.
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion44)
+			data, err := encodeRemoteScope(scope, proc)
+			require.NoError(t, err)
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion43)
+			_, err = encodeRemoteScope(scope, proc)
+			require.ErrorContains(t, err, "MORPC protocol version 44")
+			_, err = decodeScope(data, proc, true, nil)
+			require.ErrorContains(t, err, "MORPC protocol version 44")
+		})
+	}
 }
 
 func TestPartitionTopNPipelineRoundTrip(t *testing.T) {
@@ -4566,6 +5243,7 @@ func TestPartitionTopNPipelineRoundTrip(t *testing.T) {
 	original.Limit = limit
 	original.PartitionByCount = 1
 	original.PreReduce = true
+	original.WithTies = true
 	defer original.Release()
 
 	_, instruction, err := convertToPipelineInstruction(original, nil, ctx, 0)
@@ -4580,9 +5258,31 @@ func TestPartitionTopNPipelineRoundTrip(t *testing.T) {
 	defer restored.Release()
 	require.Equal(t, int32(1), restored.PartitionByCount)
 	require.True(t, restored.PreReduce)
+	require.True(t, restored.WithTies)
 	require.Len(t, restored.OrderBySpecs, 2)
 	require.Equal(t, uint64(7), restored.Limit.GetLit().GetU64Val())
 	require.Equal(t, planpb.OrderBySpec_DESC, restored.OrderBySpecs[1].Flag)
+}
+
+func TestPartitionTopNWithTiesRemoteProtocolValidation(t *testing.T) {
+	proc := testutil.NewProcess(t)
+	rt := moruntime.ServiceRuntime(proc.GetService())
+	previous, hadPrevious := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+	t.Cleanup(func() {
+		if hadPrevious {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, previous)
+		} else {
+			rt.CompareAndDeleteGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion69)
+		}
+	})
+
+	p := &pipeline.Pipeline{Children: []*pipeline.Pipeline{{
+		InstructionList: []*pipeline.Instruction{{PartitionTopNWithTies: true}},
+	}}}
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion68)
+	require.ErrorContains(t, validateRemotePartitionTopNWithTiesPipelineProtocol(proc, p), "protocol version 69")
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion69)
+	require.NoError(t, validateRemotePartitionTopNWithTiesPipelineProtocol(proc, p))
 }
 
 // newDispatchSrcScopeForTest builds a cross-CN shuffle dispatch source scope:
@@ -4732,4 +5432,85 @@ func TestCoordinatorLocalShuffleAttachesRemoteDispatchSource(t *testing.T) {
 	require.Contains(t, receivers[0].PreScopes, remoteSource)
 	require.True(t, checkPipelineStandaloneExecutableAtRemote(remoteSource),
 		"remote source only has remote receiver routes and must remain remotely executable")
+}
+
+func TestNotifyLateErrorSurvivesSuccessfulStop(t *testing.T) {
+	for _, tc := range []struct{ early, terminal string }{
+		{"canceled receive", "execution"}, {"nil forwarding result", "execution"},
+		{"canceled receive", "malformed"}, {"nil forwarding result", "malformed"},
+		{"canceled receive", "execution malformed"}, {"nil forwarding result", "execution malformed"},
+	} {
+		earlyReturn := tc.early
+		t.Run(earlyReturn+"/"+tc.terminal, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			proc := testutil.NewProcess(t)
+			queryCtx := proc.Base.GetContextBase().BuildQueryCtx(proc.GetTopContext())
+			proc.BuildPipelineContext(queryCtx)
+			scopeProc := proc.NewContextChildProc(1)
+			reg := scopeProc.Reg.MergeReceivers[0]
+			uid := uuid.Must(uuid.NewV7())
+			scope := &Scope{Proc: scopeProc, RemoteReceivRegInfos: []RemoteReceivRegInfo{{Idx: 0, Uuid: uid, FromAddr: "remote-cn"}}}
+			responses := make(chan morpc.Message, 1)
+			stream := mock_morpc.NewMockStream(ctrl)
+			stream.EXPECT().ID().Return(uint64(91)).AnyTimes()
+			stops := 0
+			stream.EXPECT().Send(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, request morpc.Message) error {
+				switch request.(*pipeline.Message).GetCmd() {
+				case pipeline.Method_PrepareDoneNotifyMessage:
+					if earlyReturn == "canceled receive" {
+						scopeProc.Cancel(process.ErrPipelineStopped)
+					} else {
+						require.True(t, reg.SendEnd())
+						<-reg.Ch2
+						responses <- makeRemoteBatchMessage(t, batch.NewWithSize(0))
+					}
+				case pipeline.Method_StopSending:
+					// Remote cleanup depends on the local Merge receiving its End.
+					// This dependency must be released before waiting for our reply.
+					select {
+					case <-reg.Done():
+					default:
+						return moerr.NewInternalErrorNoCtx("local terminal is still pending")
+					}
+					stops++
+					terminal := &pipeline.Message{Sid: pipeline.Status_MessageEnd}
+					if tc.terminal != "execution" {
+						terminal.Analyse = []byte("{")
+					}
+					if tc.terminal != "malformed" {
+						terminal.SetMoError(context.Background(), moerr.NewQueryInterrupted(context.Background()))
+					}
+					responses <- terminal
+				}
+				return nil
+			}).AnyTimes()
+			stream.EXPECT().Close(true).Return(nil)
+			factory := func(ctx context.Context, _, _ string, mp *mpool.MPool, _ *AnalyzeModule) (*messageSenderOnClient, error) {
+				return &messageSenderOnClient{ctx: ctx, mp: mp, receiveCh: responses, streamSender: stream, safeToClose: true}, nil
+			}
+			var wg sync.WaitGroup
+			results := make(chan notifyMessageResult, 1)
+			scope.sendNotifyMessageWithFactory(&wg, results, factory)
+			select {
+			case result := <-results:
+				results <- result
+			case <-time.After(time.Second):
+				t.Fatal("notify late terminal did not reach scheduler")
+			}
+			wg.Wait()
+			err := (&Compile{}).collectMergeRunResults(scopeProc, scopeRunResult{}, nil, results, context.Background())
+			if tc.terminal == "malformed" {
+				require.ErrorContains(t, err, "unexpected end of JSON input")
+			} else {
+				var me *moerr.Error
+				require.ErrorAs(t, err, &me)
+				require.Equal(t, uint16(moerr.ErrQueryInterrupted), me.ErrorCode())
+				require.True(t, process.IsPipelineFailure(err))
+			}
+			require.Equal(t, 1, stops)
+			require.NoError(t, queryCtx.Err())
+			require.NoError(t, reg.Err(), "local consumer is released before the scheduler receives the late failure")
+			require.Zero(t, proc.Mp().CurrNB())
+		})
+	}
 }

@@ -47,6 +47,8 @@ func TestIntersect(t *testing.T) {
 	setProcForTest(proc, c.arg)
 	err := c.arg.Prepare(c.proc)
 	require.NoError(t, err)
+	iterator := c.arg.ctr.iterator
+	require.NotNil(t, iterator)
 	cnt := 0
 	end, err = vm.Exec(c.arg, c.proc)
 	require.NoError(t, err)
@@ -56,8 +58,10 @@ func TestIntersect(t *testing.T) {
 		require.Equal(t, 3, len(result.Vecs)) // 3 column
 	}
 	require.Equal(t, 1, cnt) // 1 row
+	require.Equal(t, iterator, c.arg.ctr.iterator)
 
 	c.arg.Reset(c.proc, false, nil)
+	require.Nil(t, c.arg.ctr.iterator)
 
 	setProcForTest(proc, c.arg)
 	err = c.arg.Prepare(c.proc)
@@ -137,7 +141,7 @@ func TestAuditIntersectFreeReleasesBuildState(t *testing.T) {
 	_, err := vm.Exec(c.arg, proc)
 	require.NoError(t, err)
 	require.NotNil(t, c.arg.ctr.hashTable)
-	require.NotEmpty(t, c.arg.ctr.cnts)
+	require.Len(t, c.arg.ctr.unmatched, 2)
 
 	for _, child := range c.arg.Children {
 		child.Free(proc, true, nil)
@@ -149,7 +153,7 @@ func TestAuditIntersectFreeReleasesBuildState(t *testing.T) {
 	cleaned = true
 
 	require.Nil(t, c.arg.ctr.hashTable)
-	require.Nil(t, c.arg.ctr.cnts)
+	require.Nil(t, c.arg.ctr.unmatched)
 	require.Nil(t, c.arg.ctr.buf)
 	require.Equal(t, int64(0), proc.Mp().CurrNB())
 }

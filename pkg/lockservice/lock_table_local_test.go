@@ -229,6 +229,8 @@ func TestCloseLocalLockTableWithBlockedWaiter(t *testing.T) {
 		[]string{"s1"},
 		func(_ *lockTableAllocator, s []*service) {
 			tableID := uint64(10)
+			txn2 := []byte{2}
+			txn3 := []byte{3}
 
 			l := s[0]
 			ctx, cancel := context.WithTimeout(context.Background(),
@@ -244,8 +246,28 @@ func TestCloseLocalLockTableWithBlockedWaiter(t *testing.T) {
 				[][]byte{{1}},
 				pb.Granularity_Row)
 
+			v, err := l.getLockTable(context.Background(), 0, tableID)
+			require.NoError(t, err)
+			lt := v.(*localLockTable)
+			waitersQueued := make(chan struct{}, 2)
+			var txn2Queued, txn3Queued sync.Once
+			lt.options.beforeWait = func(c *lockContext) func() {
+				switch {
+				case bytes.Equal(c.txn.txnID, txn2):
+					txn2Queued.Do(func() { waitersQueued <- struct{}{} })
+				case bytes.Equal(c.txn.txnID, txn3):
+					txn3Queued.Do(func() { waitersQueued <- struct{}{} })
+				}
+				return func() {}
+			}
+
 			var wg sync.WaitGroup
 			wg.Add(2)
+			defer func() {
+				cancel()
+				wg.Wait()
+			}()
+			results := make(chan error, 2)
 			// txn2 wait txn1 or txn3
 			go func() {
 				defer wg.Done()
@@ -253,10 +275,10 @@ func TestCloseLocalLockTableWithBlockedWaiter(t *testing.T) {
 					ctx,
 					tableID,
 					[][]byte{{1}},
-					[]byte{2},
+					txn2,
 					newTestRowExclusiveOptions(),
 				)
-				require.Equal(t, ErrLockTableNotFound, err)
+				results <- err
 			}()
 
 			// txn3 wait txn2 or txn1
@@ -266,28 +288,25 @@ func TestCloseLocalLockTableWithBlockedWaiter(t *testing.T) {
 					ctx,
 					tableID,
 					[][]byte{{1}},
-					[]byte{3},
+					txn3,
 					newTestRowExclusiveOptions(),
 				)
-				require.Equal(t, ErrLockTableNotFound, err)
+				results <- err
 			}()
 
-			v, err := l.getLockTable(context.Background(), 0, tableID)
-			require.NoError(t, err)
-			lt := v.(*localLockTable)
-			for {
-				lt.mu.RLock()
-				lock, ok := lt.mu.store.Get([]byte{1})
-				require.True(t, ok)
-				lt.mu.RUnlock()
-				if lock.waiters.size() == 2 {
-					break
+			for i := 0; i < 2; i++ {
+				select {
+				case <-waitersQueued:
+				case <-ctx.Done():
+					t.Fatalf("waiter was not admitted before table close: %v", ctx.Err())
 				}
-				time.Sleep(time.Millisecond * 10)
 			}
 
 			v.close(closeReasonServiceClose)
 			wg.Wait()
+			for i := 0; i < 2; i++ {
+				require.ErrorIs(t, <-results, ErrLockTableNotFound)
+			}
 		})
 }
 
@@ -1444,6 +1463,16 @@ func TestTableDefChangedAtRetainedAfterUnlock(t *testing.T) {
 					require.Nil(t, decoded.TableDefChangedAt)
 					require.NoError(t, service.Unlock(ctx, []byte("fresh"), timestamp.Timestamp{}))
 
+					// Transaction admission and plan generation are different clocks: a
+					// fresh transaction can still execute a cached pre-DDL plan.
+					stalePlanOptions := freshOptions
+					stalePlanSnapshot := changedAt.Prev()
+					stalePlanOptions.PlanSnapshotTs = &stalePlanSnapshot
+					result, err = service.Lock(ctx, tableID, tc.rows, []byte("stale-plan"), stalePlanOptions)
+					require.NoError(t, err)
+					require.Equal(t, changedAt, *result.TableDefChangedAt)
+					require.NoError(t, service.Unlock(ctx, []byte("stale-plan"), timestamp.Timestamp{}))
+
 					result, err = service.Lock(ctx, tableID, tc.rows, []byte{5}, options)
 					require.NoError(t, err)
 					require.Equal(t, changedAt, *result.TableDefChangedAt)
@@ -2149,12 +2178,26 @@ func TestExclusiveLockBudgetAppliesAcrossRequests(t *testing.T) {
 					require.NoError(t, err)
 					_, err = caller.Lock(ctx, table, newTestRows(5), txnID, opts)
 					require.NoError(t, err)
+					// Once the first replacement commits, even one below-budget row must
+					// widen the previous range directly. Rebuilding exact locks here was
+					// the large-DML lock/ledger churn regression.
+					_, err = caller.Lock(ctx, table, newTestRows(6), txnID, opts)
+					require.NoError(t, err)
+					ownerTxn := owner.activeTxnHolder.getActiveTxn(txnID, false, "")
+					require.NotNil(t, ownerTxn)
+					ownerTxn.RLock()
+					require.Equal(t, 2,
+						ownerTxn.lockHolders[0].tableKeys[table].mustGet().len())
+					require.Contains(t,
+						ownerTxn.lockHolders[0].coarsenedTables(), table)
+					ownerTxn.RUnlock()
+
 					// A later generation must compact the previous range together with
 					// newly retained points, not start a fresh per-call budget.
 					_, err = caller.Lock(ctx, table, newTestRows(7, 8), txnID, opts)
 					require.NoError(t, err)
 
-					// The budget is transaction/table scoped: the owner compacts four
+					// The budget is transaction/table scoped: the owner compacts five
 					// individually small requests to one bounded physical range. A v28
 					// remote origin retains only its table-scoped cleanup route.
 					for _, service := range []*service{caller, owner} {
@@ -2243,6 +2286,14 @@ func TestExclusiveLockBudgetRemainsBoundedAcrossExecutionBatches(t *testing.T) {
 				txn.RUnlock()
 				require.LessOrEqual(t, retained, budget,
 					"retained lock keys exceeded the transaction/table budget after batch %d", batch)
+				if batch >= 2 {
+					require.Equal(t, 2, retained,
+						"a committed coarsened range regrew exact row locks after batch %d", batch)
+					txn.RLock()
+					require.Contains(t,
+						txn.lockHolders[0].coarsenedTables(), table)
+					txn.RUnlock()
+				}
 			}
 
 			txn := s.activeTxnHolder.getActiveTxn(txnID, false, "")
@@ -2810,18 +2861,37 @@ func TestRangeLockModeUpgradeUpdatesBothEnds(t *testing.T) {
 
 			// Step 2: txn2 requests Exclusive range lock → blocked
 			txn2 := newTestTxnID(2)
-			txn2Done := make(chan struct{}, 1)
-			go func() {
-				_, err := l.Lock(ctx, tableID, rangeRows, txn2, exclusiveOpt)
-				require.NoError(t, err)
-				txn2Done <- struct{}{}
+			txn2Waiting := make(chan struct{})
+			var txn2WaitOnce sync.Once
+			lt.options.beforeWait = func(c *lockContext) func() {
+				if bytes.Equal(c.txn.txnID, txn2) {
+					txn2WaitOnce.Do(func() { close(txn2Waiting) })
+				}
+				return func() {}
+			}
+			txn2Done := make(chan error, 1)
+			var wg sync.WaitGroup
+			wg.Add(1)
+			defer func() {
+				cancel()
+				wg.Wait()
 			}()
-			time.Sleep(100 * time.Millisecond)
+			go func() {
+				defer wg.Done()
+				_, err := l.Lock(ctx, tableID, rangeRows, txn2, exclusiveOpt)
+				txn2Done <- err
+			}()
+			select {
+			case <-txn2Waiting:
+			case <-ctx.Done():
+				t.Fatalf("txn2 did not begin waiting for the range lock: %v", ctx.Err())
+			}
 
 			// Step 3: txn1 releases → txn2 promoted to Exclusive holder
 			require.NoError(t, l.Unlock(ctx, txn1, timestamp.Timestamp{PhysicalTime: 1}))
 			select {
-			case <-txn2Done:
+			case err := <-txn2Done:
+				require.NoError(t, err)
 			case <-time.After(5 * time.Second):
 				t.Fatal("txn2 (Exclusive) did not acquire range lock in time")
 			}
@@ -2844,25 +2914,39 @@ func TestRangeLockModeUpgradeUpdatesBothEnds(t *testing.T) {
 
 			// Step 5: txn3 requests Shared range lock → should be blocked by Exclusive holder
 			txn3 := newTestTxnID(3)
-			txn3Done := make(chan struct{}, 1)
+			txn3Waiting := make(chan struct{})
+			var txn3WaitOnce sync.Once
+			lt.options.beforeWait = func(c *lockContext) func() {
+				if bytes.Equal(c.txn.txnID, txn3) {
+					txn3WaitOnce.Do(func() { close(txn3Waiting) })
+				}
+				return func() {}
+			}
+			txn3Done := make(chan error, 1)
+			wg.Add(1)
 			go func() {
+				defer wg.Done()
 				_, err := l.Lock(ctx, tableID, rangeRows, txn3, sharedOpt)
-				require.NoError(t, err)
-				txn3Done <- struct{}{}
+				txn3Done <- err
 			}()
 
 			select {
-			case <-txn3Done:
-				t.Fatal("txn3 (Shared) should be BLOCKED by txn2 (Exclusive range lock), " +
-					"but it was granted. This means setModePairedRangeLock did not update both ends.")
-			case <-time.After(500 * time.Millisecond):
-				// Expected: txn3 is blocked
+			case <-txn3Waiting:
+			case <-ctx.Done():
+				t.Fatalf("txn3 did not enter the wait path: %v", ctx.Err())
+			}
+			select {
+			case err := <-txn3Done:
+				t.Fatalf("txn3 (Shared) should be blocked by txn2 (Exclusive range lock), "+
+					"but it completed before txn2 was released: %v", err)
+			default:
 			}
 
 			// Cleanup
 			require.NoError(t, l.Unlock(ctx, txn2, timestamp.Timestamp{PhysicalTime: 2}))
 			select {
-			case <-txn3Done:
+			case err := <-txn3Done:
+				require.NoError(t, err)
 			case <-time.After(5 * time.Second):
 				t.Fatal("txn3 did not acquire lock after txn2 released")
 			}
@@ -3086,18 +3170,37 @@ func TestRangeLockWithInterleavedRowLocks(t *testing.T) {
 
 			// Step 3: txn3 requests Exclusive range lock → blocked by txn2's Shared range lock
 			txn3 := newTestTxnID(3)
-			txn3Done := make(chan struct{}, 1)
-			go func() {
-				_, err := l.Lock(ctx, tableID, rangeRows, txn3, exclusiveRangeOpt)
-				require.NoError(t, err)
-				txn3Done <- struct{}{}
+			txn3Waiting := make(chan struct{})
+			var txn3WaitOnce sync.Once
+			lt.options.beforeWait = func(c *lockContext) func() {
+				if bytes.Equal(c.txn.txnID, txn3) {
+					txn3WaitOnce.Do(func() { close(txn3Waiting) })
+				}
+				return func() {}
+			}
+			txn3Done := make(chan error, 1)
+			var wg sync.WaitGroup
+			wg.Add(1)
+			defer func() {
+				cancel()
+				wg.Wait()
 			}()
-			time.Sleep(100 * time.Millisecond)
+			go func() {
+				defer wg.Done()
+				_, err := l.Lock(ctx, tableID, rangeRows, txn3, exclusiveRangeOpt)
+				txn3Done <- err
+			}()
+			select {
+			case <-txn3Waiting:
+			case <-ctx.Done():
+				t.Fatalf("txn3 did not begin waiting for the range lock: %v", ctx.Err())
+			}
 
 			// Step 4: txn2 releases range lock → txn3 promoted to Exclusive holder
 			require.NoError(t, l.Unlock(ctx, txn2, timestamp.Timestamp{PhysicalTime: 1}))
 			select {
-			case <-txn3Done:
+			case err := <-txn3Done:
+				require.NoError(t, err)
 			case <-time.After(5 * time.Second):
 				t.Fatal("txn3 (Exclusive) did not acquire range lock in time")
 			}

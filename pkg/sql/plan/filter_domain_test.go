@@ -25,7 +25,7 @@ import (
 func setupInDomainRewriteTest(t *testing.T) (*MockCompilerContext, *QueryBuilder, int32, *planpb.Expr) {
 	t.Helper()
 
-	ctx := NewMockCompilerContext(true)
+	ctx := NewMockCompilerContext(true, newPlanTestProcess(t))
 	builder := NewQueryBuilder(planpb.Query_SELECT, ctx, false, false)
 	tag := builder.GenNewBindTag()
 	colExpr := &planpb.Expr{
@@ -681,7 +681,7 @@ func TestRewriteInDomainNonScanNodeRecurses(t *testing.T) {
 func setupStringInDomainRewriteTest(t *testing.T) (*MockCompilerContext, *QueryBuilder, int32, *planpb.Expr) {
 	t.Helper()
 
-	ctx := NewMockCompilerContext(true)
+	ctx := NewMockCompilerContext(true, newPlanTestProcess(t))
 	builder := NewQueryBuilder(planpb.Query_SELECT, ctx, false, false)
 	tag := builder.GenNewBindTag()
 	colExpr := &planpb.Expr{
@@ -941,6 +941,39 @@ func TestRewriteInDomainCastSkippedForAmbiguousStringIntegralDomain(t *testing.T
 	require.Equal(t, "=", builder.qry.Nodes[0].FilterList[1].GetF().Func.ObjName)
 }
 
+func TestNormalizeColumnDomainInListExpressionFixpoint(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "issue reproducer",
+			sql: "select count(*) from mo_catalog.mo_snapshots where kind = 'branch' and sname in (" +
+				"concat('__mo_branch_', cast(288097 as char)), concat('__mo_branch_', cast(288098 as char)))",
+		},
+		{
+			name: "cast constants",
+			sql:  "select count(*) from nation where n_name = 'x' and n_comment in (cast(1 as char), cast(2 as char))",
+		},
+		{
+			name: "mixed constant and expression",
+			sql:  "select count(*) from nation where n_name = 'x' and n_comment in ('prefix-1', concat('prefix-', cast(2 as char)))",
+		},
+		{
+			name: "prepared concat parameters",
+			sql: "prepare stmt from 'select count(*) from nation where n_name = ''x'' and n_comment in (" +
+				"concat(''prefix-'', ?), concat(''prefix-'', ?))'",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := runOneStmt(NewMockOptimizer(false, newPlanTestProcess(t)), t, test.sql)
+			require.NoError(t, err)
+		})
+	}
+}
+
 // makeInt64InWithNullExpr builds an IN list containing a NULL literal. The
 // binder converts this into `or(in(col, non_null_values), =(col, NULL))`, so
 // the returned expression is an `or`, not a plain `in` — tests exercising the
@@ -1016,7 +1049,7 @@ func TestRewriteInDomainOuterInWithNullSkipsNotIn(t *testing.T) {
 func setupUint8InDomainRewriteTest(t *testing.T) (*MockCompilerContext, *QueryBuilder, int32, *planpb.Expr) {
 	t.Helper()
 
-	ctx := NewMockCompilerContext(true)
+	ctx := NewMockCompilerContext(true, newPlanTestProcess(t))
 	builder := NewQueryBuilder(planpb.Query_SELECT, ctx, false, false)
 	tag := builder.GenNewBindTag()
 	colExpr := &planpb.Expr{

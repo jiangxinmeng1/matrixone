@@ -389,3 +389,116 @@ FROM (
 ) v
 WHERE status = 'FAIL'
   AND check_id <> 'excluded';
+
+-- issue #28233: a signed BIGINT and BIGINT UNSIGNED need an exact common type
+DROP TABLE IF EXISTS union_signed_unsigned_28233;
+CREATE TABLE union_signed_unsigned_28233 (
+    id INT PRIMARY KEY,
+    s BIGINT,
+    u BIGINT UNSIGNED
+);
+INSERT INTO union_signed_unsigned_28233 VALUES
+    (1, -1, 18446744073709551615),
+    (2, NULL, 18446744073709551614),
+    (3, 9223372036854775807, 9223372036854775808),
+    (4, 0, 0),
+    (5, -9223372036854775808, 0),
+    (6, 0, 1);
+
+SELECT v FROM (
+    SELECT s AS v FROM union_signed_unsigned_28233
+    UNION ALL
+    SELECT u FROM union_signed_unsigned_28233
+) q ORDER BY v;
+
+SELECT v FROM (
+    SELECT u AS v FROM union_signed_unsigned_28233
+    UNION ALL
+    SELECT s FROM union_signed_unsigned_28233
+) q ORDER BY v;
+
+SELECT v FROM (
+    SELECT s AS v FROM union_signed_unsigned_28233
+    UNION
+    SELECT u FROM union_signed_unsigned_28233
+) q ORDER BY v;
+
+SELECT MIN(v), MAX(v), COUNT(DISTINCT v) FROM (
+    SELECT s AS v FROM union_signed_unsigned_28233
+    UNION ALL
+    SELECT u FROM union_signed_unsigned_28233
+) q;
+
+SELECT v FROM (
+    SELECT s AS v FROM union_signed_unsigned_28233
+    INTERSECT
+    SELECT u FROM union_signed_unsigned_28233
+) q ORDER BY v;
+
+SELECT v FROM (
+    SELECT s AS v FROM union_signed_unsigned_28233
+    INTERSECT ALL
+    SELECT u FROM union_signed_unsigned_28233
+) q ORDER BY v;
+
+SELECT v FROM (
+    SELECT s AS v FROM union_signed_unsigned_28233
+    EXCEPT
+    SELECT u FROM union_signed_unsigned_28233
+) q ORDER BY v;
+
+SELECT v FROM (
+    SELECT s AS v FROM union_signed_unsigned_28233
+    MINUS
+    SELECT u FROM union_signed_unsigned_28233
+) q ORDER BY v;
+
+SELECT COALESCE(s, u) AS v FROM union_signed_unsigned_28233 ORDER BY id;
+SELECT COALESCE(u, s) AS v FROM union_signed_unsigned_28233 ORDER BY id;
+
+DROP TABLE IF EXISTS union_signed_unsigned_28233_ctas;
+CREATE TABLE union_signed_unsigned_28233_ctas AS
+SELECT s AS v FROM union_signed_unsigned_28233 WHERE id = 1
+UNION ALL
+SELECT u FROM union_signed_unsigned_28233 WHERE id = 1;
+SELECT column_name, column_type, is_nullable, numeric_precision, numeric_scale
+FROM information_schema.columns
+WHERE table_schema = database()
+  AND table_name = 'union_signed_unsigned_28233_ctas'
+ORDER BY ordinal_position;
+SELECT v FROM union_signed_unsigned_28233_ctas ORDER BY v;
+
+SELECT CAST(18446744073709551615 AS SIGNED);
+
+DROP TABLE IF EXISTS union_signed_unsigned_28233_empty;
+CREATE TABLE union_signed_unsigned_28233_empty AS
+SELECT s AS v FROM union_signed_unsigned_28233 WHERE 1 = 0
+UNION ALL
+SELECT u FROM union_signed_unsigned_28233 WHERE 1 = 0;
+SELECT column_name, column_type, is_nullable, numeric_precision, numeric_scale
+FROM information_schema.columns
+WHERE table_schema = database()
+  AND table_name = 'union_signed_unsigned_28233_empty'
+ORDER BY ordinal_position;
+SELECT v FROM union_signed_unsigned_28233_empty;
+DROP TABLE union_signed_unsigned_28233_empty;
+
+DROP TABLE union_signed_unsigned_28233_ctas;
+DROP TABLE union_signed_unsigned_28233;
+
+-- Nested UNION transport must return Top's retained buffers before account teardown.
+SELECT COUNT(*) AS row_count, CAST(SUM(x) AS SIGNED) AS total
+FROM ((SELECT 1 AS x UNION SELECT 1+0 UNION SELECT 2 ORDER BY x LIMIT 2)
+      UNION SELECT 3 UNION SELECT 4) u;
+
+-- Both LIMIT 0 consumers skip their blocking aggregates. Sharing their CTE
+-- must not eagerly evaluate a producer that would otherwise raise an error.
+CREATE TABLE cte_zero_limit (k INT, v VARCHAR(20));
+INSERT INTO cte_zero_limit VALUES (1, 'not-an-integer');
+WITH c AS (
+    SELECT k, SUM(CAST(v AS BIGINT)) AS total FROM cte_zero_limit GROUP BY k
+)
+SELECT x FROM (SELECT SUM(total) AS x FROM c LIMIT 0) a
+UNION ALL
+SELECT x FROM (SELECT SUM(total) AS x FROM c LIMIT 0) b;
+DROP TABLE cte_zero_limit;

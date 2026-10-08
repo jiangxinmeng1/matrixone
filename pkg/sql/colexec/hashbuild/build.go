@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"slices"
@@ -72,6 +71,9 @@ func (hashBuild *HashBuild) Prepare(proc *process.Process) (err error) {
 	}
 
 	hashBuild.ctr.setSpillThreshold(hashBuild.SpillThreshold)
+	hashBuild.ctr.autoSpillTriggered = false
+	hashBuild.ctr.autoSpillLimitAtTrigger = 0
+	hashBuild.ctr.autoSpillHasGrouping = false
 	hashBuild.ctr.spillUUID = fmt.Sprintf("hb_%d", hashBuildSpillSequence.Add(1))
 
 	budget, err := proc.GetExecutionResourceBudget()
@@ -100,6 +102,10 @@ func (hashBuild *HashBuild) Prepare(proc *process.Process) (err error) {
 	hashBuild.ctr.hashmapBuilder.DedupColName = hashBuild.DedupColName
 	hashBuild.ctr.hashmapBuilder.DedupColTypes = hashBuild.DedupColTypes
 	hashBuild.ctr.hashmapBuilder.TrackNullKeys = hashBuild.TrackNullKeys
+	hashBuild.ctr.hashmapBuilder.joinDiagnostic = hashBuild.JoinDiagnostic
+	if hashBuild.JoinDiagnostic != nil {
+		hashBuild.JoinDiagnostic.Prepare(proc)
+	}
 
 	err = hashBuild.ctr.hashmapBuilder.Prepare(
 		hashBuild.Conditions,
@@ -107,6 +113,7 @@ func (hashBuild *HashBuild) Prepare(proc *process.Process) (err error) {
 		hashBuild.DedupDeleteMarkerColIdx,
 		hashBuild.DedupDeleteKeepColIdxList,
 		proc,
+		hashBuild.OwnsConstantFilterDiagnostics,
 	)
 	return TerminalBudgetError(proc.Ctx, err)
 }
@@ -170,6 +177,9 @@ func (hashBuild *HashBuild) sendJoinMap(proc *process.Process) error {
 		)
 	}
 	if atomic.LoadUint32(&ctr.terminalPublished) != 0 {
+		if proc.Ctx.Err() != nil {
+			return proc.Ctx.Err()
+		}
 		return moerr.NewQueryInterrupted(proc.Ctx)
 	}
 
@@ -180,7 +190,7 @@ func (hashBuild *HashBuild) sendJoinMap(proc *process.Process) error {
 			jm.FreeMemory()
 		}
 	}()
-	spillMode := len(ctr.spilledFds) > 0
+	spillMode := ctr.spillBundle != nil
 	if ctr.hashmapBuilder.InputBatchRowCount > 0 {
 		if spillMode {
 			jm = message.NewJoinMap(
@@ -204,19 +214,29 @@ func (hashBuild *HashBuild) sendJoinMap(proc *process.Process) error {
 			if ctr.spillBundle == nil || ctr.hashmapBuilder.budget == nil {
 				return process.ErrExecutionResourceInvalid
 			}
+			files, err := ctr.spillBundle.accountedFiles(
+				proc.Ctx,
+				ctr.hashmapBuilder.budget,
+			)
+			if err != nil {
+				return err
+			}
 			payload := message.SpillBuildPayload{
-				Files:     ctr.spillBundle.accountedFiles(),
+				Files:     files,
 				BudgetRef: ctr.hashmapBuilder.budget,
 			}
 			if err := jm.SetSpillBuildPayload(payload); err != nil {
+				_ = payload.Close()
 				return moerr.NewInternalError(proc.Ctx, err.Error())
 			}
-			ctr.spilledFds = nil
 			ctr.spillBundle = nil
 		}
 	}
 
 	if !hashBuild.publishJoinMap(proc, jm) {
+		if proc.Ctx.Err() != nil {
+			return proc.Ctx.Err()
+		}
 		return moerr.NewQueryInterrupted(proc.Ctx)
 	}
 	joinMapOwned = false
@@ -242,6 +262,17 @@ func (hashBuild *HashBuild) build(
 	analyzer process.Analyzer,
 ) (retErr error) {
 	ctr := &hashBuild.ctr
+	if ctr.autoSpill && hashBuild.IsShuffle && hashBuild.NeedHashMap {
+		if ctr.memoryGrowthParticipant != nil {
+			return process.ErrExecutionResourceInvalid
+		}
+		ctr.memoryGrowthParticipant, retErr =
+			ctr.hashmapBuilder.budget.RegisterMemoryGrowthParticipant()
+		if retErr != nil {
+			return retErr
+		}
+		defer ctr.releaseMemoryGrowthParticipant()
+	}
 	ctr.spillConditions = hashBuild.Conditions
 	spillMode := false
 	var spillFiles []*os.File
@@ -309,6 +340,17 @@ func (hashBuild *HashBuild) build(
 		}
 		spillMode = true
 		analyzer.GetOpStats().AddExtraStat("HashBuildSpillStarts", 1)
+		if ctr.autoSpillTriggered {
+			analyzer.GetOpStats().AddExtraStat("HashBuildAdaptiveSpillStarts", 1)
+			analyzer.GetOpStats().SetMaxExtraStat(
+				"HashBuildAdaptiveSpillLimitBytes",
+				hashBuildStatInt64(ctr.autoSpillLimitAtTrigger),
+			)
+		}
+		// Once spill starts this worker no longer competes for resident growth.
+		// Removing it before draining turns its still-live retained batches into
+		// fixed usage for every remaining participant until each physical free.
+		ctr.releaseMemoryGrowthParticipant()
 		// Drain retained copies oldest-first.  Each successful partition is
 		// followed immediately by reservation and mpool release, so the source
 		// batch and one partition scratch are the only simultaneous peaks.
@@ -338,16 +380,11 @@ func (hashBuild *HashBuild) build(
 				return err
 			}
 		}
-		// No retained state remains after the drain. Drop every mandatory
-		// recovery-class borrower before returning the conservative floor, then
-		// let direct sources use ordinary allocation-led admission.
+		// The retained drain is not the end of this producer: later direct
+		// inputs still need hash/selection/codec scratch. Return these borrowers
+		// to the admitted floor, but keep the floor until build's deferred
+		// cleanup so pressure cannot strand the next input's minimum allocation.
 		ctr.dropMandatorySpillRecoveryScratch()
-		if err := hashBuild.releaseRecoveryCapacity(
-			ctr.hashmapBuilder.mapAllocationAccount,
-			true,
-		); err != nil {
-			return err
-		}
 		v2.HashBuildSpillDepthCounter.WithLabelValues("spill", "1").Inc()
 		return nil
 	}
@@ -355,10 +392,9 @@ func (hashBuild *HashBuild) build(
 		if err := startSpill(); err != nil {
 			return err
 		}
-		// Recovery headroom proves that already-retained batches can be drained;
-		// an upstream-owned direct source cannot strand retained state. Admit its
-		// scratch at the physical allocation sites instead of applying the
-		// conservative retained-batch projection as a query-fatal gate.
+		// Reuse any admitted recovery floor, growing it only at actual scratch
+		// allocation sites. Do not apply the conservative retained-batch
+		// projection as a query-fatal gate to an upstream-owned direct source.
 		return ctr.spillBatchWithPressure(
 			proc, bat, spillFiles, ctr.spillExprExecs, analyzer, false)
 	}
@@ -389,7 +425,7 @@ func (hashBuild *HashBuild) build(
 		// particular, a rejected retained-copy admission below must not add the
 		// same upstream batch a second time when it is spilled directly.
 		ctr.hashmapBuilder.InputBatchRowCount += result.Batch.RowCount()
-		// If in spill mode, spill this batch directly to open files.
+		// If in spill mode, append this batch to dormant named bucket files.
 		if spillMode {
 			if err := spillDirect(result.Batch); err != nil {
 				return err
@@ -400,7 +436,12 @@ func (hashBuild *HashBuild) build(
 		// input size was already computed for analyzer accounting, so this keeps
 		// speculative spill sizing and reservation off the resident hot path while
 		// preserving enough budget headroom to drain the batches already retained.
-		if hashBuild.shouldSpillBeforeRetain(inputBatchSize) {
+		spillBeforeRetain, spillDecisionErr :=
+			hashBuild.shouldSpillBeforeRetain(inputBatchSize, result.Batch)
+		if spillDecisionErr != nil {
+			return spillDecisionErr
+		}
+		if spillBeforeRetain {
 			if err := spillDirect(result.Batch); err != nil {
 				return err
 			}
@@ -456,7 +497,8 @@ func (hashBuild *HashBuild) build(
 		}
 		needUniqueVec := false
 		ctr.hashmapBuilder.uniqueKeySlots = nil
-		if !hashBuild.IsShuffle && hashBuild.RuntimeFilterSpec != nil {
+		if !hashBuild.IsShuffle && hashBuild.RuntimeFilterSpec != nil &&
+			(hashBuild.JoinDiagnostic == nil || hashBuild.RuntimeFilterSpec.MustApply) {
 			// Membership-filter consumers own a separate typed-key contract.
 			// Ordinary exact filters collect unique keys only when the plan
 			// advertises every producer-side closure required by their payload
@@ -485,7 +527,17 @@ func (hashBuild *HashBuild) build(
 			}
 		}
 
-		err := ctr.hashmapBuilder.BuildHashmap(hashBuild.HashOnPK, hashBuild.NeedAllocateSels, needUniqueVec, proc)
+		runtimeFilterLimit := int32(-1)
+		if needUniqueVec && !hashBuild.RuntimeFilterSpec.UseMembershipFilter {
+			runtimeFilterLimit = hashBuild.RuntimeFilterSpec.UpperLimit
+		}
+		err := ctr.hashmapBuilder.buildHashmapWithRuntimeFilterLimit(
+			hashBuild.HashOnPK,
+			hashBuild.NeedAllocateSels,
+			needUniqueVec,
+			runtimeFilterLimit,
+			proc,
+		)
 		collectionFallback, _ :=
 			ctr.hashmapBuilder.runtimeFilterFallbackState()
 		rebuildSafe := ctr.hashmapBuilder.RetainedBatchRecoverySafe()
@@ -537,8 +589,8 @@ func (hashBuild *HashBuild) build(
 
 	// spillBatchBounded flushes each selected bucket immediately; no persistent
 	// 32-bucket vectors remain here. Flush serialized records accumulated across
-	// source batches before rewinding every file and publishing the
-	// complete set, including a spill entered after hard map-budget rejection.
+	// source batches before publishing the complete dormant named-file set,
+	// including a spill entered after hard map-budget rejection.
 	if spillMode {
 		if err := checkHashBuildCanceled(proc); err != nil {
 			return err
@@ -546,14 +598,6 @@ func (hashBuild *HashBuild) build(
 		if err := ctr.flushSpillBuffers(proc, spillFiles, analyzer); err != nil {
 			return err
 		}
-		for _, f := range spillFiles {
-			if f != nil {
-				if _, err := f.Seek(0, io.SeekStart); err != nil {
-					return err
-				}
-			}
-		}
-		ctr.spilledFds = spillFiles
 		spillFiles = nil
 		bundleTransferred = true
 	}
@@ -835,11 +879,24 @@ func (hashBuild *HashBuild) handleRuntimeFilter(
 	if hashBuild.RuntimeFilterSpec == nil {
 		return nil
 	}
+	if hashBuild.JoinDiagnostic != nil && !hashBuild.RuntimeFilterSpec.MustApply {
+		// Probe input cardinality activates ON diagnostics. An optional filter
+		// from this join must not erase every probe row before that point.
+		runtimeFilter := message.RuntimeFilterMessage{
+			Tag: hashBuild.RuntimeFilterSpec.Tag,
+			Typ: message.RuntimeFilter_PASS,
+		}
+		hashBuild.sendRuntimeFilter(runtimeFilter, hashBuild.RuntimeFilterSpec, proc)
+		return nil
+	}
 
 	var runtimeFilter message.RuntimeFilterMessage
 	runtimeFilter.Tag = hashBuild.RuntimeFilterSpec.Tag
 
 	spec := hashBuild.RuntimeFilterSpec
+	if spec.ScalarPredicate {
+		return hashBuild.handleScalarRuntimeFilter(proc, &runtimeFilter, spec)
+	}
 	// Unique keys are source state for an optional message, never transferred
 	// with the message payload. Release them on every terminal path, including
 	// malformed cached plans and contradictory empty/missing states.
@@ -854,7 +911,7 @@ func (hashBuild *HashBuild) handleRuntimeFilter(
 	// A spilled build has no resident unique-key vector. Treating that absence
 	// as an empty build would publish DROP and incorrectly discard every probe
 	// row, so spill always disables this optional optimization.
-	if len(ctr.spilledFds) > 0 {
+	if ctr.spillBundle != nil {
 		runtimeFilter.Typ = message.RuntimeFilter_PASS
 		hashBuild.sendRuntimeFilter(runtimeFilter, spec, proc)
 		return nil
@@ -1014,6 +1071,92 @@ func (hashBuild *HashBuild) handleRuntimeFilter(
 	runtimeFilter.Data = data
 	runtimeFilter.SetMemoryRelease(release)
 	hashBuild.sendRuntimeFilter(runtimeFilter, spec, proc)
+	ctr.runtimeFilterIn = true
+	return nil
+}
+
+// handleScalarRuntimeFilter publishes an optional early filter for a logical
+// FILTER above an uncorrelated SINGLE join.  The retained build is the scalar
+// subquery result itself, so only an actual cardinality of one can constrain
+// the probe.  More than one row must fail open: the untouched SINGLE operator
+// remains responsible for raising the cardinality error at its original scope.
+func (hashBuild *HashBuild) handleScalarRuntimeFilter(
+	proc *process.Process,
+	runtimeFilter *message.RuntimeFilterMessage,
+	spec *plan.RuntimeFilterSpec,
+) error {
+	ctr := &hashBuild.ctr
+	buildExpr := runtimefilter.BuildKeyExpr(spec)
+	if hashBuild.NeedHashMap || !hashBuild.NeedBatches ||
+		spec.UseMembershipFilter || spec.MatchPrefix ||
+		len(spec.KeyComponentProbeTypes) != 0 || spec.UpperLimit != 1 ||
+		buildExpr == nil ||
+		buildExpr.GetCol() == nil || buildExpr.GetCol().ColPos < 0 {
+		runtimeFilter.Typ = message.RuntimeFilter_PASS
+		hashBuild.sendRuntimeFilter(*runtimeFilter, spec, proc)
+		return nil
+	}
+
+	switch ctr.hashmapBuilder.InputBatchRowCount {
+	case 0:
+		runtimeFilter.Typ = message.RuntimeFilter_DROP
+		hashBuild.sendRuntimeFilter(*runtimeFilter, spec, proc)
+		return nil
+	case 1:
+		// Continue below.
+	default:
+		runtimeFilter.Typ = message.RuntimeFilter_PASS
+		hashBuild.sendRuntimeFilter(*runtimeFilter, spec, proc)
+		return nil
+	}
+
+	var keyVec *vector.Vector
+	keySlot := int(buildExpr.GetCol().ColPos)
+	for _, bat := range ctr.hashmapBuilder.Batches.Buf {
+		if bat == nil || bat.RowCount() == 0 {
+			continue
+		}
+		if bat.RowCount() != 1 || keySlot >= len(bat.Vecs) ||
+			bat.Vecs[keySlot] == nil || bat.Vecs[keySlot].Length() != 1 {
+			runtimeFilter.Typ = message.RuntimeFilter_PASS
+			hashBuild.sendRuntimeFilter(*runtimeFilter, spec, proc)
+			return nil
+		}
+		keyVec = bat.Vecs[keySlot]
+		break
+	}
+	if keyVec == nil {
+		runtimeFilter.Typ = message.RuntimeFilter_PASS
+		hashBuild.sendRuntimeFilter(*runtimeFilter, spec, proc)
+		return nil
+	}
+	if keyVec.IsNull(0) {
+		runtimeFilter.Typ = message.RuntimeFilter_DROP
+		hashBuild.sendRuntimeFilter(*runtimeFilter, spec, proc)
+		return nil
+	}
+	if keyVec.GetGrouping().GetBitmap().CountRange(0, 1) != 0 ||
+		runtimefilter.ExactKeyEncoding(spec, *keyVec.GetType()) !=
+			keycodec.ExactRuntimeFilterRaw {
+		runtimeFilter.Typ = message.RuntimeFilter_PASS
+		hashBuild.sendRuntimeFilter(*runtimeFilter, spec, proc)
+		return nil
+	}
+
+	data, release, err := ctr.hashmapBuilder.marshalRuntimeFilterVector(
+		keyVec, proc.Mp())
+	if err != nil {
+		if hashBuild.fallbackOptionalRuntimeFilter(
+			err, runtimeFilter, spec, proc) {
+			return nil
+		}
+		return err
+	}
+	runtimeFilter.Typ = message.RuntimeFilter_IN
+	runtimeFilter.Card = 1
+	runtimeFilter.Data = data
+	runtimeFilter.SetMemoryRelease(release)
+	hashBuild.sendRuntimeFilter(*runtimeFilter, spec, proc)
 	ctr.runtimeFilterIn = true
 	return nil
 }
@@ -1358,6 +1501,17 @@ func (hashBuild *HashBuild) fallbackOptionalRuntimeFilter(
 ) bool {
 	kind := runtimefilter.ClassifyOptionalFallback(err)
 	if kind == runtimefilter.OptionalFallbackNone {
+		return false
+	}
+	if spec.MustApply {
+		// Publish a terminal message so the probe side cannot remain blocked, but
+		// preserve the admission/allocation error: a required semantic input must
+		// never be converted into a successful optional PASS fallback.
+		*runtimeFilter = message.RuntimeFilterMessage{
+			Tag: spec.Tag,
+			Typ: message.RuntimeFilter_PASS,
+		}
+		hashBuild.sendRuntimeFilter(*runtimeFilter, spec, proc)
 		return false
 	}
 

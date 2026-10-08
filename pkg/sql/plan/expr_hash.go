@@ -102,6 +102,18 @@ func hashExprInto(h writeByter, expr *plan.Expr) {
 	writeUint32(h, uint32(expr.Typ.Width))
 	writeUint32(h, uint32(expr.Typ.Scale))
 	writeUint32(h, expr.Typ.Charset)
+	writeUint32(h, expr.Typ.CollationVersion)
+	writeUint32(h, expr.Typ.CollationCoercibility)
+	if expr.Typ.CollationCoercibilitySet {
+		writeByte(h, 1)
+	} else {
+		writeByte(h, 0)
+	}
+	if expr.Typ.CollationMergeConflict {
+		writeByte(h, 1)
+	} else {
+		writeByte(h, 0)
+	}
 
 	switch v := expr.Expr.(type) {
 	case *plan.Expr_Lit:
@@ -142,6 +154,12 @@ func hashExprInto(h writeByter, expr *plan.Expr) {
 		writeByte(h, tagVec)
 		if v.Vec != nil {
 			writeUint32(h, uint32(v.Vec.Len))
+			writeUint32(h, v.Vec.StringSource)
+			if v.Vec.DecimalLiteralRequiresV82 {
+				writeByte(h, 1)
+			} else {
+				writeByte(h, 0)
+			}
 			writeUint64(h, uint64(len(v.Vec.Data)))
 			_, _ = h.Write(v.Vec.Data)
 		}
@@ -176,8 +194,8 @@ func literalForExecutableIdentity(typ plan.Type, lit *plan.Literal) *plan.Litera
 }
 
 func executableLiteralForm(typ plan.Type, form plan.StringLiteralForm) plan.StringLiteralForm {
-	staticDomain := types.StaticStringDomain(types.NewWithCharset(
-		types.T(typ.Id), typ.Width, typ.Scale, uint8(typ.Charset)))
+	staticDomain := types.StaticStringDomain(types.MustTypeFromPlan(
+		typ))
 	if form == plan.StringLiteralForm_STRING_LITERAL_TEXT &&
 		staticDomain == types.StringDomainText {
 		return plan.StringLiteralForm_STRING_LITERAL_NONE
@@ -185,10 +203,26 @@ func executableLiteralForm(typ plan.Type, form plan.StringLiteralForm) plan.Stri
 	return form
 }
 
+func executableLiteralStringSource(lit *plan.Literal) uint32 {
+	if lit == nil {
+		return 0
+	}
+	if lit.StringSource != 0 {
+		return lit.StringSource
+	}
+	return uint32(types.StringSourceLiteral) + 1
+}
+
 func hashLitInto(h writeByter, typ plan.Type, lit *plan.Literal) {
 	if lit == nil {
 		writeByte(h, 0)
 		return
+	}
+	writeUint32(h, executableLiteralStringSource(lit))
+	if lit.DecimalLiteralRequiresV82 {
+		writeByte(h, 1)
+	} else {
+		writeByte(h, 0)
 	}
 	if lit.Isnull {
 		writeByte(h, 1)
@@ -285,7 +319,7 @@ func exprStructuralEqual(a, b *plan.Expr) bool {
 		return false
 	}
 	if a.Typ.Id != b.Typ.Id || a.Typ.Width != b.Typ.Width ||
-		a.Typ.Scale != b.Typ.Scale || a.Typ.Charset != b.Typ.Charset {
+		a.Typ.Scale != b.Typ.Scale || !a.Typ.SameCollation(b.Typ) {
 		return false
 	}
 	switch av := a.Expr.(type) {
@@ -351,7 +385,10 @@ func exprStructuralEqual(a, b *plan.Expr) bool {
 		}
 		// IsSerialized is diagnostic provenance and must not affect execution
 		// identity, just like Literal.IsSerialized.
-		return av.Vec.Len == bv.Vec.Len && bytes.Equal(av.Vec.Data, bv.Vec.Data)
+		return av.Vec.Len == bv.Vec.Len &&
+			av.Vec.StringSource == bv.Vec.StringSource &&
+			av.Vec.DecimalLiteralRequiresV82 == bv.Vec.DecimalLiteralRequiresV82 &&
+			bytes.Equal(av.Vec.Data, bv.Vec.Data)
 	default:
 		// Fallback: compare proto bytes.
 		ab, aerr := a.Marshal()
@@ -378,7 +415,9 @@ func literalEqual(typ plan.Type, a, b *plan.Literal) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	if a.Isnull != b.Isnull {
+	if a.Isnull != b.Isnull ||
+		a.DecimalLiteralRequiresV82 != b.DecimalLiteralRequiresV82 ||
+		executableLiteralStringSource(a) != executableLiteralStringSource(b) {
 		return false
 	}
 	if a.Isnull {

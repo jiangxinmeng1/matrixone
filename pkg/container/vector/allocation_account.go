@@ -68,6 +68,70 @@ func AllocationAccountSelectionsEqual(
 		left.capacityClass == right.capacityClass
 }
 
+func allocationAccountSelectionsShareProvenance(
+	left, right *AllocationAccountSelection,
+) bool {
+	return left != nil && right != nil &&
+		left.account == right.account &&
+		left.owner == right.owner &&
+		left.dataSite == right.dataSite &&
+		left.areaSite == right.areaSite &&
+		left.nullsSite == right.nullsSite &&
+		left.groupingSite == right.groupingSite
+}
+
+// ShuffleWithAllocationAccount is Shuffle with a capacity class selected for
+// the replacement storage. The alternate selection must preserve the vector's
+// account, owner, and sites: this changes admission only, never allocation
+// provenance. Existing and replacement buffers keep their own physical leases,
+// so restoring the ordinary selection after the call cannot relabel memory.
+func (v *Vector) ShuffleWithAllocationAccount(
+	sels []int64,
+	mp *mpool.MPool,
+	selection *AllocationAccountSelection,
+) error {
+	if v == nil ||
+		!allocationAccountSelectionsShareProvenance(v.allocationAccount, selection) {
+		return mpool.ErrAllocationAccountMismatch
+	}
+	if err := selection.validate(); err != nil {
+		return err
+	}
+	ordinary := v.allocationAccount
+	v.allocationAccount = selection
+	defer func() {
+		v.allocationAccount = ordinary
+	}()
+	return v.Shuffle(sels, mp)
+}
+
+// UnionBatchWithAllocationAccount is UnionBatch with an alternate capacity
+// class for allocations made by this copy only. The destination keeps its
+// ordinary selection so a downstream Dup or append cannot accidentally spend
+// the producing operator's private recovery floor.
+func (v *Vector) UnionBatchWithAllocationAccount(
+	source *Vector,
+	offset int64,
+	count int,
+	flags []uint8,
+	mp *mpool.MPool,
+	selection *AllocationAccountSelection,
+) error {
+	if v == nil ||
+		!allocationAccountSelectionsShareProvenance(v.allocationAccount, selection) {
+		return mpool.ErrAllocationAccountMismatch
+	}
+	if err := selection.validate(); err != nil {
+		return err
+	}
+	ordinary := v.allocationAccount
+	v.allocationAccount = selection
+	defer func() {
+		v.allocationAccount = ordinary
+	}()
+	return v.UnionBatch(source, offset, count, flags, mp)
+}
+
 func NewAllocationAccountSelection(
 	account *mpool.AllocationAccount,
 	owner mpool.AllocationOwner,
@@ -294,6 +358,7 @@ func (v *Vector) hasBackingStorage() bool {
 	return cap(v.data) != 0 ||
 		cap(v.area) != 0 ||
 		cap(v.prepareParamKinds) != 0 ||
+		cap(v.stringSources) != 0 ||
 		(v.binaryStringRows != nil &&
 			(v.binaryStringRows.Size() != 0 ||
 				v.binaryStringRows.ExternalStorageCapacity() != 0)) ||
@@ -311,9 +376,11 @@ func (v *Vector) hasBackingStorage() bool {
 // borrowed aliases; ordinary bitmap backing is Go-owned and remains GC-visible
 // after replacement. Accounted bitmap storage is explicit external storage.
 func (v *Vector) hasOwnedBackingStorage() bool {
-	return cap(v.data) != 0 && !v.cantFreeData ||
+	return v.dataLease != nil || v.areaLease != nil ||
+		cap(v.data) != 0 && !v.cantFreeData ||
 		cap(v.area) != 0 && !v.cantFreeArea ||
 		cap(v.prepareParamKinds) != 0 ||
+		cap(v.stringSources) != 0 ||
 		(v.binaryStringRows != nil && v.binaryStringRows.ExternalStorageCapacity() != 0) ||
 		(v.textStringRows != nil && v.textStringRows.ExternalStorageCapacity() != 0) ||
 		v.nsp.GetBitmap().ExternalStorageCapacity() != 0 ||
@@ -539,6 +606,11 @@ func (v *Vector) allocateBitmapGrowth(
 }
 
 func (v *Vector) freeBitmapStorage(mp *mpool.MPool) {
+	if v.nsp.HasBorrowedValidity() {
+		// Release the source view without materializing it. The bitmap may still
+		// carry the admitted MPool COW destination reserved before publication.
+		v.nsp.Reset()
+	}
 	for _, value := range []*bitmap.Bitmap{
 		v.nsp.GetBitmap(),
 		v.gsp.GetBitmap(),
@@ -609,6 +681,16 @@ func (v *Vector) growOwned(
 	size int,
 	data bool,
 ) ([]byte, error) {
+	if v.HasBorrowedBacking() {
+		if err := v.MaterializeOwned(mp); err != nil {
+			return nil, err
+		}
+		if data {
+			old = v.data
+		} else {
+			old = v.area
+		}
+	}
 	if size <= cap(old) {
 		return old[:size], nil
 	}
@@ -617,17 +699,12 @@ func (v *Vector) growOwned(
 			"vector growth does not have a mpool",
 		)
 	}
+	capacity, ok := mpool.GrowCapacity(int64(cap(old)), int64(size))
+	if !ok {
+		return nil, mpool.ErrAllocationAllocatorLimit
+	}
 	if cap(old) != 0 || v.allocationAccount == nil {
 		return mp.Grow(old, size, v.offHeap)
-	}
-
-	capacity, ok := mpool.GrowCapacity(0, int64(size))
-	if !ok {
-		return nil, moerr.NewInternalErrorNoCtxf(
-			"invalid mpool grow capacity, old %d, required %d",
-			cap(old),
-			size,
-		)
 	}
 	buf, err := v.allocOwned(mp, int(capacity), true, data)
 	if err != nil {

@@ -67,6 +67,9 @@ func (partition *Partition) Prepare(proc *process.Process) (err error) {
 	if partition.Limit != nil {
 		return partition.prepareTopN(proc)
 	}
+	if partition.Algorithm == plan2.Node_PARTITION_ALGORITHM_HASH {
+		return partition.prepareHash(proc)
+	}
 
 	if len(partition.ctr.executors) > 0 {
 		return nil
@@ -90,6 +93,9 @@ func (partition *Partition) Prepare(proc *process.Process) (err error) {
 func (partition *Partition) Call(proc *process.Process) (vm.CallResult, error) {
 	if partition.Limit != nil {
 		return partition.callTopN(proc)
+	}
+	if partition.Algorithm == plan2.Node_PARTITION_ALGORITHM_HASH {
+		return partition.callHash(proc)
 	}
 	analyzer := partition.OpAnalyzer
 
@@ -187,7 +193,7 @@ func (ctr *container) generateCompares(fs []*plan.OrderBySpec) {
 		}
 
 		exprTyp := fs[i].Expr.Typ
-		typ := types.NewWithCharset(types.T(exprTyp.Id), exprTyp.Width, exprTyp.Scale, uint8(exprTyp.Charset))
+		typ := types.MustTypeFromPlan(exprTyp)
 		ctr.compares[i] = compare.New(typ, desc, nullsLast)
 	}
 }
@@ -215,7 +221,7 @@ func (ctr *container) pickAndSend(proc *process.Process, result *vm.CallResult) 
 		if wholeLength == 0 || fromRemoveBatch {
 			choice = ctr.pickFirstRow()
 		} else {
-			if choice, hasSame = ctr.pickSameRow(row, cols); !hasSame {
+			if choice, hasSame = ctr.pickSameRow(row, cols, choice); !hasSame {
 				break
 			}
 		}
@@ -278,10 +284,13 @@ func (ctr *container) pickFirstRow() (batIndex int) {
 	return i
 }
 
-func (ctr *container) pickSameRow(row int64, cols []*vector.Vector) (batIndex int, hasSame bool) {
+func (ctr *container) pickSameRow(row int64, cols []*vector.Vector, first int) (batIndex int, hasSame bool) {
 	l := len(ctr.indexList)
 
-	j := 0
+	// Only the previously selected batch advanced. Earlier heads were already
+	// different from this group and cannot become equal without advancing.
+	// A new group or removal restarts through pickFirstRow in pickAndSend.
+	j := first
 	for ; j < l; j++ {
 		hasSame = true
 		for k := 0; k < len(ctr.compares); k++ {

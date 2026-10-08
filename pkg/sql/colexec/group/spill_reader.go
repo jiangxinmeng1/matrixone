@@ -20,6 +20,7 @@ import (
 	"os"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec/spillio"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/spillutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
@@ -207,12 +208,14 @@ func (r *groupSpillReader) Free() {
 // storage uses ordinary statement capacity and falls back to direct writes
 // under pressure, leaving the mandatory recovery floor to spill scratch.
 type groupSpillWriter struct {
-	ctr      *container
-	target   io.Writer
-	ctx      context.Context
-	buffer   reusableSpillBuffer
-	disabled bool
-	failed   error
+	ctr       *container
+	target    io.Writer
+	file      *os.File
+	pageCache spillio.SequentialWriteCache
+	ctx       context.Context
+	buffer    reusableSpillBuffer
+	disabled  bool
+	failed    error
 }
 
 func newGroupSpillWriter(
@@ -224,9 +227,11 @@ func newGroupSpillWriter(
 	if ctr == nil || ctr.mp == nil || target == nil || ctx == nil {
 		return nil, mpool.ErrAllocationAccountInvalid
 	}
+	file, _ := target.(*os.File)
 	return &groupSpillWriter{
 		ctr:    ctr,
 		target: spillutil.NewDiskReservationWriter(target, disk),
+		file:   file,
 		ctx:    ctx,
 	}, nil
 }
@@ -299,6 +304,84 @@ func (w *groupSpillWriter) Write(value []byte) (int, error) {
 	return written, nil
 }
 
+// WriteSelectedFixedRows appends one sparse fixed-width selection to the
+// existing coalescing buffer in bounded chunks. The bytes are identical to
+// writing every selected value separately; only the call and bounds-check
+// overhead on the spill hot path changes.
+func (w *groupSpillWriter) WriteSelectedFixedRows(
+	data []byte,
+	width int,
+	rows []int32,
+) (int, error) {
+	if w == nil || w.target == nil {
+		return 0, io.ErrClosedPipe
+	}
+	if width < 0 || width > spillWrBufSize ||
+		(width != 0 && len(data)%width != 0) {
+		return 0, mpool.ErrAllocationAccountInvalid
+	}
+	if width == 0 || len(rows) == 0 {
+		return 0, nil
+	}
+	if w.failed != nil {
+		return 0, w.failed
+	}
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := w.ensureBuffer(); err != nil {
+		return 0, err
+	}
+	if w.disabled {
+		written := 0
+		for _, selected := range rows {
+			row := int(selected)
+			if row < 0 || row >= len(data)/width {
+				return written, mpool.ErrAllocationAccountInvalid
+			}
+			n, err := w.writePhysical(data[row*width : (row+1)*width])
+			written += n
+			if err != nil {
+				return written, err
+			}
+		}
+		return written, nil
+	}
+
+	written := 0
+	rowCount := len(data) / width
+	for len(rows) != 0 {
+		if err := w.ctx.Err(); err != nil {
+			return written, err
+		}
+		spaceRows := (spillWrBufSize - w.buffer.Len()) / width
+		if spaceRows == 0 {
+			if err := w.Flush(); err != nil {
+				return written, err
+			}
+			spaceRows = spillWrBufSize / width
+		}
+		chunkRows := min(spaceRows, len(rows))
+		oldLength := w.buffer.Len()
+		chunkBytes := chunkRows * width
+		if err := w.buffer.Resize(oldLength + chunkBytes); err != nil {
+			return written, err
+		}
+		output := w.buffer.Bytes()[oldLength:]
+		for outputRow, selected := range rows[:chunkRows] {
+			row := int(selected)
+			if row < 0 || row >= rowCount {
+				_ = w.buffer.Resize(oldLength)
+				return written, mpool.ErrAllocationAccountInvalid
+			}
+			copy(output[outputRow*width:], data[row*width:(row+1)*width])
+		}
+		written += chunkBytes
+		rows = rows[chunkRows:]
+	}
+	return written, nil
+}
+
 func (w *groupSpillWriter) Flush() error {
 	if w == nil || w.target == nil {
 		return nil
@@ -327,9 +410,11 @@ func (w *groupSpillWriter) Free() {
 	if w.buffer != nil {
 		w.buffer.Free()
 	}
+	w.pageCache.Finish(w.file)
 	w.buffer = nil
 	w.ctr = nil
 	w.target = nil
+	w.file = nil
 	w.ctx = nil
 	w.disabled = true
 	w.failed = nil
@@ -339,7 +424,11 @@ func (w *groupSpillWriter) Free() {
 // Codec writes are coalesced above this boundary so accounting does not
 // serialize every small logical fragment on the shared execution budget.
 func (w *groupSpillWriter) writePhysical(value []byte) (int, error) {
-	return writeGroupSpillBytes(w.target, value)
+	n, err := writeGroupSpillBytes(w.target, value)
+	if err == nil && w.file != nil {
+		err = w.pageCache.RecordWrite(w.file, n)
+	}
+	return n, err
 }
 
 func writeGroupSpillBytes(target io.Writer, value []byte) (int, error) {

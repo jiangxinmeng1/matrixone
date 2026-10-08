@@ -839,7 +839,7 @@ func (mgr *TxnManager) onApply(items ...any) {
 			observeTNCommitQueueStage("wait_wal_and_tail", started)
 
 			started = time.Now()
-			if _, injected := objectio.CommitWaitInjected(); injected {
+			if _, injected := objectio.CommitWaitInjected(op.Txn.GetTenantID()); injected {
 				duration := time.Millisecond * time.Duration(rand.Intn(10))
 				time.Sleep(duration)
 			}
