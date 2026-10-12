@@ -269,6 +269,8 @@ func (entry *flushTableTailEntry) collectDelsAndTransfer(
 				rowIDVec = containers.MakeVector(types.T_Rowid.ToType(), entry.rt.VectorPool.Small.GetMPool())
 			}
 			rowID := types.NewRowIDWithObjectIDBlkNumAndRowID(*entry.createdObjHandle.GetID(), destpos.BlkIdx, destpos.RowIdx)
+			logutil.Infof("[CN-REWRITE-TRANSFER] append delete kind=flush source=%s rowid=%s pk=%v ts=%s target=%s",
+				obj.ID().String(), rowid[i].String(), deletesPK.Get(i), ts[i].ToString(), rowID.String())
 			rowIDVec.Append(rowID, false)
 			pkVec.Append(deletesPK.Get(i), false)
 			pendingDels.add(rowid[i])

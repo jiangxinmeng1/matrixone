@@ -1685,6 +1685,32 @@ retryScan:
 	}
 }
 
+// formatNonNullRowIDs is used only by duplicate diagnostics. Keep it out of
+// the normal dedup path: formatting every candidate RowID would add both a
+// scan and allocations to the commit queue hot path.
+func formatNonNullRowIDs(rows containers.Vector) string {
+	if rows == nil || rows.Length() == 0 {
+		return "[]"
+	}
+	values := make([]string, 0, rows.Length())
+	rowIDs := vector.MustFixedColWithTypeCheck[types.Rowid](rows.GetDownstreamVector())
+	for i := 0; i < rows.Length(); i++ {
+		if rows.IsNull(i) {
+			continue
+		}
+		values = append(values, rowIDs[i].String())
+	}
+	return "[" + strings.Join(values, ",") + "]"
+}
+
+func (tbl *txnTable) workspaceDeleteRowIDs() string {
+	if tbl.tombstoneTable == nil || tbl.tombstoneTable.tableSpace == nil ||
+		tbl.tombstoneTable.tableSpace.node == nil || tbl.tombstoneTable.tableSpace.node.data == nil {
+		return "[]"
+	}
+	return formatNonNullRowIDs(tbl.tombstoneTable.tableSpace.node.data.GetVectorByName(objectio.TombstoneAttr_Rowid_Attr))
+}
+
 // DoPrecommitDedupByPK 1. it do deduplication by traversing all the Objects/blocks, and
 // skipping over some blocks/Objects which being active or drop-committed or aborted;
 //  2. it is called when txn dequeues from preparing queue.
@@ -1731,12 +1757,17 @@ func (tbl *txnTable) DoPrecommitDedupByPK(
 				colName = tbl.dataTable.schema.GetPrimaryKey().Name
 			}
 			if !rowIDs.IsNull(i) {
-				logutil.Error("Duplicate",
+				logutil.Error("[CN-REWRITE-DUPLICATE] DoPrecommitDedupByPK",
 					zap.String("table", tbl.dataTable.schema.Name),
 					zap.Bool("is tombstone", isTombstone),
+					zap.String("txn", tbl.store.txn.Repr()),
 					zap.String("phase", phase),
 					zap.String("from", tbl.dedupTS.Next().ToString()),
 					zap.String("to", ts.ToString()),
+					zap.String("pk", common.TypeStringValue(*pks.GetType(), pks.Get(i), false)),
+					zap.String("rowid", vector.GetFixedAtNoTypeCheck[types.Rowid](rowIDs.GetDownstreamVector(), i).String()),
+					zap.String("workspace-delete-rowids", tbl.workspaceDeleteRowIDs()),
+					zap.String("remaining-rowids", formatNonNullRowIDs(rowIDs)),
 				)
 				entry := common.TypeStringValue(*pks.GetType(), pks.Get(i), false)
 				err = moerr.NewDuplicateEntryNoCtx(entry, colName)
@@ -1811,6 +1842,15 @@ func (tbl *txnTable) DoPrecommitDedupByNode(ctx context.Context, stats objectio.
 			if !rowIDs.IsNull(i) {
 				colName := tbl.getSchema(false).GetPrimaryKey().Name
 				entry := common.TypeStringValue(*pks.GetType(), pks.Get(i), false)
+				logutil.Error("[CN-REWRITE-DUPLICATE] DoPrecommitDedupByNode",
+					zap.String("table", tbl.dataTable.schema.Name),
+					zap.Bool("is tombstone", isTombstone),
+					zap.String("txn", tbl.store.txn.Repr()),
+					zap.String("pk", entry),
+					zap.String("rowid", vector.GetFixedAtNoTypeCheck[types.Rowid](rowIDs.GetDownstreamVector(), i).String()),
+					zap.String("workspace-delete-rowids", tbl.workspaceDeleteRowIDs()),
+					zap.String("remaining-rowids", formatNonNullRowIDs(rowIDs)),
+				)
 				err = moerr.NewDuplicateEntryNoCtx(entry, colName)
 				return
 			}
