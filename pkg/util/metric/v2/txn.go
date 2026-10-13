@@ -240,6 +240,30 @@ var (
 			Name:      "tn_preprepare_object_bookmark_total",
 			Help:      "Bookmark decisions and prefix objects skipped by TN incremental PrePrepare dedup.",
 		}, []string{"type", "group", "result"})
+
+	// TxnTNPrePrepareAObjectMaxCommitUnavailablePerScan records the number of
+	// appendable objects without a finalized max commit timestamp in one
+	// PrePrepare object-list scan. A histogram makes the average and tail of
+	// the per-scan value directly observable.
+	TxnTNPrePrepareAObjectMaxCommitUnavailablePerScan = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "mo",
+			Subsystem: "txn",
+			Name:      "tn_preprepare_aobject_max_commit_unavailable_per_scan",
+			Help:      "Number of appendable objects without a finalized max commit timestamp in one TN PrePrepare scan.",
+			Buckets:   []float64{0, 1, 2, 3, 4, 8, 16, 32, 64, 128, 256, 512, 1024},
+		}, []string{"type"})
+
+	// TxnTNPrePrepareFindDeletesObjectCounter counts only tombstone objects
+	// selected by the queue-side findDeletes scan. It is separate from the
+	// generic ObjectList counters so Freeze scans cannot be included.
+	TxnTNPrePrepareFindDeletesObjectCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "mo",
+			Subsystem: "txn",
+			Name:      "tn_preprepare_find_deletes_object_total",
+			Help:      "Tombstone objects selected by TN PrePrepare findDeletes.",
+		}, []string{"group", "result"})
 )
 
 // UpdateTxnAObjectMaxCommitState publishes one table/object-list snapshot.

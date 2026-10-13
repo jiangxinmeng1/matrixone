@@ -124,6 +124,46 @@ func TestGetDuplicatedRowsSkipsIneligibleCandidates(t *testing.T) {
 	require.True(t, skippedRowIDs.IsNull(0))
 }
 
+func TestGetDuplicatedRowsWithRowVisibilityChecksCandidatesOnly(t *testing.T) {
+	idx := NewMutIndex(types.T_int32.ToType())
+	indexedKeys := containers.MakeVector(types.T_int32.ToType(), common.DefaultAllocator)
+	defer indexedKeys.Close()
+	indexedKeys.Append(int32(7), false)
+	indexedKeys.Append(int32(7), false)
+	require.NoError(t, idx.BatchUpsert(indexedKeys.GetDownstreamVector(), 0))
+
+	query := containers.MakeVector(types.T_int32.ToType(), common.DefaultAllocator)
+	defer query.Close()
+	query.Append(int32(8), false) // no ART candidate
+	query.Append(int32(7), false) // two ART candidates
+	rowIDs := containers.MakeVector(types.T_Rowid.ToType(), common.DefaultAllocator)
+	defer rowIDs.Close()
+	rowIDs.Append(nil, true)
+	rowIDs.Append(nil, true)
+
+	objID := types.NewObjectid()
+	blkID := types.NewBlockidWithObjectID(&objID, 0)
+	var visibleRows []uint32
+	err := idx.GetDuplicatedRowsWithRowVisibility(
+		context.Background(),
+		query.GetDownstreamVector(),
+		nil,
+		&blkID,
+		rowIDs.GetDownstreamVector(),
+		func(row uint32) (bool, error) {
+			visibleRows = append(visibleRows, row)
+			return true, nil
+		},
+		func(uint32) error { return nil },
+		nil,
+		common.DefaultAllocator,
+	)
+	require.NoError(t, err)
+	require.True(t, rowIDs.IsNull(0))
+	require.False(t, rowIDs.IsNull(1))
+	require.Equal(t, []uint32{1}, visibleRows)
+}
+
 func TestContainsSkipsIneligibleTombstoneCandidates(t *testing.T) {
 	idx := NewMutIndex(types.T_Rowid.ToType())
 	objID := types.NewObjectid()

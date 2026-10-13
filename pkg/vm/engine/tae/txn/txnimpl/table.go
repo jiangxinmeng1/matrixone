@@ -57,6 +57,25 @@ const (
 	TransferSinkerMemorySizeThreshold = common.Const1MBytes * 50
 )
 
+// dedupVisibilityMode identifies the visibility rules used by one dedup
+// phase.  Keeping this explicit is important: data lookup and tombstone
+// lookup must use the same mode within a phase, while the three phases have
+// deliberately different fences.
+type dedupVisibilityMode uint8
+
+const (
+	dedupVisibilitySnapshot dedupVisibilityMode = iota
+	dedupVisibilityFreeze
+	dedupVisibilityPrePrepare
+)
+
+func dedupVisibilityModeForPhase(phase string) dedupVisibilityMode {
+	if phase == txnif.PrePreparePhase {
+		return dedupVisibilityPrePrepare
+	}
+	return dedupVisibilityFreeze
+}
+
 func observePrePrepareDedupStep(isTombstone bool, step string, start time.Time) {
 	observePrePrepareDedupStepDuration(isTombstone, step, time.Since(start))
 }
@@ -1286,7 +1305,7 @@ func (tbl *txnTable) GetByFilter(
 			candidates,
 			types.TS{},
 			tbl.store.txn.GetStartTS(),
-			true,
+			dedupVisibilitySnapshot,
 		)
 		if err != nil && !moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict) {
 			return
@@ -1437,10 +1456,11 @@ func (tbl *txnTable) PrePrepareDedup(ctx context.Context, isTombstone bool, phas
 	}
 	var zm index.ZM
 	dedupType := tbl.store.txn.GetDedupType()
+	mode := dedupVisibilityModeForPhase(phase)
 	if !dedupType.SkipSourcePersisted() {
 		stepStart := time.Now()
 		for _, stats := range baseTable.tableSpace.stats {
-			err = tbl.DoPrecommitDedupByNode(ctx, stats, isTombstone)
+			err = tbl.DoPrecommitDedupByNode(ctx, stats, isTombstone, mode, ts)
 			if err != nil {
 				return
 			}
@@ -1510,7 +1530,7 @@ func (tbl *txnTable) DedupSnapByPK(
 	}
 	from, to := types.TS{}, tbl.store.txn.GetStartTS()
 	if !isTombstone && candidates.HasCandidate() {
-		err = tbl.findDeletesForCandidates(ctx, candidates, from, to, true)
+		err = tbl.findDeletesForCandidates(ctx, candidates, from, to, dedupVisibilitySnapshot)
 		if err != nil {
 			logutil.Errorf("getRowsByPK failed 2, %v", err)
 			return
@@ -1524,6 +1544,9 @@ func (tbl *txnTable) DedupSnapByPK(
 			logutil.Error("Append Duplicate",
 				zap.String("table", tbl.dataTable.schema.Name),
 				zap.Bool("isTombstone", isTombstone),
+				zap.String("txn", tbl.store.txn.Repr()),
+				zap.String("txn-start-ts", tbl.store.txn.GetStartTS().ToString()),
+				zap.String("txn-prepare-ts", tbl.store.txn.GetPrepareTS().ToString()),
 				zap.String("pk", keys.PPString(keys.Length())),
 				zap.String("rowids", rowIDs.PPString(rowIDs.Length())),
 			)
@@ -1544,7 +1567,7 @@ func (tbl *txnTable) findDeletesForCandidates(
 	ctx context.Context,
 	candidates *duplicatedRowIDs,
 	from, to types.TS,
-	waitCommitted bool,
+	mode dedupVisibilityMode,
 ) error {
 	combined := tbl.store.rt.VectorPool.Small.GetVector(&objectio.RowidType)
 	defer combined.Close()
@@ -1576,10 +1599,61 @@ func (tbl *txnTable) findDeletesForCandidates(
 			}
 		}
 	}
-	err := tbl.findDeletes(ctx, combined, from, to, false, !waitCommitted)
+	var err error
+	if mode == dedupVisibilitySnapshot {
+		err = tbl.findDeletesBySnapshot(ctx, combined)
+	} else {
+		err = tbl.findDeletes(ctx, combined, from, to, false, mode)
+	}
 	// Preserve partial filtering if a later tombstone returns a WW conflict.
 	copyBack()
 	return err
+}
+
+// findDeletesBySnapshot uses the same catalog-visible object iterator as
+// getRowsByPK.  Append-time data and tombstone lookup therefore make the same
+// object-version decision instead of using a snapshot for data and an
+// incremental object-list range for tombstones.
+func (tbl *txnTable) findDeletesBySnapshot(
+	ctx context.Context,
+	rowIDs containers.Vector,
+) error {
+	if rowIDs.Length() == 0 || rowIDs.NullCount() == rowIDs.Length() {
+		return nil
+	}
+	pkType := rowIDs.GetType()
+	keysZM := index.NewZM(pkType.Oid, pkType.Scale)
+	if err := index.BatchUpdateZM(keysZM, rowIDs.GetDownstreamVector()); err != nil {
+		return err
+	}
+	if err := tbl.contains(ctx, rowIDs, keysZM, common.WorkspaceAllocator); err != nil {
+		return err
+	}
+	if rowIDs.NullCount() == rowIDs.Length() || tbl.tombstoneTable == nil {
+		return nil
+	}
+	return tbl.tombstoneTable.foreachVisibleObject(func(obj *catalog.ObjectEntry) error {
+		objData := obj.GetObjectData()
+		if objData == nil {
+			panic(fmt.Sprintf("logic error, object %v", obj.StringWithLevel(3)))
+		}
+		if obj.Rows() != 0 {
+			skip, err := quickSkipThisObject(ctx, keysZM, obj)
+			if err != nil {
+				return err
+			}
+			if skip {
+				return nil
+			}
+		}
+		return objData.Contains(
+			ctx,
+			tbl.store.txn,
+			rowIDs,
+			keysZM,
+			common.WorkspaceAllocator,
+		)
+	})
 }
 
 /*
@@ -1594,7 +1668,7 @@ func (tbl *txnTable) findDeletes(
 	rowIDs containers.Vector,
 	from, to types.TS,
 	collectMetrics bool,
-	usePrepareTS bool,
+	mode dedupVisibilityMode,
 ) (err error) {
 	// The vector keeps one slot per input PK, and deleted candidates are
 	// represented by NULL rowids. If no candidate remains, do not build a
@@ -1627,13 +1701,13 @@ func (tbl *txnTable) findDeletes(
 	// successful delete is visible to that snapshot. After the wait, Contains
 	// checks the AppendNode again. A committed delete participates in the lookup;
 	// an aborted delete has IsAborted set by ApplyRollback and is ignored.
-	if !usePrepareTS {
+	if mode == dedupVisibilityFreeze {
 		tbl.waitTombstoneRowsCommittedBefore(to, rowIDs, keysZM)
 	}
 
 retryScan:
 	for {
-		if !usePrepareTS {
+		if mode == dedupVisibilityFreeze {
 			tbl.entry.WaitTombstoneObjectCommitted(to)
 		}
 		snapshot := tbl.entry.MakeTombstoneObjectSnapshot()
@@ -1642,7 +1716,7 @@ retryScan:
 		if collectMetrics {
 			scope = "preprepare_find_deletes"
 		}
-		scanStats, err = foreachIncrementalObjectWithStats(snapshot, true, from, to, tbl.entry.ID, scope, func(obj *catalog.ObjectEntry, _ *incrementalObjectScanStats) error {
+		scanStats, err = foreachIncrementalObjectWithStats(snapshot, true, from, to, tbl.entry.ID, scope, tbl.store.txn, mode, func(obj *catalog.ObjectEntry, _ *incrementalObjectScanStats) error {
 			objData := obj.GetObjectData()
 			if objData == nil {
 				panic(fmt.Sprintf("logic error, object %v", obj.StringWithLevel(3)))
@@ -1670,7 +1744,7 @@ retryScan:
 			observeIncrementalObjectScanStats(true, scanStats)
 		}
 		if err != nil {
-			if !usePrepareTS && moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict) &&
+			if mode == dedupVisibilityFreeze && moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict) &&
 				tbl.waitTombstoneRowsCommittedBefore(to, rowIDs, keysZM) {
 				// A merge/flush transaction may attach transfer tombstones
 				// after the pre-scan wait. It has now reached a terminal state;
@@ -1724,13 +1798,13 @@ func (tbl *txnTable) DoPrecommitDedupByPK(
 	ts types.TS,
 ) (err error) {
 	moprobe.WithRegion(context.Background(), moprobe.TxnTableDoPrecommitDedupByPK, func() {
-		now := tbl.store.rt.Now()
+		mode := dedupVisibilityModeForPhase(phase)
 		if tbl.dedupTS.IsEmpty() {
 			tbl.dedupTS = tbl.store.txn.GetStartTS()
 		}
 		var rowIDs containers.Vector
 		stepStart := time.Now()
-		rowIDs, err = tbl.getBaseTable(isTombstone).incrementalGetRowsByPK(tbl.store.ctx, pks, tbl.dedupTS.Next(), ts, phase == txnif.PrePreparePhase)
+		rowIDs, err = tbl.getBaseTable(isTombstone).incrementalGetRowsByPK(tbl.store.ctx, pks, tbl.dedupTS.Next(), ts, mode)
 		if phase == txnif.PrePreparePhase {
 			observePrePrepareDedupStep(isTombstone, "incremental_get_rows", stepStart)
 		}
@@ -1740,7 +1814,7 @@ func (tbl *txnTable) DoPrecommitDedupByPK(
 		defer rowIDs.Close()
 		if !isTombstone {
 			stepStart = time.Now()
-			err = tbl.findDeletes(tbl.store.ctx, rowIDs, tbl.dedupTS.Next(), now, phase == txnif.PrePreparePhase, phase == txnif.PrePreparePhase)
+			err = tbl.findDeletes(tbl.store.ctx, rowIDs, tbl.dedupTS.Next(), ts, phase == txnif.PrePreparePhase, mode)
 			if phase == txnif.PrePreparePhase {
 				observePrePrepareDedupStep(isTombstone, "find_deletes", stepStart)
 			}
@@ -1762,6 +1836,8 @@ func (tbl *txnTable) DoPrecommitDedupByPK(
 					zap.Bool("is tombstone", isTombstone),
 					zap.String("txn", tbl.store.txn.Repr()),
 					zap.String("phase", phase),
+					zap.String("txn-start-ts", tbl.store.txn.GetStartTS().ToString()),
+					zap.String("txn-prepare-ts", tbl.store.txn.GetPrepareTS().ToString()),
 					zap.String("from", tbl.dedupTS.Next().ToString()),
 					zap.String("to", ts.ToString()),
 					zap.String("pk", common.TypeStringValue(*pks.GetType(), pks.Get(i), false)),
@@ -1781,7 +1857,13 @@ func (tbl *txnTable) DoPrecommitDedupByPK(
 	return
 }
 
-func (tbl *txnTable) DoPrecommitDedupByNode(ctx context.Context, stats objectio.ObjectStats, isTombstone bool) (err error) {
+func (tbl *txnTable) DoPrecommitDedupByNode(
+	ctx context.Context,
+	stats objectio.ObjectStats,
+	isTombstone bool,
+	mode dedupVisibilityMode,
+	to types.TS,
+) (err error) {
 	//loaded := false
 	//TODO::load ZM/BF index first, then load PK column if necessary.
 
@@ -1823,17 +1905,16 @@ func (tbl *txnTable) DoPrecommitDedupByNode(ctx context.Context, stats objectio.
 		defer closeFunc()
 		defer pks.Close()
 		var rowIDs containers.Vector
-		now := tbl.store.rt.Now()
 		if tbl.dedupTS.IsEmpty() {
 			tbl.dedupTS = tbl.store.txn.GetStartTS()
 		}
-		rowIDs, err = tbl.getBaseTable(isTombstone).incrementalGetRowsByPK(ctx, pks, tbl.dedupTS.Next(), now, false)
+		rowIDs, err = tbl.getBaseTable(isTombstone).incrementalGetRowsByPK(ctx, pks, tbl.dedupTS.Next(), to, mode)
 		if err != nil {
 			return
 		}
 		defer rowIDs.Close()
 		if !isTombstone {
-			err = tbl.findDeletes(ctx, rowIDs, tbl.dedupTS, now, false, false)
+			err = tbl.findDeletes(ctx, rowIDs, tbl.dedupTS.Next(), to, false, mode)
 		}
 		if err != nil {
 			return
@@ -1846,6 +1927,11 @@ func (tbl *txnTable) DoPrecommitDedupByNode(ctx context.Context, stats objectio.
 					zap.String("table", tbl.dataTable.schema.Name),
 					zap.Bool("is tombstone", isTombstone),
 					zap.String("txn", tbl.store.txn.Repr()),
+					zap.String("phase", txnif.PrePreparePhase),
+					zap.String("from", tbl.dedupTS.Next().ToString()),
+					zap.String("to", to.ToString()),
+					zap.String("txn-start-ts", tbl.store.txn.GetStartTS().ToString()),
+					zap.String("txn-prepare-ts", tbl.store.txn.GetPrepareTS().ToString()),
 					zap.String("pk", entry),
 					zap.String("rowid", vector.GetFixedAtNoTypeCheck[types.Rowid](rowIDs.GetDownstreamVector(), i).String()),
 					zap.String("workspace-delete-rowids", tbl.workspaceDeleteRowIDs()),

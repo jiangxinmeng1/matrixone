@@ -193,6 +193,8 @@ func initTxnMetrics() {
 	registry.MustRegister(TxnTNPrePrepareObjectCounter)
 	registry.MustRegister(TxnTNPrePrepareObjectScanCounter)
 	registry.MustRegister(TxnTNPrePrepareObjectBookmarkCounter)
+	registry.MustRegister(TxnTNPrePrepareAObjectMaxCommitUnavailablePerScan)
+	registry.MustRegister(TxnTNPrePrepareFindDeletesObjectCounter)
 
 	registry.MustRegister(txnQueueSizeGauge)
 	registry.MustRegister(TxnTNCommitQueueStageDurationHistogram)

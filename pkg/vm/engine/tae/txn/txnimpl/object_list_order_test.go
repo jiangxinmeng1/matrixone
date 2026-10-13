@@ -87,6 +87,53 @@ func TestForeachIncrementalObjectDropStartsAfterFrom(t *testing.T) {
 	require.Equal(t, []types.TS{types.BuildTS(4, 0), types.BuildTS(5, 0)}, deletedAt)
 }
 
+// TestForeachIncrementalObjectSkipsOtherTxnDroppedCEntry verifies the
+// transfer/dedup object-list boundary:
+//
+//   - transfer resolves the object through GetLatestNode and sees the D-entry;
+//   - the C-entry is placed in appendable_create_with_drop, not
+//     appendable_create;
+//   - incremental dedup scans appendable_create and appendable_drop, so the
+//     old C-entry is not passed to GetDuplicatedRows.
+//
+// This is the negative test for the suspected timing window: if this starts
+// visiting the C-entry, transfer and dedup are no longer using compatible
+// object-list group boundaries.
+func TestForeachIncrementalObjectSkipsOtherTxnDroppedCEntry(t *testing.T) {
+	cata := catalog.MockCatalog(nil)
+	db := catalog.MockDBEntryWithAccInfo(0, 1)
+	table := catalog.MockTableEntryWithDB(db, 2)
+
+	created := catalog.MockCreatedObjectEntry2ListWithAppendable(
+		table, cata, false, true, types.BuildTS(1, 0),
+	)
+	dropped := catalog.MockDroppedObjectEntry2List(created, types.BuildTS(2, 0))
+	snapshot := table.MakeDataObjectSnapshot()
+
+	var visited *catalog.ObjectEntry
+	_, err := foreachIncrementalObjectWithStats(
+		snapshot,
+		false,
+		types.BuildTS(1, 0),
+		types.BuildTS(3, 0),
+		table.ID,
+		"other",
+		nil,
+		dedupVisibilityFreeze,
+		func(obj *catalog.ObjectEntry, _ *incrementalObjectScanStats) error {
+			if obj.ID().EQ(created.ID()) {
+				visited = obj
+			}
+			return nil
+		},
+	)
+	require.NoError(t, err)
+
+	// This is what TransferDeletes sees for the same object ID.
+	require.Same(t, dropped, created.GetLatestNode())
+	require.Nil(t, visited)
+}
+
 func TestForeachIncrementalObjectSkipsFinalizedOldAppendableObject(t *testing.T) {
 	factory := tables.NewDataFactory(nil, "")
 	cata := catalog.MockCatalog(factory)

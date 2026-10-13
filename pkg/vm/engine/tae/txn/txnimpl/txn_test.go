@@ -151,7 +151,7 @@ func TestIncrementalGetRowsByPKReleasesResultOnError(t *testing.T) {
 		pks,
 		from,
 		to,
-		true,
+		dedupVisibilityPrePrepare,
 	)
 	if rowIDs != nil {
 		defer rowIDs.Close()
@@ -222,7 +222,7 @@ func TestFindDeletesForCandidatesRetainsPartialFilteringOnWW(t *testing.T) {
 	entry.AddEntryLocked(first)
 	entry.AddEntryLocked(second)
 
-	err = tbl.findDeletesForCandidates(context.Background(), candidates, types.TS{}, types.MaxTs(), false)
+	err = tbl.findDeletesForCandidates(context.Background(), candidates, types.TS{}, types.MaxTs(), dedupVisibilityPrePrepare)
 	require.True(t, moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict), err)
 	require.True(t, candidates.appendable.IsNull(candidates.appendableByKey[0][0]))
 	require.False(t, candidates.nonAppendable.IsNull(candidates.nonAppendableByKey[0][0]))

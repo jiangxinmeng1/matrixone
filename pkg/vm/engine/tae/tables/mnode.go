@@ -32,6 +32,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index/indexwrapper"
+	"go.uber.org/zap"
 )
 
 var _ NodeT = (*memoryNode)(nil)
@@ -131,6 +132,67 @@ func (node *memoryNode) getDuplicatedRowsLocked(
 		getRowSelection,
 		skipFn,
 		mp)
+}
+
+// getDuplicatedRowsByRowVisibilityLocked deliberately checks the PK index
+// before looking at append MVCC.  The old RowSelection path walks the whole
+// prepare index and builds a holes bitmap for every dedup request, even when
+// the queried keys are absent from this object.  For an in-memory AObject we
+// already hold the object read lock, so a candidate RowID can safely resolve
+// its AppendNode directly.
+func (node *memoryNode) getDuplicatedRowsByRowVisibilityLocked(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	from, to types.TS,
+	keys containers.Vector,
+	keysZM index.ZM,
+	rowIDs containers.Vector,
+	mp *mpool.MPool,
+) (err error) {
+	blkID := objectio.NewBlockidWithObjectID(node.object.meta.Load().ID(), 0)
+	rowVisible := func(row uint32) (bool, error) {
+		appendnode := node.object.appendMVCC.GetAppendNodeByRowLocked(row)
+		if appendnode == nil || appendnode.IsAborted() {
+			return false, nil
+		}
+		// Use the AppendNode's own Prepare field.  The transaction may already
+		// have a PrepareTS while PrepareCommit has not copied it into this node;
+		// treating txn.GetPrepareTS() as visible here would make a transaction
+		// deduplicate against its own still-uncommitted append.
+		if appendnode.Prepare == txnif.UncommitTS {
+			return false, nil
+		}
+		visible, _ := appendnode.PreparedIn(from, to)
+		return visible, nil
+	}
+	return node.pkIndex.GetDuplicatedRowsWithRowVisibility(
+		ctx,
+		keys.GetDownstreamVector(),
+		keysZM,
+		&blkID,
+		rowIDs.GetDownstreamVector(),
+		rowVisible,
+		node.checkConflictLocked(txn),
+		func(row uint32) {
+			appendnode := node.object.appendMVCC.GetAppendNodeByRowLocked(row)
+			prepareTS := txnif.UncommitTS
+			if appendnode != nil {
+				prepareTS = appendnode.GetPrepare()
+			}
+			rowID := objectio.NewRowid(&blkID, row)
+			logutil.Info("[DEDUP-ROW-SELECTED]",
+				zap.String("path", "aobject"),
+				zap.String("rowid", rowID.String()),
+				zap.String("reason", "art-candidate-append-prepare-in-range"),
+				zap.String("append-prepare-ts", prepareTS.ToString()),
+				zap.String("from", from.ToString()),
+				zap.String("to", to.ToString()),
+				zap.String("txn-start-ts", txn.GetStartTS().ToString()),
+				zap.String("txn-prepare-ts", txn.GetPrepareTS().ToString()),
+			)
+		},
+		mp,
+	)
 }
 
 func (node *memoryNode) Rows() (uint32, error) {
@@ -368,6 +430,21 @@ func (node *memoryNode) GetDuplicatedRows(
 	return
 }
 
+func (node *memoryNode) GetDuplicatedRowsByRowVisibility(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	from, to types.TS,
+	keys containers.Vector,
+	keysZM index.ZM,
+	rowIDs containers.Vector,
+	mp *mpool.MPool,
+) (err error) {
+	node.object.RLock()
+	defer node.object.RUnlock()
+	return node.getDuplicatedRowsByRowVisibilityLocked(
+		ctx, txn, from, to, keys, keysZM, rowIDs, mp)
+}
+
 func (node *memoryNode) checkConflictLocked(
 	txn txnif.TxnReader,
 ) func(row uint32) error {
@@ -378,6 +455,13 @@ func (node *memoryNode) checkConflictLocked(
 		}
 		if appendnode.IsAborted() {
 			return index.ErrNotFound
+		}
+		// A committing append from the reader's own transaction must not be
+		// reported as a WW conflict.  Its row is still subject to the separate
+		// AppendNode Prepare visibility check; recognizing the same transaction
+		// here only prevents the conflict scan from stopping on its own row.
+		if appendnode.IsSameTxn(txn) {
+			return nil
 		}
 		// IMPORTANT: THIS RELIES ON THE PREPARE-QUEUE SERIALIZATION CONTRACT.
 		//

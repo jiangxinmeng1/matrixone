@@ -334,11 +334,30 @@ func (tbl *baseTable) getRowsByPK(ctx context.Context, pks containers.Vector) (r
 		}
 		objectRowIDs.Close()
 		if err != nil {
-			logutil.Infof("getRowsByPK failed GetDuplicate: %v, obj %v", err, obj.ID().String())
 			return
 		}
 	}
 	return
+}
+
+// foreachVisibleObject visits exactly the catalog object versions used by
+// getRowsByPK.  Callers that need snapshot visibility for another index (for
+// example tombstone lookup) should use this helper instead of constructing an
+// incremental ObjectList range with a different visibility rule.
+func (tbl *baseTable) foreachVisibleObject(fn func(*catalog.ObjectEntry) error) error {
+	var it *catalog.VisibleCommittedObjectIt
+	if tbl.isTombstone {
+		it = tbl.txnTable.entry.MakeTombstoneVisibleObjectIt(tbl.txnTable.store.txn)
+	} else {
+		it = tbl.txnTable.entry.MakeDataVisibleObjectIt(tbl.txnTable.store.txn)
+	}
+	defer it.Release()
+	for it.Next() {
+		if err := fn(it.Item()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 /*
@@ -349,7 +368,7 @@ func foreachIncrementalObject(
 	from, to types.TS,
 	fn func(*catalog.ObjectEntry) error,
 ) error {
-	_, err := foreachIncrementalObjectWithStats(snapshot, false, from, to, 0, "other", func(obj *catalog.ObjectEntry, _ *incrementalObjectScanStats) error {
+	_, err := foreachIncrementalObjectWithStats(snapshot, false, from, to, 0, "other", nil, dedupVisibilityFreeze, func(obj *catalog.ObjectEntry, _ *incrementalObjectScanStats) error {
 		return fn(obj)
 	})
 	return err
@@ -461,6 +480,8 @@ var prePrepareDedupStepObservers = func() map[string][2]metricObserver {
 	for _, step := range []string{
 		"source_persisted", "build_pk_vector", "build_pk_zonemap", "pk_dedup",
 		"incremental_get_rows", "find_deletes", "check_duplicate_rows",
+		"find_deletes_build_zonemap", "find_deletes_workspace_contains",
+		"find_deletes_tombstone_scan", "find_deletes_object_contains",
 		"wait_object_committed", "object_list_scan", "object_entry_filter",
 		"object_filter_created_at", "object_filter_deleted_at",
 		"object_filter_visible_by_ts", "object_filter_group_state",
@@ -603,6 +624,13 @@ func observePrePrepareObjectScan(
 }
 
 func observeIncrementalObjectScanStats(isTombstone bool, stats incrementalObjectScanStats) {
+	typ := "data"
+	if isTombstone {
+		typ = "tombstone"
+	}
+	v2.TxnTNPrePrepareAObjectMaxCommitUnavailablePerScan.WithLabelValues(typ).
+		Observe(float64(stats.aobjectMaxCommitUnavailable))
+
 	observePrePrepareDedupStepDuration(isTombstone, "object_list_scan", stats.scan)
 	observePrePrepareDedupStepDuration(isTombstone, "object_entry_filter", stats.filter)
 	observePrePrepareDedupStepDuration(isTombstone, "object_filter_created_at", stats.createdAt)
@@ -669,8 +697,91 @@ func foreachIncrementalObjectWithStats(
 	from, to types.TS,
 	tableID uint64,
 	scope string,
+	reader txnif.TxnReader,
+	mode dedupVisibilityMode,
 	fn func(*catalog.ObjectEntry, *incrementalObjectScanStats) error,
 ) (stats incrementalObjectScanStats, err error) {
+	usePrepareTS := mode == dedupVisibilityPrePrepare
+	// ObjectList counters and per-object timings are queue diagnostics. Freeze
+	// uses the same traversal helper, but must not contribute to PrePrepare
+	// metrics or make queue scans appear larger than they are.
+	collectPrePrepareMetrics := scope == "preprepare" || scope == "preprepare_find_deletes"
+	// Normal readers wait until catalog MVCC has applied its commit timestamp
+	// and then use CreatedAt/DeletedAt directly. PrePrepareDedup is different:
+	// it runs in the serialized pre-WAL worker, where a predecessor can be in
+	// Preparing but not yet ApplyCommitted. In that path the entry's
+	// CreateNode/DeleteNode prepare timestamp is the visibility fence. Keep
+	// this opt-in so Freeze, GetByFilter, and other readers retain their
+	// existing wait-and-read semantics.
+	objectTimes := func(obj *catalog.ObjectEntry) (createdAt, deletedAt types.TS) {
+		createdAt = obj.CreatedAt
+		deletedAt = obj.DeletedAt
+		if !usePrepareTS {
+			return
+		}
+		// Do not make a just-created object visible to its own object-level
+		// dedup: the source-persisted path is querying the object it is about to
+		// publish and would otherwise match every row against itself.
+		if createdAt == txnif.UncommitTS {
+			createdAt = obj.CreateNode.GetPrepare()
+		}
+		if deletedAt == txnif.UncommitTS {
+			deletedAt = obj.DeleteNode.GetPrepare()
+		}
+		return
+	}
+	// Freeze uses the normal catalog MVCC visibility path.  It is important
+	// that this is not reduced to the PrepareTS check used by PrePrepare:
+	// Freeze can see an active object version belonging to its own txn, while
+	// an active version belonging to another txn is not a committed object
+	// that should participate in the range scan.  Committed objects newer than
+	// the txn start TS are deliberately kept here; their CreatedAt/DeletedAt
+	// range is what makes them conflict candidates for dedup.
+	freezeObjectVisible := func(obj *catalog.ObjectEntry) bool {
+		if reader == nil {
+			return true
+		}
+		visible := obj.IsVisible(reader)
+		if !visible && !obj.IsCommitted() {
+			return false
+		}
+		// A create entry and its delete entry can both be present while this
+		// transaction is freezing.  Do not dedup the old version against the
+		// replacement written by the same transaction.
+		if obj.DeleteNode.IsSameTxn(reader) {
+			return false
+		}
+		next := obj.GetNextVersion()
+		return next == nil || !next.DeleteNode.IsSameTxn(reader)
+	}
+	// PrePrepare runs in the serialized pre-WAL worker.  It cannot wait for
+	// the catalog commit path in the same way as Freeze, so it uses the
+	// predecessor's PrepareTS and only hides a same-transaction drop.
+	prePrepareSameTxnDrop := func(obj *catalog.ObjectEntry) bool {
+		if !usePrepareTS || reader == nil {
+			return false
+		}
+		if obj.DeleteNode.IsSameTxn(reader) {
+			return true
+		}
+		// The create entry keeps the delete entry as its next version. Both
+		// entries can be present in the snapshot while the same transaction is
+		// still preparing; hide the old version from its replacement dedup.
+		next := obj.GetNextVersion()
+		return next != nil && next.DeleteNode.IsSameTxn(reader)
+	}
+	shouldSkipForPhase := func(obj *catalog.ObjectEntry) bool {
+		if usePrepareTS {
+			return prePrepareSameTxnDrop(obj)
+		}
+		return !freezeObjectVisible(obj)
+	}
+	objectVisibleByTS := func(createdAt, deletedAt, ts types.TS) bool {
+		if createdAt.GT(&ts) {
+			return false
+		}
+		return deletedAt.IsEmpty() || !deletedAt.LT(&ts)
+	}
 	groupStats := make(map[catalog.ObjectListGroup]*incrementalObjectScanStats)
 	var activeStats *incrementalObjectScanStats
 	getGroupStats := func(group catalog.ObjectListGroup) *incrementalObjectScanStats {
@@ -688,6 +799,10 @@ func foreachIncrementalObjectWithStats(
 		dst.groupState += src.groupState
 		dst.maxCommit += src.maxCommit
 		dst.operation += src.operation
+		dst.aobjectCandidate += src.aobjectCandidate
+		dst.aobjectScanned += src.aobjectScanned
+		dst.aobjectMaxCommitSkipped += src.aobjectMaxCommitSkipped
+		dst.aobjectMaxCommitUnavailable += src.aobjectMaxCommitUnavailable
 	}
 	observeObject := func(obj *catalog.ObjectEntry, result int) {
 		activeStats.metrics.add(obj, result)
@@ -764,11 +879,28 @@ func foreachIncrementalObjectWithStats(
 			maxCommitBefore := activeStats.maxCommit
 			operationBefore := activeStats.operation
 			observeObject(obj, objectScanVisited)
-			createdAfterTo := obj.CreatedAt.GT(&to)
+			if shouldSkipForPhase(obj) {
+				recordFilter(entryStart, maxCommitBefore, operationBefore)
+				return true
+			}
+			createdAt, deletedAt := objectTimes(obj)
+			createdAfterTo := createdAt.GT(&to)
 			if createdAfterTo {
 				observeObject(obj, objectScanCreatedAfterTo)
 				recordFilter(entryStart, maxCommitBefore, operationBefore)
-				return false
+				// An uncommitted entry is ordered by UncommitTS in the catalog
+				// tree, while its prepared timestamp may be inside [from, to].
+				// Do not terminate the group on that raw sentinel.
+				return !(usePrepareTS && obj.CreatedAt == txnif.UncommitTS)
+			}
+			// Keep create-group filtering consistent with the data scan: an
+			// object whose delete timestamp is before the snapshot must not be
+			// consulted by findDeletes, even if its catalog entry is still in
+			// the create group while the delete is being prepared.
+			if !objectVisibleByTS(createdAt, deletedAt, to) {
+				observeObject(obj, objectScanNotVisibleAtTo)
+				recordFilter(entryStart, maxCommitBefore, operationBefore)
+				return true
 			}
 			if shouldSkipAObject(obj) {
 				recordFilter(entryStart, maxCommitBefore, operationBefore)
@@ -782,14 +914,14 @@ func foreachIncrementalObjectWithStats(
 		}
 		scanStart := time.Now()
 		bookmarkStart, bookmarkValid, bookmarkSkipped := (*catalog.ObjectEntry)(nil), false, 0
-		if appendable {
+		if appendable && !usePrepareTS {
 			bookmarkStart, bookmarkValid, bookmarkSkipped = snapshot.CommitBookmarkStartWithCount(group, from)
 		}
 		if from == txnif.UncommitTS {
 			bookmarkValid = false
 			bookmarkSkipped = 0
 		}
-		if group == catalog.ObjectListGroupAppendableCreate {
+		if collectPrePrepareMetrics && group == catalog.ObjectListGroupAppendableCreate {
 			kind := "data"
 			if isTombstone {
 				kind = "tombstone"
@@ -824,8 +956,10 @@ func foreachIncrementalObjectWithStats(
 			snapshot.AscendGroup(group, from, visitEntry)
 		}
 		localStats.scan += time.Since(scanStart)
-		observePrePrepareObjectScan(tableID, isTombstone, group, localStats.metrics)
-		observeIncrementalObjectGroupScanStats(isTombstone, group, *localStats)
+		if collectPrePrepareMetrics {
+			observePrePrepareObjectScan(tableID, isTombstone, group, localStats.metrics)
+			observeIncrementalObjectGroupScanStats(isTombstone, group, *localStats)
+		}
 		mergeStats(&stats, localStats)
 		return err
 	}
@@ -842,20 +976,25 @@ func foreachIncrementalObjectWithStats(
 			maxCommitBefore := activeStats.maxCommit
 			operationBefore := activeStats.operation
 			observeObject(obj, objectScanVisited)
-			deletedAfterFrom := obj.DeletedAt.GT(&from)
+			if shouldSkipForPhase(obj) {
+				recordFilter(entryStart, maxCommitBefore, operationBefore)
+				return true
+			}
+			createdAt, deletedAt := objectTimes(obj)
+			deletedAfterFrom := deletedAt.GT(&from)
 			// Ascend is inclusive. Drop processing starts strictly after from.
 			if !deletedAfterFrom {
 				observeObject(obj, objectScanDeletedAtOrBeforeFrom)
 				recordFilter(entryStart, maxCommitBefore, operationBefore)
 				return true
 			}
-			createdAfterTo := obj.CreatedAt.GT(&to)
+			createdAfterTo := createdAt.GT(&to)
 			if createdAfterTo {
 				observeObject(obj, objectScanCreatedAfterTo)
 				recordFilter(entryStart, maxCommitBefore, operationBefore)
 				return true
 			}
-			visible := obj.VisibleByTS(to)
+			visible := objectVisibleByTS(createdAt, deletedAt, to)
 			if !visible {
 				observeObject(obj, objectScanNotVisibleAtTo)
 				recordFilter(entryStart, maxCommitBefore, operationBefore)
@@ -872,7 +1011,7 @@ func foreachIncrementalObjectWithStats(
 			return err == nil
 		}
 		bookmarkStart, bookmarkValid := (*catalog.ObjectEntry)(nil), false
-		if group == catalog.ObjectListGroupAppendableDrop {
+		if group == catalog.ObjectListGroupAppendableDrop && !usePrepareTS {
 			bookmarkStart, bookmarkValid = snapshot.CommitBookmarkStart(group, from)
 		}
 		if from == txnif.UncommitTS {
@@ -911,21 +1050,21 @@ func boolToInt(value bool) int {
 
 // incrementalGetRowsByPK checks the inclusive logical interval [from, to].
 // Callers that hold an exclusive dedup watermark must pass watermark.Next().
-func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers.Vector, from, to types.TS, inQueue bool) (rowIDs containers.Vector, err error) {
+func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers.Vector, from, to types.TS, mode dedupVisibilityMode) (rowIDs containers.Vector, err error) {
 	stepStart := time.Now()
 	var snapshot catalog.ObjectListSnapshot
 	if tbl.isTombstone {
-		if !inQueue {
+		if mode == dedupVisibilityFreeze {
 			tbl.txnTable.entry.WaitTombstoneObjectCommitted(to)
 		}
 		snapshot = tbl.txnTable.entry.MakeTombstoneObjectSnapshot()
 	} else {
-		if !inQueue {
+		if mode == dedupVisibilityFreeze {
 			tbl.txnTable.entry.WaitDataObjectCommitted(to)
 		}
 		snapshot = tbl.txnTable.entry.MakeDataObjectSnapshot()
 	}
-	if inQueue {
+	if mode == dedupVisibilityPrePrepare {
 		observePrePrepareDedupStep(tbl.isTombstone, "wait_object_committed", stepStart)
 	}
 	rowIDs = tbl.txnTable.store.rt.VectorPool.Small.GetVector(&objectio.RowidType)
@@ -947,10 +1086,10 @@ func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers
 
 	var scanStats incrementalObjectScanStats
 	scope := "freeze"
-	if inQueue {
+	if mode == dedupVisibilityPrePrepare {
 		scope = "preprepare"
 	}
-	scanStats, err = foreachIncrementalObjectWithStats(snapshot, tbl.isTombstone, from, to, tbl.txnTable.entry.ID, scope, func(obj *catalog.ObjectEntry, stats *incrementalObjectScanStats) error {
+	scanStats, err = foreachIncrementalObjectWithStats(snapshot, tbl.isTombstone, from, to, tbl.txnTable.entry.ID, scope, tbl.txnTable.store.txn, mode, func(obj *catalog.ObjectEntry, stats *incrementalObjectScanStats) error {
 		if isEmptyDroppedAppendableObject(obj) {
 			// The group counter is emitted once after the group traversal. Keep
 			// this callback allocation-free and only record the local result.
@@ -972,7 +1111,7 @@ func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers
 		stats.metrics.add(obj, objectScanGetDuplicatedRows)
 		return err
 	})
-	if inQueue {
+	if mode == dedupVisibilityPrePrepare {
 		observeIncrementalObjectScanStats(tbl.isTombstone, scanStats)
 	}
 	if err != nil {
