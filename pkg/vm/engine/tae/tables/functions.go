@@ -109,26 +109,6 @@ var getRowIDAlkFunctions = map[types.T]any{
 	types.T_array_float64: getDuplicatedRowIDABlkBytesFunc,
 }
 
-func logSelectedDuplicateRow(
-	txn txnif.TxnReader,
-	blkID types.Blockid,
-	row uint32,
-	commitTS, from, to types.TS,
-	reason string,
-) {
-	rowID := objectio.NewRowid(&blkID, row)
-	logutil.Info("[DEDUP-ROW-SELECTED]",
-		zap.String("path", "nobject"),
-		zap.String("rowid", rowID.String()),
-		zap.String("reason", reason),
-		zap.String("row-commit-ts", commitTS.ToString()),
-		zap.String("from", from.ToString()),
-		zap.String("to", to.ToString()),
-		zap.String("txn-start-ts", txn.GetStartTS().ToString()),
-		zap.String("txn-prepare-ts", txn.GetPrepareTS().ToString()),
-	)
-}
-
 var containsNABlkFunctions = map[types.T]any{
 	types.T_Rowid: containsNABlkFuncFactory(types.CompareRowidRowidAligned),
 }
@@ -367,7 +347,6 @@ func getDuplicatedRowIDABlkBytesFunc(args ...any) func([]byte, bool, int) error 
 					}
 					rowID := objectio.NewRowid(&blkID, uint32(row))
 					rowIDs.Update(rowOffset, rowID, false)
-					logSelectedDuplicateRow(txn, blkID, uint32(row), txnif.UncommitTS, from, to, "missing-row-commit-ts-fallback")
 					return nil
 				}
 				commitTS := vector.GetFixedAtNoTypeCheck[types.TS](tsVec.GetDownstreamVector(), row)
@@ -394,7 +373,6 @@ func getDuplicatedRowIDABlkBytesFunc(args ...any) func([]byte, bool, int) error 
 				}
 				rowID := objectio.NewRowid(&blkID, uint32(row))
 				rowIDs.Update(rowOffset, rowID, false)
-				logSelectedDuplicateRow(txn, blkID, uint32(row), commitTS, from, to, "row-commit-ts-in-dedup-window")
 				return nil
 			}, nil, nil)
 	}
@@ -434,7 +412,6 @@ func getDuplicatedRowIDABlkFuncFactory[T types.FixedSizeT](comp func(T, T) int) 
 						}
 						rowID := objectio.NewRowid(&blkID, uint32(row))
 						rowIDs.Update(rowOffset, rowID, false)
-						logSelectedDuplicateRow(txn, blkID, uint32(row), txnif.UncommitTS, from, to, "missing-row-commit-ts-fallback")
 						return nil
 					}
 					commitTS := tsVec.Get(row).(types.TS)
@@ -459,7 +436,6 @@ func getDuplicatedRowIDABlkFuncFactory[T types.FixedSizeT](comp func(T, T) int) 
 					}
 					rowID := objectio.NewRowid(&blkID, uint32(row))
 					rowIDs.Update(rowOffset, rowID, false)
-					logSelectedDuplicateRow(txn, blkID, uint32(row), commitTS, from, to, "row-commit-ts-in-dedup-window")
 					return nil
 				}, nil, nil)
 		}

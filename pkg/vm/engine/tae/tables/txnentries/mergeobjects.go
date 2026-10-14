@@ -325,9 +325,6 @@ func (entry *mergeObjectsEntry) transferObjectDeletes(
 	}()
 	for i := 0; i < count; i++ {
 		if entry.transferredDels.contains(rowid[i]) || pendingDels.contains(rowid[i]) {
-			logutil.Infof("[CN-REWRITE-TRANSFER] skip duplicate source=%s rowid=%s ts=%s already-transferred=%t pending=%t",
-				dropped.ID().String(), rowid[i].String(), ts[i].ToString(),
-				entry.transferredDels.contains(rowid[i]), pendingDels.contains(rowid[i]))
 			continue
 		}
 		row := rowid[i].GetRowOffset()
@@ -365,8 +362,6 @@ func (entry *mergeObjectsEntry) transferObjectDeletes(
 			rowIDVec = containers.MakeVector(types.T_Rowid.ToType(), entry.rt.VectorPool.Small.GetMPool())
 		}
 		rowID := types.NewRowIDWithObjectIDBlkNumAndRowID(*targetObj.GetID(), destpos.BlkIdx, destpos.RowIdx)
-		logutil.Infof("[CN-REWRITE-TRANSFER] append delete source=%s rowid=%s pk=%v ts=%s target=%s",
-			dropped.ID().String(), rowid[i].String(), deletesPK.Get(i), ts[i].ToString(), rowID.String())
 		rowIDVec.Append(rowID, false)
 		pkVec.Append(deletesPK.Get(i), false)
 		pendingDels.add(rowid[i])
@@ -379,9 +374,6 @@ func (entry *mergeObjectsEntry) transferObjectDeletes(
 			if _, sarg, injected := fault.TriggerFault(objectio.FJ_TransferErrorAfterTransfer); injected {
 				err = moerr.NewInternalErrorNoCtx(sarg)
 			}
-		} else {
-			logutil.Errorf("[CN-REWRITE-TRANSFER] append delete failed source=%s rows=%s pks=%s err=%v",
-				dropped.ID().String(), rowIDVec.PPString(rowIDVec.Length()), pkVec.PPString(pkVec.Length()), err)
 		}
 	}
 	return

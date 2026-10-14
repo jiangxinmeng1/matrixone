@@ -32,7 +32,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index/indexwrapper"
-	"go.uber.org/zap"
 )
 
 var _ NodeT = (*memoryNode)(nil)
@@ -173,24 +172,7 @@ func (node *memoryNode) getDuplicatedRowsByRowVisibilityLocked(
 		rowIDs.GetDownstreamVector(),
 		rowVisible,
 		node.checkConflictLocked(txn),
-		func(row uint32) {
-			appendnode := node.object.appendMVCC.GetAppendNodeByRowLocked(row)
-			prepareTS := txnif.UncommitTS
-			if appendnode != nil {
-				prepareTS = appendnode.GetPrepare()
-			}
-			rowID := objectio.NewRowid(&blkID, row)
-			logutil.Info("[DEDUP-ROW-SELECTED]",
-				zap.String("path", "aobject"),
-				zap.String("rowid", rowID.String()),
-				zap.String("reason", "art-candidate-append-prepare-in-range"),
-				zap.String("append-prepare-ts", prepareTS.ToString()),
-				zap.String("from", from.ToString()),
-				zap.String("to", to.ToString()),
-				zap.String("txn-start-ts", txn.GetStartTS().ToString()),
-				zap.String("txn-prepare-ts", txn.GetPrepareTS().ToString()),
-			)
-		},
+		nil,
 		mp,
 	)
 }
