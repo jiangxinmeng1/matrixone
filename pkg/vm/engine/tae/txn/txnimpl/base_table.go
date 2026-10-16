@@ -684,6 +684,47 @@ func observeIncrementalObjectGroupScanStats(
 	}
 }
 
+// logPrePrepareObjectGroupStats prints one summary per ObjectList group.  The
+// result is intentionally based on the local counters, so it distinguishes
+// entries merely visited from objects that actually reached GetDuplicatedRows.
+// Keep this at group granularity; logging every object would distort the
+// queue timings that this diagnostic is meant to explain.
+func logPrePrepareObjectGroupStats(
+	tableID uint64,
+	isTombstone bool,
+	group catalog.ObjectListGroup,
+	from, to types.TS,
+	stats incrementalObjectScanStats,
+) {
+	typeName := "data"
+	if isTombstone {
+		typeName = "tombstone"
+	}
+	naobject := stats.metrics.counts[1]
+	aobject := stats.metrics.counts[0]
+	if naobject[objectScanVisited] == 0 && aobject[objectScanVisited] == 0 {
+		return
+	}
+	logutil.Infof(
+		"[PrePrepareDedupObjectScan] table=%d type=%s group=%s from=%s to=%s "+
+			"naobject_visited=%d naobject_selected=%d naobject_created_after_to=%d "+
+			"naobject_deleted_at_or_before_from=%d naobject_not_visible_at_to=%d "+
+			"aobject_visited=%d aobject_selected=%d",
+		tableID,
+		typeName,
+		incrementalObjectGroupName(group),
+		from.ToString(),
+		to.ToString(),
+		naobject[objectScanVisited],
+		naobject[objectScanGetDuplicatedRows],
+		naobject[objectScanCreatedAfterTo],
+		naobject[objectScanDeletedAtOrBeforeFrom],
+		naobject[objectScanNotVisibleAtTo],
+		aobject[objectScanVisited],
+		aobject[objectScanGetDuplicatedRows],
+	)
+}
+
 func maxDuration(left, right time.Duration) time.Duration {
 	if left > right {
 		return left
@@ -959,6 +1000,7 @@ func foreachIncrementalObjectWithStats(
 		if collectPrePrepareMetrics {
 			observePrePrepareObjectScan(tableID, isTombstone, group, localStats.metrics)
 			observeIncrementalObjectGroupScanStats(isTombstone, group, *localStats)
+			logPrePrepareObjectGroupStats(tableID, isTombstone, group, from, to, *localStats)
 		}
 		mergeStats(&stats, localStats)
 		return err
@@ -1027,6 +1069,9 @@ func foreachIncrementalObjectWithStats(
 		localStats.scan += time.Since(scanStart)
 		observePrePrepareObjectScan(tableID, isTombstone, group, localStats.metrics)
 		observeIncrementalObjectGroupScanStats(isTombstone, group, *localStats)
+		if collectPrePrepareMetrics {
+			logPrePrepareObjectGroupStats(tableID, isTombstone, group, from, to, *localStats)
+		}
 		mergeStats(&stats, localStats)
 		return err
 	}
