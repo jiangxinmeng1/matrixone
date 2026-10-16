@@ -187,6 +187,7 @@ func initTxnMetrics() {
 	registry.MustRegister(TxnLockRPCQueueRejectCounter)
 	registry.MustRegister(txnPKChangeCheckCounter)
 	registry.MustRegister(txnPKMayBeChangedCounter)
+	registry.MustRegister(TxnTNPrePrepareObjectScanCounter)
 
 	registry.MustRegister(txnQueueSizeGauge)
 	registry.MustRegister(TxnDeadlockDetectorQueueDepthGauge)

@@ -159,6 +159,17 @@ var (
 	TxnPKMayBeChangedMemHitCounter        = txnPKMayBeChangedCounter.WithLabelValues("mem_hit")
 	TxnPKMayBeChangedMemNotFlushedCounter = txnPKMayBeChangedCounter.WithLabelValues("mem_not_flushed")
 	TxnPKMayBeChangedPersistedCounter     = txnPKMayBeChangedCounter.WithLabelValues("persisted")
+
+	// TxnTNPrePrepareObjectScanCounter counts object-list entries visited by
+	// the serialized PrePrepare dedup path. Freeze scans are excluded by the
+	// caller so this metric can be compared directly with queue work.
+	TxnTNPrePrepareObjectScanCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "mo",
+			Subsystem: "txn",
+			Name:      "tn_preprepare_object_scan_total",
+			Help:      "Object-list entries visited and selected by TN PrePrepare dedup.",
+		}, []string{"type", "group", "result"})
 )
 
 var (

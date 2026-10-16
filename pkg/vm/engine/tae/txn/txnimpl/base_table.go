@@ -24,6 +24,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
@@ -348,56 +349,65 @@ func (tbl *baseTable) getRowsByPK(ctx context.Context, pks containers.Vector) (r
 /*
 similar to findDeletes
 */
-func foreachIncrementalObject(
-	it *btree.IterG[*catalog.ObjectEntry],
-	from, to types.TS,
-	fn func(*catalog.ObjectEntry) error,
-) error {
+func incrementalObjectGroupName(group catalog.ObjectListGroup) string {
+	switch group {
+	case catalog.ObjectListGroupAppendableCreate:
+		return "appendable_create"
+	case catalog.ObjectListGroupAppendableCreateWithDrop:
+		return "appendable_create_with_drop"
+	case catalog.ObjectListGroupAppendableDrop:
+		return "appendable_drop"
+	case catalog.ObjectListGroupNonAppendableCreate:
+		return "non_appendable_create"
+	case catalog.ObjectListGroupNonAppendableCreateWithDrop:
+		return "non_appendable_create_with_drop"
+	case catalog.ObjectListGroupNonAppendableDrop:
+		return "non_appendable_drop"
+	default:
+		return "unknown"
+	}
+}
+
+func observePrePrepareObjectScan(typ string, group catalog.ObjectListGroup, result string) {
+	v2.TxnTNPrePrepareObjectScanCounter.WithLabelValues(typ, incrementalObjectGroupName(group), result).Inc()
+}
+
+/*
+similar to findDeletes
+*/
+func foreachIncrementalObject(it *btree.IterG[*catalog.ObjectEntry], from, to types.TS, fn func(*catalog.ObjectEntry) error) error {
+	return foreachIncrementalObjectWithMetrics(it, from, to, false, "", fn)
+}
+
+func foreachIncrementalObjectWithMetrics(it *btree.IterG[*catalog.ObjectEntry], from, to types.TS, collectMetrics bool, typ string, fn func(*catalog.ObjectEntry) error) error {
 	visit := func(obj *catalog.ObjectEntry, appendable bool) error {
-		if obj.CreatedAt.GT(&to) || (!appendable && obj.CreatedAt.LT(&from)) || !obj.VisibleByTS(to) {
-			return nil
-		}
+		if collectMetrics { observePrePrepareObjectScan(typ, obj.ObjectListGroup(), "visited") }
+		if obj.CreatedAt.GT(&to) || (!appendable && obj.CreatedAt.LT(&from)) || !obj.VisibleByTS(to) { return nil }
+		if collectMetrics { observePrePrepareObjectScan(typ, obj.ObjectListGroup(), "selected") }
 		return fn(obj)
 	}
 	if catalog.SeekObjectListGroupBefore(it, catalog.ObjectListGroupAppendableCreate, from) {
-		if err := visit(it.Item(), true); err != nil {
-			return err
-		}
+		if err := visit(it.Item(), true); err != nil { return err }
 	}
 	for ok := catalog.SeekObjectListGroup(it, catalog.ObjectListGroupAppendableCreate, from); ok; ok = it.Next() {
 		obj := it.Item()
-		if obj.ObjectListGroup() != catalog.ObjectListGroupAppendableCreate || obj.CreatedAt.GT(&to) {
-			break
-		}
-		if err := visit(obj, true); err != nil {
-			return err
-		}
+		if obj.ObjectListGroup() != catalog.ObjectListGroupAppendableCreate || obj.CreatedAt.GT(&to) { break }
+		if err := visit(obj, true); err != nil { return err }
 	}
 	visitDropGroup := func(group catalog.ObjectListGroup) error {
 		appendable := group == catalog.ObjectListGroupAppendableDrop
 		for ok := catalog.SeekObjectListGroup(it, group, to); ok; ok = it.Next() {
 			obj := it.Item()
-			if obj.ObjectListGroup() != group {
-				break
-			}
-			if err := visit(obj, appendable); err != nil {
-				return err
-			}
+			if obj.ObjectListGroup() != group { break }
+			if err := visit(obj, appendable); err != nil { return err }
 		}
 		return nil
 	}
-	if err := visitDropGroup(catalog.ObjectListGroupAppendableDrop); err != nil {
-		return err
-	}
-
+	if err := visitDropGroup(catalog.ObjectListGroupAppendableDrop); err != nil { return err }
 	for ok := catalog.SeekObjectListGroup(it, catalog.ObjectListGroupNonAppendableCreate, from); ok; ok = it.Next() {
 		obj := it.Item()
-		if obj.ObjectListGroup() != catalog.ObjectListGroupNonAppendableCreate || obj.CreatedAt.GT(&to) {
-			break
-		}
-		if err := visit(obj, false); err != nil {
-			return err
-		}
+		if obj.ObjectListGroup() != catalog.ObjectListGroupNonAppendableCreate || obj.CreatedAt.GT(&to) { break }
+		if err := visit(obj, false); err != nil { return err }
 	}
 	return visitDropGroup(catalog.ObjectListGroupNonAppendableDrop)
 }
@@ -430,7 +440,9 @@ func (tbl *baseTable) incrementalGetRowsByPK(ctx context.Context, pks containers
 		pks.Length(),
 		common.WorkspaceAllocator,
 	)
-	err = foreachIncrementalObject(&objIt, from, to, func(obj *catalog.ObjectEntry) error {
+	typ := "data"
+	if tbl.isTombstone { typ = "tombstone" }
+	err = foreachIncrementalObjectWithMetrics(&objIt, from, to, inQueue, typ, func(obj *catalog.ObjectEntry) error {
 		if isEmptyDroppedAppendableObject(obj) {
 			return nil
 		}
