@@ -13135,7 +13135,6 @@ func testConcurrentUpdateByPreviousRowIDWithFlushMergeDuration(
 					errC <- fmt.Errorf("background flush returned duplicate: %w", err)
 					return
 				}
-				continue
 			case <-mergeTicker.C:
 			}
 
