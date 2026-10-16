@@ -27,7 +27,7 @@ var (
 	concurrentUpdateMergeInterval = 250 * time.Millisecond
 )
 
-func TestConcurrentUpdateByPreviousRowIDWithFastFlushMerge5Min(t *testing.T) {
+func TestConcurrentUpdateByPreviousRowIDWithFastFlushMerge10Min(t *testing.T) {
 	oldFlushInterval := concurrentUpdateFlushInterval
 	oldMergeInterval := concurrentUpdateMergeInterval
 	concurrentUpdateFlushInterval = time.Millisecond
@@ -38,6 +38,6 @@ func TestConcurrentUpdateByPreviousRowIDWithFastFlushMerge5Min(t *testing.T) {
 	}()
 
 	testConcurrentUpdateByPreviousRowIDWithFlushMergeDuration(
-		t, 128, 128, 0, 5*time.Minute,
+		t, 128, 128, 0, 10*time.Minute,
 	)
 }
