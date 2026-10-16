@@ -13028,19 +13028,34 @@ func TestConcurrentUpdateByPreviousRowIDWithFlushMerge(t *testing.T) {
 	testConcurrentUpdateByPreviousRowIDWithFlushMerge(t, 32, 32, 40)
 }
 
+// TestConcurrentUpdateByPreviousRowIDWithFlushMerge10Min is the long-running
+// queue-pressure variant used for performance checks.  Each worker owns one
+// PK, so updates for one PK remain serial while all 128 PKs run concurrently.
+func TestConcurrentUpdateByPreviousRowIDWithFlushMerge10Min(t *testing.T) {
+	testConcurrentUpdateByPreviousRowIDWithFlushMergeDuration(t, 128, 128, 0, 10*time.Minute)
+}
+
 func testConcurrentUpdateByPreviousRowIDWithFlushMerge(
 	t *testing.T, keyCount, workerCount, updatesPerWorker int,
 ) {
+	testConcurrentUpdateByPreviousRowIDWithFlushMergeDuration(t, keyCount, workerCount, updatesPerWorker, 0)
+}
+
+func testConcurrentUpdateByPreviousRowIDWithFlushMergeDuration(
+	t *testing.T, keyCount, workerCount, updatesPerWorker int, runDuration time.Duration,
+) {
 	defer testutils.AfterTest(t)()
 	testutils.EnsureNoLeak(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	timeout := 3 * time.Minute
+	if runDuration > 0 {
+		timeout = runDuration + 2*time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	const maxAttemptsPerTxn = 1000
-	const (
-		flushInterval = 10 * time.Millisecond
-		mergeInterval = 250 * time.Millisecond
-	)
+	flushInterval := concurrentUpdateFlushInterval
+	mergeInterval := concurrentUpdateMergeInterval
 
 	opts := config.WithLongScanAndCKPOpts(nil)
 	tae := testutil.NewTestEngine(ctx, ModuleName, t, opts)
@@ -13095,6 +13110,8 @@ func testConcurrentUpdateByPreviousRowIDWithFlushMerge(
 	var flushCount atomic.Uint64
 	var mergeCount atomic.Uint64
 	var commitTombstoneDuplicateCount atomic.Uint64
+	var committedCount atomic.Uint64
+	var attemptCount atomic.Uint64
 	errC := make(chan error, workerCount+1)
 	stopMaintenance := make(chan struct{})
 	var maintenanceWG sync.WaitGroup
@@ -13158,6 +13175,34 @@ func testConcurrentUpdateByPreviousRowIDWithFlushMerge(
 		}
 	}()
 
+	var progressWG sync.WaitGroup
+	stopProgress := make(chan struct{})
+	if runDuration > 0 {
+		progressWG.Add(1)
+		go func() {
+			defer progressWG.Done()
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			var lastCommitted, lastAttempts uint64
+			var elapsed time.Duration
+			for {
+				select {
+				case <-stopProgress:
+					return
+				case <-ticker.C:
+					elapsed += time.Minute
+					committed := committedCount.Load()
+					attempts := attemptCount.Load()
+					t.Logf("[LONG-UPDATE-PROGRESS] elapsed=%s committed=%d committed-last-minute=%d attempts=%d attempts-last-minute=%d flushes=%d merges=%d tombstone-duplicate-retries=%d",
+						elapsed, committed, committed-lastCommitted, attempts, attempts-lastAttempts,
+						flushCount.Load(), mergeCount.Load(), commitTombstoneDuplicateCount.Load())
+					lastCommitted = committed
+					lastAttempts = attempts
+				}
+			}
+		}()
+	}
+
 	var workersWG sync.WaitGroup
 	workersWG.Add(workerCount)
 	for worker := 0; worker < workerCount; worker++ {
@@ -13166,9 +13211,17 @@ func testConcurrentUpdateByPreviousRowIDWithFlushMerge(
 			defer workersWG.Done()
 			key := worker % keyCount
 			pk := keyBatches[key].Vecs[schema.GetSingleSortKeyIdx()].Get(0)
-			for update := 0; update < updatesPerWorker; update++ {
+			deadline := time.Time{}
+			if runDuration > 0 {
+				deadline = time.Now().Add(runDuration)
+			}
+			for update := 0; updatesPerWorker == 0 || update < updatesPerWorker; update++ {
+				if !deadline.IsZero() && time.Now().After(deadline) {
+					break
+				}
 				committed := false
 				for attempt := 0; attempt < maxAttemptsPerTxn; attempt++ {
+					attemptCount.Add(1)
 					txn, rel, err := openRelation()
 					if err != nil {
 						errC <- fmt.Errorf("worker %d update %d open relation: %w", worker, update, err)
@@ -13201,6 +13254,7 @@ func testConcurrentUpdateByPreviousRowIDWithFlushMerge(
 					}
 					if err == nil {
 						committed = true
+						committedCount.Add(1)
 						break
 					}
 					if moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry) {
@@ -13237,6 +13291,10 @@ func testConcurrentUpdateByPreviousRowIDWithFlushMerge(
 	workersWG.Wait()
 	close(stopMaintenance)
 	maintenanceWG.Wait()
+	if runDuration > 0 {
+		close(stopProgress)
+		progressWG.Wait()
+	}
 	close(errC)
 	for err := range errC {
 		require.NoError(t, err)
