@@ -13135,42 +13135,11 @@ func testConcurrentUpdateByPreviousRowIDWithFlushMergeDuration(
 					errC <- fmt.Errorf("background flush returned duplicate: %w", err)
 					return
 				}
+				continue
 			case <-mergeTicker.C:
 			}
-
-			txn, rel, err := openRelation()
-			if err != nil {
-				continue
-			}
-			objects := make([]*catalog.ObjectEntry, 0, 8)
-			it := rel.MakeObjectIt(false)
-			for it.Next() {
-				obj := it.GetObject().GetMeta().(*catalog.ObjectEntry)
-				if !obj.IsAppendable() {
-					objects = append(objects, obj)
-				}
-			}
-			it.Close()
-			if len(objects) < 2 {
-				_ = txn.Rollback(context.Background())
-				continue
-			}
-			objects = objects[:2]
-			task, err := jobs.NewMergeObjectsTask(nil, txn, objects, tae.Runtime, 0, false)
-			if err == nil {
-				err = task.OnExec(ctx)
-			}
-			if err == nil {
-				err = txn.Commit(ctx)
-			} else {
-				_ = txn.Rollback(context.Background())
-			}
-			if err == nil {
-				mergeCount.Add(1)
-			} else if moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry) {
-				errC <- fmt.Errorf("background merge returned duplicate: %w", err)
-				return
-			}
+			tae.MergeBlocks(true)
+			mergeCount.Add(1)
 		}
 	}()
 
