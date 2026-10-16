@@ -18,6 +18,7 @@ import (
 	"context"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -684,45 +685,118 @@ func observeIncrementalObjectGroupScanStats(
 	}
 }
 
-// logPrePrepareObjectGroupStats prints one summary per ObjectList group.  The
-// result is intentionally based on the local counters, so it distinguishes
-// entries merely visited from objects that actually reached GetDuplicatedRows.
-// Keep this at group granularity; logging every object would distort the
-// queue timings that this diagnostic is meant to explain.
-func logPrePrepareObjectGroupStats(
+// prePrepareObjectLogStats is an in-memory aggregation bucket for one table,
+// object type, and ObjectList group.  It is deliberately independent from the
+// Prometheus counters: the latter are permanent process counters, while this
+// state is periodically swapped to produce a bounded diagnostic window.
+type prePrepareObjectLogStats struct {
+	calls  atomic.Uint64
+	counts [2][objectScanResultCount]atomic.Uint64
+}
+
+type prePrepareObjectLogSnapshot struct {
+	calls  uint64
+	counts [2][objectScanResultCount]uint64
+}
+
+func (s *prePrepareObjectLogStats) add(counts objectScanMetricCounts) {
+	s.calls.Add(1)
+	for kind := range counts.counts {
+		for result, count := range counts.counts[kind] {
+			if count != 0 {
+				s.counts[kind][result].Add(count)
+			}
+		}
+	}
+}
+
+func (s *prePrepareObjectLogStats) snapshotAndReset() prePrepareObjectLogSnapshot {
+	var snapshot prePrepareObjectLogSnapshot
+	snapshot.calls = s.calls.Swap(0)
+	for kind := range s.counts {
+		for result := range s.counts[kind] {
+			snapshot.counts[kind][result] = s.counts[kind][result].Swap(0)
+		}
+	}
+	return snapshot
+}
+
+type prePrepareObjectLogKey struct {
+	tableID     uint64
+	isTombstone bool
+	group       catalog.ObjectListGroup
+}
+
+var (
+	prePrepareObjectLogBuckets sync.Map
+	prePrepareObjectLogOnce    sync.Once
+)
+
+func startPrePrepareObjectLogReporter() {
+	prePrepareObjectLogOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				flushPrePrepareObjectLogStats()
+			}
+		}()
+	})
+}
+
+func flushPrePrepareObjectLogStats() {
+	prePrepareObjectLogBuckets.Range(func(key, value any) bool {
+		bucket := value.(*prePrepareObjectLogStats)
+		snapshot := bucket.snapshotAndReset()
+		if snapshot.calls == 0 {
+			return true
+		}
+		k := key.(prePrepareObjectLogKey)
+		typeName := "data"
+		if k.isTombstone {
+			typeName = "tombstone"
+		}
+		naobject := snapshot.counts[1]
+		aobject := snapshot.counts[0]
+		logutil.Infof(
+			"[PrePrepareDedupObjectScan] window=10s table=%d type=%s group=%s calls=%d "+
+				"naobject_visited=%d naobject_selected=%d naobject_created_after_to=%d "+
+				"naobject_deleted_at_or_before_from=%d naobject_not_visible_at_to=%d "+
+				"aobject_visited=%d aobject_selected=%d",
+			k.tableID,
+			typeName,
+			incrementalObjectGroupName(k.group),
+			snapshot.calls,
+			naobject[objectScanVisited],
+			naobject[objectScanGetDuplicatedRows],
+			naobject[objectScanCreatedAfterTo],
+			naobject[objectScanDeletedAtOrBeforeFrom],
+			naobject[objectScanNotVisibleAtTo],
+			aobject[objectScanVisited],
+			aobject[objectScanGetDuplicatedRows],
+		)
+		return true
+	})
+}
+
+// recordPrePrepareObjectGroupStats records one group in memory.  Logging is
+// intentionally deferred to the 10-second reporter so the PrePrepare queue
+// does not perform an Info log for every transaction/group.
+func recordPrePrepareObjectGroupStats(
 	tableID uint64,
 	isTombstone bool,
 	group catalog.ObjectListGroup,
-	from, to types.TS,
 	stats incrementalObjectScanStats,
 ) {
-	typeName := "data"
-	if isTombstone {
-		typeName = "tombstone"
-	}
 	naobject := stats.metrics.counts[1]
 	aobject := stats.metrics.counts[0]
 	if naobject[objectScanVisited] == 0 && aobject[objectScanVisited] == 0 {
 		return
 	}
-	logutil.Infof(
-		"[PrePrepareDedupObjectScan] table=%d type=%s group=%s from=%s to=%s "+
-			"naobject_visited=%d naobject_selected=%d naobject_created_after_to=%d "+
-			"naobject_deleted_at_or_before_from=%d naobject_not_visible_at_to=%d "+
-			"aobject_visited=%d aobject_selected=%d",
-		tableID,
-		typeName,
-		incrementalObjectGroupName(group),
-		from.ToString(),
-		to.ToString(),
-		naobject[objectScanVisited],
-		naobject[objectScanGetDuplicatedRows],
-		naobject[objectScanCreatedAfterTo],
-		naobject[objectScanDeletedAtOrBeforeFrom],
-		naobject[objectScanNotVisibleAtTo],
-		aobject[objectScanVisited],
-		aobject[objectScanGetDuplicatedRows],
-	)
+	startPrePrepareObjectLogReporter()
+	key := prePrepareObjectLogKey{tableID: tableID, isTombstone: isTombstone, group: group}
+	bucketValue, _ := prePrepareObjectLogBuckets.LoadOrStore(key, &prePrepareObjectLogStats{})
+	bucketValue.(*prePrepareObjectLogStats).add(stats.metrics)
 }
 
 func maxDuration(left, right time.Duration) time.Duration {
@@ -1000,7 +1074,7 @@ func foreachIncrementalObjectWithStats(
 		if collectPrePrepareMetrics {
 			observePrePrepareObjectScan(tableID, isTombstone, group, localStats.metrics)
 			observeIncrementalObjectGroupScanStats(isTombstone, group, *localStats)
-			logPrePrepareObjectGroupStats(tableID, isTombstone, group, from, to, *localStats)
+			recordPrePrepareObjectGroupStats(tableID, isTombstone, group, *localStats)
 		}
 		mergeStats(&stats, localStats)
 		return err
@@ -1070,7 +1144,7 @@ func foreachIncrementalObjectWithStats(
 		observePrePrepareObjectScan(tableID, isTombstone, group, localStats.metrics)
 		observeIncrementalObjectGroupScanStats(isTombstone, group, *localStats)
 		if collectPrePrepareMetrics {
-			logPrePrepareObjectGroupStats(tableID, isTombstone, group, from, to, *localStats)
+			recordPrePrepareObjectGroupStats(tableID, isTombstone, group, *localStats)
 		}
 		mergeStats(&stats, localStats)
 		return err
