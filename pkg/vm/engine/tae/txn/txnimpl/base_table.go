@@ -692,12 +692,22 @@ func observeIncrementalObjectGroupScanStats(
 type prePrepareObjectLogStats struct {
 	calls  atomic.Uint64
 	counts [2][objectScanResultCount]atomic.Uint64
+
+	// Keep the per-scan selected NAObject distribution in a fixed atomic
+	// histogram.  This is updated on the PrePrepare hot path without a map,
+	// allocation, or lock.  The reporter snapshots it every 10 seconds.
+	naobjectSelected         [prePrepareNAObjectHistogramSize]atomic.Uint64
+	naobjectSelectedOverflow atomic.Uint64
 }
 
 type prePrepareObjectLogSnapshot struct {
-	calls  uint64
-	counts [2][objectScanResultCount]uint64
+	calls                    uint64
+	counts                   [2][objectScanResultCount]uint64
+	naobjectSelected         [prePrepareNAObjectHistogramSize]uint64
+	naobjectSelectedOverflow uint64
 }
+
+const prePrepareNAObjectHistogramSize = 256
 
 func (s *prePrepareObjectLogStats) add(counts objectScanMetricCounts) {
 	s.calls.Add(1)
@@ -707,6 +717,12 @@ func (s *prePrepareObjectLogStats) add(counts objectScanMetricCounts) {
 				s.counts[kind][result].Add(count)
 			}
 		}
+	}
+	selected := counts.counts[1][objectScanGetDuplicatedRows]
+	if selected < prePrepareNAObjectHistogramSize {
+		s.naobjectSelected[selected].Add(1)
+	} else {
+		s.naobjectSelectedOverflow.Add(1)
 	}
 }
 
@@ -718,6 +734,10 @@ func (s *prePrepareObjectLogStats) snapshotAndReset() prePrepareObjectLogSnapsho
 			snapshot.counts[kind][result] = s.counts[kind][result].Swap(0)
 		}
 	}
+	for count := range s.naobjectSelected {
+		snapshot.naobjectSelected[count] = s.naobjectSelected[count].Swap(0)
+	}
+	snapshot.naobjectSelectedOverflow = s.naobjectSelectedOverflow.Swap(0)
 	return snapshot
 }
 
@@ -725,6 +745,60 @@ type prePrepareObjectLogKey struct {
 	tableID     uint64
 	isTombstone bool
 	group       catalog.ObjectListGroup
+}
+
+type prePrepareNAObjectDistributionEntry struct {
+	tableID       uint64
+	isTombstone   bool
+	group         catalog.ObjectListGroup
+	naobjectCount int
+	occurrences   uint64
+}
+
+func isHigherNAObjectDistributionEntry(
+	left, right prePrepareNAObjectDistributionEntry,
+) bool {
+	if left.naobjectCount != right.naobjectCount {
+		return left.naobjectCount > right.naobjectCount
+	}
+	if left.occurrences != right.occurrences {
+		return left.occurrences > right.occurrences
+	}
+	if left.tableID != right.tableID {
+		return left.tableID < right.tableID
+	}
+	if left.isTombstone != right.isTombstone {
+		return !left.isTombstone
+	}
+	return left.group < right.group
+}
+
+func addNAObjectDistributionTop(
+	top []prePrepareNAObjectDistributionEntry,
+	entry prePrepareNAObjectDistributionEntry,
+) []prePrepareNAObjectDistributionEntry {
+	insertAt := len(top)
+	for i := range top {
+		if isHigherNAObjectDistributionEntry(entry, top[i]) {
+			insertAt = i
+			break
+		}
+	}
+	if insertAt == len(top) && len(top) == 10 {
+		return top
+	}
+	if len(top) < 10 {
+		top = append(top, prePrepareNAObjectDistributionEntry{})
+	}
+	last := len(top) - 1
+	if last > 9 {
+		last = 9
+	}
+	for i := last; i > insertAt; i-- {
+		top[i] = top[i-1]
+	}
+	top[insertAt] = entry
+	return top
 }
 
 var (
@@ -745,6 +819,7 @@ func startPrePrepareObjectLogReporter() {
 }
 
 func flushPrePrepareObjectLogStats() {
+	var top []prePrepareNAObjectDistributionEntry
 	prePrepareObjectLogBuckets.Range(func(key, value any) bool {
 		bucket := value.(*prePrepareObjectLogStats)
 		snapshot := bucket.snapshotAndReset()
@@ -775,8 +850,46 @@ func flushPrePrepareObjectLogStats() {
 			aobject[objectScanVisited],
 			aobject[objectScanGetDuplicatedRows],
 		)
+		for naobjectCount := 1; naobjectCount < len(snapshot.naobjectSelected); naobjectCount++ {
+			occurrences := snapshot.naobjectSelected[naobjectCount]
+			if occurrences == 0 {
+				continue
+			}
+			top = addNAObjectDistributionTop(top, prePrepareNAObjectDistributionEntry{
+				tableID:       k.tableID,
+				isTombstone:   k.isTombstone,
+				group:         k.group,
+				naobjectCount: naobjectCount,
+				occurrences:   occurrences,
+			})
+		}
+		if snapshot.naobjectSelectedOverflow != 0 {
+			top = addNAObjectDistributionTop(top, prePrepareNAObjectDistributionEntry{
+				tableID:       k.tableID,
+				isTombstone:   k.isTombstone,
+				group:         k.group,
+				naobjectCount: prePrepareNAObjectHistogramSize,
+				occurrences:   snapshot.naobjectSelectedOverflow,
+			})
+		}
 		return true
 	})
+	for rank, entry := range top {
+		typeName := "data"
+		if entry.isTombstone {
+			typeName = "tombstone"
+		}
+		logutil.Infof(
+			"[PrePrepareDedupNAObjectTop] window=10s rank=%d table=%d type=%s group=%s "+
+				"naobject_selected_count=%d occurrences=%d",
+			rank+1,
+			entry.tableID,
+			typeName,
+			incrementalObjectGroupName(entry.group),
+			entry.naobjectCount,
+			entry.occurrences,
+		)
+	}
 }
 
 // recordPrePrepareObjectGroupStats records one group in memory.  Logging is
