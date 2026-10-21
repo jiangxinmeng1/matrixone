@@ -39,10 +39,6 @@ func AddColumn(
 
 	tableDef := alterPlan.CopyTableDef
 
-	if len(tableDef.Cols) == TableColumnCountLimit {
-		return false, moerr.NewErrTooManyFields(ctx.GetContext())
-	}
-
 	specNewColumn := spec.Column
 	// Check whether added column has existed.
 	newColName := specNewColumn.Name.ColName()
@@ -56,12 +52,11 @@ func AddColumn(
 			"column name %s is reserved for external table scans", newColName)
 	}
 
-	colType, err := getTypeFromAst(ctx.GetContext(), specNewColumn.Type)
+	colType, err := getColumnTypeFromAst(ctx.GetContext(), specNewColumn, tableDef.DefaultCharset, nil)
 	if err != nil {
 		return false, err
 	}
-	colType.Charset = uint32(types.CharsetType(types.T(colType.Id)))
-	if err = applyDefaultAndColumnAttributesToType(ctx.GetContext(), &colType, tableDef.DefaultCharset, specNewColumn.Attributes); err != nil {
+	if err = requireMediumIntProtocolForAuthoring(ctx.GetContext(), ctx.GetProcess(), colType); err != nil {
 		return false, err
 	}
 	if err = checkTypeCapSize(ctx.GetContext(), &colType, newColName); err != nil {
@@ -168,17 +163,7 @@ func buildAddColumnAndConstraint(ctx CompilerContext, alterPlan *plan.AlterTable
 			if err != nil {
 				return nil, err
 			}
-			uniqueIndex := &tree.UniqueIndex{
-				KeyParts: []*tree.KeyPart{{ColName: specNewColumn.Name}},
-			}
-
-			constrNames := map[string]bool{}
-			// Check not empty constraint name whether is duplicated.
-			for _, idx := range alterPlan.CopyTableDef.Indexes {
-				constrNames[indexNameKey(idx.IndexName)] = true
-			}
-			// set empty constraint names(index and unique index)
-			setEmptyUniqueIndexName(constrNames, uniqueIndex)
+			uniqueIndex := newAlterColumnUniqueIndex(alterPlan.CopyTableDef, specNewColumn)
 
 			indexDef, err := checkAddColumWithUniqueKey(ctx.GetContext(), alterPlan.CopyTableDef, uniqueIndex)
 			if err != nil {
@@ -285,6 +270,9 @@ func checkTypeCapSize(ctx context.Context, ty *plan.Type, name string) error {
 }
 
 func checkPrimaryKeyPartType(ctx context.Context, colType plan.Type, columnName string) error {
+	if err := rejectNativeUnicodePrimaryKey(ctx, colType, columnName); err != nil {
+		return err
+	}
 	if colType.GetId() == int32(types.T_blob) {
 		return moerr.NewNotSupported(ctx, "blob type in primary key")
 	}
@@ -310,6 +298,9 @@ func checkPrimaryKeyPartType(ctx context.Context, colType plan.Type, columnName 
 }
 
 func checkUniqueKeyPartType(ctx context.Context, colType plan.Type, columnName string) error {
+	if err := rejectNativeUnicodeUniqueKey(ctx, colType, columnName); err != nil {
+		return err
+	}
 	if colType.GetId() == int32(types.T_blob) {
 		return moerr.NewNotSupported(ctx, "blob type in primary key")
 	}
@@ -407,6 +398,7 @@ func DropColumn(
 	alterPlan *plan.AlterTable,
 	colName string,
 	alterCtx *AlterTableContext,
+	preserveIndexes bool,
 ) (bool, error) {
 
 	tableDef := alterPlan.CopyTableDef
@@ -416,8 +408,13 @@ func DropColumn(
 		return false, moerr.NewErrCantDropFieldOrKey(ctx.GetContext(), colName)
 	}
 
-	// We only support dropping column with single-value none Primary Key index covered now.
-	if err := handleDropColumnWithIndex(ctx.GetContext(), colName, tableDef); err != nil {
+	// A replacement keeps index bindings, but never the dropped column's source
+	// mapping. Genuine removals retain the existing index cleanup authority.
+	if preserveIndexes {
+		if err := validateFunctionalTable(ctx.GetContext(), tableDef); err != nil {
+			return column.Primary, err
+		}
+	} else if err := handleDropColumnWithIndex(ctx.GetContext(), colName, tableDef); err != nil {
 		return column.Primary, err
 	}
 	if err := handleDropColumnWithPrimaryKey(ctx.GetContext(), colName, tableDef); err != nil {
@@ -562,7 +559,9 @@ func handleDropColumnWithIndex(ctx context.Context, colName string, tbInfo *Tabl
 }
 
 func handleDropColumnWithPrimaryKey(ctx context.Context, colName string, tbInfo *TableDef) error {
-	if tbInfo.Pkey != nil && tbInfo.Pkey.PkeyColName == catalog.FakePrimaryKeyColName {
+	// DROP PRIMARY KEY in an earlier action of the same ALTER leaves Pkey nil.
+	// Dropping a different column must not dereference that removed key.
+	if tbInfo.Pkey == nil || tbInfo.Pkey.PkeyColName == catalog.FakePrimaryKeyColName {
 		return nil
 	} else {
 		tbInfo.Pkey.Names = RemoveIf[string](tbInfo.Pkey.Names, func(t string) bool {

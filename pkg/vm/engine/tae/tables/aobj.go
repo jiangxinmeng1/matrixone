@@ -50,7 +50,8 @@ func newAObject(
 ) *aobject {
 	obj := &aobject{}
 	obj.baseObject = newBaseObject(obj, meta, rt)
-	if meta.IsForcePNode() || obj.meta.Load().HasDropCommitted() {
+	dropped := meta.HasDropCommitted()
+	if (meta.IsForcePNode() || dropped) && !isUnwrittenAppendable(meta) {
 		// A recovered persisted object does not carry the complete in-memory
 		// AppendNode history. Its max commit bound must remain unknown.
 		obj.appendMVCC.MarkAppendHistoryIncomplete()
@@ -59,7 +60,6 @@ func newAObject(
 		node := NewNode(pnode)
 		node.Ref()
 		obj.node.Store(node)
-		obj.FreezeAppend()
 	} else {
 		mnode := newMemoryNode(obj.baseObject, isTombstone)
 		node := NewNode(mnode)
@@ -68,6 +68,11 @@ func newAObject(
 		// A live aobject has no safe prefix bound until it is sealed and all
 		// of its AppendNodes are terminal.
 		meta.MarkAppendMaxPending()
+	}
+	if dropped || meta.IsForcePNode() {
+		// Replayed empty shells still have no file and must stay in memory,
+		// but their committed drop must never allow another append.
+		obj.FreezeAppend()
 	}
 	rows, _ := obj.Rows()
 	obj.reserved.Store(uint32(rows))
@@ -202,25 +207,15 @@ func (obj *aobject) GetDuplicatedRows(
 	node := obj.PinNode()
 	defer node.Unref()
 	if !node.IsPersisted() {
-		// Build the prepare-range selection from the immutable COW snapshot
-		// before GetDuplicatedRows takes the object lock for ART and conflict
-		// checks. PrePrepare assigns/publishes predecessor PrepareTS values in
-		// the same serialized worker before this read; later active appends are
-		// still handled by the newest-owner conflict check under the lock.
-		selection, snapshot := obj.appendMVCC.GetRowSelectionAfterWithSnapshot(from, to)
-		fn := func() (index.RowSelection, error) {
-			// PrepareCommit also takes the object lock. If it published a new
-			// snapshot between the lock-free traversal above and this callback,
-			// rebuild from the now-stable snapshot while holding the lock.
-			if !obj.appendMVCC.IsPrepareSnapshotCurrent(snapshot) {
-				return obj.appendMVCC.GetRowSelectionAfter(from, to), nil
-			}
-			return selection, nil
-		}
-		return node.GetDuplicatedRows(
+		// Check the PK ART first.  Only candidate RowIDs returned by the ART
+		// need an AppendNode visibility check; do not build a full-object
+		// RowSelection and holes bitmap for every dedup request.
+		mnode := node.NodeT.(*memoryNode)
+		return mnode.GetDuplicatedRowsByRowVisibility(
 			ctx,
 			txn,
-			fn,
+			from,
+			to,
 			keys,
 			keysZM,
 			rowIDs,

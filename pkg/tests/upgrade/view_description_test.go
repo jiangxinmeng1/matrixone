@@ -25,6 +25,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/bootstrap/versions"
 	"github.com/matrixorigin/matrixone/pkg/bootstrap/versions/v4_0_10"
+	"github.com/matrixorigin/matrixone/pkg/bootstrap/versions/v4_0_14"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/embed"
@@ -42,29 +43,53 @@ func openViewDescriptionDB(t *testing.T, port int64, user string) *sql.DB {
 	return db
 }
 
+func cleanupViewDescriptionSQL(t *testing.T, db *sql.DB, query string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	_, err := db.ExecContext(ctx, query)
+	if err != nil {
+		t.Errorf("view description cleanup %q: %v", query, err)
+	}
+}
+
 func TestViewDescriptionPublicSQL(t *testing.T) {
 	embed.RunSingleCNBaseClusterTests(t, func(cluster embed.Cluster) {
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		defer cancel()
+		setupCtx, setupCancel := context.WithTimeout(t.Context(), 90*time.Second)
+		defer setupCancel()
 		cn, err := cluster.GetCNService(0)
 		require.NoError(t, err)
 		db := openViewDescriptionDB(t, cn.GetServiceConfig().CN.Frontend.Port, "dump:111")
 		var viewName, viewDDL, charset, collation string
-		require.NoError(t, db.QueryRowContext(ctx, "show create view information_schema.columns").Scan(
+		require.NoError(t, db.QueryRowContext(setupCtx, "show create view information_schema.columns").Scan(
 			&viewName, &viewDDL, &charset, &collation))
 		require.Equal(t, "columns", viewName)
 		require.Contains(t, strings.ToLower(viewDDL), "__mo_visible_subscription_views")
 		require.Equal(t, "utf8mb4", charset)
 		require.Equal(t, "utf8mb4_general_ci", collation)
-		exec := func(q string) { t.Helper(); _, err := db.ExecContext(ctx, q); require.NoError(t, err, q) }
-		exec("create database view_description_test")
-		defer exec("drop database view_description_test")
-		t.Run("SHOW target replacement", func(t *testing.T) {
+		_, err = db.ExecContext(setupCtx, "create database view_description_test")
+		require.NoError(t, err)
+		defer cleanupViewDescriptionSQL(t, db, "drop database view_description_test")
+		setupCancel()
+		// Each phase owns its budget. A successful subtest (including its
+		// cleanup) must not consume the next phase's execution context.
+		if !t.Run("SHOW target replacement", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+			defer cancel()
 			testShowColumnsTargetReplacement(t, ctx, db)
-		})
-		t.Run("current schema consumers", func(t *testing.T) {
+		}) {
+			return
+		}
+		if !t.Run("current schema consumers", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+			defer cancel()
 			testViewMetadataConsumers(t, ctx, db)
-		})
+		}) {
+			return
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+		defer cancel()
+		exec := func(q string) { t.Helper(); _, err := db.ExecContext(ctx, q); require.NoError(t, err, q) }
 		exec("create table view_description_test.src (x varchar(5), qty int not null default 7)")
 		exec("create view view_description_test.v as select x as label, qty from view_description_test.src")
 		describe := func(query string) [][]sql.NullString {
@@ -89,27 +114,27 @@ func TestViewDescriptionPublicSQL(t *testing.T) {
 		}
 		before := describe("desc view_description_test.v")
 		require.Len(t, before, 2)
-		require.Equal(t, "VARCHAR(5)", before[0][1].String)
+		require.Equal(t, "varchar(5)", before[0][1].String)
 		exec("alter table view_description_test.src modify column x varchar(60)")
 		exec("alter table view_description_test.src modify column qty bigint not null default 9")
 		after := describe("desc view_description_test.v")
 		require.Len(t, after, 2)
-		require.Equal(t, "VARCHAR(60)", after[0][1].String)
+		require.Equal(t, "varchar(60)", after[0][1].String)
 		require.Equal(t, "9", after[1][4].String)
 		require.Equal(t, "NO", after[1][2].String)
 		filtered := describe("show columns from view_description_test.v like 'label'")
 		require.Len(t, filtered, 1)
-		require.Equal(t, "VARCHAR(60)", filtered[0][1].String)
+		require.Equal(t, "varchar(60)", filtered[0][1].String)
 		filtered = describe("show columns from view_description_test.v where Field = 'qty'")
 		require.Len(t, filtered, 1)
 		require.Equal(t, "9", filtered[0][4].String)
 		full := describe("show full columns from view_description_test.v")
 		require.Len(t, full, 2)
-		require.Equal(t, "VARCHAR(60)", full[0][1].String)
+		require.Equal(t, "varchar(60)", full[0][1].String)
 		require.Equal(t, "9", full[1][5].String)
 		var stored string
 		require.NoError(t, db.QueryRowContext(ctx, "select mo_show_visible_bin(atttyp,3) from mo_catalog.mo_columns where att_database='view_description_test' and att_relname='v' and attname='label'").Scan(&stored))
-		require.Equal(t, "VARCHAR(5)", stored)
+		require.Equal(t, "varchar(5)", stored)
 		// A prepared SHOW must not retain the VALUES rows produced by its first bind.
 		showConn, err := db.Conn(ctx)
 		require.NoError(t, err)
@@ -136,7 +161,7 @@ func TestViewDescriptionPublicSQL(t *testing.T) {
 				require.Equal(t, want, got)
 				return firstType
 			}
-			require.Equal(t, "VARCHAR(60)", checkShow("label", "qty"))
+			require.Equal(t, "varchar(60)", checkShow("label", "qty"))
 			writer, err := db.Conn(ctx)
 			require.NoError(t, err)
 			defer writer.Close()
@@ -164,11 +189,11 @@ func TestViewDescriptionPublicSQL(t *testing.T) {
 				require.False(t, rows.Next())
 				require.NoError(t, rows.Err())
 			}
-			checkNested("VARCHAR(60)")
+			checkNested("varchar(60)")
 			_, err = writer.ExecContext(ctx, "alter table src modify column x varchar(70)")
 			require.NoError(t, err)
-			require.Equal(t, "VARCHAR(70)", checkShow("label", "qty"))
-			checkNested("VARCHAR(70)")
+			require.Equal(t, "varchar(70)", checkShow("label", "qty"))
+			checkNested("varchar(70)")
 			_, err = writer.ExecContext(ctx, "drop table src")
 			require.NoError(t, err)
 			func() {
@@ -181,7 +206,7 @@ func TestViewDescriptionPublicSQL(t *testing.T) {
 			}()
 			_, err = writer.ExecContext(ctx, "create table src (x varchar(60), qty bigint not null default 9)")
 			require.NoError(t, err)
-			require.Equal(t, "VARCHAR(60)", checkShow("label", "qty"))
+			require.Equal(t, "varchar(60)", checkShow("label", "qty"))
 		}()
 		exec("create table view_description_test.unrelated_source (x int)")
 		exec("create view view_description_test.unrelated_view as select x from view_description_test.unrelated_source")
@@ -195,7 +220,7 @@ func TestViewDescriptionPublicSQL(t *testing.T) {
 		require.NoError(t, prepared.QueryRowContext(ctx).Scan(&width))
 		require.Equal(t, 60, width)
 		exec("create snapshot view_description_history for account")
-		defer exec("drop snapshot view_description_history")
+		defer cleanupViewDescriptionSQL(t, db, "drop snapshot view_description_history")
 		exec("drop table view_description_test.src")
 		require.NoError(t, db.QueryRowContext(ctx,
 			"select character_maximum_length from information_schema.columns {snapshot = 'view_description_history'} "+
@@ -234,7 +259,7 @@ func TestViewDescriptionPublicSQL(t *testing.T) {
 		exec("create table view_description_test.src (x varchar(90), qty bigint not null default 11)")
 		repaired := describe("desc view_description_test.v")
 		require.Len(t, repaired, 2)
-		require.Equal(t, "VARCHAR(90)", repaired[0][1].String)
+		require.Equal(t, "varchar(90)", repaired[0][1].String)
 		require.Equal(t, "11", repaired[1][4].String)
 		require.NoError(t, db.QueryRowContext(ctx, "select character_maximum_length from information_schema.columns where table_schema='view_description_test' and table_name='v' and column_name='label'").Scan(&width))
 		require.Equal(t, 90, width)
@@ -341,7 +366,7 @@ func testShowColumnsTargetReplacement(t *testing.T, ctx context.Context, db *sql
 			}()
 		}
 	}
-	check("VARCHAR(5)")
+	check("varchar(5)")
 	exec("drop table view_description_test.show_target")
 	exec("create view view_description_test.show_target as select x from view_description_test.show_source")
 	exec("alter table view_description_test.show_source modify column x varchar(60)")
@@ -350,12 +375,12 @@ func testShowColumnsTargetReplacement(t *testing.T, ctx context.Context, db *sql
 		"select character_maximum_length from information_schema.columns "+
 			"where table_schema='view_description_test' and table_name='show_target'").Scan(&width))
 	require.Equal(t, 60, width, "execution-time metadata is the independent control")
-	check("VARCHAR(60)")
+	check("varchar(60)")
 	// A rebuilt View plan must also notice replacement by an ordinary table.
 	exec("drop view view_description_test.show_target")
 	exec("create table view_description_test.show_target (x bigint)")
 	exec("drop table view_description_test.show_source")
-	check("BIGINT(64)")
+	check("bigint")
 	exec("drop table view_description_test.show_target")
 	rows, err := prepared.QueryContext(ctx)
 	if rows != nil {
@@ -423,7 +448,7 @@ func TestViewDescriptionUdfDatabaseContext(t *testing.T) {
 		require.NoError(t, err)
 		_, err = definition.ExecContext(ctx, "create view v as select f_answer() as answer")
 		require.NoError(t, err)
-		expectedType := "BIGINT"
+		expectedType := "bigint"
 		checkShow := func(query string) {
 			t.Helper()
 			rows, queryErr := definition.QueryContext(ctx, query)
@@ -440,7 +465,7 @@ func TestViewDescriptionUdfDatabaseContext(t *testing.T) {
 			}
 			require.NoError(t, rows.Scan(targets...))
 			require.Equal(t, "answer", values[0].String)
-			require.Equal(t, expectedType, strings.ToUpper(values[1].String))
+			require.Equal(t, expectedType, values[1].String)
 			require.False(t, rows.Next())
 			require.NoError(t, rows.Err())
 		}
@@ -477,7 +502,7 @@ func TestViewDescriptionUdfDatabaseContext(t *testing.T) {
 			require.NoError(t, prepared.QueryRowContext(ctx).Scan(
 				&field, &typ, &nullable, &key, &defaultValue, &extra, &comment))
 			require.Equal(t, "answer", field.String)
-			require.Equal(t, expectedType, strings.ToUpper(typ.String))
+			require.Equal(t, expectedType, typ.String)
 		}
 		checkShow("desc view_description_udf.v")
 		checkPrepared()
@@ -502,7 +527,7 @@ func TestViewDescriptionUdfDatabaseContext(t *testing.T) {
 		require.NoError(t, err)
 		_, err = definition.ExecContext(ctx, "use mo_catalog")
 		require.NoError(t, err)
-		expectedType = "VARCHAR(9)"
+		expectedType = "varchar(9)"
 		checkShow("show full columns from view_description_udf.v")
 		checkShow("execute view_udf_columns")
 		checkPrepared()
@@ -520,7 +545,7 @@ func TestViewDescriptionUdfDatabaseContext(t *testing.T) {
 					result.ReadRows(func(n int, cols []*vector.Vector) bool {
 						require.Equal(t, 1, n)
 						require.Equal(t, "answer", executor.GetStringRows(cols[0])[0])
-						require.Equal(t, expectedType, strings.ToUpper(executor.GetStringRows(cols[1])[0]))
+						require.Equal(t, expectedType, executor.GetStringRows(cols[1])[0])
 						found = true
 						return true
 					})
@@ -554,7 +579,7 @@ type failedViewColumnsUpgradeTxn struct {
 }
 
 func (txn failedViewColumnsUpgradeTxn) Exec(sql string, opts executor.StatementOption) (executor.Result, error) {
-	if sql == sysview.InformationSchemaColumnsDDL {
+	if sql == sysview.InformationSchemaColumnsV100DDL() {
 		return executor.Result{}, txn.failure
 	}
 	return txn.TxnExecutor.Exec(sql, opts)
@@ -596,8 +621,56 @@ func testViewColumnsUpgradeRollback(t *testing.T, ctx context.Context, sqlExecut
 			}
 			return v4_0_10.Handler.HandleTenantUpgrade(ctx, int32(tenantID), txn)
 		}, opts))
-		require.Equal(t, sysview.InformationSchemaColumnsDDL, definition())
+		require.Equal(t, sysview.InformationSchemaColumnsV100DDL(), definition())
 	}
+}
+
+// Verify the follow-up native-Unicode refresh against a real tenant
+// transaction. This is intentionally separate from the historical 4.0.10
+// repair above: an already-4.0.13 tenant must take the 4.0.14 route.
+type failedNativeViewColumnsUpgradeTxn struct {
+	executor.TxnExecutor
+	failure error
+}
+
+func (txn failedNativeViewColumnsUpgradeTxn) Exec(sql string, opts executor.StatementOption) (executor.Result, error) {
+	if sql == sysview.InformationSchemaColumnsDDL {
+		return executor.Result{}, txn.failure
+	}
+	return txn.TxnExecutor.Exec(sql, opts)
+}
+
+func testNativeViewColumnsUpgradeRollback(t *testing.T, ctx context.Context, sqlExecutor executor.SQLExecutor, tenantID uint32) {
+	t.Helper()
+	opts := executor.Options{}.WithDatabase(catalog.MO_CATALOG).
+		WithAccountID(catalog.System_Account).WithWaitCommittedLogApplied()
+	definition := func() string {
+		t.Helper()
+		var exists bool
+		var ddl string
+		require.NoError(t, sqlExecutor.ExecTxn(ctx, func(txn executor.TxnExecutor) error {
+			var err error
+			exists, ddl, err = versions.CheckViewDefinition(txn, tenantID, "information_schema", "columns")
+			return err
+		}, opts))
+		require.True(t, exists, "failed migration must not leave COLUMNS missing")
+		return ddl
+	}
+	require.Equal(t, sysview.InformationSchemaColumnsV100DDL(), definition())
+	injected := errors.New("injected native COLUMNS creation failure")
+	err := sqlExecutor.ExecTxn(ctx, func(txn executor.TxnExecutor) error {
+		return v4_0_14.Handler.HandleTenantUpgrade(ctx, int32(tenantID), failedNativeViewColumnsUpgradeTxn{txn, injected})
+	}, opts)
+	require.ErrorIs(t, err, injected)
+	require.Equal(t, sysview.InformationSchemaColumnsV100DDL(), definition(), "DROP must roll back with CREATE")
+	require.NoError(t, sqlExecutor.ExecTxn(ctx, func(txn executor.TxnExecutor) error {
+		return v4_0_14.Handler.HandleTenantUpgrade(ctx, int32(tenantID), txn)
+	}, opts))
+	require.Equal(t, sysview.InformationSchemaColumnsDDL, definition())
+	require.NoError(t, sqlExecutor.ExecTxn(ctx, func(txn executor.TxnExecutor) error {
+		return v4_0_14.Handler.HandleTenantUpgrade(ctx, int32(tenantID), txn)
+	}, opts))
+	require.Equal(t, sysview.InformationSchemaColumnsDDL, definition(), "a completed refresh must be idempotent")
 }
 
 func TestViewDescriptionSubscription(t *testing.T) {
@@ -731,14 +804,23 @@ func TestViewDescriptionSubscription(t *testing.T) {
 		require.Equal(t, "binary", publisherTable[3].charset)
 
 		testViewColumnsUpgradeRollback(t, ctx, sqlExecutor, tenantID)
+		checkHistoricalColumnsWidth := func() {
+			t.Helper()
+			var historicalWidth int
+			require.NoError(t, subscriber.QueryRowContext(ctx,
+				"select character_maximum_length from information_schema.columns {snapshot='view_description_legacy_columns'} "+
+					"where table_schema='subscribed' and table_name='v' and column_name='x'").Scan(&historicalWidth))
+			require.Equal(t, 7, historicalWidth, "an old system template must not resurrect creation-time View columns")
+		}
+		// V100 has the on-demand View-column migration but still uses the
+		// historical selector projection. Verify a cross-tenant snapshot is
+		// adapted before the native V109 refresh is applied.
+		checkHistoricalColumnsWidth()
+		testNativeViewColumnsUpgradeRollback(t, ctx, sqlExecutor, tenantID)
 		require.Equal(t, publisherTable, readCharsets(subscriber, "subscribed", "charset_src"))
 		require.Equal(t, publisherView, readCharsets(subscriber, "subscribed", "charset_v"))
 		require.Equal(t, legacySubscriptionView, readCharsets(subscriber, "subscribed", "charset_v"))
-		var historicalWidth int
-		require.NoError(t, subscriber.QueryRowContext(ctx,
-			"select character_maximum_length from information_schema.columns {snapshot='view_description_legacy_columns'} "+
-				"where table_schema='subscribed' and table_name='v' and column_name='x'").Scan(&historicalWidth))
-		require.Equal(t, 7, historicalWidth, "an old system template must not resurrect creation-time View columns")
+		checkHistoricalColumnsWidth()
 
 		// The snapshot belongs to the subscriber, but the View's source database
 		// belongs to the publisher. Database existence and relation binding must
@@ -793,7 +875,7 @@ func TestViewDescriptionSubscription(t *testing.T) {
 		require.NoError(t, subscriber.QueryRowContext(ctx, "desc subscribed.v").Scan(
 			&field, &typ, &nullable, &key, &defaultValue, &extra, &comment))
 		require.Equal(t, "x", field.String)
-		require.Equal(t, "VARCHAR(60)", typ.String)
+		require.Equal(t, "varchar(60)", typ.String)
 		showStmt, err := subscriber.PrepareContext(ctx, "show columns from subscribed.v")
 		require.NoError(t, err)
 		defer showStmt.Close()
@@ -808,8 +890,8 @@ func TestViewDescriptionSubscription(t *testing.T) {
 			require.False(t, rows.Next())
 			require.NoError(t, rows.Err())
 		}
-		checkSubscribedShow("VARCHAR(60)")
-		checkSubscribedShow("VARCHAR(60)")
+		checkSubscribedShow("varchar(60)")
+		checkSubscribedShow("varchar(60)")
 		// System View columns remain sourced from the catalog, not regenerated
 		// from the internal SQL used to populate the View.
 		rows, err := subscriber.QueryContext(ctx, "desc mo_catalog.mo_variables")
@@ -837,7 +919,7 @@ func TestViewDescriptionSubscription(t *testing.T) {
 		defer cleanup(subscriber, "drop snapshot view_description_sub_same_name")
 		exec("alter table view_description_pub.src modify column x varchar(90)")
 		checkHistoricalView("view_description_sub_same_name", 60)
-		checkSubscribedShow("VARCHAR(90)")
+		checkSubscribedShow("varchar(90)")
 		require.NoError(t, prepared.QueryRowContext(ctx).Scan(&width))
 		require.Equal(t, 90, width)
 		// Batch metadata scans omit invalid Views, but retain a diagnostic for

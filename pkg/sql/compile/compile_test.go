@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	goruntime "runtime"
+	godebug "runtime/debug"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -57,6 +59,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/aggexec"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec/dependent"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/dispatch"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/group"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/hashbuild"
@@ -103,11 +106,43 @@ func TestBroadcastJoinUsesHashAfterPreparedDiagnosticProof(t *testing.T) {
 		bind("=", leftID, rightID), bind("=", leftTime, guard),
 	}}
 	c := &Compile{proc: proc}
+	assertDependentAlgorithm := func(want vm.OpType) {
+		children := []*plan.Node{
+			{ProjectList: []*plan.Expr{leftID, leftTime}},
+			{ProjectList: []*plan.Expr{rightID, rightTime}},
+		}
+		factory, err := c.compileDependentJoin(plan2.DeepCopyNode(node), children)
+		require.NoError(t, err)
+		op, err := factory(proc, []*dependent.DemandInput{{}, {}})
+		require.NoError(t, err)
+		root := op.(*dependent.JoinKernel)
+		defer func() {
+			root.Free(proc, false, nil)
+			root.Join.Free(proc, false, nil)
+			root.Build.Free(proc, false, nil)
+			root.Join.Release()
+			root.Build.Release()
+		}()
+		require.Equal(t, want, root.Join.OpType())
+	}
 	require.False(t, c.broadcastJoinUsesHash(node), "unproved guarded ON retains LoopJoin")
+	assertDependentAlgorithm(vm.LoopJoin)
 	c.SetPreparedJoinDiagnosticFree(true)
 	require.True(t, c.broadcastJoinUsesHash(node), "current clean binding permits HashJoin")
+	assertDependentAlgorithm(vm.HashJoin)
 	c.SetPreparedJoinDiagnosticFree(false)
 	require.False(t, c.broadcastJoinUsesHash(node), "a subsequent execution must not inherit proof")
+	assertDependentAlgorithm(vm.LoopJoin)
+
+	// A single nullable MARK key is otherwise hash eligible, but must retain
+	// pair-local guarded diagnostics until this execution proves them clean.
+	node.JoinType = plan.Node_MARK
+	node.OnList = node.OnList[1:]
+	assertDependentAlgorithm(vm.LoopJoin)
+	c.SetPreparedJoinDiagnosticFree(true)
+	assertDependentAlgorithm(vm.HashJoin)
+	c.SetPreparedJoinDiagnosticFree(false)
+	assertDependentAlgorithm(vm.LoopJoin)
 }
 
 func TestHasOrderedGroupConcat(t *testing.T) {
@@ -160,6 +195,71 @@ func TestCompileClearResetsExecutionType(t *testing.T) {
 	require.Zero(t, c.prePipelineLockTableID, "pooled compiles must not retain a backfill lock request")
 }
 
+func TestCompileClearResetsSkipIndexTaskRegistration(t *testing.T) {
+	// The ALTER COPY private replica create opts out of index task
+	// registration on its executor Compile. Exercise the pool reset directly,
+	// independent of which object sync.Pool would choose for the next
+	// allocation: a released Compile must not hand that suppression to an
+	// unrelated frontend statement.
+	c := &Compile{
+		proc:                      testutil.NewProcess(t),
+		MessageBoard:              message.NewMessageBoard(),
+		affectRows:                new(atomic.Uint64),
+		skipIndexTaskRegistration: true,
+	}
+	c.clear()
+	require.False(t, c.skipIndexTaskRegistration,
+		"a pooled compile must not retain the private index-registration policy")
+}
+
+func TestCompilePoolHandoffClearsPrivateIndexRegistrationPolicy(t *testing.T) {
+	// Reproduce the frontend ownership boundary: the private ALTER COPY
+	// executor releases its Compile, then an ordinary frontend statement
+	// allocates the next generation from the global reuse pool. Two layers
+	// hold that boundary: Release runs clear() before sync.Pool.Put, and
+	// NewCompile re-initializes the flag after sync.Pool.Get.
+	//
+	// sync.Pool's documented contract permits Put to discard values and Get
+	// to return an unrelated object, and the race runtime drops Put values
+	// deliberately (runtime_randn(4) in sync/pool.go), so pointer identity
+	// between the released and the reallocated compile cannot be required.
+	// The oracle is the policy of every object the public constructor
+	// returns: each round seeds the pool with the exact leak payload and
+	// asserts the ordinary registration policy on the constructed frontend
+	// compile. A leak can only travel through a Put that the pool kept, and
+	// every kept Put is a round whose frontend object is unconditionally
+	// checked, so drops never mask a leaked policy. The deterministic
+	// clear() reset layer stays covered, pool-free, by
+	// TestCompileClearResetsSkipIndexTaskRegistration.
+	oldProcs := goruntime.GOMAXPROCS(1)
+	defer goruntime.GOMAXPROCS(oldProcs)
+	oldPercent := godebug.SetGCPercent(-1)
+	defer godebug.SetGCPercent(oldPercent)
+
+	const handoffs = 16
+	sameObject := 0
+	for round := 0; round < handoffs; round++ {
+		private := NewCompile("test", "test", "create table __mo_alter_copy_replica", "", "",
+			nil, testutil.NewProcess(t), nil, false, nil, time.Now())
+		// txnExecutor.Exec sets this for the private replica create's nested
+		// compiler (sql_executor.go), which Release returns to the pool.
+		private.skipIndexTaskRegistration = true
+		private.Release()
+
+		frontend := NewCompile("test", "test", "create table ordinary", "", "",
+			nil, testutil.NewProcess(t), nil, false, nil, time.Now())
+		require.False(t, frontend.skipIndexTaskRegistration,
+			"round %d: a frontend compile must not inherit the private preparation policy", round)
+		frontend.Release()
+		if frontend == private {
+			sameObject++
+		}
+	}
+	// Informational only: the race runtime drops Put values purposefully, so
+	// zero reuse observations is a legitimate outcome, never a failure.
+	t.Logf("pool handed back the released compile in %d/%d rounds", sameObject, handoffs)
+}
+
 func TestCompileMongoDBQueryDiagnosticsAreRedacted(t *testing.T) {
 	for _, sql := range []string{
 		`select * from mongo_events where __mo_query = '{"filter":{"password":"super-secret-value"}}'`,
@@ -208,65 +308,92 @@ func TestFilterScanStorageExprsExcludesVolatilePredicates(t *testing.T) {
 }
 
 func TestCompileRunPreservesBinaryPrepareParamAcrossRetries(t *testing.T) {
-	ctx := defines.AttachAccountId(context.Background(), catalog.System_Account)
-	proc := testutil.NewProcess(t)
-	proc.Base.SessionInfo.ApplySQLSelectLimit = true
-	proc.GetSessionInfo().Buf = buffer.New()
-	proc.SetResolveVariableFunc(func(name string, _, _ bool) (interface{}, error) {
-		if name == plan2.SQLSelectLimitVariable {
-			return ^uint64(0), nil
-		}
-		return "STRICT_TRANS_TABLES", nil
-	})
-	compilerCtx := plan2.NewEmptyCompilerContext(newPlanTestProcess(t))
-	compilerCtx.SetContext(ctx)
-	stmts, err := mysql.Parse(ctx, "select ?", 1)
-	require.NoError(t, err)
-	query, err := plan2.NewPrepareOptimizer(compilerCtx).Optimize(stmts[0], true)
-	require.NoError(t, err)
-	pn := &plan.Plan{Plan: &plan.Plan_Query{Query: query}, IsPrepare: true}
-	_, _, err = plan2.ResetPreparePlan(compilerCtx, pn)
-	require.NoError(t, err)
+	for _, tc := range []struct {
+		name     string
+		borrowed bool
+		cause    error
+	}{
+		{"ordinary_rc", false, moerr.NewTxnNeedRetryNoCtx()},
+		{"borrowed_rc", true, moerr.NewTxnNeedRetryNoCtx()},
+		{"borrowed_definition", true, moerr.NewTxnNeedRetryWithDefChangedNoCtx()},
+		{"borrowed_vector", true, moerr.NewVectorNeedRetryWithPreModeNoCtx()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			borrowed := tc.borrowed
+			ctx := defines.AttachAccountId(context.Background(), catalog.System_Account)
+			proc := testutil.NewProcess(t)
+			proc.Base.SessionInfo.ApplySQLSelectLimit = true
+			proc.GetSessionInfo().Buf = buffer.New()
+			proc.SetResolveVariableFunc(func(name string, _, _ bool) (interface{}, error) {
+				if name == plan2.SQLSelectLimitVariable {
+					return ^uint64(0), nil
+				}
+				return "STRICT_TRANS_TABLES", nil
+			})
+			compilerCtx := plan2.NewEmptyCompilerContext(newPlanTestProcess(t))
+			compilerCtx.SetContext(ctx)
+			stmts, err := mysql.Parse(ctx, "select ?", 1)
+			require.NoError(t, err)
+			query, err := plan2.NewPrepareOptimizer(compilerCtx).Optimize(stmts[0], true)
+			require.NoError(t, err)
+			pn := &plan.Plan{Plan: &plan.Plan_Query{Query: query}, IsPrepare: true}
+			_, _, err = plan2.ResetPreparePlan(compilerCtx, pn)
+			require.NoError(t, err)
 
-	ctrl := gomock.NewController(t)
-	txnCli, txnOp := newTestTxnClientAndOpWithIsolation(ctrl, txn.TxnIsolation_RC)
-	proc.Base.TxnClient = txnCli
-	proc.Base.TxnOperator = txnOp
-	proc.Ctx = ctx
-	proc.ReplaceTopCtx(ctx)
+			ctrl := gomock.NewController(t)
+			txnCli, txnOp := newTestTxnClientAndOpWithIsolation(ctrl, txn.TxnIsolation_RC)
+			proc.Base.TxnClient = txnCli
+			proc.Base.TxnOperator = txnOp
+			proc.SetIncrStatementDisabled(borrowed)
+			rollbacks := 0
+			txnOp.GetWorkspace().(*Ws).rollbackLastStatement = func(context.Context) error { rollbacks++; return nil }
+			proc.Ctx = ctx
+			proc.ReplaceTopCtx(ctx)
 
-	want := []byte{'A', 'B', 0, 0}
-	params := vector.NewVec(types.T_text.ToType())
-	require.NoError(t, vector.AppendBytes(params, want, false, proc.Mp()))
-	proc.SetOwnedPrepareParamsWithIsBin(params, []bool{true})
+			want := []byte{'A', 'B', 0, 0}
+			params := vector.NewVec(types.T_text.ToType())
+			require.NoError(t, vector.AppendBytes(params, want, false, proc.Mp()))
+			proc.SetOwnedPrepareParamsWithIsBin(params, []bool{true})
 
-	evaluations := 0
-	fill := func(bat *batch.Batch, _ *perfcounter.CounterSet) error {
-		if bat == nil {
-			return nil
-		}
-		require.Len(t, bat.Vecs, 1)
-		require.True(t, bat.Vecs[0].GetIsBin(), "binary semantics were lost on evaluation %d", evaluations+1)
-		require.Equal(t, want, bat.Vecs[0].GetBytesAt(0))
-		evaluations++
-		if evaluations <= 2 {
-			return moerr.NewTxnNeedRetryNoCtx()
-		}
-		return nil
+			evaluations := 0
+			fill := func(bat *batch.Batch, _ *perfcounter.CounterSet) error {
+				if bat == nil {
+					return nil
+				}
+				require.Len(t, bat.Vecs, 1)
+				require.True(t, bat.Vecs[0].GetIsBin(), "binary semantics were lost on evaluation %d", evaluations+1)
+				require.Equal(t, want, bat.Vecs[0].GetBytesAt(0))
+				evaluations++
+				if evaluations <= 2 {
+					return tc.cause
+				}
+				return nil
+			}
+
+			c := NewCompile("test", "test", "select ?", "", "", newStubEngine(), proc, stmts[0], false, nil, time.Now())
+			require.NoError(t, c.Compile(ctx, pn, fill))
+			_, err = c.Run(0)
+			if borrowed {
+				require.ErrorIs(t, err, tc.cause, "borrowed execution must return the original retry error")
+				require.Equal(t, 1, evaluations)
+				require.Zero(t, rollbacks, "child retry must not roll back caller writes")
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, 3, evaluations)
+				require.Equal(t, 2, c.retryTimes)
+				require.Equal(t, 2, rollbacks)
+			}
+			if !borrowed {
+				require.Zero(t, params.Length())
+				require.Nil(t, params.GetData())
+				require.Nil(t, params.GetArea())
+			}
+			c.Release()
+			proc.Free()
+			proc.GetSessionInfo().Buf.Free()
+
+		})
 	}
-
-	c := NewCompile("test", "test", "select ?", "", "", newStubEngine(), proc, stmts[0], false, nil, time.Now())
-	require.NoError(t, c.Compile(ctx, pn, fill))
-	_, err = c.Run(0)
-	require.NoError(t, err)
-	require.Equal(t, 3, evaluations)
-	require.Equal(t, 2, c.retryTimes)
-	require.Zero(t, params.Length())
-	require.Nil(t, params.GetData())
-	require.Nil(t, params.GetArea())
-	c.Release()
-	proc.Free()
-	proc.GetSessionInfo().Buf.Free()
 }
 
 func TestSQLSelectLimitIsResolvedForEachExecution(t *testing.T) {
@@ -323,6 +450,45 @@ func TestSQLSelectLimitIsResolvedForEachExecution(t *testing.T) {
 	_, err = c.Run(0)
 	require.NoError(t, err)
 	require.Zero(t, rows)
+
+	// The same cached Compile must follow the current statement owner after
+	// Reset, rather than retain a policy chosen when it was first constructed.
+	limitValue = 1
+	rows = 0
+	rollbacks := 0
+	txnOp.GetWorkspace().(*Ws).rollbackLastStatement = func(context.Context) error { rollbacks++; return nil }
+	cause := moerr.NewTxnNeedRetryNoCtx()
+	proc.SetIncrStatementDisabled(true)
+	fill = func(bat *batch.Batch, _ *perfcounter.CounterSet) error {
+		if bat != nil {
+			rows += bat.RowCount()
+			return cause
+		}
+		return nil
+	}
+	require.NoError(t, c.Reset(proc, time.Now(), fill, sql))
+	_, err = c.Run(0)
+	require.ErrorIs(t, err, cause)
+	require.Equal(t, 1, rows)
+	require.Zero(t, rollbacks)
+
+	proc.SetIncrStatementDisabled(false)
+	rows = 0
+	fill = func(bat *batch.Batch, _ *perfcounter.CounterSet) error {
+		if bat != nil {
+			rows += bat.RowCount()
+			if rows == 1 {
+				return cause
+			}
+		}
+		return nil
+	}
+	require.NoError(t, c.Reset(proc, time.Now(), fill, sql))
+	_, err = c.Run(0)
+	require.NoError(t, err)
+	require.Equal(t, 2, rows)
+	require.Equal(t, 1, rollbacks)
+
 }
 
 func TestSQLSelectLimitOperatorSelection(t *testing.T) {
@@ -893,7 +1059,8 @@ func TestApplyExecutorLockWaitTimeout(t *testing.T) {
 }
 
 type Ws struct {
-	advanceSnapshot func(context.Context, timestamp.Timestamp) error
+	rollbackLastStatement func(context.Context) error
+	advanceSnapshot       func(context.Context, timestamp.Timestamp) error
 }
 
 func (w *Ws) SetCloneTxn(snapshot int64) {}
@@ -930,6 +1097,9 @@ func (w *Ws) AdvanceSnapshot(ctx context.Context, ts timestamp.Timestamp) error 
 }
 
 func (w *Ws) RollbackLastStatement(ctx context.Context) error {
+	if w.rollbackLastStatement != nil {
+		return w.rollbackLastStatement(ctx)
+	}
 	return nil
 }
 
@@ -1076,6 +1246,142 @@ func TestCompileLockNonCandidatePreservesExactMainMutation(t *testing.T) {
 	require.Len(t, got, 1)
 	require.Empty(t, node.LockTargets)
 	require.Same(t, target, c.lockTables[target.TableId])
+}
+
+func TestCompileLockRejectsOptimisticNonBlockingBeforeScopeExecution(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		noWait bool
+		skip   bool
+	}{
+		{name: "NOWAIT", noWait: true},
+		{name: "SKIP LOCKED", skip: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newPrePipelineLockTestCompile(t, plan.Query_SELECT)
+			ctrl := gomock.NewController(t)
+			txnOp := mock_frontend.NewMockTxnOperator(ctrl)
+			txnOp.EXPECT().Txn().Return(txn.TxnMeta{Mode: txn.TxnMode_Optimistic}).AnyTimes()
+			c.proc.Base.TxnOperator = txnOp
+
+			source := newScope(Normal)
+			source.Proc = c.proc
+			source.setRootOperator(colexec.NewMockOperator())
+			t.Cleanup(func() {
+				source.FreeOperator(c)
+				source.release()
+			})
+			originalRoot := source.RootOp
+			target := &plan.LockTarget{
+				TableId: 42, PrimaryColTyp: plan.Type{Id: int32(types.T_int64)},
+				Mode: lockpb.LockMode_Shared, NoWait: tc.noWait, SkipLocked: tc.skip,
+			}
+
+			got, err := c.compileLock(&plan.Node{LockTargets: []*plan.LockTarget{target}}, []*Scope{source})
+			require.Error(t, err)
+			require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported), "%v", err)
+			require.Nil(t, got)
+			require.Same(t, originalRoot, source.RootOp,
+				"optimistic nonblocking plans must fail while scopes are only being compiled")
+			require.Empty(t, source.PreScopes)
+		})
+	}
+}
+
+func TestCompileRejectsOptimisticNonBlockingBeforeScopeConstruction(t *testing.T) {
+	for _, mode := range []struct {
+		name       string
+		noWait     bool
+		skipLocked bool
+	}{{name: "NOWAIT", noWait: true},
+		{name: "SKIP alone", skipLocked: true}} {
+		for _, tc := range []struct {
+			name                                    string
+			optimistic, disabled, coarse, coarseEnd bool
+			message                                 string
+		}{
+			{name: "optimistic", optimistic: true, message: "pessimistic transaction"},
+			{name: "disabled", disabled: true, message: "physical lock admission"},
+			{name: "coarse", coarse: true, message: "exact row lock targets"},
+			{name: "coarse at EOF", coarseEnd: true, message: "exact row lock targets"},
+		} {
+			for _, correlated := range []bool{false, true} {
+				shape := "ordinary"
+				if correlated {
+					shape = "dependent"
+				}
+				t.Run(mode.name+"/"+tc.name+"/"+shape, func(t *testing.T) {
+					c := NewMockCompile(t)
+					c.disableLock = tc.disabled
+					ctrl := gomock.NewController(t)
+					txnOp := mock_frontend.NewMockTxnOperator(ctrl)
+					txnMode := txn.TxnMode_Pessimistic
+					if tc.optimistic {
+						txnMode = txn.TxnMode_Optimistic
+					}
+					txnOp.EXPECT().Txn().Return(txn.TxnMeta{Mode: txnMode}).AnyTimes()
+					c.proc.Base.TxnOperator = txnOp
+					target := &plan.LockTarget{TableId: 42, Mode: lockpb.LockMode_Shared, NoWait: mode.noWait, SkipLocked: mode.skipLocked, LockTable: tc.coarse, LockTableAtTheEnd: tc.coarseEnd}
+					query := &plan.Query{StmtType: plan.Query_SELECT, Steps: []int32{0}, Nodes: []*plan.Node{{NodeType: plan.Node_LOCK_OP, LockTargets: []*plan.LockTarget{target}}}}
+					if correlated {
+						query.Correlation = &plan.CorrelationSpec{Programs: []*plan.CorrelationProgram{{RootNode: 0}}}
+					}
+					queryPlan := &plan.Plan{Plan: &plan.Plan_Query{Query: query}}
+					err := c.Compile(context.Background(), queryPlan, nil)
+					require.Error(t, err)
+					require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported), "%v", err)
+					require.ErrorContains(t, err, tc.message)
+					require.Nil(t, c.scopes, "rejection must precede source construction")
+					require.Nil(t, c.cnList, "rejection must precede remote scheduling")
+					require.Empty(t, c.lockTables)
+					require.Same(t, target, query.Nodes[0].LockTargets[0])
+				})
+			}
+		}
+	}
+}
+
+func TestCompileLockDisabledSkipsAllStatementLocks(t *testing.T) {
+	c := NewMockCompile(t)
+	c.disableLock = true
+	target := &plan.LockTarget{TableId: 42, LockTable: true}
+	node := &plan.Node{LockTargets: []*plan.LockTarget{target}}
+	scope := &Scope{}
+
+	got, err := c.compileLock(node, []*Scope{scope})
+	require.NoError(t, err)
+	require.Equal(t, []*Scope{scope}, got)
+	require.Nil(t, scope.RootOp)
+	require.Empty(t, c.lockTables)
+	require.Equal(t, []*plan.LockTarget{target}, node.LockTargets)
+
+	// A pessimistic transaction can still request an internal lock-free
+	// statement; nonblocking SQL must not silently bypass physical admission.
+	ctrl := gomock.NewController(t)
+	txnOp := mock_frontend.NewMockTxnOperator(ctrl)
+	txnOp.EXPECT().Txn().Return(txn.TxnMeta{Mode: txn.TxnMode_Pessimistic}).AnyTimes()
+	c.proc.Base.TxnOperator = txnOp
+	target.LockTable = false
+	target.NoWait = true
+	got, err = c.compileLock(node, []*Scope{scope})
+	require.Error(t, err)
+	require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported), "%v", err)
+	require.Nil(t, got)
+	require.Nil(t, scope.RootOp)
+	require.Empty(t, c.lockTables)
+	require.Equal(t, []*plan.LockTarget{target}, node.LockTargets)
+
+	// SKIP alone must not pass just because NOWAIT is unset.
+	target.NoWait = false
+	target.SkipLocked = true
+	got, err = c.compileLock(node, []*Scope{scope})
+	require.Error(t, err)
+	require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotSupported), "%v", err)
+	require.Nil(t, got)
+	require.Nil(t, scope.RootOp)
+	require.Empty(t, c.lockTables)
+	require.Equal(t, []*plan.LockTarget{target}, node.LockTargets)
+
 }
 
 func TestCompileLockPrePipelineTargetAdmission(t *testing.T) {
@@ -1835,7 +2141,7 @@ func TestFrozenResultMetadataAcceptsEquivalentVectorAccessPath(t *testing.T) {
 	}
 	makeVectorPlan := func() *plan.Plan {
 		const vectorTag = int32(10)
-		vectorSpec := &plan.VectorIndexScan{
+		vectorSpec := &plan.IndexSearchScan{
 			SourceTable:    &plan.ObjectRef{SchemaName: "source_db", ObjName: "source_table"},
 			SourceTableDef: sourceTable,
 			Index:          &plan.IndexDef{IndexAlgo: catalog.MoIndexIvfFlatAlgo.ToString()},
@@ -1862,7 +2168,7 @@ func TestFrozenResultMetadataAcceptsEquivalentVectorAccessPath(t *testing.T) {
 			Nodes: []*plan.Node{
 				{
 					NodeId:      0,
-					NodeType:    plan.Node_VECTOR_INDEX_SCAN,
+					NodeType:    plan.Node_INDEX_SEARCH_SCAN,
 					BindingTags: []int32{vectorTag},
 					TableDef: &plan.TableDef{Cols: []*plan.ColDef{
 						{Name: "pkid", Typ: sourceTable.Cols[2].Typ},
@@ -1871,7 +2177,7 @@ func TestFrozenResultMetadataAcceptsEquivalentVectorAccessPath(t *testing.T) {
 						{Name: "__mo_index_include_payload", Typ: sourceTable.Cols[1].Typ},
 					}},
 					ProjectList:     vectorProjectList,
-					VectorIndexScan: vectorSpec,
+					IndexSearchScan: vectorSpec,
 				},
 				{NodeId: 1, NodeType: plan.Node_PROJECT, Children: []int32{0}, ProjectList: resultProjectList},
 			},
@@ -3823,14 +4129,14 @@ func newShuffleJoinTestNode(dop int32) *plan.Node {
 	leftCol := &plan.Expr{
 		Typ: plan.Type{Id: int32(types.T_int64)},
 		Expr: &plan.Expr_Col{Col: &plan.ColRef{
-			RelPos: 1,
+			RelPos: 0,
 			ColPos: 0,
 		}},
 	}
 	rightCol := &plan.Expr{
 		Typ: plan.Type{Id: int32(types.T_int64)},
 		Expr: &plan.Expr_Col{Col: &plan.ColRef{
-			RelPos: 2,
+			RelPos: 1,
 			ColPos: 0,
 		}},
 	}
@@ -3850,6 +4156,7 @@ func newShuffleJoinTestNode(dop int32) *plan.Node {
 		OnList: []*plan.Expr{{
 			Typ: plan.Type{Id: int32(types.T_bool)},
 			Expr: &plan.Expr_F{F: &plan.Function{
+				Func: &plan.ObjectRef{Obj: function.EncodeOverloadID(function.EQUAL, 0), ObjName: "="},
 				Args: []*plan.Expr{leftCol, rightCol},
 			}},
 		}},
@@ -3902,4 +4209,31 @@ func TestNewCompileTxnOffsetForInternalSql(t *testing.T) {
 		c := NewCompile("test", "test", "select 1", "", "", nil, proc, nil, false, nil, time.Now())
 		require.Equal(t, 7, c.TxnOffset)
 	})
+}
+
+func TestWindowIntervalValidationPrecedesSourceInitialization(t *testing.T) {
+	c := newPrePipelineLockTestCompile(t, plan.Query_SELECT)
+	ctrl := gomock.NewController(t)
+	eng := mock_frontend.NewMockEngine(ctrl)
+	// Source initialization must never acquire the table for an invalid bound.
+	eng.EXPECT().Database(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	c.e = eng
+	c.scopes = []*Scope{{Proc: c.proc, DataSource: &Source{node: &plan.Node{
+		ObjRef: &plan.ObjectRef{SchemaName: "test"}, TableDef: &plan.TableDef{Name: "d"},
+	}}}}
+	bound := &plan.Expr{Typ: plan.Type{Id: int32(types.T_interval)}, Expr: &plan.Expr_List{List: &plan.ExprList{List: []*plan.Expr{
+		plan2.MakePlan2StringConstExprWithType("-1"), plan2.MakePlan2StringConstExprWithType("second"),
+	}}}}
+	c.pn.GetQuery().Steps = []int32{1}
+	c.pn.GetQuery().Nodes = []*plan.Node{
+		{WinSpecList: []*plan.Expr{{Expr: &plan.Expr_W{W: &plan.WindowSpec{Frame: &plan.FrameClause{
+			Type: plan.FrameClause_RANGE, Start: &plan.FrameBound{Type: plan.FrameBound_PRECEDING, Val: bound}, End: &plan.FrameBound{Type: plan.FrameBound_CURRENT_ROW},
+		}}}}}},
+		{Children: []int32{0}, Limit: plan2.MakePlan2Uint64ConstExprWithType(0)},
+	}
+	started := false
+	err := c.runPipelineAttempt(func() error { started = true; return nil })
+	require.ErrorContains(t, err, "frame start or end is negative, NULL")
+	require.False(t, started)
+	require.Nil(t, c.scopes[0].DataSource.R)
 }

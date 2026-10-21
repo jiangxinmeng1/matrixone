@@ -20,6 +20,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/clusterservice"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
@@ -40,17 +41,23 @@ func (c *Compile) constrainRemoteExpressionWorkers(qry *plan.Query) error {
 	}
 	// This rebind requirement also applies to local execution. Do not hide it
 	// behind the remote-placement fast path or an earlier worker fallback.
+	if features.InvalidDecimalStatisticalResultContract {
+		return moerr.NewNotSupportedNoCtx("decimal statistical result contract requires rebinding")
+	}
+	if features.InvalidTemporalResultContract {
+		return moerr.NewNotSupportedNoCtx("temporal result vector contract mismatch requires rebinding")
+	}
 	if features.LegacyIntervalUnits {
 		return moerr.NewNotSupportedNoCtx("legacy interval unit contract requires rebinding")
 	}
 	if c.execType != plan2.ExecTypeAP_MULTICN {
 		return nil
 	}
-	required := remoteExpressionProtocolVersion(features)
+	required := executionRemoteExpressionProtocolVersion(c.proc, features)
 	if required == 0 {
 		return nil
 	}
-	supported, err := remoteWorkersSupportProtocol(c.proc, c.cnList, required)
+	supported, err := remoteWorkersSupportProtocolForPlacement(c.proc, c.cnList, required)
 	if err != nil || supported {
 		return err
 	}
@@ -59,8 +66,24 @@ func (c *Compile) constrainRemoteExpressionWorkers(qry *plan.Query) error {
 	return err
 }
 
+// Diagnostics depend on the outer statement and current session mode, unlike
+// expression result contracts. Keep this floor out of persisted-plan admission.
+func executionRemoteExpressionProtocolVersion(proc *process.Process, features plan.RemoteExpressionFeatures) int64 {
+	required := remoteExpressionProtocolVersion(features)
+	if features.ScalarDivision && proc.DivisionByZeroWarningsEnabled() {
+		required = max(required, defines.MORPCVersion116)
+	}
+	return required
+}
+
 func remoteExpressionProtocolVersion(features plan.RemoteExpressionFeatures) int64 {
 	required := max(requiredExpressionContractProtocolVersion(features), temporalExpressionProtocolVersion(features))
+	if features.LoadFKIgnoreCheck {
+		required = max(required, defines.MORPCVersion125)
+	}
+	if features.TimestampDatetimeResultContracts || features.DynamicTimeResultContracts {
+		required = max(required, defines.MORPCVersion122)
+	}
 	if features.IntegerArithmeticDomains {
 		required = max(required, defines.MORPCVersion71)
 	}
@@ -76,6 +99,9 @@ func remoteExpressionProtocolVersion(features plan.RemoteExpressionFeatures) int
 	if features.PreparedPrecisionScalar {
 		required = max(required, defines.MORPCVersion95)
 	}
+	if features.DecimalIntegerDivisionSemantics {
+		required = max(required, defines.MORPCVersion121)
+	}
 	if features.DecimalDivisionSemantics {
 		required = max(required, defines.MORPCVersion97)
 	}
@@ -90,6 +116,24 @@ func remoteExpressionProtocolVersion(features plan.RemoteExpressionFeatures) int
 	}
 	if features.DecimalLiteralSemantics {
 		required = max(required, defines.MORPCVersion89)
+	}
+	if features.MediumIntAssignmentBounds {
+		required = max(required, defines.MORPCVersion110)
+	}
+	if features.DateNumericResultContracts {
+		required = max(required, defines.MORPCVersion112)
+	}
+	if features.LeastGreatestCollationSemantics {
+		required = max(required, defines.MORPCVersion117)
+	}
+	if features.DecimalStatisticalResultContracts {
+		required = max(required, defines.MORPCVersion113)
+	}
+	if features.TableCollationFunction {
+		required = max(required, defines.MORPCVersion118)
+	}
+	if features.CalendarIntervalNormalization {
+		required = max(required, defines.MORPCVersion115)
 	}
 	return required
 }
@@ -111,6 +155,9 @@ func requiredExpressionContractProtocolVersion(features plan.RemoteExpressionFea
 }
 
 func temporalExpressionProtocolVersion(features plan.RemoteExpressionFeatures) int64 {
+	if features.TimestampAddSecondIntervals {
+		return defines.MORPCVersion124
+	}
 	if features.TemporalResultContracts || features.NormalizedIntervalUnits || features.WeekSessionDefault {
 		return defines.MORPCVersion98
 	}
@@ -123,6 +170,8 @@ var errRemoteCapabilityProbeTimeout = moerr.NewInternalError(
 
 // Probe the selected workers as well as the coordinator's rollout gate.
 // Capabilities are not cached across executions or sender checks.
+// A false result without an error means support could not be verified;
+// observation failures retain their cause for required gates and send checks.
 func remoteWorkersSupportProtocol(proc *process.Process, workers engine.Nodes, minimum int64) (bool, error) {
 	if proc == nil {
 		return false, nil
@@ -141,15 +190,31 @@ func remoteWorkersSupportProtocol(proc *process.Process, workers engine.Nodes, m
 	ctx, cancel := context.WithTimeoutCause(parent, 5*time.Second, errRemoteCapabilityProbeTimeout)
 	defer cancel()
 	for _, worker := range workers {
-		version, known, err := remoteWorkerProtocolVersion(ctx, proc, worker)
-		if err != nil {
-			return false, parent.Err()
+		version, known, probeErr := remoteWorkerProtocolVersion(ctx, proc, worker)
+		if err := parent.Err(); err != nil {
+			return false, err
+		}
+		if probeErr != nil {
+			return false, probeErr
 		}
 		if !known || version < minimum {
 			return false, nil
 		}
 	}
 	return true, nil
+}
+
+// Optional placement may safely fall back locally when remote support cannot
+// be verified. Only statement cancellation is fatal here, even when a probe's
+// own error is context.Canceled or context.DeadlineExceeded.
+func remoteWorkersSupportProtocolForPlacement(proc *process.Process, workers engine.Nodes, minimum int64) (bool, error) {
+	supported, err := remoteWorkersSupportProtocol(proc, workers, minimum)
+	if proc != nil && proc.Ctx != nil {
+		if parentErr := proc.Ctx.Err(); parentErr != nil {
+			return false, parentErr
+		}
+	}
+	return supported && err == nil, nil
 }
 
 // remoteWorkerProtocolVersion resolves the actual pipeline endpoint and owns
@@ -200,4 +265,49 @@ func remoteWorkerProtocolVersion(ctx context.Context, proc *process.Process, wor
 		return 0, false, nil
 	}
 	return resp.GetProtocolVersion.Version, true, nil
+}
+
+// Cached compilations can survive a cluster capability rollback. Reject changed
+// result contracts and LOAD FK admission here, before Prepare or statement
+// effects; placement/receiver owners retain the other expression policies.
+func validateTemporalResultProtocol(proc *process.Process, owner any) error {
+	var required int64
+	if queryPlan, ok := owner.(*plan.Plan); ok {
+		if create := createTableForNameAdmission(queryPlan); create != nil {
+			required = create.CtasExecutionProtocolVersion
+		}
+	}
+	var version int64
+	var known bool
+	if proc != nil {
+		if rt := moruntime.ServiceRuntime(proc.GetService()); rt != nil {
+			value, exists := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+			var valid bool
+			version, valid = value.(int64)
+			known = exists && valid
+		}
+	}
+	if required < 0 {
+		return moerr.NewNotSupportedNoCtx("invalid CTAS population protocol requirement requires rebinding")
+	}
+	if required > 0 && (!known || version < required) {
+		return moerr.NewNotSupportedf(context.Background(), "CTAS population requires MORPC protocol version %d", required)
+	}
+	if known && version >= defines.MORPCVersion125 {
+		return nil
+	}
+	features, err := plan.RequiredRemoteExpressionFeatures(owner)
+	if err != nil {
+		return err
+	}
+	if features.LoadFKIgnoreCheck && (!known || version < defines.MORPCVersion125) {
+		return moerr.NewNotSupportedNoCtx("LOAD IGNORE foreign-key filtering requires MORPC protocol version 125")
+	}
+	if features.InvalidTemporalResultContract {
+		return moerr.NewNotSupportedNoCtx("temporal result vector contract mismatch requires rebinding")
+	}
+	if (features.TimestampDatetimeResultContracts || features.DynamicTimeResultContracts) && (!known || version < defines.MORPCVersion122) {
+		return moerr.NewNotSupportedNoCtx("temporal result contracts require MORPC protocol version 122")
+	}
+	return nil
 }

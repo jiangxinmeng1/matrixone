@@ -851,23 +851,55 @@ const (
 	// JSON_AGG_TO_DOUBLE is the MySQL warning-conversion boundary used by
 	// numeric aggregates (SUM/AVG/VAR_*/STDDEV_*). It is not public SQL.
 	JSON_AGG_TO_DOUBLE = 585
+	// JSON_ARRAY_INSERT inserts values before array elements selected by paths.
+	// Keep main's allocated id stable when adding newer internal functions.
+	JSON_ARRAY_INSERT = 586
+	// Internal schema-aware serializers used by index maintenance. They are
+	// deliberately separate from generic SERIAL, whose value round trip must
+	// remain lossless for SQL callers.
+	// Keep UUID_SHORT's main-branch id stable. The physical serializers are
+	// internal functions introduced by this change and therefore follow it.
+	PHYSICAL_SERIAL        = 588
+	PHYSICAL_SERIAL_FULL   = 589
+	PHYSICAL_COLLATION_KEY = 590
 
 	EXTRACTVALUE            = 581
 	UPDATEXML               = 582
 	TO_INTERVAL_MICROSECOND = 583
-	// JSON_ARRAY_INSERT inserts values before array elements selected by paths.
-	JSON_ARRAY_INSERT = 586
-
 	// FUNCTION_END_NUMBER is not a function, just a flag to record the max number of function.
 	// TODO: every one should put the new function id in front of this one if you want to make a new function.
 	UUID_SHORT = 587
 
-	FUNCTION_END_NUMBER = 588
+	TANH  = 591
+	COSH  = 592
+	ASINH = 593
+	ACOSH = 594
+	ATANH = 595
+
+	FORMAT_BYTES     = 596
+	FORMAT_PICO_TIME = 597
+
+	TO_CALENDAR_INTERVAL        = 598
+	CHECK_ASYNC_DATALINK_SOURCE = 599
+	INTERNAL_TABLE_COLLATION    = 600
+
+	TIMESTAMPADD_SECOND_INTERVAL = 601
+
+	// Internal LOAD IGNORE predicate; gated by cluster protocol 125.
+	LOAD_FK_IGNORE_CHECK = 602
+
+	FUNCTION_END_NUMBER = 603
 )
 
 // functionIdRegister is what function we have registered already.
 var functionIdRegister = map[string]int32{
+	"timestampadd_second_interval": TIMESTAMPADD_SECOND_INTERVAL,
+	"_check_async_datalink_source": CHECK_ASYNC_DATALINK_SOURCE,
+
+	"format_bytes":            FORMAT_BYTES,
+	"format_pico_time":        FORMAT_PICO_TIME,
 	"to_interval_microsecond": TO_INTERVAL_MICROSECOND,
+	"to_calendar_interval":    TO_CALENDAR_INTERVAL,
 	"extractvalue":            EXTRACTVALUE,
 	"updatexml":               UPDATEXML,
 	// operators
@@ -1054,6 +1086,7 @@ var functionIdRegister = map[string]int32{
 	"asin":                           ASIN,
 	"assert":                         ASSERT,
 	"_check_constraint_assert":       CHECK_CONSTRAINT_ASSERT,
+	"_load_fk_ignore_check":          LOAD_FK_IGNORE_CHECK,
 	"bit_length":                     BIT_LENGTH,
 	"date":                           DATE,
 	"time":                           TIME,
@@ -1095,6 +1128,11 @@ var functionIdRegister = map[string]int32{
 	"sign":                           SIGN,
 	"sin":                            SIN,
 	"sinh":                           SINH,
+	"tanh":                           TANH,
+	"cosh":                           COSH,
+	"asinh":                          ASINH,
+	"acosh":                          ACOSH,
+	"atanh":                          ATANH,
 	"space":                          SPACE,
 	"tan":                            TAN,
 	"week":                           WEEK,
@@ -1226,6 +1264,9 @@ var functionIdRegister = map[string]int32{
 	"serial":                         SERIAL,
 	"serial_full":                    SERIAL_FULL,
 	"serial_extract":                 SERIAL_EXTRACT,
+	"physical_serial":                PHYSICAL_SERIAL,
+	"physical_serial_full":           PHYSICAL_SERIAL_FULL,
+	"physical_collation_key":         PHYSICAL_COLLATION_KEY,
 	"hash_value":                     HASH,
 	"hash_partition":                 HASH_PARTITION,
 	"mo_tuple_expr":                  MO_TUPLE_EXPR,
@@ -1304,6 +1345,7 @@ var functionIdRegister = map[string]int32{
 	"internal_numeric_scale":         INTERNAL_NUMERIC_SCALE,
 	"internal_datetime_scale":        INTERNAL_DATETIME_SCALE,
 	"internal_column_character_set":  INTERNAL_COLUMN_CHARACTER_SET,
+	"internal_table_collation":       INTERNAL_TABLE_COLLATION,
 	"internal_auto_increment":        INTERNAL_AUTO_INCREMENT,
 	"nextval":                        NEXTVAL,
 	"setval":                         SETVAL,
@@ -1325,6 +1367,7 @@ var functionIdRegister = map[string]int32{
 	"st_geometryfromtext":            ST_GEOMFROMTEXT,
 	"st_geomfromwkb":                 ST_GEOMFROMWKB,
 	"st_geomfrombinary":              ST_GEOMFROMWKB,
+	"point":                          ST_POINT,
 	"st_point":                       ST_POINT,
 	"st_point32":                     ST_POINT32,
 	"st_pointfromtext":               ST_POINTFROMTEXT,

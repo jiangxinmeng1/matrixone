@@ -30,6 +30,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/bootstrap"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/cdc"
 	"github.com/matrixorigin/matrixone/pkg/clusterservice"
 	"github.com/matrixorigin/matrixone/pkg/cnservice/cnclient"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -135,9 +136,6 @@ func NewService(
 	}
 	cfg.Frontend.SetMaxMessageSize(uint64(cfg.RPC.MaxMessageSize))
 
-	configKVMap, _ := dumpCnConfig(*cfg)
-	options = append(options, WithConfigData(configKVMap))
-
 	options = append(options, WithBootstrapOptions(
 		bootstrap.WithUpgradeTenantBatch(cfg.UpgradeTenantBatchSize),
 		bootstrap.WithKek(cfg.Frontend.KeyEncryptionKey),
@@ -155,6 +153,7 @@ func NewService(
 	}
 
 	srv := &service{
+		rt: runtime.ServiceRuntime(cfg.UUID),
 		metadata: metadata.CNStore{
 			UUID: cfg.UUID,
 			Role: metadata.MustParseCNRole(cfg.Role),
@@ -203,6 +202,10 @@ func NewService(
 	for _, opt := range options {
 		opt(srv)
 	}
+	// Publish the effective configuration after constructor overrides, retaining
+	// the computed CN map's precedence over caller/common config data.
+	configKVMap, _ := dumpCnConfig(*cfg)
+	WithConfigData(configKVMap)(srv)
 	srv.stopper = stopper.NewStopper("cn-service", stopper.WithLogger(srv.logger))
 
 	srv.registerServices()
@@ -486,7 +489,9 @@ func (s *service) Start() (err error) {
 		if err != nil || complete {
 			return err
 		}
-		if err = s.waitForViewMetadataAdmissionHandoff(false, uint64(defines.MORPCVersion98)); err != nil {
+		// Fresh derived schema also publishes the C03 TABLES function. Existing
+		// complete clusters keep the skip path above during a rolling upgrade.
+		if err = s.waitForViewMetadataAdmissionHandoff(false, uint64(defines.MORPCVersion118)); err != nil {
 			return err
 		}
 		return bootstrap.InitSystemViews(ctx, s.sqlExecutor)
@@ -571,7 +576,10 @@ func (s *service) closeService() error {
 			s.stopFrontendSerialized,
 			s.closeBootstrapService,
 			// Stop scheduled statements as well as interactive frontend work.
+			s.stopTableDetector,
 			s.stopTask,
+			s.closeTableDetector,
+			s.closeCDCWatermarkUpdater,
 			s.closePipelineAdmission,
 			func() error {
 				if s.server == nil {
@@ -593,8 +601,14 @@ func (s *service) closeService() error {
 			return
 		}
 		withdrawErr := s.withdrawViewMetadataAdmission()
+		// Engine-owned statistics and cleanup transactions still use txn/RPC/
+		// lock services. An incomplete engine drain cannot certify that those
+		// dependencies are unused, even when remote ingress is withdrawn.
+		if err := s.closeStoreEngine(); err != nil {
+			s.closeErr = errors.Join(withdrawErr, err)
+			return
+		}
 		localErr := closeCNServiceSteps(
-			s.closeStoreEngine,
 			s.stopRPCs,
 			func() error {
 				// stop I/O pipeline
@@ -941,31 +955,33 @@ func (s *service) handleRequest(
 func (s *service) initMOServer(ctx context.Context, pu *config.ParameterUnit, aicm *defines.AutoIncrCacheManager) error {
 	var err error
 	logutil.Infof("Shutdown The Server With Ctrl+C | Ctrl+\\.")
-	cancelMoServerCtx, cancelMoServerFunc := context.WithCancel(ctx)
-	s.cancelMoServerFunc = cancelMoServerFunc
+	frontendCtx, cancelFrontend := context.WithCancel(ctx)
+	s.cancelMoServerFunc = cancelFrontend
 
 	pu.FileService = s.fileService
 	pu.LockService = s.lockService
 
 	logutil.Info("Initialize the engine ...")
-	err = s.initEngine(ctx, cancelMoServerCtx, pu)
+	// Background transactions may still be finishing after frontend shutdown.
+	// Engine.Close owns their logtail dependency; frontend cancellation must
+	// not stop it before task and pipeline producers have drained.
+	err = s.initEngine(ctx, pu)
 	if err != nil {
 		return err
 	}
 
-	s.createMOServer(cancelMoServerCtx, pu, aicm)
+	s.createMOServer(frontendCtx, pu, aicm)
 	return nil
 }
 
 func (s *service) initEngine(
 	ctx context.Context,
-	cancelMoServerCtx context.Context,
 	pu *config.ParameterUnit,
 ) error {
 	switch s.cfg.Engine.Type {
 
 	case EngineDistributedTAE:
-		if err := s.initDistributedTAE(cancelMoServerCtx, pu); err != nil {
+		if err := s.initDistributedTAE(ctx, pu); err != nil {
 			return err
 		}
 
@@ -1306,7 +1322,9 @@ func (s *service) initInternalSQlExecutor(mp *mpool.MPool) {
 		s.udfService,
 		s.pu.GetTaskService(),
 	)
-	runtime.ServiceRuntime(s.cfg.UUID).SetGlobalVariables(runtime.InternalSQLExecutor, s.sqlExecutor)
+	s.rt.SetGlobalVariables(runtime.InternalSQLExecutor, s.sqlExecutor)
+	cdc.InitTableDetector(s.rt, s.sqlExecutor)
+	cdc.InitCDCWatermarkUpdater(s.rt, frontend.NewInternalExecutor(s.cfg.UUID))
 	s.initMongoDBRuntime()
 }
 
@@ -1598,4 +1616,32 @@ func (s *service) initProcessCodecService() {
 
 func (s *service) GetTxnClient() client.TxnClient {
 	return s._txnClient
+}
+
+func (s *service) stopTableDetector() error {
+	if d := cdc.TableDetectorFromRuntime(s.rt); d != nil {
+		d.Stop()
+	}
+	return nil
+}
+
+func (s *service) closeTableDetector() error {
+	if d := cdc.TableDetectorFromRuntime(s.rt); d != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return d.CloseAndWait(ctx)
+	}
+	return nil
+}
+
+func (s *service) closeCDCWatermarkUpdater() error {
+	if u := cdc.CDCWatermarkUpdaterFromRuntime(s.rt); u != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := u.CloseAndWait(ctx); err != nil {
+			return err
+		}
+		s.rt.CompareAndDeleteGlobalVariables(runtime.CDCWatermarkUpdater, u)
+	}
+	return nil
 }

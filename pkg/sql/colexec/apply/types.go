@@ -43,10 +43,11 @@ type container struct {
 	rbat  *batch.Batch
 	inbat *batch.Batch
 
-	batIdx   int
-	tfFinish bool
-	tfNull   bool
-	sels     []int32
+	batIdx              int
+	tfFinish            bool
+	tfNull              bool
+	preserveSourceBatch bool
+	sels                []int32
 }
 
 type Apply struct {
@@ -56,7 +57,7 @@ type Apply struct {
 	Typs      []types.Type
 
 	TableFunction   *table_function.TableFunction
-	VectorIndexScan *plan.VectorIndexScan
+	IndexSearchScan *plan.IndexSearchScan
 	VectorAttrs     []string
 	// TxnOffset is the statement boundary used by correlated vector scans.
 	// APPLY must preserve it across every provider row and remote generation.

@@ -29,9 +29,12 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/matrixorigin/matrixone/pkg/common/collation"
+	"github.com/matrixorigin/matrixone/pkg/common/collation/encoding"
 	"github.com/matrixorigin/matrixone/pkg/common/hashmap"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/common/sqlquote"
 	"github.com/matrixorigin/matrixone/pkg/common/util"
 	"github.com/matrixorigin/matrixone/pkg/config"
 	"github.com/matrixorigin/matrixone/pkg/container/hashtable"
@@ -615,48 +618,17 @@ func builtInMoShowVisibleBin(parameters []*vector.Vector, result vector.Function
 			if err != nil {
 				return nil, err
 			}
-
-			ts := typ.String()
-			ret := ""
-			// after decimal fix, remove this
-			if typ.Oid.IsDecimal() {
-				ts = "DECIMAL"
-				ret = fmt.Sprintf("%s(%d,%d)", ts, typ.Width, typ.Scale)
+			var ret string
+			// Public metadata queries use this path for ENUM with an empty
+			// attr_enum, which represents the single empty-string member.
+			if typ.Oid == types.T_enum {
+				ret = "enum('')"
+			} else if formatted, ok := types.FormatSQLColumnType(*typ); ok {
+				ret = strings.ToLower(formatted)
 			} else if typ.Oid == types.T_geometry || typ.Oid == types.T_geometry32 {
 				ret = geometryShowColumnType(typ)
-			} else if typ.Oid == types.T_text {
-				switch typ.Width {
-				case types.MaxTinyTextLen:
-					ret = "TINYTEXT"
-				case types.MaxMediumTextLen:
-					ret = "MEDIUMTEXT"
-				case types.MaxLongTextLen:
-					ret = "LONGTEXT"
-				case 0, types.MaxStringSize:
-					ret = "TEXT"
-				default:
-					ret = fmt.Sprintf("%s(%d)", ts, typ.Width)
-				}
-			} else if typ.Oid == types.T_blob {
-				switch typ.Width {
-				case types.MaxTinyTextLen:
-					ret = "TINYBLOB"
-				case types.MaxMediumTextLen:
-					ret = "MEDIUMBLOB"
-				case types.MaxLongTextLen:
-					ret = "LONGBLOB"
-				case types.MaxStringSize:
-					ret = "BLOB"
-				default:
-					ret = fmt.Sprintf("%s(%d)", ts, typ.Width)
-				}
-			} else if typ.IsIntOrUint() && typ.Width == 0 {
-				// Width is the physical type width for stored integer columns, but
-				// expression-only integer types may leave it unset. Do not expose
-				// that internal zero as a MySQL display width.
-				ret = ts
 			} else {
-				ret = fmt.Sprintf("%s(%d)", ts, typ.Width)
+				ret = fmt.Sprintf("%s(%d)", typ.String(), typ.Width)
 			}
 
 			return functionUtil.QuickStrToBytes(ret), nil
@@ -757,11 +729,11 @@ func builtInMoShowVisibleBinEnum(parameters []*vector.Vector, result vector.Func
 		if err != nil {
 			return nil, err
 		}
-		typeName := "ENUM"
+		typeName := "enum"
 		if typ.Oid == types.T_json && strings.HasPrefix(strings.ToLower(strings.TrimSpace(enumStr)), "array(") {
 			return functionUtil.QuickStrToBytes(enumStr), nil
 		} else if typ.Oid == types.T_uint64 {
-			typeName = "SET"
+			typeName = "set"
 		} else if typ.Oid == types.T_geometry {
 			subtype := ""
 			sridDefined := false
@@ -794,23 +766,25 @@ func builtInMoShowVisibleBinEnum(parameters []*vector.Vector, result vector.Func
 			return nil, moerr.NewNotSupportedf(proc.Ctx, "show visible bin enum, the type must be enum/set, but got %s", typ.String())
 		}
 
-		// get enum values
-		enums := strings.Split(enumStr, ",")
-		enumVal := ""
-		for i, e := range enums {
-			enumVal += fmt.Sprintf("'%s'", e)
-			if i < len(enums)-1 {
-				enumVal += ","
+		members := strings.Split(enumStr, ",")
+		if typ.Oid == types.T_uint64 {
+			if enumStr == "" {
+				return nil, nil
 			}
+			members = types.DecodeSetValues(enumStr)
 		}
-		ret := fmt.Sprintf("%s(%s)", typeName, enumVal)
+		for i := range members {
+			members[i] = sqlquote.String(members[i])
+		}
+		ret := typeName + "(" + strings.Join(members, ",") + ")"
+
 		return functionUtil.QuickStrToBytes(ret), nil
 	}
 
 	for i := uint64(0); i < uint64(length); i++ {
 		v1, null1 := p1.GetStrValue(i)
 		enumStr, null2 := enumVal.GetStrValue(i)
-		if null1 || null2 || len(v1) == 0 || len(enumStr) == 0 {
+		if null1 || null2 || len(v1) == 0 {
 			if err := rs.AppendBytes(nil, true); err != nil {
 				return err
 			}
@@ -1176,6 +1150,10 @@ func builtInInternalCharacterSet(parameters []*vector.Vector, result vector.Func
 					identity = 1
 				case types.CharsetUTF8:
 					identity = 3
+				case types.CharsetUTF8MB3UnicodeCI:
+					identity = 4
+				case types.CharsetUTF8MB4UnicodeCI:
+					identity = 5
 				}
 				if err := rs.Append(identity, false); err != nil {
 					return err
@@ -1746,7 +1724,7 @@ func builtInMoLogDate(parameters []*vector.Vector, result vector.FunctionResultW
 				}
 			} else {
 				generalTime.ResetTime()
-				success := coreStrToDate(proc.Ctx, generalTime, parsedInput, formatMask)
+				success, _ := coreStrToDate(proc.Ctx, generalTime, parsedInput, formatMask)
 				if success && types.ValidDate(int32(generalTime.year), generalTime.month, generalTime.day) {
 					val := types.DateFromCalendar(int32(generalTime.year), generalTime.month, generalTime.day)
 					if err = rs.Append(val, false); err != nil {
@@ -3302,8 +3280,21 @@ func builtInHashPartition(parameters []*vector.Vector, result vector.FunctionRes
 // input vec is [[1, 1, 1], [2, 2, null], [3, 3, 3]]
 // result vec is [serial(1, 2, 3), serial(1, 2, 3), null]
 func (op *opSerial) BuiltInSerial(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	return op.builtInSerial(parameters, result, proc, length, selectList, false)
+}
+
+func (op *opSerial) BuiltInPhysicalSerial(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	return op.builtInSerial(parameters, result, proc, length, selectList, true)
+}
+
+func (op *opSerial) builtInSerial(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList, physicalKey bool) error {
 	rs := vector.MustFunctionResult[types.Varlena](result)
 	var err error
+	if physicalKey {
+		if err = validatePhysicalSerialValues(parameters, length); err != nil {
+			return err
+		}
+	}
 
 	bitMap := new(nulls.Nulls)
 	for _, v := range parameters {
@@ -3317,7 +3308,7 @@ func (op *opSerial) BuiltInSerial(parameters []*vector.Vector, result vector.Fun
 	if len(op.funcs) == 0 {
 		op.funcs = make([]func(v *vector.Vector, idx int, ps *types.Packer), len(parameters))
 		for i, p := range parameters {
-			op.funcs[i], err = getPackFun(p)
+			op.funcs[i], err = getPackFunWithPhysical(p, physicalKey)
 			if err != nil {
 				return err
 			}
@@ -3355,14 +3346,27 @@ func (op *opSerial) BuiltInSerial(parameters []*vector.Vector, result vector.Fun
 }
 
 func (op *opSerial) BuiltInSerialFull(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	return op.builtInSerialFull(parameters, result, proc, length, selectList, false)
+}
+
+func (op *opSerial) BuiltInPhysicalSerialFull(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	return op.builtInSerialFull(parameters, result, proc, length, selectList, true)
+}
+
+func (op *opSerial) builtInSerialFull(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList, physicalKey bool) error {
 	rs := vector.MustFunctionResult[types.Varlena](result)
 
 	var err error
+	if physicalKey {
+		if err = validatePhysicalSerialValues(parameters, length); err != nil {
+			return err
+		}
+	}
 	if len(op.funcs) == 0 {
 		op.funcs = make([]func(v *vector.Vector, idx int, ps *types.Packer), len(parameters))
 		for i, p := range parameters {
 			if !p.IsConstNull() {
-				op.funcs[i], err = getPackFun(p)
+				op.funcs[i], err = getPackFunWithPhysical(p, physicalKey)
 				if err != nil {
 					return err
 				}
@@ -3386,7 +3390,33 @@ func (op *opSerial) BuiltInSerialFull(parameters []*vector.Vector, result vector
 	return nil
 }
 
+// validatePhysicalSerialValues is the abortable admission boundary for the
+// SQL physical_serial and physical_serial_full functions. Their pack closures
+// intentionally share the legacy no-error serializer, so validate every
+// native Unicode value before any output row is published. This keeps invalid
+// UTF-8 and out-of-repertoire values from becoming a second raw-byte identity.
+func validatePhysicalSerialValues(parameters []*vector.Vector, length int) error {
+	for _, v := range parameters {
+		if v == nil || !types.IsUnicodeCollation(v.GetType().Charset) || !v.GetType().Oid.IsMySQLString() {
+			continue
+		}
+		for i := 0; i < length; i++ {
+			if v.IsNull(uint64(i)) {
+				continue
+			}
+			if err := types.ValidateCollationValue(*v.GetType(), v.GetBytesAt(i)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func getPackFun(v *vector.Vector) (func(v *vector.Vector, idx int, ps *types.Packer), error) {
+	return getPackFunWithPhysical(v, false)
+}
+
+func getPackFunWithPhysical(v *vector.Vector, physicalKey bool) (func(v *vector.Vector, idx int, ps *types.Packer), error) {
 	switch v.GetType().Oid {
 	case types.T_bool:
 		return func(v *vector.Vector, idx int, ps *types.Packer) {
@@ -3505,6 +3535,9 @@ func getPackFun(v *vector.Vector) (func(v *vector.Vector, idx int, ps *types.Pac
 		types.T_datalink:
 		return func(v *vector.Vector, idx int, ps *types.Packer) {
 			val := v.GetBytesAt(idx)
+			if physicalKey && types.IsUnicodeCollation(v.GetType().Charset) {
+				val = types.CollationKeyOrOriginal(v.GetType().Charset, val)
+			}
 			ps.EncodeStringType(val)
 		}, nil
 	}
@@ -3512,10 +3545,84 @@ func getPackFun(v *vector.Vector) (func(v *vector.Vector, idx int, ps *types.Pac
 	return nil, moerr.NewInternalErrorNoCtxf("not supported type %s", v.GetType().String())
 }
 
-// SerialHelper is unified function used in builtInSerial and BuiltInSerialFull
-// To use it inside builtInSerial, pass the bitMap pointer and set isFull false
-// To use it inside BuiltInSerialFull, pass the bitMap as nil and set isFull to true
+// BuiltInPhysicalCollationKey materializes the one-part key used by a
+// secondary index. Unlike generic SERIAL this is intentionally an opaque
+// comparison-key value; callers must not expose it as the source string.
+func BuiltInPhysicalCollationKey(parameters []*vector.Vector, result vector.FunctionResultWrapper, _ *process.Process, length int, selectList *FunctionSelectList) error {
+	if len(parameters) != 1 {
+		return moerr.NewInvalidInputNoCtx("physical_collation_key expects one argument")
+	}
+	from := vector.GenerateFunctionStrParameter(parameters[0])
+	rs := vector.MustFunctionResult[types.Varlena](result)
+	typ := *parameters[0].GetType()
+	for i := 0; i < length; i++ {
+		if functionRowSkipped(selectList, uint64(i)) {
+			if err := rs.AppendBytes(nil, true); err != nil {
+				return err
+			}
+			continue
+		}
+		value, null := from.GetStrValue(uint64(i))
+		if null {
+			if err := rs.AppendBytes(nil, true); err != nil {
+				return err
+			}
+			continue
+		}
+		var err error
+		value, err = types.PhysicalCollationKey(typ, value)
+		if err != nil {
+			return err
+		}
+		if err := rs.AppendBytes(value, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SerialHelper encodes original values for the generic SERIAL/SERIAL_FULL
+// contract.  Generic serialization is intentionally lossless: transformed
+// comparison keys belong only to the physical index-key boundary.
+//
+// To use it inside builtInSerial, pass the bitMap pointer and set isFull false.
+// To use it inside BuiltInSerialFull, pass the bitMap as nil and set isFull to
+// true.
 func SerialHelper(v *vector.Vector, bitMap *nulls.Nulls, ps []*types.Packer, isFull bool) {
+	serialHelper(v, bitMap, ps, isFull, false)
+}
+
+// PhysicalSerialHelper is the schema-aware serializer used by secondary
+// index producers.  It keeps the generic SERIAL value contract separate from
+// the opaque UCA comparison-key domain used for native Unicode index parts.
+func PhysicalSerialHelper(v *vector.Vector, bitMap *nulls.Nulls, ps []*types.Packer, isFull bool) {
+	serialHelper(v, bitMap, ps, isFull, true)
+}
+
+// PhysicalSerialHelperChecked validates native Unicode values before building
+// an index key.  The historical helper has no error return because it is also
+// used by generic planner-only paths; index producers that can abort a batch
+// should use this wrapper so malformed/repertoire-invalid bytes cannot become
+// a tagged raw fallback in a persisted key.
+func PhysicalSerialHelperChecked(v *vector.Vector, bitMap *nulls.Nulls, ps []*types.Packer, isFull bool) error {
+	if v == nil || !types.IsUnicodeCollation(v.GetType().Charset) || !v.GetType().Oid.IsMySQLString() {
+		PhysicalSerialHelper(v, bitMap, ps, isFull)
+		return nil
+	}
+	values, area := vector.MustVarlenaRawData(v)
+	for i := range values {
+		if v.IsNull(uint64(i)) {
+			continue
+		}
+		if err := types.ValidateCollationValue(*v.GetType(), values[i].GetByteSlice(area)); err != nil {
+			return err
+		}
+	}
+	PhysicalSerialHelper(v, bitMap, ps, isFull)
+	return nil
+}
+
+func serialHelper(v *vector.Vector, bitMap *nulls.Nulls, ps []*types.Packer, isFull, physicalKey bool) {
 
 	if !isFull && bitMap == nil {
 		// if you are using it inside the builtInSerial then, you should pass bitMap
@@ -3952,15 +4059,22 @@ func SerialHelper(v *vector.Vector, bitMap *nulls.Nulls, ps []*types.Packer, isF
 					}
 					continue
 				}
-				ps[i].EncodeStringType(value)
+				ps[i].EncodeStringType(serialStringValue(*v.GetType(), value, physicalKey))
 			}
 		} else {
 			vs := vector.ExpandBytesCol(v)
 			for i := range vs {
-				ps[i].EncodeStringType(vs[i])
+				ps[i].EncodeStringType(serialStringValue(*v.GetType(), vs[i], physicalKey))
 			}
 		}
 	}
+}
+
+func serialStringValue(typ types.Type, value []byte, physicalKey bool) []byte {
+	if physicalKey && types.IsUnicodeCollation(typ.Charset) {
+		return types.CollationKeyOrOriginal(typ.Charset, value)
+	}
+	return value
 }
 
 // builtInSerialExtract is used to extract a tupleElement from the serial vector.
@@ -4541,6 +4655,47 @@ func builtInSinh(parameters []*vector.Vector, result vector.FunctionResultWrappe
 	return nil
 }
 
+func builtInTanh(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	return opUnaryFixedToFixed[float64, float64](parameters, result, proc, length, math.Tanh, selectList)
+}
+
+func builtInCosh(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	return opUnaryFixedToFixedWithErrorCheck[float64, float64](parameters, result, proc, length, func(v float64) (float64, error) {
+		r := math.Cosh(v)
+		if math.IsInf(r, 0) && !math.IsInf(v, 0) {
+			// 标准库的 Exp(abs(v))/2 可能提前溢出；先缩放再相乘，保留可表示的 COSH 结果。
+			e := math.Exp(math.Abs(v) / 2)
+			r = (e / 2) * e
+		}
+		if math.IsInf(r, 0) {
+			return 0, moerr.NewOutOfRangeNoCtxf("float64", "DOUBLE value is out of range in 'cosh(%v)'", v)
+		}
+		return r, nil
+	}, selectList)
+}
+
+func builtInASinh(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	return opUnaryFixedToFixed[float64, float64](parameters, result, proc, length, math.Asinh, selectList)
+}
+
+func builtInACosh(parameters []*vector.Vector, result vector.FunctionResultWrapper, _ *process.Process, length int, selectList *FunctionSelectList) error {
+	return opUnaryFixedToFixedWithNullCheck[float64, float64](parameters, result, length, func(v float64) (float64, bool) {
+		if v < 1 {
+			return 0, true
+		}
+		return math.Acosh(v), false
+	}, selectList)
+}
+
+func builtInATanh(parameters []*vector.Vector, result vector.FunctionResultWrapper, _ *process.Process, length int, selectList *FunctionSelectList) error {
+	return opUnaryFixedToFixedWithNullCheck[float64, float64](parameters, result, length, func(v float64) (float64, bool) {
+		if v <= -1 || v >= 1 {
+			return 0, true
+		}
+		return math.Atanh(v), false
+	}, selectList)
+}
+
 func builtInCos(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
 	p1 := vector.GenerateFunctionFixedTypeParameter[float64](parameters[0])
 	rs := vector.MustFunctionResult[float64](result)
@@ -4690,13 +4845,21 @@ func builtInRadians(parameters []*vector.Vector, result vector.FunctionResultWra
 }
 
 func builtInLn(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
-	return opUnaryFixedToFixedWithNullOnError[float64, float64](parameters, result, proc, length, func(v float64) (float64, error) {
+	// The LN/LOG kernel returns NULL for invalid arguments (executed for both
+	// LN(x) and the unary LOG(x) overload). Per-row warning 3020 diagnostics
+	// are reported by the shared post-pass, which also keeps folded scalar
+	// calls from collapsing the per-row warning count (#30214).
+	if err := opUnaryFixedToFixedWithNullOnError[float64, float64](parameters, result, proc, length, func(v float64) (float64, error) {
 		return momath.Ln(v)
-	}, selectList)
+	}, selectList); err != nil {
+		return err
+	}
+	appendLogarithmArgWarnings(parameters, result.GetResultVector(), proc, length, selectList)
+	return nil
 }
 
 func builtInLog(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
-	return opBinaryFixedFixedToFixedWithNullOnError[float64, float64, float64](parameters, result, proc, length, func(v1, v2 float64) (float64, error) {
+	if err := opBinaryFixedFixedToFixedWithNullOnError[float64, float64, float64](parameters, result, proc, length, func(v1, v2 float64) (float64, error) {
 		if v1 == 1 {
 			return 0, moerr.NewInvalidArg(proc.Ctx, "log base", 1)
 		}
@@ -4709,19 +4872,31 @@ func builtInLog(parameters []*vector.Vector, result vector.FunctionResultWrapper
 			return 0, moerr.NewInvalidArg(proc.Ctx, "log input", "<= 0")
 		}
 		return tempV2 / tempV1, nil
-	}, selectList)
+	}, selectList); err != nil {
+		return err
+	}
+	appendLogarithmArgWarnings(parameters, result.GetResultVector(), proc, length, selectList)
+	return nil
 }
 
 func builtInLog2(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
-	return opUnaryFixedToFixedWithNullOnError[float64, float64](parameters, result, proc, length, func(v float64) (float64, error) {
+	if err := opUnaryFixedToFixedWithNullOnError[float64, float64](parameters, result, proc, length, func(v float64) (float64, error) {
 		return momath.Log2(v)
-	}, selectList)
+	}, selectList); err != nil {
+		return err
+	}
+	appendLogarithmArgWarnings(parameters, result.GetResultVector(), proc, length, selectList)
+	return nil
 }
 
 func builtInLog10(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
-	return opUnaryFixedToFixedWithNullOnError[float64, float64](parameters, result, proc, length, func(v float64) (float64, error) {
+	if err := opUnaryFixedToFixedWithNullOnError[float64, float64](parameters, result, proc, length, func(v float64) (float64, error) {
 		return momath.Lg(v)
-	}, selectList)
+	}, selectList); err != nil {
+		return err
+	}
+	appendLogarithmArgWarnings(parameters, result.GetResultVector(), proc, length, selectList)
+	return nil
 }
 
 type opBuiltInRand struct {
@@ -4770,7 +4945,7 @@ func (op *opBuiltInRand) builtInRand(parameters []*vector.Vector, result vector.
 	return nil
 }
 
-func builtInConvertUsingCharset(parameters []*vector.Vector, result vector.FunctionResultWrapper, _ *process.Process, length int, selectList *FunctionSelectList) error {
+func builtInConvertUsingCharset(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
 	result.UseOptFunctionParamFrame(2)
 	rs := vector.MustFunctionResult[types.Varlena](result)
 	p1 := vector.OptGetBytesParamFromWrapper(rs, 0, parameters[0])
@@ -4791,6 +4966,7 @@ func builtInConvertUsingCharset(parameters []*vector.Vector, result vector.Funct
 			}
 		}
 	}
+	borrower := encoding.NewBorrowedConvertUsing(proc.Ctx)
 	for i := uint64(0); i < uint64(length); i++ {
 		if selectList != nil && !selectList.ShouldEvalAllRow() && selectList.Contains(i) {
 			if err := rs.AppendMustNullForBytesResult(); err != nil {
@@ -4823,18 +4999,30 @@ func builtInConvertUsingCharset(parameters []*vector.Vector, result vector.Funct
 				return err
 			}
 		}
-		if identity != collation.BinaryIdentity && !utf8.Valid(value) {
-			if err := rs.AppendMustNullForBytesResult(); err != nil {
-				return err
-			}
-			continue
+		dst := collation.CharsetUTF8MB4
+		if identity == collation.BinaryIdentity {
+			dst = collation.CharsetBinary
 		}
-
-		if err := rs.AppendMustBytesValue(value); err != nil {
+		// The existing evaluator interprets internal bytes in the target
+		// repertoire. SQL admission above still resolves utf8 aliases to MB4.
+		limit := mpool.MaxAllocationSize()
+		if len(value) > types.VarlenaInlineSize {
+			limit -= int64(len(rs.GetResultVector().GetArea()))
+		}
+		isNull, err := borrower.Borrow(dst, value, limit)
+		if err != nil {
+			return err
+		}
+		if isNull {
+			err = rs.AppendMustNullForBytesResult()
+		} else {
+			err = rs.AppendMustBytesValue(value)
+		}
+		if err != nil {
 			return err
 		}
 	}
-	return nil
+	return borrower.Finish()
 }
 
 func resolveConvertCharset(charset []byte) (collation.Identity, error) {

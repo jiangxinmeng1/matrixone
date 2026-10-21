@@ -306,6 +306,8 @@ func TestExternalArrowLoadFromLocalMinIOAndRejectsObjectChange(t *testing.T) {
 	require.NoError(t, err)
 	proc = newArrowLoadTestProc(t)
 	param := externalArrowParam(fs, identityPath, int64(len(payload)), tree.ARROW_CONTAINER_FILE)
+	// This direct reader path must bind the policy normally installed by Prepare.
+	param.Extern.Ctx = process.SQLFileAccessContext(proc.Ctx, proc)
 	param.Fileparam.FileIndex = 1
 	param.Fileparam.Filepath = identityPath
 	reader, err := NewArrowReader(param, proc, account)
@@ -562,6 +564,13 @@ func TestBuildArrowTargetsUsesPhysicalColumnTypeAcrossGeneratedGap(t *testing.T)
 	require.True(t, targets[1].NotNull)
 	require.Equal(t, 1, targets[1].MOIndex)
 	require.Equal(t, "id", targets[1].AttrName)
+
+	cols[2].Typ = plan.Type{Id: int32(types.T_uint64), Enumvalues: ",", NotNullable: true}
+	targets, err = BuildArrowTargets(context.Background(), attrs, cols)
+	require.NoError(t, err)
+	require.Equal(t, ",", targets[1].SetValues)
+	require.Equal(t, 1, targets[1].MOIndex)
+	require.Empty(t, targets[0].SetValues)
 
 	_, err = BuildArrowTargets(context.Background(), []plan.ExternAttr{{ColIndex: 3}}, cols)
 	require.ErrorContains(t, err, "index 3")
@@ -912,6 +921,8 @@ func externalArrowParam(fs fileservice.FileService, path string, size int64, con
 func newArrowLoadTestProc(t *testing.T) *process.Process {
 	t.Helper()
 	proc := testutil.NewProc(t)
+	proc.Base.SessionInfo.Account = "sys"
+	proc.Base.SessionInfo.Role = "moadmin"
 	frontend := &config.FrontendParameters{}
 	frontend.SetDefaultValues()
 	proc.Ctx = context.WithValue(proc.Ctx, config.ParameterUnitKey,

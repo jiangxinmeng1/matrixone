@@ -44,6 +44,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
 	"github.com/matrixorigin/matrixone/pkg/sql/util"
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
+	"github.com/matrixorigin/matrixone/pkg/util/sysview"
 	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace/statistic"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
@@ -82,6 +83,7 @@ type TxnCompilerContext struct {
 	tcw     ComputationWrapper
 	execCtx *ExecCtx
 	// cached backExec for subscription meta queries, reused within the same transaction
+	viewSchemaRead bool
 	cachedBackExec BackgroundExec
 	mu             sync.Mutex
 }
@@ -342,6 +344,11 @@ func (tcc *TxnCompilerContext) resolvePhysicalObjectAccount(
 	snapshot *plan2.Snapshot,
 ) uint32 {
 	accountID := tcc.execCtx.ses.GetAccountId()
+	if tcc.viewSchemaRead {
+		if current, err := defines.GetAccountId(tcc.GetContext()); err == nil {
+			accountID = current
+		}
+	}
 	if snapshot != nil && snapshot.Tenant != nil {
 		accountID = snapshot.Tenant.TenantID
 	}
@@ -739,10 +746,23 @@ func (tcc *TxnCompilerContext) Resolve(dbName string, tableName string, snapshot
 		}
 	}
 
-	// Check if it is a temporary table in the current session
-	realName, isTmpTable := tcc.GetSession().GetTempTable(dbName, tableName)
-	if isTmpTable {
-		tableName = realName
+	// Session temporary names belong to its account, not to a publisher (or
+	// historical foreign tenant) whose catalog this private View reader uses.
+	useSessionTemporary := true
+	if tcc.viewSchemaRead {
+		identity := &plan2.ObjectRef{SchemaName: dbName, ObjName: tableName}
+		if sub != nil {
+			identity.SchemaName = sub.DbName
+			identity.PubInfo = &plan.PubInfo{TenantId: sub.AccountId}
+		}
+		useSessionTemporary = tcc.resolvePhysicalObjectAccount(identity, nil, snapshot) == tcc.GetSession().GetAccountId()
+	}
+	isTmpTable := false
+	if useSessionTemporary {
+		realName, temporary := tcc.GetSession().GetTempTable(dbName, tableName)
+		if temporary {
+			tableName, isTmpTable = realName, true
+		}
 	}
 
 	ctx, table, err := tcc.getRelation(dbName, tableName, sub, snapshot)
@@ -757,7 +777,7 @@ func (tcc *TxnCompilerContext) Resolve(dbName string, tableName string, snapshot
 		return nil, nil, err
 	}
 	ownedTemporary := false
-	if owner, ok := tcc.GetSession().(process.TemporaryTableDDL); ok {
+	if owner, ok := tcc.GetSession().(process.TemporaryTableDDL); ok && useSessionTemporary {
 		ownedTemporary = owner.OwnsTemporaryTable(dbName, tableName)
 	}
 	tableDef.IsTemporary = isTmpTable || ownedTemporary
@@ -809,10 +829,13 @@ func (tcc *TxnCompilerContext) ResolveIndexTableByRef(
 		}
 	}
 
-	// Check if it is a temporary table in the current session
-	realName, isTmpTable := tcc.GetSession().GetTempTable(ref.SchemaName, tblName)
-	if isTmpTable {
-		tblName = realName
+	// The caller's temporary index names cannot replace a foreign publisher's
+	// physical index relation in a private View read.
+	if !tcc.viewSchemaRead || tcc.resolvePhysicalObjectAccount(ref, nil, snapshot) == tcc.GetSession().GetAccountId() {
+		realName, isTmpTable := tcc.GetSession().GetTempTable(ref.SchemaName, tblName)
+		if isTmpTable {
+			tblName = realName
+		}
 	}
 
 	ctx, table, err := tcc.getRelation(ref.SchemaName, tblName, subMeta, snapshot)
@@ -1504,6 +1527,15 @@ func (tcc *TxnCompilerContext) GetSubscriptionMeta(dbName string, snapshot *plan
 		}
 	}
 
+	if tcc.viewSchemaRead && plan2.IsSnapshotValid(snapshot) && snapshot.TS.Less(tcc.GetTxnHandler().GetTxn().SnapshotTS()) {
+		ses := tcc.GetSession()
+		bh := ses.InitBackExec(txn, ses.GetDatabaseName(), fakeDataSetFetcher2)
+		if back, ok := bh.(*backExec); ok {
+			back.backSes.ReplaceDerivedStmt(true)
+		}
+		defer bh.Close()
+		return getSubscriptionMeta(tempCtx, dbName, ses, txn, bh)
+	}
 	bh := tcc.getOrCreateBackExec(tempCtx)
 	bh.ClearExecResultSet()
 	return getSubscriptionMeta(tempCtx, dbName, tcc.GetSession(), txn, bh)
@@ -1670,53 +1702,8 @@ func getVisibleSubscriptionMetadata(
 	return visible, nil
 }
 
-// subscriptionMetadataVisibilitySQL mirrors the canonical
-// information_schema table visibility rules using only subscriber-local
-// objects. Subscription tables are virtual in the subscriber catalog, so the
-// supported grant surface is database/global scope; exact table grants cannot
-// be resolved there. Subscriber role IDs are never evaluated in the publisher
-// account.
 func subscriptionMetadataVisibilitySQL(subscriptionNames string, protocolVersion int64) string {
-	activeRolesSQL := "SELECT role_id FROM mo_current_roles() role_closure"
-	if protocolVersion < defines.MORPCVersion41 {
-		// Match the persisted information_schema compatibility view during a
-		// rolling deployment. The full local table-function closure is available
-		// only after every CN supports protocol v41.
-		activeRolesSQL = "SELECT current_role_id() UNION " +
-			"SELECT rg.granted_id FROM mo_catalog.mo_role_grant rg " +
-			"WHERE rg.grantee_id = current_role_id()"
-	}
-	return fmt.Sprintf(`WITH __subscription_active_roles(role_id) AS (
-    %s
-), __subscription_databases AS (
-    SELECT dat_id, datname, owner
-    FROM mo_catalog.mo_database
-    WHERE account_id = current_account_id() AND datname IN (%s)
-), __subscription_broad_visibility AS (
-    SELECT db.dat_id, db.datname
-    FROM __subscription_databases db
-    WHERE db.owner IN (SELECT role_id FROM __subscription_active_roles)
-       OR EXISTS (
-            SELECT 1
-            FROM mo_catalog.mo_role_privs rp
-            JOIN __subscription_active_roles ar ON rp.role_id = ar.role_id
-            WHERE rp.obj_type IN ('table','view') AND (
-                (rp.privilege_level = '*.*' AND rp.obj_id = 0)
-                OR (rp.privilege_level IN ('d.*','*') AND rp.obj_id = db.dat_id)
-            )
-       )
-       OR EXISTS (
-            SELECT 1
-            FROM mo_catalog.mo_role_privs rp
-            JOIN __subscription_active_roles ar ON rp.role_id = ar.role_id
-            WHERE rp.obj_type = 'database'
-              AND rp.privilege_name IN ('show tables','database all','database ownership')
-              AND ((rp.privilege_level IN ('*','*.*') AND rp.obj_id = 0)
-                   OR (rp.privilege_level = 'd' AND rp.obj_id = db.dat_id))
-       )
-)
-SELECT datname, 1 AS all_tables, 0 AS table_id
-FROM __subscription_broad_visibility`, activeRolesSQL, subscriptionNames)
+	return sysview.SubscriptionMetadataVisibilitySQL(subscriptionNames, protocolVersion)
 }
 
 func (tcc *TxnCompilerContext) CheckSubscriptionValid(subName, accName, pubName string) error {

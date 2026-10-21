@@ -1531,7 +1531,7 @@ func TestWindowOrderedPercentileFullPartitionBroadcasts(t *testing.T) {
 }
 
 func TestWindowOrderedPercentileSpills(t *testing.T) {
-	proc := testutil.NewProcessWithOwnedMPool(t, "", mpool.MustNewZero())
+	proc := newWindowSpillProcess(t)
 	const rows = 20_000
 	values := make([]int32, rows)
 	for i := range values {
@@ -1616,7 +1616,7 @@ func TestWindowOrderedPercentileFinalizationHonorsCancellation(t *testing.T) {
 }
 
 func TestWindowOrderedPercentileSpilledMergeCancellationClosesAndReuses(t *testing.T) {
-	proc := testutil.NewProcessWithOwnedMPool(t, "", mpool.MustNewZero())
+	proc := newWindowSpillProcess(t)
 	trackingFS := installTrackingSpillFileService(t, proc)
 	const rows = 20_000
 	values := make([]int32, rows)
@@ -2379,16 +2379,85 @@ func TestWindowOrderFunctionsUsePeerBoundaries(t *testing.T) {
 	require.Equal(t, int64(0), proc.Mp().CurrNB())
 }
 
-func TestNtileBucketCountRejectsNull(t *testing.T) {
-	mp := mpool.MustNewZero()
-	bucketVec := vector.NewConstNull(types.T_int64.ToType(), 1, mp)
-	defer bucketVec.Free(mp)
-
-	ctr := container{
-		aggVecs: []colexec.ExprEvalVector{{Vec: []*vector.Vector{bucketVec}}},
+func TestNtileBucketCountValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   int64
+		isNull  bool
+		message string
+	}{
+		{"null", 0, true, "ntile bucket count cannot be NULL"},
+		{"zero", 0, false, "ntile bucket count must be positive"},
+		{"negative", -5, false, "ntile bucket count must be positive"},
+		{"one", 1, false, ""},
+		{"positive", 3, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mp := mpool.MustNewZero()
+			defer mp.Free(nil)
+			defer func() {
+				require.Zero(t, mp.CurrNB())
+			}()
+			bucketVec, err := vector.NewConstFixed(types.T_int64.ToType(), tc.value, 1, mp)
+			require.NoError(t, err)
+			defer bucketVec.Free(mp)
+			if tc.isNull {
+				require.NoError(t, vector.SetConstNull(bucketVec, 1, mp))
+			}
+			ctr := container{aggVecs: []colexec.ExprEvalVector{{Vec: []*vector.Vector{bucketVec}}}}
+			value, err := ctr.ntileBucketCount(0)
+			if tc.message == "" {
+				require.NoError(t, err)
+				require.Equal(t, tc.value, value)
+			} else {
+				require.ErrorContains(t, err, tc.message)
+				require.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput))
+			}
+		})
 	}
-	_, err := ctr.ntileBucketCount(0)
-	require.ErrorContains(t, err, "ntile bucket count cannot be NULL")
+}
+
+func TestWindowReuseWithEmptyInput(t *testing.T) {
+	proc := testutil.NewProcessWithOwnedMPool(t, "", mpool.MustNewZero())
+	arg := &Window{
+		WinSpecList: []*plan.Expr{{Expr: &plan.Expr_W{W: &plan.WindowSpec{
+			Name: "row_number", WindowFunc: newFunExpr("row_number"),
+		}}}},
+		Aggs: []aggexec.AggFuncExecExpression{newRowNumberAggExpr(t)},
+	}
+	child := colexec.NewMockOperator()
+	arg.AppendChild(child)
+	t.Cleanup(func() {
+		arg.Free(proc, false, nil)
+		child.Free(proc, false, nil)
+		proc.Free()
+		require.Zero(t, proc.Mp().CurrNB())
+	})
+	for _, values := range [][]int32{nil, {1, 2, 3}, nil, {4, 5}} {
+		arg.Reset(proc, false, nil)
+		child.Free(proc, false, nil)
+		if len(values) != 0 {
+			child.WithBatchs([]*batch.Batch{makeInt32Batch(proc.Mp(), values)})
+		} else {
+			child.WithBatchs([]*batch.Batch{batch.EmptyBatch})
+		}
+		require.NoError(t, arg.Prepare(proc))
+		var got []uint64
+		for {
+			result, err := vm.Exec(arg, proc)
+			require.NoError(t, err)
+			if result.Batch == nil {
+				require.Equal(t, vm.ExecStop, result.Status)
+				break
+			}
+			require.Positive(t, result.Batch.RowCount())
+			got = append(got, vector.MustFixedColWithTypeCheck[uint64](result.Batch.Vecs[1])...)
+		}
+		require.Len(t, got, len(values))
+		for i, rank := range got {
+			require.Equal(t, uint64(i+1), rank)
+		}
+	}
 }
 
 func TestWindowResetBeforeAllChunksReleasesState(t *testing.T) {
@@ -3096,6 +3165,198 @@ func TestWindowOrdersPartitionedInput(t *testing.T) {
 	require.Equal(t, int64(0), proc.Mp().CurrNB())
 }
 
+func TestWindowConstantNullKeysAcrossBatches(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		function          string
+		partitioned       bool
+		constantPartition bool
+		want              []uint64
+	}{
+		{"partitioned_row_number", "row_number", true, false, []uint64{1, 2, 1}},
+		{"partitioned_rank", "rank", true, false, []uint64{1, 1, 1}},
+		{"unpartitioned_dense_rank", "dense_rank", false, false, []uint64{1, 1, 1}},
+		{"constant_partition_then_id", "row_number", true, true, []uint64{1, 2, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proc := testutil.NewProcessWithOwnedMPool(t, "", mpool.MustNewZero())
+			t.Cleanup(func() { require.Zero(t, proc.Mp().CurrNB()) })
+			t.Cleanup(proc.Free)
+			batches := []*batch.Batch{batch.NewWithSize(1), batch.NewWithSize(1)}
+			op := colexec.NewMockOperator().WithBatchs(batches)
+			t.Cleanup(func() { op.Free(proc, false, nil) })
+			for i, values := range [][]int32{{1, 1}, {2}} {
+				batches[i].Vecs[0] = testutil.MakeInt32Vector(values, nil, proc.Mp())
+				batches[i].SetRowCount(len(values))
+			}
+			null := &plan.Expr{
+				Typ:  plan.Type{Id: int32(types.T_any)},
+				Expr: &plan.Expr_Lit{Lit: &plan.Literal{Isnull: true}},
+			}
+			var partitions []*plan.Expr
+			var orders []*plan.OrderBySpec
+			if tc.constantPartition {
+				partitions = append(partitions, null)
+				orders = append(orders, &plan.OrderBySpec{Expr: null})
+			}
+			if tc.partitioned {
+				partitions = append(partitions, newColExpr(0))
+				orders = append(orders, &plan.OrderBySpec{Expr: newColExpr(0)})
+			}
+			orders = append(orders, &plan.OrderBySpec{Expr: null})
+			arg := &Window{
+				WinSpecList: []*plan.Expr{{Expr: &plan.Expr_W{W: &plan.WindowSpec{
+					Name: tc.function, WindowFunc: newFunExpr(tc.function),
+					PartitionBy: partitions, OrderBy: orders,
+				}}}},
+				Aggs: []aggexec.AggFuncExecExpression{newOrderWindowAggExpr(t, tc.function)},
+			}
+			t.Cleanup(func() { arg.Free(proc, false, nil) })
+			arg.AppendChild(op)
+			require.NoError(t, arg.Prepare(proc))
+			require.Equal(t, tc.want, collectFixedWindowColumn[uint64](t, arg, proc, 1))
+		})
+	}
+}
+
+func TestWindowConstantKeysWithForcedSpill(t *testing.T) {
+	for _, tc := range []struct {
+		name, function         string
+		partitioned, realOrder bool
+		want                   []uint64
+	}{
+		{"partition_and_null", "row_number", true, false, []uint64{1, 2, 3, 1}},
+		{"mixed_order_peers", "rank", true, true, []uint64{1, 1, 3, 1}},
+		{"all_constant", "dense_rank", false, false, []uint64{1, 1, 1, 1}},
+		{"range_peer_sum", "sum", true, true, nil},
+		{"spill_admission_failure", "rank", true, true, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proc := newWindowSpillProcess(t)
+			t.Cleanup(func() { require.Zero(t, proc.Mp().CurrNB()) })
+			t.Cleanup(proc.Free)
+			input := batch.NewWithSize(2)
+			input.Vecs[0] = testutil.MakeInt32Vector([]int32{2, 1, 1, 1}, nil, proc.Mp())
+			input.Vecs[1] = testutil.MakeInt32Vector([]int32{30, 20, 10, 10}, nil, proc.Mp())
+			input.SetRowCount(4)
+			child := colexec.NewMockOperator().WithBatchs([]*batch.Batch{input})
+			t.Cleanup(func() { child.Free(proc, false, nil) })
+			null := &plan.Expr{Typ: plan.Type{Id: int32(types.T_any)}, Expr: &plan.Expr_Lit{Lit: &plan.Literal{Isnull: true}}}
+			partitions := []*plan.Expr{null}
+			orders := []*plan.OrderBySpec{{Expr: null}}
+			if tc.partitioned {
+				partitions = append(partitions, newColExpr(0))
+			}
+			if tc.realOrder {
+				orders = append(orders, &plan.OrderBySpec{Expr: newColExpr(1)}, &plan.OrderBySpec{Expr: null})
+			}
+			arg := &Window{
+				WinSpecList: []*plan.Expr{{Expr: &plan.Expr_W{W: &plan.WindowSpec{
+					Name: tc.function, WindowFunc: newFunExpr(tc.function), PartitionBy: partitions, OrderBy: orders,
+				}}}},
+				Aggs:           []aggexec.AggFuncExecExpression{newOrderWindowAggExpr(t, "rank")},
+				SpillThreshold: 1,
+				PartitionTopN:  true,
+			}
+			if tc.function != "sum" {
+				arg.Aggs = []aggexec.AggFuncExecExpression{newOrderWindowAggExpr(t, tc.function)}
+			}
+			if tc.function == "sum" {
+				arg.Aggs = []aggexec.AggFuncExecExpression{newAggExprAt(1)}
+				arg.WinSpecList[0].GetW().Frame = &plan.FrameClause{
+					Type:  plan.FrameClause_RANGE,
+					Start: &plan.FrameBound{Type: plan.FrameBound_CURRENT_ROW},
+					End:   &plan.FrameBound{Type: plan.FrameBound_CURRENT_ROW},
+				}
+			}
+			t.Cleanup(func() { arg.Free(proc, false, nil) })
+			arg.AppendChild(child)
+			require.NoError(t, arg.Prepare(proc))
+			if tc.name == "spill_admission_failure" {
+				budget, err := proc.GetExecutionResourceBudget()
+				require.NoError(t, err)
+				reservation, err := budget.ReserveSpillDisk(budget.SpillDiskCap())
+				require.NoError(t, err)
+				t.Cleanup(func() {
+					if reservation != nil {
+						require.True(t, reservation.Release())
+					}
+					require.Zero(t, budget.SpillDiskUsed())
+					require.Zero(t, budget.SpillFDUsed())
+				})
+				_, err = arg.Call(proc)
+				require.True(t, moerr.IsMoErrCode(err, moerr.ErrOOM), err)
+				require.NotErrorIs(t, err, process.ErrExecutionResourceAdmission)
+				require.Contains(t, err.Error(), "window spill disk")
+				require.Equal(t, []int32{2, 1, 1, 1}, vector.MustFixedColWithTypeCheck[int32](input.Vecs[0]))
+				for i, order := range arg.Fs {
+					if order.Expr.GetLit() != nil {
+						require.NotNil(t, arg.ctr.orderVecs[i].Vec[0])
+						require.True(t, arg.ctr.orderVecs[i].Vec[0].IsConst())
+					}
+				}
+				return
+			}
+			if tc.function == "sum" {
+				require.Equal(t, []int64{20, 20, 20, 30}, collectFixedWindowColumn[int64](t, arg, proc, 2))
+			} else {
+				require.Equal(t, tc.want, collectFixedWindowColumn[uint64](t, arg, proc, 2))
+			}
+			if tc.partitioned {
+				require.Positive(t, arg.OpAnalyzer.GetOpStats().SpillRows)
+			} else {
+				require.Zero(t, arg.OpAnalyzer.GetOpStats().SpillRows)
+			}
+			for i, order := range arg.Fs {
+				if order.Expr.GetLit() != nil {
+					require.True(t, arg.ctr.orderVecs[i].Vec[0].IsConst())
+				}
+			}
+		})
+	}
+}
+
+func TestWindowOrderVectorRepresentationChanges(t *testing.T) {
+	proc := testutil.NewProcessWithOwnedMPool(t, "", mpool.MustNewZero())
+	t.Cleanup(func() { require.Zero(t, proc.Mp().CurrNB()) })
+	t.Cleanup(proc.Free)
+	batches := []*batch.Batch{batch.NewWithSize(1), batch.NewWithSize(1), batch.NewWithSize(1), batch.NewWithSize(1)}
+	t.Cleanup(func() {
+		for _, bat := range batches {
+			bat.Clean(proc.Mp())
+		}
+	})
+	var err error
+	batches[0].Vecs[0], err = vector.NewConstFixed(types.T_int32.ToType(), int32(7), 2, proc.Mp())
+	require.NoError(t, err)
+	batches[1].Vecs[0] = testutil.MakeInt32Vector([]int32{8, 7}, nil, proc.Mp())
+	batches[2].Vecs[0] = testutil.MakeInt32Vector([]int32{4}, nil, proc.Mp())
+	batches[3].Vecs[0] = vector.NewConstNull(types.T_int32.ToType(), 3, proc.Mp())
+	order, err := colexec.MakeEvalVector(proc, []*plan.Expr{newColExpr(0)})
+	require.NoError(t, err)
+	ctr := &container{orderVecs: []colexec.ExprEvalVector{order}}
+	t.Cleanup(ctr.freeExes)
+	t.Cleanup(func() { ctr.freeVector(proc.Mp()) })
+	var previous *vector.Vector
+	for i, bat := range batches {
+		source := bat.Vecs[0]
+		bat.SetRowCount(source.Length())
+		require.NoError(t, ctr.evalOrderVector(bat, proc))
+		owned := ctr.orderVecs[0].Vec[0]
+		require.NotSame(t, source, owned)
+		require.Equal(t, source.Length(), owned.Length())
+		require.Equal(t, source.IsConst(), owned.IsConst())
+		require.Equal(t, source.IsConstNull(), owned.IsConstNull())
+		if !source.IsConstNull() {
+			require.Equal(t, vector.MustFixedColWithTypeCheck[int32](source), vector.MustFixedColWithTypeCheck[int32](owned))
+		}
+		if i == 2 {
+			require.Same(t, previous, owned) // Normal flat batches retain buffer reuse.
+		}
+		previous = owned
+	}
+}
+
 func TestWindowPartitionTopNCoalescesAndResetsRowNumber(t *testing.T) {
 	proc := testutil.NewProcessWithOwnedMPool(t, "", mpool.MustNewZero())
 	first := batch.NewWithSize(2)
@@ -3144,7 +3405,7 @@ func TestWindowPartitionTopNCoalescesAndResetsRowNumber(t *testing.T) {
 }
 
 func TestWindowPartitionTopNSeparatesGroupingNullFromEmptyString(t *testing.T) {
-	proc := testutil.NewProcessWithOwnedMPool(t, "", mpool.MustNewZero())
+	proc := newWindowSpillProcess(t)
 	input := batch.NewWithSize(2)
 	input.Vecs[0] = vector.NewVec(types.T_varchar.ToType())
 	require.NoError(t, vector.AppendStringList(input.Vecs[0], []string{"", "", ""}, nil, proc.Mp()))
@@ -4601,11 +4862,12 @@ func TestSearchLeftRightDateTimeTypes(t *testing.T) {
 
 func intervalExpr(diff int64, unit types.IntervalType) *plan.Expr {
 	return &plan.Expr{
+		Typ: plan.Type{Id: int32(types.T_interval)},
 		Expr: &plan.Expr_List{List: &plan.ExprList{List: []*plan.Expr{
-			{Expr: &plan.Expr_Lit{Lit: &plan.Literal{
+			{Typ: plan.Type{Id: int32(types.T_int64)}, Expr: &plan.Expr_Lit{Lit: &plan.Literal{
 				Value: &plan.Literal_I64Val{I64Val: diff},
 			}}},
-			{Expr: &plan.Expr_Lit{Lit: &plan.Literal{
+			{Typ: plan.Type{Id: int32(types.T_int64)}, Expr: &plan.Expr_Lit{Lit: &plan.Literal{
 				Value: &plan.Literal_I64Val{I64Val: int64(unit)},
 			}}},
 		}}},
@@ -4765,6 +5027,58 @@ func TestWindowTimestampRangeUsesSessionTimeZone(t *testing.T) {
 			require.Equal(t, test.utcFollowing, [2]int{start, end})
 		})
 	}
+}
+
+func TestWindowAccountedScratchRetirement(t *testing.T) {
+	proc := testutil.NewProcessWithOwnedMPool(t, t.Name(), mpool.MustNewZero())
+	defer proc.Free()
+	budget, err := proc.GetExecutionResourceBudget()
+	require.NoError(t, err)
+	registry, err := mpool.NewAllocationAccountRegistry(1, 32)
+	require.NoError(t, err)
+	account, err := registry.OpenWithController(1<<20, budget)
+	require.NoError(t, err)
+	defer func() {
+		account.Seal()
+		_, err := registry.Finalize(account)
+		require.NoError(t, err)
+	}()
+	ctr := &container{}
+	require.NoError(t, ctr.allocation.Set(account))
+	defer ctr.allocation.FreeMetadata()
+	defer ctr.clearCivilOrder()
+	loc, err := time.LoadLocation("America/New_York")
+	require.NoError(t, err)
+	vec := vector.NewVec(types.T_timestamp.ToType())
+	defer vec.Free(proc.Mp())
+	for _, instant := range []string{"2024-11-03 05:30:00", "2024-11-03 06:30:00"} {
+		value, err := types.ParseTimestamp(time.UTC, instant, 6)
+		require.NoError(t, err)
+		require.NoError(t, vector.AppendFixed(vec, value, false, proc.Mp()))
+	}
+	frame := &plan.FrameClause{Type: plan.FrameClause_RANGE,
+		Start: &plan.FrameBound{Type: plan.FrameBound_PRECEDING, Val: intervalExpr(30, types.Minute)},
+		End:   &plan.FrameBound{Type: plan.FrameBound_CURRENT_ROW}}
+	for range 3 {
+		selection, err := ctr.timestampRangeSelection(proc, loc, 1, 0, 2, vec, frame)
+		require.NoError(t, err)
+		require.Equal(t, []timestampCivilOrderSpan{{start: 0, end: 1}, {start: 1, end: 2}}, selection.spans)
+		live := budget.Used()
+		require.Positive(t, live)
+		_, err = ctr.timestampRangeSelection(proc, loc, 0, 0, 2, vec, frame)
+		require.NoError(t, err)
+		require.Equal(t, live, budget.Used(), "row demands reuse admitted scratch")
+		ctr.clearCivilOrder()
+		require.Zero(t, budget.Used(), "the next materialized order batch starts with no retained index")
+	}
+	reservation, err := budget.ReserveTransientMemory(budget.Cap())
+	require.NoError(t, err)
+	defer reservation.Release()
+	_, err = ctr.timestampCivilOrderIndex(proc, loc, 0, 2, vec, false)
+	require.Error(t, err)
+	require.Empty(t, ctr.timestampCivilOrder)
+	reservation.Release()
+	require.Zero(t, budget.Used())
 }
 
 func TestWindowTimestampRangeFoldMembership(t *testing.T) {
@@ -6185,4 +6499,23 @@ func TestTemporalRangeCalendarIntervalOverflow(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestSearchRightNarrowedNullSuffix(t *testing.T) {
+	mp := mpool.MustNewZero()
+	defer mpool.DeleteMPool(mp)
+	vec := vector.NewVec(types.T_int64.ToType())
+	defer vec.Free(mp)
+	for i, value := range []int64{1, 0, 0, 0} {
+		require.NoError(t, vector.AppendFixed(vec, value, i >= 2, mp))
+	}
+	offset := &plan.Expr{Expr: &plan.Expr_Lit{Lit: &plan.Literal{Value: &plan.Literal_I64Val{I64Val: 2}}}}
+	for _, start := range []int{0, 1, 2, 3, 4} {
+		got, err := searchRight(start, 4, 1, vec, offset, false, true)
+		require.NoError(t, err)
+		require.Equal(t, max(start, 2), got, "finite DESC FOLLOWING bound excludes NULL tail")
+	}
+	got, err := searchRight(0, 4, 2, vec, offset, false, true)
+	require.NoError(t, err)
+	require.Equal(t, 4, got, "NULL current key retains its peer group")
 }

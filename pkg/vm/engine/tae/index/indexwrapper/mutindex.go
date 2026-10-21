@@ -261,6 +261,123 @@ func (idx *MutIndex) GetDuplicatedRows(
 	return
 }
 
+// GetDuplicatedRowsWithRowVisibility checks the PK index first and asks the
+// caller about MVCC visibility only for rows returned by the ART. This avoids
+// building a full-object RowSelection for in-memory AObjects.
+func (idx *MutIndex) GetDuplicatedRowsWithRowVisibility(
+	ctx context.Context,
+	keys *vector.Vector,
+	keysZM index.ZM,
+	blkID *types.Blockid,
+	rowIDs *vector.Vector,
+	rowVisibleFn func(row uint32) (bool, error),
+	skipFn func(row uint32) error,
+	selectedFn func(row uint32),
+	mp *mpool.MPool,
+) (err error) {
+	return idx.getDuplicatedRows(
+		ctx,
+		keys,
+		keysZM,
+		blkID,
+		rowIDs,
+		nil,
+		rowVisibleFn,
+		skipFn,
+		selectedFn,
+		mp,
+	)
+}
+
+func (idx *MutIndex) getDuplicatedRows(
+	ctx context.Context,
+	keys *vector.Vector,
+	keysZM index.ZM,
+	blkID *types.Blockid,
+	rowIDs *vector.Vector,
+	getRowSelectionFn func() (index.RowSelection, error),
+	rowVisibleFn func(row uint32) (bool, error),
+	skipFn func(row uint32) error,
+	selectedFn func(row uint32),
+	mp *mpool.MPool,
+) (err error) {
+	if keysZM.Valid() {
+		if exist := idx.zonemap.FastIntersect(keysZM); !exist {
+			return
+		}
+	} else if exist := idx.zonemap.FastContainsAny(keys); !exist {
+		return
+	}
+	op := func(v []byte, _ bool, offset int) error {
+		if !rowIDs.IsNull(uint64(offset)) {
+			return nil
+		}
+		rows, err := idx.art.Search(v)
+		if err == index.ErrNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if skipFn != nil {
+			for i := len(rows) - 1; i >= 0; i-- {
+				err = skipFn(rows[i])
+				if err == index.ErrNotFound {
+					continue
+				}
+				if err != nil {
+					return err
+				}
+				break
+			}
+		}
+		var selection index.RowSelection
+		if getRowSelectionFn != nil {
+			selection, err = getRowSelectionFn()
+			if err != nil {
+				return err
+			}
+		}
+		var maxRow uint32
+		exist := false
+		for i := len(rows) - 1; i >= 0; i-- {
+			if rowVisibleFn != nil {
+				visible, err := rowVisibleFn(rows[i])
+				if err != nil {
+					return err
+				}
+				if !visible {
+					continue
+				}
+			} else if !selection.Contains(rows[i]) {
+				continue
+			}
+			if skipFn != nil {
+				err = skipFn(rows[i])
+				if err == index.ErrNotFound {
+					continue
+				}
+				if err != nil {
+					return err
+				}
+			}
+			maxRow = rows[i]
+			exist = true
+			break
+		}
+		if !exist {
+			return nil
+		}
+		rowID := objectio.NewRowid(blkID, maxRow)
+		containers.UpdateValue(rowIDs, uint32(offset), rowID, false, mp)
+		if selectedFn != nil {
+			selectedFn(maxRow)
+		}
+		return nil
+	}
+	return containers.ForeachWindowBytes(keys, 0, keys.Length(), op, nil)
+}
+
 func (idx *MutIndex) Contains(
 	ctx context.Context,
 	keys *vector.Vector,

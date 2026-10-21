@@ -74,6 +74,14 @@ func rollbackTxnFunc(ses FeSession, execErr error, execCtx *ExecCtx) error {
 		sessionRollsBackTxnOnError(ses, execErr)
 	txnErr := ses.GetTxnHandler().Rollback(execCtx)
 	if txnErr != nil {
+		// A nested fatal error may already have sealed the cleanup owner. Keep
+		// the original typed failure for the client instead of masking it with
+		// that owner's terminal rejection (or a secondary cleanup failure).
+		if moerr.MustRollbackTxn(execErr) {
+			ses.Error(execCtx.reqCtx, txnErr.Error())
+			logStatementStatus(execCtx.reqCtx, ses, execCtx.stmt, fail, execErr)
+			return execErr
+		}
 		logStatementStatus(execCtx.reqCtx, ses, execCtx.stmt, fail, txnErr)
 		return txnErr
 	}
@@ -717,7 +725,7 @@ func requiresPessimisticObjectLifecycleTxn(
 		// check in TxnHandler.Create rejects an active non-pessimistic txn.
 		return !st.Temporary && ses != nil && ses.GetTxnHandler().InActiveTxn()
 	case *tree.TruncateTable, *tree.CreatePitr, *tree.DropPitr, *tree.AlterPitr,
-		*tree.DropDatabase, *tree.DropView, *tree.DropSequence, *tree.AlterView,
+		*tree.AlterDatabase, *tree.DropDatabase, *tree.DropView, *tree.DropSequence, *tree.AlterView,
 		*tree.AlterSequence, *tree.DataBranchDeleteTable, *tree.DataBranchDeleteDatabase,
 		*tree.DataBranchDiff, *tree.DataBranchMerge, *tree.DataBranchPick:
 		return true
@@ -788,6 +796,11 @@ func (th *TxnHandler) createTxnOpUnsafe(execCtx *ExecCtx) error {
 		accountID = execCtx.ses.GetTenantInfo().TenantID
 		userName = execCtx.ses.GetTenantInfo().User
 	}
+	// Tests must not change CN defaults while background task connections are live.
+	// Lifecycle requirements below still take precedence over this scoped mode.
+	if mode, ok := moruntime.GetTxnModeTestConfig(execCtx.ses.GetService(), accountID); ok {
+		opts = append(opts, txnclient.WithTxnMode(mode))
+	}
 	sessionInfo := execCtx.ses.GetDebugString()
 	opts = append(opts,
 		txnclient.WithTxnCreateBy(
@@ -837,6 +850,17 @@ func (th *TxnHandler) createTxnOpUnsafe(execCtx *ExecCtx) error {
 		}
 	} else if hasSelectedIsolation {
 		opts = append(opts, txnclient.WithTxnIsolation(selectedIsolation))
+	}
+	if backSes != nil && backSes.authorizationSnapshot != nil {
+		opts = append(opts, txnclient.WithAuthorizationSnapshot(backSes.authorizationSnapshot))
+	} else if ses, ok := execCtx.ses.(*Session); ok {
+		admission, err := statementSnapshotOption(execCtx.reqCtx, ses, pu.TxnClient)
+		if err != nil {
+			return err
+		}
+		if admission != nil {
+			opts = append(opts, admission)
+		}
 	}
 
 	var (
@@ -929,8 +953,8 @@ func (th *TxnHandler) Commit(execCtx *ExecCtx) error {
 }
 
 // commitBeforeStatement ends the transaction that precedes a statement with
-// MySQL's implicit-commit-before rule.  It intentionally bypasses Commit's
-// option-bit policy: an explicit BEGIN or AUTOCOMMIT=0 must not keep the old
+// MySQL's implicit-commit-before rule or starts a replacement BEGIN. It
+// intentionally bypasses Commit's option-bit policy: an explicit BEGIN or AUTOCOMMIT=0 must not keep the old
 // workspace alive across TRUNCATE or RENAME TABLE. The unsafe path remains the sole
 // owner of commit-result-unknown, temporary-table, and DDL-generation cleanup.
 func (th *TxnHandler) commitBeforeStatement(execCtx *ExecCtx) error {

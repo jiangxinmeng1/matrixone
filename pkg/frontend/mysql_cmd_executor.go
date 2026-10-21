@@ -205,22 +205,8 @@ var RecordStatement = func(ctx context.Context, ses *Session, proc *process.Proc
 	if cw != nil {
 		ses.ast = statement
 		binExec, prepareName := cw.BinaryExecute()
-		execSql := makeExecuteSql(ctx, ses, statement, binExec, prepareName)
-		if len(execSql) != 0 {
-			bb := strings.Builder{}
-			bb.WriteString(envStmt)
-			bb.WriteString(" // ")
-			bb.WriteString(execSql)
-			text = commonutil.Abbreviate(bb.String(), int(getPu(ses.GetService()).SV.LengthOfQueryPrinted))
-		} else {
-			// ignore envStmt == ""
-			// case: exec `set @t = 2;` will trigger an internal query with the same session.
-			// If you need real sql, can try:
-			//	+ fmtCtx := tree.NewFmtCtx(dialect.MYSQL, tree.WithQuoteString(true))
-			//	+ cw.GetAst().Format(fmtCtx)
-			//  + envStmt = fmtCtx.String()
-			text = commonutil.Abbreviate(envStmt, int(getPu(ses.GetService()).SV.LengthOfQueryPrinted))
-		}
+		text = makeExecuteSql(ctx, ses, statement, binExec, prepareName, envStmt,
+			int(getPu(ses.GetService()).SV.LengthOfQueryPrinted))
 	} else {
 		u, _ := util.FastUuid()
 		stmID = uuid.UUID(u)
@@ -1497,6 +1483,7 @@ func doSetVar(
 	type evaluatedAssignment struct {
 		assign                  *tree.VarAssignmentExpr
 		value                   interface{}
+		setNamesCollation       string
 		userVarIsBin            bool
 		userVarRuntimeDomain    types.RuntimeStringDomain
 		valueType               plan.Type
@@ -1520,9 +1507,12 @@ func doSetVar(
 	}
 	for _, assign := range sv.Assignments {
 		if assign.SetNames {
-			for _, name := range []string{
+			names := make([]string, 0, 4)
+			names = append(names,
 				"character_set_client", "character_set_connection", "character_set_results",
-			} {
+			)
+			names = append(names, "collation_connection")
+			for _, name := range names {
 				captureSystemReplayability(name)
 			}
 		} else if assign.System {
@@ -1587,12 +1577,62 @@ func doSetVar(
 				}
 			}
 		}
+		// SET NAMES DEFAULT is represented by a synthetic "names" assignment,
+		// so it cannot use the ordinary system-variable DEFAULT resolution above.
+		// The generic expression evaluator intentionally materializes DEFAULT as
+		// a boolean marker; resolve the SET NAMES form to the effective server
+		// default character set before the string system-variable setters see it.
+		if assign.SetNames {
+			if _, isDefault := assign.Value.(*tree.DefaultVal); isDefault {
+				value, evalErr = ses.GetGlobalSysVar("character_set_server")
+				if evalErr != nil {
+					return evaluatedAssignment{}, evalErr
+				}
+				if value == nil {
+					value = gSysVarsDefs["character_set_server"].Default
+				}
+			}
+		}
 		if err := validateCharsetAssignment(assign, value); err != nil {
 			return evaluatedAssignment{}, err
+		}
+		setNamesCollation := ""
+		if assign.SetNames {
+			_, isDefault := assign.Value.(*tree.DefaultVal)
+			switch {
+			case assign.Reserved != nil:
+				literal, literalOK := assign.Reserved.(*tree.NumVal)
+				if !literalOK {
+					return evaluatedAssignment{}, moerr.NewInvalidInputNoCtx("SET NAMES requires a constant collation")
+				}
+				setNamesCollation = literal.String()
+			case isDefault:
+				setNamesCollation, evalErr = resolveSetNamesDefaultCollation(ses)
+				if evalErr != nil {
+					return evaluatedAssignment{}, evalErr
+				}
+				// character_set_server and collation_server are stored
+				// independently. Validate their effective pair before the
+				// session setters run so an inconsistent historical/global
+				// configuration cannot publish a partial SET NAMES DEFAULT
+				// state.
+				if evalErr = validateCharsetCollationPair(value, setNamesCollation); evalErr != nil {
+					return evaluatedAssignment{}, evalErr
+				}
+			default:
+				setNamesCollation, evalErr = resolveImplicitSetNamesCollation(ses, value)
+				if evalErr != nil {
+					return evaluatedAssignment{}, evalErr
+				}
+			}
+			if evalErr = validateCharsetSystemVariable("collation_connection", setNamesCollation); evalErr != nil {
+				return evaluatedAssignment{}, evalErr
+			}
 		}
 		return evaluatedAssignment{
 			assign:                  assign,
 			value:                   value,
+			setNamesCollation:       setNamesCollation,
 			userVarIsBin:            isBin,
 			userVarRuntimeDomain:    runtimeDomain,
 			valueType:               valueType,
@@ -1662,9 +1702,12 @@ func doSetVar(
 		}
 		replayable := !preparedExpression && sql != "" && execCtx.singleStatementQuery
 		if assign.SetNames {
-			for _, name := range []string{
+			names := make([]string, 0, 4)
+			names = append(names,
 				"character_set_client", "character_set_connection", "character_set_results",
-			} {
+			)
+			names = append(names, "collation_connection")
+			for _, name := range names {
 				mark(name, replayable)
 			}
 			return
@@ -1701,16 +1744,22 @@ func doSetVar(
 
 		//TODO : fix SET NAMES after parser is ready
 		if assign.SetNames {
-			//replaced into three system variable:
-			//character_set_client, character_set_connection, and character_set_results
+			// SET NAMES updates the three character-set variables. An explicit
+			// COLLATE clause additionally updates collation_connection below.
 			replacedBy := []string{
 				"character_set_client", "character_set_connection", "character_set_results",
 			}
 			for _, rb := range replacedBy {
-				err = setVarFunc(assign.System, assign.Global, rb, value, sql)
+				err = setVarFunc(true, false, rb, value, sql)
 				if err != nil {
 					return err
 				}
+			}
+			// SET NAMES always changes the implicit connection collation when
+			// COLLATE is omitted. Explicit COLLATE and DEFAULT resolution were
+			// validated while evaluating the assignment, before any writes.
+			if err = setVarFunc(true, false, "collation_connection", item.setNamesCollation, sql); err != nil {
+				return err
 			}
 		} else if scope, isTxnIsolation := transactionIsolationAssignmentScope(assign); isTxnIsolation {
 			switch scope {
@@ -2267,6 +2316,9 @@ func doShowVariables(ses *Session, execCtx *ExecCtx, sv *tree.ShowVariables) err
 			}
 		} else {
 			if value, err = ses.GetSessionSysVar(name); err != nil {
+				if name == "collation_database" || name == "character_set_database" {
+					return err
+				}
 				continue
 			}
 		}
@@ -2423,9 +2475,10 @@ func executeAnalyzeDerivedQuery(ses *Session, outerExecCtx *ExecCtx, sql string)
 		policy = outerExecCtx.input.rewritePolicy
 	}
 	derivedInput := &UserInput{
-		sql:                       sql,
-		rewritePolicy:             policy,
-		rewritePolicyMaterialized: true,
+		sql:                        sql,
+		rewritePolicy:              policy,
+		rewritePolicyMaterialized:  true,
+		sameStatementAuthorization: true,
 	}
 	if err := doComQuery(ses, &tempExecCtx, derivedInput); err != nil {
 		return nil, err
@@ -2623,7 +2676,7 @@ func writeExplainResult(
 	if err != nil {
 		return err
 	}
-	if explainSchedulingEnabled(ses) {
+	if es.Format != explain.EXPLAIN_FORMAT_JSON && explainSchedulingEnabled(ses) {
 		if rawSQL == "" {
 			rawSQL = ses.GetSql()
 		}
@@ -2647,6 +2700,9 @@ func writeExplainResult(
 	//2. fill the result set
 	//column
 	explainColName := plan2.GetPlanTitle(explainQuery.QueryPlan, txnHaveDDL)
+	if es.Format == explain.EXPLAIN_FORMAT_JSON {
+		explainColName = "EXPLAIN"
+	}
 	col1 := new(MysqlColumn)
 	col1.SetColumnType(defines.MYSQL_TYPE_VAR_STRING)
 	col1.SetName(explainColName)
@@ -2803,9 +2859,16 @@ func extractPrepareStmtSQL(ctx context.Context, sql, sqlMode string) (string, er
 	if scanner.CommentFlag {
 		scanner.TakeExecutableCommentEnd()
 		var commentEnd int
+		previousToken := mysql.FROM
 		for commentEnd == 0 {
 			previousPos := scanner.Pos
-			token, _ := scanner.Scan()
+			var token int
+			if previousToken == int('.') {
+				token, _ = scanner.ScanAfterDot()
+			} else {
+				token, _ = scanner.Scan()
+			}
+			previousToken = token
 			commentEnd = scanner.TakeExecutableCommentEnd()
 			if commentEnd == 0 &&
 				(token == mysql.EofChar() || token == mysql.LEX_ERROR || scanner.Pos == previousPos) {
@@ -2842,6 +2905,13 @@ func doPrepareStmtInSession(
 	originSql, err := extractPrepareStmtSQL(execCtx.reqCtx, sql, sessionSQLModeForParser(owner))
 	if err != nil {
 		return nil, err
+	}
+	if !preparedOwnerPolicyCaptured(execCtx) {
+		// Background/procedure PREPARE has raw SQL but no frontend request
+		// snapshot. Reparse it under the owner's policy before planning; the
+		// caller's old AST must not be stamped with a newly captured generation.
+		return doPrepareStringWithParamTypes(owner, executionSes, execCtx,
+			&tree.PrepareString{Name: st.Name, Sql: originSql}, paramTypes)
 	}
 	prepareStmt, err := createPrepareStmtInSession(execCtx, owner, executionSes, originSql, st, st.Stmt)
 	if err != nil {
@@ -2899,9 +2969,62 @@ func doPrepareString(ses *Session, execCtx *ExecCtx, st *tree.PrepareString) (*P
 }
 
 func doPrepareStringInSession(owner *Session, executionSes FeSession, execCtx *ExecCtx, st *tree.PrepareString) (*PrepareStmt, error) {
+	return doPrepareStringWithParamTypes(owner, executionSes, execCtx, st, nil)
+}
+
+func preparedOwnerPolicyCaptured(execCtx *ExecCtx) bool {
+	return execCtx.input != nil && execCtx.input.rewritePolicy != nil && execCtx.input.rewritePolicy.captured
+}
+
+// capturePreparedOwnerPolicy closes the producer boundary for background SQL
+// without changing the immutable snapshot of an existing frontend request.
+// Catalog I/O stays outside the session locks. The temporary context belongs
+// only to this PREPARE, not to later statements in a procedure.
+func capturePreparedOwnerPolicy(execCtx *ExecCtx, owner *Session) (bool, func(), error) {
+	if preparedOwnerPolicyCaptured(execCtx) {
+		return false, func() {}, nil
+	}
+	if execCtx.input != nil && execCtx.input.rewritePolicyMaterialized {
+		return false, nil, moerr.NewInvalidState(execCtx.reqCtx, "prepared statement has materialized SQL without a captured owner policy")
+	}
+	policy, err := captureRewritePolicy(execCtx.reqCtx, owner)
+	if err != nil {
+		return false, nil, err
+	}
+	previousInput, previousEnabled, previousRemap := execCtx.input, execCtx.rewriteEnabled, execCtx.remapDb
+	input := &UserInput{}
+	if previousInput != nil {
+		*input = *previousInput
+	}
+	input.rewritePolicy = policy
+	execCtx.input, execCtx.rewriteEnabled = input, policy.enabled
+	return true, func() {
+		execCtx.input, execCtx.rewriteEnabled, execCtx.remapDb = previousInput, previousEnabled, previousRemap
+	}, nil
+}
+
+func doPrepareStringWithParamTypes(owner *Session, executionSes FeSession, execCtx *ExecCtx, st *tree.PrepareString, paramTypes []byte) (*PrepareStmt, error) {
+	capturedNow, restore, err := capturePreparedOwnerPolicy(execCtx, owner)
+	if err != nil {
+		return nil, err
+	}
+	defer restore()
 	nonuser := executionSes.GetStmtProfile().GetSqlSourceType() == constant.CloudNoUserSql ||
 		statementSQLSource(st.Sql, sessionSQLModeForParser(owner)) == constant.CloudNoUserSql
-	rewritten, innerStmt, remapDb, err := prepareStringStatement(execCtx, owner, st.Sql)
+	var rewritten string
+	var innerStmt tree.Statement
+	var remapDb map[string]string
+	if capturedNow {
+		// A materialized outer hint does not exist on this producer. Apply the
+		// actual owner snapshot to the raw inner SQL, including mandatory rules
+		// when the optional enable_remap_hint switch is disabled.
+		rewritten, err = execCtx.input.rewritePolicy.rewrite(execCtx.reqCtx, st.Sql, sessionSQLModeForParser(owner))
+		if err == nil {
+			rewritten, innerStmt, remapDb, err = parsePreparedStatement(execCtx, owner, rewritten)
+		}
+	} else {
+		rewritten, innerStmt, remapDb, err = prepareStringStatement(execCtx, owner, st.Sql)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -2921,6 +3044,9 @@ func doPrepareStringInSession(owner *Session, executionSes FeSession, execCtx *E
 		return nil, err
 	}
 	prepareStmt.IsCloudNonuser = nonuser
+	if len(paramTypes) > 0 {
+		prepareStmt.ParamTypes = paramTypes
+	}
 
 	if err = owner.SetPrepareStmt(execCtx.reqCtx, prepareStmt.Name, prepareStmt); err != nil {
 		prepareStmt.Close()
@@ -2944,7 +3070,10 @@ func prepareStringStatement(execCtx *ExecCtx, ses *Session, sql string) (string,
 			return sql, nil, nil, err
 		}
 	}
+	return parsePreparedStatement(execCtx, ses, rewritten)
+}
 
+func parsePreparedStatement(execCtx *ExecCtx, ses *Session, rewritten string) (string, tree.Statement, map[string]string, error) {
 	v, err := ses.GetSessionSysVar("lower_case_table_names")
 	if err != nil {
 		return rewritten, nil, nil, err
@@ -2957,6 +3086,14 @@ func prepareStringStatement(execCtx *ExecCtx, ses *Session, sql string) (string,
 		sessionSQLModeForParser(ses),
 	)
 	if err != nil {
+		// The inner statement's syntax failures arrive as plain parser
+		// errors (PositionedErr), not moerr.Error. Report them as
+		// ER_PARSE_ERROR (1064/42000) the same way the statement would be
+		// rejected when executed directly, instead of a generic 1105
+		// internal error.
+		if _, positioned := err.(mysql.PositionedErr); positioned {
+			err = moerr.NewParseError(execCtx.reqCtx, err.Error())
+		}
 		return rewritten, nil, nil, err
 	}
 	if len(stmts) != 1 {
@@ -3001,6 +3138,11 @@ func createPrepareStmtInSession(
 	originSQL string,
 	stmt tree.Statement,
 	saveStmt tree.Statement) (*PrepareStmt, error) {
+	// Every executable handle must prove which policy actually participated
+	// in planning. Publication cannot repair missing provenance afterward.
+	if !preparedOwnerPolicyCaptured(execCtx) {
+		return nil, moerr.NewInvalidState(execCtx.reqCtx, "prepared statement requires a captured owner policy before planning")
+	}
 	// Nested planning may change the session's current statement. Capture the
 	// owner statement now; neighboring statements in the request are irrelevant.
 	nonuser := executionSes.GetStmtProfile().GetSqlSourceType() == constant.CloudNoUserSql
@@ -3123,6 +3265,12 @@ func createPrepareStmtInSession(
 		schedulingSQLMode:          schedulingSQLMode,
 	}
 	prepareStmt.refreshGenerateSeriesParamMetadata(prepareControl.Plan)
+	if execCtx.input != nil && execCtx.input.rewritePolicy != nil &&
+		execCtx.input.rewritePolicy.captured {
+		prepareStmt.rewritePolicyGeneration = execCtx.input.rewritePolicy.generation
+		prepareStmt.rewritePolicyCaptured = true
+		prepareStmt.rewritePolicyEnabled = execCtx.input.rewritePolicy.enabled
+	}
 
 	_, ok := preparePlan.GetDcl().Control.(*plan.DataControl_Prepare)
 	if ok {
@@ -3209,10 +3357,15 @@ func doDeallocateInSession(owner *Session, executionSes FeSession, execCtx *Exec
 }
 
 func doReset(ctx context.Context, ses *Session, st *tree.Reset) error {
-	prepareStmt, err := ses.GetPrepareStmt(ctx, string(st.Name))
+	// RESET is a cleanup operation. It must remain reachable for an
+	// invalidated handle so clients can discard LONG_DATA and close a retained
+	// cursor before preparing a replacement. Execution paths continue to use
+	// the checked lookup and still reject the handle.
+	prepareStmt, err := ses.getPrepareStmtAllowInvalidated(ctx, string(st.Name))
 	if err != nil {
 		return err
 	}
+	prepareStmt.closeCursor()
 	prepareStmt.resetBinaryParamState()
 	return nil
 }
@@ -3610,16 +3763,8 @@ func handleSwitchRole(ses FeSession, execCtx *ExecCtx, sr *tree.SetRole) error {
 }
 
 func doKill(ses *Session, execCtx *ExecCtx, k *tree.Kill) error {
-	var err error
-	//true: kill a connection
-	//false: kill a query in a connection
-	idThatKill := uint64(ses.GetConnectionID())
-	if !k.Option.Exist || k.Option.Typ == tree.KillTypeConnection {
-		err = getRtMgr(ses.GetService()).kill(execCtx.reqCtx, true, idThatKill, k.ConnectionId, "")
-	} else {
-		err = getRtMgr(ses.GetService()).kill(execCtx.reqCtx, false, idThatKill, k.ConnectionId, k.StmtOption.StatementId)
-	}
-	return err
+	killConnection := !k.Option.Exist || k.Option.Typ == tree.KillTypeConnection
+	return killSession(execCtx.reqCtx, ses, k.ConnectionId, killConnection, k.StmtOption.StatementId)
 }
 
 // handleKill kill a connection or query
@@ -3951,43 +4096,85 @@ func getExplainOption(reqCtx context.Context, options []tree.OptionElem) (*expla
 	es := explain.NewExplainDefaultOptions()
 	if options == nil {
 		return es, nil
-	} else {
-		for _, v := range options {
-			if strings.EqualFold(v.Name, tree.VerboseOption) {
-				if strings.EqualFold(v.Value, "TRUE") || v.Value == "NULL" {
-					es.Verbose = true
-				} else if strings.EqualFold(v.Value, "FALSE") {
-					es.Verbose = false
-				} else {
-					return nil, moerr.NewInvalidInputf(reqCtx, "invalid explain option '%s', valud '%s'", v.Name, v.Value)
-				}
-			} else if strings.EqualFold(v.Name, tree.AnalyzeOption) {
-				if strings.EqualFold(v.Value, "TRUE") || v.Value == "NULL" {
-					es.Analyze = true
-				} else if strings.EqualFold(v.Value, "FALSE") {
-					es.Analyze = false
-				} else {
-					return nil, moerr.NewInvalidInputf(reqCtx, "invalid explain option '%s', valud '%s'", v.Name, v.Value)
-				}
-			} else if strings.EqualFold(v.Name, tree.FormatOption) {
-				if strings.EqualFold(v.Value, "TEXT") {
-					es.Format = explain.EXPLAIN_FORMAT_TEXT
-				} else if strings.EqualFold(v.Value, "JSON") {
-					return nil, moerr.NewNotSupportedf(reqCtx, "Unsupport explain format '%s'", v.Value)
-				} else if strings.EqualFold(v.Value, "DOT") {
-					return nil, moerr.NewNotSupportedf(reqCtx, "Unsupport explain format '%s'", v.Value)
-				} else {
-					return nil, moerr.NewInvalidInputf(reqCtx, "invalid explain option '%s', valud '%s'", v.Name, v.Value)
-				}
-			} else if strings.EqualFold(v.Name, tree.CheckOption) {
-				if err := json.Unmarshal([]byte(v.Value), &es.CheckExpr); err != nil {
-					return nil, moerr.NewInvalidInputf(reqCtx, "invalid explain option '%s', valud '%s': %s", v.Name, v.Value, err.Error())
-				}
-			} else {
+	}
+
+	seen := make(map[string]struct{}, len(options))
+	phyplan := false
+	check := false
+	for _, v := range options {
+		name := strings.ToLower(strings.TrimSpace(v.Name))
+		if _, ok := seen[name]; ok {
+			return nil, moerr.NewInvalidInputf(reqCtx, "duplicate explain option '%s'", v.Name)
+		}
+		seen[name] = struct{}{}
+
+		switch name {
+		case "verbose":
+			value, ok := parseExplainBool(v.Value)
+			if !ok {
 				return nil, moerr.NewInvalidInputf(reqCtx, "invalid explain option '%s', valud '%s'", v.Name, v.Value)
 			}
+			es.Verbose = value
+		case "analyze":
+			value, ok := parseExplainBool(v.Value)
+			if !ok {
+				return nil, moerr.NewInvalidInputf(reqCtx, "invalid explain option '%s', valud '%s'", v.Name, v.Value)
+			}
+			es.Analyze = value
+		case "phyplan":
+			value, ok := parseExplainBool(v.Value)
+			if !ok {
+				return nil, moerr.NewInvalidInputf(reqCtx, "invalid explain option '%s', valud '%s'", v.Name, v.Value)
+			}
+			phyplan = value
+		case "format":
+			value := strings.Trim(strings.TrimSpace(v.Value), "'")
+			value = strings.Trim(value, string('"'))
+			value = strings.ToUpper(value)
+			switch value {
+			case "TEXT":
+				es.Format = explain.EXPLAIN_FORMAT_TEXT
+			case "JSON":
+				es.Format = explain.EXPLAIN_FORMAT_JSON
+			case "DOT":
+				return nil, moerr.NewNotSupportedf(reqCtx, "Unsupport explain format '%s'", v.Value)
+			default:
+				return nil, moerr.NewInvalidInputf(reqCtx, "invalid explain option '%s', valud '%s'", v.Name, v.Value)
+			}
+		case "check":
+			check = true
+			if err := json.Unmarshal([]byte(v.Value), &es.CheckExpr); err != nil {
+				return nil, moerr.NewInvalidInputf(reqCtx, "invalid explain option '%s', valud '%s': %s", v.Name, v.Value, err.Error())
+			}
+		default:
+			return nil, moerr.NewInvalidInputf(reqCtx, "invalid explain option '%s', valud '%s'", v.Name, v.Value)
 		}
-		return es, nil
+	}
+	if es.Format == explain.EXPLAIN_FORMAT_JSON {
+		if es.Analyze {
+			return nil, moerr.NewNotSupported(reqCtx, "EXPLAIN ANALYZE FORMAT=JSON is not supported")
+		}
+		if phyplan {
+			return nil, moerr.NewNotSupported(reqCtx, "EXPLAIN PHYPLAN FORMAT=JSON is not supported")
+		}
+		if check {
+			return nil, moerr.NewNotSupported(reqCtx, "EXPLAIN FORMAT=JSON does not support CHECK")
+		}
+	}
+	return es, nil
+}
+
+func parseExplainBool(value string) (bool, bool) {
+	value = strings.Trim(strings.TrimSpace(value), "'")
+	value = strings.Trim(value, string('"'))
+	value = strings.ToUpper(value)
+	switch value {
+	case "TRUE", "NULL":
+		return true, true
+	case "FALSE":
+		return false, true
+	default:
+		return false, false
 	}
 }
 
@@ -4397,6 +4584,15 @@ var GetComputationWrapper = func(execCtx *ExecCtx, db string, user string, eng e
 	var statementRemaps []map[string]string
 	if preparePlan := execCtx.input.getPreparePlan(); preparePlan != nil {
 		execCtx.input.genSqlSourceType(ses)
+		// Binary execute carries the prepared plan directly in UserInput. Check
+		// the owning handle before the plan reaches privilege checks or Compile;
+		// parsing the packet already checks this in the normal protocol path, but
+		// this guard also covers internal callers that construct UserInput.
+		if execCtx.input.isBinaryProtExecute {
+			if _, err := ses.GetPrepareStmt(execCtx.reqCtx, execCtx.input.stmtName); err != nil {
+				return nil, err
+			}
+		}
 		tcw := InitTxnComputationWrapper(ses, execCtx.input.stmt, proc)
 		tcw.plan = preparePlan.GetDcl().GetPrepare().Plan
 		tcw.binaryPrepare = execCtx.input.isBinaryProtExecute
@@ -4618,6 +4814,19 @@ func refreshStatementScopedSessionInfo(ses FeSession, proc *process.Process) {
 	if proc == nil || proc.Base == nil {
 		return
 	}
+	// Refresh the authenticated snapshot at every statement boundary, including
+	// later statements within a COM_QUERY and prepared EXECUTE.
+	proc.Base.SessionInfo.Account, proc.Base.SessionInfo.User, proc.Base.SessionInfo.Role = "", "", ""
+	if ses != nil {
+		if tenant := ses.GetTenantInfo(); tenant != nil {
+			tenant.mu.Lock()
+			account, user, role := tenant.Tenant, tenant.User, tenant.DefaultRole
+			tenant.mu.Unlock()
+			proc.Base.SessionInfo.Account = account
+			proc.Base.SessionInfo.User = user
+			proc.Base.SessionInfo.Role = role
+		}
+	}
 	limit, ok := process.WarningRetentionLimitFromContext(proc.GetTopContext())
 	if !ok {
 		limit, ok = resolveSessionWarningRetentionLimit(ses)
@@ -4712,8 +4921,9 @@ func isSessionSQLModeSet(stmt tree.Statement) bool {
 	return false
 }
 
-func hasStatement(fragment string, parserSQLMode string) bool {
-	scanner := mysql.NewScannerWithSQLMode(dialect.MYSQL, fragment, mysql.ParseSQLModeFlags(parserSQLMode))
+func hasStatement(input mysql.SQLContinuation, parserSQLMode string) bool {
+	scanner := mysql.NewScannerWithSQLMode(dialect.MYSQL, input.SQL, mysql.ParseSQLModeFlags(parserSQLMode))
+	scanner.CommentFlag = input.InExecutableComment
 	defer mysql.PutScanner(scanner)
 	for {
 		token, _ := scanner.Scan()
@@ -4737,7 +4947,7 @@ func prepareSQLModeStagedExecution(
 	ses FeSession,
 	p *mysql.MySQLParser,
 	sql string,
-) (first string, remaining string, staged bool, err error) {
+) (first string, remaining mysql.SQLContinuation, staged bool, err error) {
 	lctn := parserLowerCaseTableNames(ses)
 	parserSQLMode := sessionSQLModeForParser(ses)
 	stmts, parseErr := p.ParseWithSQLMode(ctx, sql, lctn, parserSQLMode)
@@ -4752,34 +4962,65 @@ func prepareSQLModeStagedExecution(
 		shouldStage := stageAt >= 0 && stageAt < len(stmts)-1
 		freeStatements(stmts)
 		if !shouldStage {
-			return "", "", false, nil
+			return "", mysql.SQLContinuation{}, false, nil
 		}
 	} else {
-		probe := sql
+		probe := mysql.SQLContinuation{SQL: sql}
 		foundSQLModeSet := false
 		for hasStatement(probe, parserSQLMode) {
-			stmt, end, firstErr := p.ParseFirstWithSQLMode(ctx, probe, lctn, parserSQLMode)
+			stmt, _, next, firstErr := p.ParseFirstStatementWithSQLMode(ctx, probe, lctn, parserSQLMode)
 			if firstErr != nil {
-				return "", "", false, parseErr
+				return "", mysql.SQLContinuation{}, false, parseErr
 			}
 			foundSQLModeSet = isSessionSQLModeSet(stmt)
 			stmt.Free()
-			probe = probe[end:]
+			probe = next
 			if foundSQLModeSet {
 				break
 			}
 		}
 		if !foundSQLModeSet || !hasStatement(probe, parserSQLMode) {
-			return "", "", false, parseErr
+			return "", mysql.SQLContinuation{}, false, parseErr
 		}
 	}
 
-	stmt, end, err := p.ParseFirstWithSQLMode(ctx, sql, lctn, parserSQLMode)
+	stmt, first, next, err := p.ParseFirstStatementWithSQLMode(ctx, mysql.SQLContinuation{SQL: sql}, lctn, parserSQLMode)
 	if err != nil {
-		return "", "", false, err
+		return "", mysql.SQLContinuation{}, false, err
 	}
 	stmt.Free()
-	return sql[:end], sql[end:], true, nil
+	return first, next, true, nil
+}
+
+// Validate ordinary batches eagerly, as before, but execute their original raw
+// continuations one at a time so each statement captures current authorization.
+func prepareAuthorizationStagedExecution(ctx context.Context, ses FeSession, p *mysql.MySQLParser, sql string) (string, mysql.SQLContinuation, bool, error) {
+	if !mysql.MayHaveMultipleStatements(sql, sessionSQLModeForParser(ses)) {
+		// Preserve the single-statement plan-cache path. Its normal parser owns
+		// syntax validation on a miss; staging must not build a discarded AST.
+		return "", mysql.SQLContinuation{}, false, nil
+	}
+	if mayNeedSQLModeStaging(sql) {
+		first, rest, staged, err := prepareSQLModeStagedExecution(ctx, ses, p, sql)
+		if err != nil || staged {
+			return first, rest, staged, err
+		}
+	}
+	stmts, err := p.ParseWithSQLMode(ctx, sql, parserLowerCaseTableNames(ses), sessionSQLModeForParser(ses))
+	if err != nil {
+		return "", mysql.SQLContinuation{}, false, err
+	}
+	multiple := len(stmts) > 1
+	freeStatements(stmts)
+	if !multiple {
+		return "", mysql.SQLContinuation{}, false, nil
+	}
+	stmt, first, rest, err := p.ParseFirstStatementWithSQLMode(ctx, mysql.SQLContinuation{SQL: sql}, parserLowerCaseTableNames(ses), sessionSQLModeForParser(ses))
+	if err != nil {
+		return "", mysql.SQLContinuation{}, false, err
+	}
+	stmt.Free()
+	return first, rest, true, nil
 }
 
 func nextSQLModeStatementInput(
@@ -4787,9 +5028,9 @@ func nextSQLModeStatementInput(
 	ses FeSession,
 	p *mysql.MySQLParser,
 	input *UserInput,
-	sql string,
-) (*UserInput, string, error) {
-	stmt, end, err := p.ParseFirstWithSQLMode(
+	sql mysql.SQLContinuation,
+) (*UserInput, mysql.SQLContinuation, error) {
+	stmt, first, next, err := p.ParseFirstStatementWithSQLMode(
 		ctx,
 		sql,
 		parserLowerCaseTableNames(ses),
@@ -4799,7 +5040,7 @@ func nextSQLModeStatementInput(
 		return nil, sql, err
 	}
 	stmt.Free()
-	return newSQLStatementInput(input, sql[:end]), sql[end:], nil
+	return newSQLStatementInput(input, first), next, nil
 }
 
 func newSQLStatementInput(input *UserInput, sql string) *UserInput {
@@ -4883,6 +5124,11 @@ func authenticateUserCanExecuteStatement(reqCtx context.Context, ses *Session, s
 		return stats, nil
 	}
 	if ses.GetTenantInfo() != nil {
+		if _, ok := stmt.(*tree.AlterDatabase); ok {
+			// A persistent database-default change must recheck both the active role
+			// membership and its current privileges, including prepared execution.
+			ses.InvalidatePrivilegeCache()
+		}
 		ses.SetPrivilege(determinePrivilegeSetOfStatement(stmt))
 		if !canCreateMongoDBTableMapping(stmt, ses.GetTenantInfo()) {
 			// The privilege model has no external-connection USAGE object yet.
@@ -5339,6 +5585,10 @@ func executeStmtWithTxn(ses FeSession,
 ) (err error) {
 	ses.EnterFPrint(FPExecStmtWithTxn)
 	defer ses.ExitFPrint(FPExecStmtWithTxn)
+	// The process survives across statements, including statements handled
+	// directly by the frontend. Stage definitions are only valid within one
+	// statement's catalog snapshot, so discard entries before planning/dispatch.
+	execCtx.proc.GetStageCache().Clear()
 	if !ses.IsDerivedStmt() {
 		err = executeStmtWithWorkspace(ses, statsArr, execCtx)
 	} else {
@@ -5346,6 +5596,12 @@ func executeStmtWithTxn(ses FeSession,
 		txnOp := ses.GetTxnHandler().GetTxn()
 		//refresh proc txnOp
 		execCtx.proc.Base.TxnOperator = txnOp
+
+		// Derived execution borrows the caller's workspace statement. A retry
+		// must be returned to its owner rather than rolling back only this child.
+		wasDisabled := execCtx.proc.IncrStatementDisabled()
+		execCtx.proc.SetIncrStatementDisabled(true)
+		defer execCtx.proc.SetIncrStatementDisabled(wasDisabled)
 
 		err = dispatchStmt(ses, statsArr, execCtx)
 		recordSessionDDL(ses, execCtx, err)
@@ -5445,6 +5701,7 @@ func executeStmtWithWorkspace(ses FeSession,
 		// initExecuteStmtParam recorded its binding database before authorization.
 		effectiveDefaultDatabase = execCtx.effectiveTxnDefaultDatabase
 	}
+	execCtx.effectiveTxnStatement = effectiveStmt
 	execCtx.effectiveTxnDefaultDatabase = effectiveDefaultDatabase
 	execCtx.txnOpt.forcePessimisticObjectLifecycle = requiresPessimisticObjectLifecycleTxn(
 		ses, effectiveStmt, effectiveDefaultDatabase,
@@ -5511,6 +5768,13 @@ func executeStmtWithWorkspace(ses FeSession,
 	err = disttae.CheckTxnIsValid(txnOp)
 	if err != nil {
 		return err
+	}
+	if backSes, ok := ses.(*backSession); ok {
+		if hook := backSes.processHook; hook != nil {
+			if err = hook(execCtx.reqCtx, execCtx.proc); err != nil {
+				return err
+			}
+		}
 	}
 
 	ses.EnterFPrint(FPExecStmtWithWorkspaceBeforeStart)
@@ -5600,6 +5864,14 @@ func executeStmtWithIncrStmt(ses FeSession,
 	if err != nil || hasRecovered {
 		return err
 	}
+	// Frontend statements have no physical Compile to establish their workspace
+	// boundary. Capture it after prior-statement maintenance, before any child
+	// execution can reorder writes or fail. Engine statements retain their
+	// existing NewCompile/Reset owner.
+	if execCtx.effectiveTxnStatement.StmtKind().ExecLocation() == tree.EXEC_IN_FRONTEND {
+		txnOp.GetWorkspace().UpdateSnapshotWriteOffset()
+	}
+
 	stats := statistic.StatsInfoFromContext(newCtx)
 	stats.AddTxnIncrStatementS3Request(statistic.S3Request{
 		List:      crs.FileService.S3.List.Load(),
@@ -5811,8 +6083,12 @@ func executeStmt(ses *Session,
 				txnCw.completeCompileExecution(c, err)
 			}
 
-			// Serialize the execution plan as json
-			_ = execCtx.cw.RecordExecPlan(execCtx.reqCtx, phyPlan)
+			// Capture detached diagnostics before the current generation is released.
+			if txnCw, ok := execCtx.cw.(*TxnComputationWrapper); ok {
+				_ = txnCw.recordExecPlan(execCtx.reqCtx, phyPlan, err)
+			} else {
+				_ = execCtx.cw.RecordExecPlan(execCtx.reqCtx, phyPlan)
+			}
 			c.Release()
 		}
 	}()
@@ -5908,6 +6184,31 @@ func rollbackWholeTxnOnPreExecutionError(ses FeSession, execCtx *ExecCtx, retErr
 }
 
 func doComQuery(ses *Session, execCtx *ExecCtx, input *UserInput) (retErr error) {
+	requestCtx := execCtx.reqCtx
+	epoch := authorizationEpochFor(requestCtx, ses)
+	adopt := false
+	ownsEpoch := true
+	if epoch != nil {
+		epoch.mu.Lock()
+		adopt = epoch.exec == execCtx && !epoch.entered && !epoch.ended
+		if input.sameStatementAuthorization && !epoch.ended && epoch.identity == rewriteRuleSessionIdentity(ses) {
+			adopt, ownsEpoch = true, false
+		}
+		if adopt {
+			epoch.entered = true
+		}
+		epoch.mu.Unlock()
+	}
+	if !adopt && requestCtx != nil {
+		execCtx.reqCtx, epoch = beginAuthorizationEpoch(requestCtx, ses, execCtx)
+		epoch.entered = true
+	}
+	defer func() {
+		if epoch != nil && ownsEpoch {
+			epoch.end()
+		}
+		execCtx.reqCtx = requestCtx
+	}()
 	ses.EnterFPrint(FPDoComQuery)
 	defer ses.ExitFPrint(FPDoComQuery)
 	defer ses.ClearDDLOwnerRoleID()
@@ -6013,9 +6314,6 @@ func doComQuery(ses *Session, execCtx *ExecCtx, input *UserInput) (retErr error)
 	}()
 
 	if ses.GetTenantInfo() != nil {
-		proc.Base.SessionInfo.Account = ses.GetTenantInfo().GetTenant()
-		proc.Base.SessionInfo.Role = ses.GetTenantInfo().GetDefaultRole()
-
 		if len(ses.GetTenantInfo().GetVersion()) != 0 {
 			proc.Base.SessionInfo.Version = ses.GetTenantInfo().GetVersion()
 		}
@@ -6034,13 +6332,21 @@ func doComQuery(ses *Session, execCtx *ExecCtx, input *UserInput) (retErr error)
 
 	execCtx.reqCtx = statistic.ContextWithStatsInfo(execCtx.reqCtx, statsInfo)
 	execCtx.isIssue3482 = input.isIssue3482Sql()
+	var statementBaseCtx context.Context
+	var statementParentCtx context.Context
+	if epoch != nil {
+		// A sibling must descend from the request, not the cancelled previous
+		// statement. Capture this owner before any implicit commit replaces epoch;
+		// single statements do not need the sibling's diagnostic context nodes.
+		statementParentCtx = epoch.parent
+	}
 
 	executionInput := input
 	stagedSQLMode := false
-	stagedRemaining := ""
+	stagedRemaining := mysql.SQLContinuation{}
 	var err error
-	if ses.GetCmd() == COM_QUERY && input.getStmt() == nil && !input.isInternal() && mayNeedSQLModeStaging(input.getSql()) {
-		first, remaining, staged, stageErr := prepareSQLModeStagedExecution(
+	if ses.GetCmd() == COM_QUERY && input.getStmt() == nil && !input.isInternal() && strings.Contains(input.getSql(), ";") {
+		first, remaining, staged, stageErr := prepareAuthorizationStagedExecution(
 			execCtx.reqCtx,
 			ses,
 			ses.GetMySQLParser(),
@@ -6054,6 +6360,7 @@ func doComQuery(ses *Session, execCtx *ExecCtx, input *UserInput) (retErr error)
 			executionInput = newSQLStatementInput(input, first)
 		}
 	}
+	rawInputs := []*UserInput{executionInput}
 	if err == nil {
 		executionInput, err = rewriteSQLStatementInput(execCtx.reqCtx, ses, executionInput)
 		if !stagedSQLMode {
@@ -6271,10 +6578,60 @@ func doComQuery(ses *Session, execCtx *ExecCtx, input *UserInput) (retErr error)
 		// has a current statement identity. Authorization and plan construction
 		// still run after this boundary, matching the DDL implicit-commit
 		// contract while keeping instrumentation failures side-effect free.
-		if execCtx.implicitCommitBefore {
+		// Replacement BEGIN also commits an existing transaction. Keep it separate
+		// from implicitCommitBefore, which additionally commits DDL at statement
+		// completion and must not commit the new transaction opened by BEGIN.
+		_, replacementBegin := stmt.(*tree.BeginTransaction)
+		replacementBegin = replacementBegin && isTopLevelClientStatement(ses, execCtx, currentInput) && !ses.GetIsInternal()
+		if execCtx.implicitCommitBefore || replacementBegin {
+			beforeCommit := ses.getLastCommitTS()
 			if err = ses.GetTxnHandler().commitBeforeStatement(execCtx); err != nil {
+				if replacementBegin && moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict) {
+					// Preserve createUnsafe's existing BEGIN error contract.
+					err = moerr.NewInternalError(execCtx.reqCtx, writeWriteConflictsErrorInfo())
+				}
 				logStatementStatus(execCtx.reqCtx, ses, stmt, fail, err)
 				return err
+			}
+			if epoch != nil && !ses.getLastCommitTS().Equal(beforeCommit) {
+				// The commit is a real causal frontier transition. Rebuild the
+				// complete policy and wrapper from raw text before authorization;
+				// never combine pre-commit rewriting with post-commit grants.
+				transition := authorizationTransitionContext{Context: execCtx.reqCtx, lifetime: epoch.parent}
+				epoch.end()
+				execCtx.reqCtx, epoch = beginAuthorizationEpoch(transition, ses, execCtx)
+				epoch.entered = true
+				proc.ReplaceTopCtx(execCtx.reqCtx)
+				refreshed := *rawInputs[i]
+				refreshed.rewritePolicy, err = captureRewritePolicy(execCtx.reqCtx, ses)
+				if err != nil {
+					return err
+				}
+				currentInput, err = rewriteSQLStatementInput(execCtx.reqCtx, ses, &refreshed)
+				if err != nil {
+					return err
+				}
+				execCtx.input = currentInput
+				rebuilt, buildErr := GetComputationWrapper(execCtx, ses.GetDatabaseName(), ses.GetUserName(), pu.StorageEngine, proc, ses)
+				if buildErr != nil {
+					return buildErr
+				}
+				if len(rebuilt) != 1 {
+					for _, w := range rebuilt {
+						w.Free()
+					}
+					return moerr.NewInternalError(execCtx.reqCtx, "implicit commit rebuilt unexpected statement count")
+				}
+				cw.Free()
+				cw, cws[i] = rebuilt[0], rebuilt[0]
+				stmt = cw.GetAst()
+				execCtx.stmt = stmt
+				effectiveStmt, effectiveDefaultDatabase, resolveErr = effectiveStatementForTxn(execCtx.reqCtx, ses, stmt)
+				if resolveErr != nil {
+					return resolveErr
+				}
+				execCtx.effectiveTxnStatement, execCtx.effectiveTxnDefaultDatabase = effectiveStmt, effectiveDefaultDatabase
+				installStatementRemap(execCtx, cw)
 			}
 		}
 
@@ -6370,6 +6727,16 @@ func doComQuery(ses *Session, execCtx *ExecCtx, input *UserInput) (retErr error)
 		}
 
 		if stagedSQLMode && hasMoreStatements {
+			if epoch != nil {
+				if statementBaseCtx == nil {
+					statementBaseCtx = statistic.ContextWithStatsInfo(
+						defines.AttachDDLOwnerRoleIDProvider(appendStatementAt(statementParentCtx, beginInstant), ses), statsInfo)
+				}
+				epoch.end()
+				execCtx.reqCtx, epoch = beginAuthorizationEpoch(statementBaseCtx, ses, execCtx)
+				epoch.entered = true
+				proc.ReplaceTopCtx(execCtx.reqCtx)
+			}
 			// SET expressions may execute an internal query, which temporarily
 			// replaces the compiler context's ExecCtx. Restore this outer query
 			// before planning the next staged statement.
@@ -6382,8 +6749,18 @@ func doComQuery(ses *Session, execCtx *ExecCtx, input *UserInput) (retErr error)
 				stagedRemaining,
 			)
 			if nextErr != nil {
-				return recordParseError(newSQLStatementInput(input, stagedRemaining), nextErr)
+				failedSQL := stagedRemaining.SQL
+				if stagedRemaining.InExecutableComment {
+					failedSQL = "/*! " + failedSQL
+				}
+				return recordParseError(newSQLStatementInput(input, failedSQL), nextErr)
 			}
+			nextInput.rewritePolicy, nextErr = captureRewritePolicy(execCtx.reqCtx, ses)
+			nextInput.rewritePolicyMaterialized = false
+			if nextErr != nil {
+				return recordParseError(nextInput, nextErr)
+			}
+			rawInputs = append(rawInputs, nextInput)
 			nextInput, nextErr = rewriteSQLStatementInput(execCtx.reqCtx, ses, nextInput)
 			if nextErr != nil {
 				return recordParseError(nextInput, nextErr)
@@ -6514,7 +6891,7 @@ func schedulingSQLByStatementWithSQLMode(ctx context.Context, sql string, sqlMod
 		}
 		return []string{sql}, []string{source}, nil
 	}
-	fragments, err := parsers.SplitSqlByStatementWithSQLMode(ctx, sql, sqlMode)
+	fragments, err := parsers.SplitSqlByStatementFragmentsWithSQLMode(ctx, sql, sqlMode)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -6527,8 +6904,8 @@ func schedulingSQLByStatementWithSQLMode(ctx context.Context, sql string, sqlMod
 	byStatement := make([]string, 0, len(fragments))
 	bySource := sources[:0]
 	for i, fragment := range fragments {
-		if parsers.FragmentHasStatement(fragment) {
-			byStatement = append(byStatement, fragment)
+		if parsers.FragmentHasStatement(fragment.SQL) {
+			byStatement = append(byStatement, fragment.SQL)
 			bySource = append(bySource, sources[i])
 		}
 	}
@@ -6660,9 +7037,18 @@ func ExecRequest(ses *Session, execCtx *ExecCtx, req *Request) (resp *Response, 
 	defer ses.ExitFPrint(FPExecRequest)
 
 	var span trace.Span
+	requestCtx := execCtx.reqCtx
 	execCtx.reqCtx, span = trace.Start(execCtx.reqCtx, "ExecRequest",
 		trace.WithKind(trace.SpanKindStatement))
 	defer span.End()
+	if execCtx.reqCtx != nil {
+		var epoch *authorizationEpoch
+		execCtx.reqCtx, epoch = beginAuthorizationEpoch(execCtx.reqCtx, ses, execCtx)
+		defer func() {
+			epoch.end()
+			execCtx.reqCtx = requestCtx
+		}()
+	}
 
 	var sql string
 	ses.Debugf(execCtx.reqCtx, "cmd %v", req.GetCmd())
@@ -6854,12 +7240,16 @@ func ExecRequest(ses *Session, execCtx *ExecCtx, req *Request) (resp *Response, 
 		stmtID := binary.LittleEndian.Uint32(data[0:4])
 		var preStmt *PrepareStmt
 		stmtName := getPrepareStmtName(stmtID)
-		preStmt, err = ses.GetPrepareStmt(execCtx.reqCtx, stmtName)
+		// Closing an invalidated handle must remain possible. Execution paths use
+		// GetPrepareStmt, which rejects the handle before any retained state is
+		// consumed; COM_STMT_CLOSE is the explicit cleanup/reprepare escape hatch.
+		preStmt, err = ses.getPrepareStmtAllowInvalidated(execCtx.reqCtx, stmtName)
 		if err != nil {
 			restoreRowCount(ses, ses.GetProc(), savedRowCount)
 			return NewGeneralErrorResponse(COM_STMT_CLOSE, ses.GetTxnHandler().GetServerStatus(), err), nil
 		}
 		preStmt.closeCursor()
+		preStmt.resetBinaryParamState()
 		prefix := ""
 		if preStmt.IsCloudNonuser {
 			prefix = "/* cloud_nonuser */"
@@ -6888,7 +7278,7 @@ func ExecRequest(ses *Session, execCtx *ExecCtx, req *Request) (resp *Response, 
 		stmtID := binary.LittleEndian.Uint32(data[0:4])
 		stmtName := getPrepareStmtName(stmtID)
 		var preStmt *PrepareStmt
-		preStmt, err = ses.GetPrepareStmt(execCtx.reqCtx, stmtName)
+		preStmt, err = ses.getPrepareStmtAllowInvalidated(execCtx.reqCtx, stmtName)
 		if err != nil {
 			// MySQL semantics: a failed statement makes the next ROW_COUNT() return -1.
 			// This early return never reaches doComQuery, so set the state here.
@@ -6896,6 +7286,7 @@ func ExecRequest(ses *Session, execCtx *ExecCtx, req *Request) (resp *Response, 
 			return NewGeneralErrorResponse(COM_STMT_RESET, ses.GetTxnHandler().GetServerStatus(), err), nil
 		}
 		preStmt.closeCursor()
+		preStmt.resetBinaryParamState()
 		prefix := ""
 		if preStmt.IsCloudNonuser {
 			prefix = "/* cloud_nonuser */"
@@ -6916,7 +7307,11 @@ func ExecRequest(ses *Session, execCtx *ExecCtx, req *Request) (resp *Response, 
 		if err != nil {
 			return NewGeneralErrorResponse(COM_SET_OPTION, ses.GetTxnHandler().GetServerStatus(), err), nil
 		}
-		return NewGeneralOkResponse(COM_SET_OPTION, ses.GetTxnHandler().GetServerStatus()), nil
+		status := ses.GetTxnHandler().GetServerStatus()
+		if ses.GetResponser().MysqlRrWr().GetU32(CAPABILITY)&CLIENT_DEPRECATE_EOF == 0 {
+			return NewResponse(EoFResponse, 0, 0, 0, status, int(COM_SET_OPTION), nil), nil
+		}
+		return NewGeneralOkResponse(COM_SET_OPTION, status), nil
 
 	default:
 		markRowCountFailed(ses, ses.GetProc())
@@ -6937,7 +7332,7 @@ func parseStmtExecute(reqCtx context.Context, ses *Session, data []byte) (string
 	stmtName := getPrepareStmtName(stmtID)
 	preStmt, err := ses.GetPrepareStmt(reqCtx, stmtName)
 	if err != nil {
-		return "", nil, err
+		return "", preStmt, err
 	}
 	if preStmt.longDataErr != nil {
 		return "", preStmt, preStmt.longDataErr
@@ -6982,6 +7377,9 @@ func executeStmtFetch(ctx context.Context, ses *Session, data []byte) (*Response
 	fetchRows := uint64(binary.LittleEndian.Uint32(data[4:8]))
 	stmt, err := ses.GetPrepareStmt(ctx, getPrepareStmtName(stmtID))
 	if err != nil {
+		if stmt != nil {
+			stmt.closeCursor()
+		}
 		return NewGeneralErrorResponse(COM_STMT_FETCH, ses.GetTxnHandler().GetServerStatus(), err), nil
 	}
 	if stmt.cursor == nil || stmt.cursor.result == nil {
@@ -7038,12 +7436,18 @@ func parseStmtSendLongData(reqCtx context.Context, ses *Session, data []byte) (e
 	pos += 4
 
 	stmtName := getPrepareStmtName(stmtID)
-	preStmt, err := ses.GetPrepareStmt(reqCtx, stmtName)
+	preStmt, err := ses.getPrepareStmtAllowInvalidated(reqCtx, stmtName)
 	if err != nil {
 		// MySQL silently discards long data for an unknown statement id.
 		return nil
 	}
 	if preStmt.longDataErr != nil {
+		return nil
+	}
+	if err = preStmt.checkRewritePolicy(reqCtx); err != nil {
+		// COM_STMT_SEND_LONG_DATA has no response packet. An invalidated
+		// handle cannot accept the upload, but the client must remain aligned
+		// for the following COM_STMT_EXECUTE, which reports ER_NEED_REPREPARE.
 		return nil
 	}
 	defer func() {
@@ -7209,7 +7613,11 @@ type jsonPlanHandler struct {
 }
 
 func NewJsonPlanHandler(ctx context.Context, stmt *motrace.StatementInfo, ses FeSession, plan *plan2.Plan, phyPlan *models.PhyPlan, opts ...marshalPlanOptions) *jsonPlanHandler {
-	h := NewMarshalPlanHandler(ctx, stmt, plan, phyPlan, opts...)
+	return newJsonPlanHandler(ctx, stmt, ses, plan, phyPlan, nil, opts...)
+}
+
+func newJsonPlanHandler(ctx context.Context, stmt *motrace.StatementInfo, ses FeSession, plan *plan2.Plan, phyPlan *models.PhyPlan, runErr error, opts ...marshalPlanOptions) *jsonPlanHandler {
+	h := newMarshalPlanHandler(ctx, stmt, plan, phyPlan, runErr, opts...)
 	statsBytes, stats := h.Stats(ctx, ses)
 	var staticJSON []byte
 	if h.marshalPlan == nil && (h.schedulingTrace == nil || !h.schedulingTrace.PersistStandalone()) {
@@ -7233,7 +7641,11 @@ func NewJsonPlanHandler(ctx context.Context, stmt *motrace.StatementInfo, ses Fe
 	}
 }
 
-func newSchedulingTracePlanHandler(ctx context.Context, trace schedule.Trace) *jsonPlanHandler {
+func newSchedulingTracePlanHandler(ctx context.Context, trace schedule.Trace, waitActiveCost time.Duration) *jsonPlanHandler {
+	if motrace.UseCompactStatementDiagnostics() {
+		d := &models.StatementDiagnostics{Version: models.DiagnosticsVersion, Level: 1, CapturedLevel: 1, Reasons: 1 << 9, Outcome: "failed", Scheduling: projectDiagnosticScheduling(&trace), Detail: models.DiagnosticDetail{Capture: "compile_failed"}}
+		return &jsonPlanHandler{statsBytes: statistic.DefaultStatsArray, persistSchedulingTrace: true, marshalHandler: &marshalPlanHandler{marshalPlan: &models.ExplainData{StatementDiagnostics: d}, marshalPlanConfig: marshalPlanConfig{waitActiveCost: waitActiveCost}}}
+	}
 	trace = trace.Clone()
 	h := &marshalPlanHandler{
 		marshalPlanConfig: marshalPlanConfig{
@@ -7277,6 +7689,7 @@ func (h *jsonPlanHandler) Free() {
 }
 
 type marshalPlanConfig struct {
+	// Negative means the transaction admission measurement is unavailable.
 	waitActiveCost          time.Duration
 	schedulingTrace         *schedule.Trace
 	schedulingTraceRecorder *schedule.TraceRecorder
@@ -7339,19 +7752,24 @@ func NewMarshalPlanHandlerCompositeSubStmt(ctx context.Context, p *plan.Plan, op
 // SetResourceSummary injects an already sealed summary into a materialized
 // explain plan. It intentionally does not touch the live resource root.
 func (h *marshalPlanHandler) SetResourceSummary(summary resource.StatementResourceSummary) {
-	if h == nil || h.marshalPlan == nil {
+	if h == nil || h.marshalPlan == nil || h.marshalPlan.StatementDiagnostics != nil {
 		return
 	}
 	h.marshalPlan.PhyPlan.Resource = &summary
 }
 
 func NewMarshalPlanHandler(ctx context.Context, stmt *motrace.StatementInfo, plan *plan2.Plan, phyPlan *models.PhyPlan, opts ...marshalPlanOptions) *marshalPlanHandler {
+	return newMarshalPlanHandler(ctx, stmt, plan, phyPlan, nil, opts...)
+}
+
+func newMarshalPlanHandler(ctx context.Context, stmt *motrace.StatementInfo, plan *plan2.Plan, phyPlan *models.PhyPlan, runErr error, opts ...marshalPlanOptions) *marshalPlanHandler {
 	// TODO: need mem improvement
 	uuid := uuid.UUID(stmt.StatementID)
 	stmt.MarkResponseAt()
 	h := &marshalPlanHandler{
-		stmt: stmt,
-		uuid: uuid,
+		stmt:              stmt,
+		uuid:              uuid,
+		marshalPlanConfig: marshalPlanConfig{waitActiveCost: -1},
 	}
 	for _, opt := range opts {
 		opt(&h.marshalPlanConfig)
@@ -7362,9 +7780,18 @@ func NewMarshalPlanHandler(ctx context.Context, stmt *motrace.StatementInfo, pla
 	needFullPlan := h.query != nil && h.needMarshalPlan()
 	h.resolveSchedulingTrace(needFullPlan)
 
+	// A short ordinary query with no resource preview cannot admit diagnostics.
+	// Keep the existing placeholder path out of the projection/policy calls.
+	if h.query != nil && !needFullPlan && runErr == nil && !h.persistSchedulingTrace && (phyPlan == nil || phyPlan.Resource == nil) {
+		return h
+	}
+	if motrace.UseCompactStatementDiagnostics() {
+		h.captureStatementDiagnostics(ctx, phyPlan, runErr)
+		return h
+	}
 	if needFullPlan {
 		h.marshalPlan = explain.BuildJsonPlan(ctx, h.uuid, &explain.MarshalPlanOptions, h.query)
-		h.marshalPlan.NewPlanStats.SetWaitActiveCost(h.waitActiveCost)
+		h.marshalPlan.NewPlanStats.SetWaitActiveCost(max(0, h.waitActiveCost))
 		if phyPlan != nil {
 			h.marshalPlan.PhyPlan = *phyPlan.CloneForExport()
 		}
@@ -7393,7 +7820,7 @@ func (h *marshalPlanHandler) resolveSchedulingTrace(includeNormalLocal bool) {
 // check longQueryTime, need after StatementInfo.MarkResponseAt
 // MoLogger NOT record ExecPlan
 func (h *marshalPlanHandler) needMarshalPlan() bool {
-	return (h.stmt.Duration-h.waitActiveCost) > motrace.GetLongQueryTime() &&
+	return (max(0, h.stmt.Duration)-max(0, h.waitActiveCost)) > motrace.GetLongQueryTime() &&
 		!h.stmt.IsMoLogger()
 }
 
@@ -7421,7 +7848,10 @@ func getMarshalPlanBufferPool() *bytes.Buffer {
 }
 
 func releaseMarshalPlanBufferPool(b *bytes.Buffer) {
-	marshalPlanBufferPool.Put(b)
+	// A legacy full plan must not inflate the buffers retained by compact rows.
+	if b.Cap() <= 64<<10 {
+		marshalPlanBufferPool.Put(b)
+	}
 }
 
 // allocBufferIfNeeded should call just right before needed.
@@ -7434,6 +7864,14 @@ func (h *marshalPlanHandler) allocBufferIfNeeded() {
 
 func (h *marshalPlanHandler) Marshal(ctx context.Context) (jsonBytes []byte) {
 	var err error
+	if h.marshalPlan != nil && h.marshalPlan.StatementDiagnostics != nil {
+		h.allocBufferIfNeeded()
+		if err = h.marshalPlan.StatementDiagnostics.WriteJSON(h.buffer); err != nil {
+			h.buffer.Reset()
+			return buildErrorJsonPlan(h.buffer, h.uuid, moerr.ErrInternal, err.Error())
+		}
+		return h.buffer.Next(h.buffer.Len())
+	}
 	if h.marshalPlan != nil {
 		sanitizeNonFiniteFloatValues(h.marshalPlan)
 		h.allocBufferIfNeeded()
@@ -7538,7 +7976,7 @@ func sanitizeNonFiniteFloatValue(v reflect.Value, seen map[uintptr]struct{}) {
 var sqlQueryIgnoreExecPlan = []byte(`{}`)
 var sqlQueryNoRecordExecPlan = []byte(`{"code":200,"message":"sql query no record execution plan"}`)
 
-func (h *marshalPlanHandler) Stats(ctx context.Context, ses FeSession) (statsByte statistic.StatsArray, stats motrace.Statistic) {
+func (h *marshalPlanHandler) Stats(ctx context.Context, _ FeSession) (statsByte statistic.StatsArray, stats motrace.Statistic) {
 	statsByte.Reset()
 	if h.query != nil {
 		options := &explain.MarshalPlanOptions
@@ -7577,9 +8015,6 @@ func (h *marshalPlanHandler) Stats(ctx context.Context, ses FeSession) (statsByt
 		statsInfo.PlanStage.BuildPlanStatsIOConsumption -
 		(statsInfo.IOAccessTimeConsumption + statsInfo.S3FSPrefetchFileIOMergerTimeConsumption)
 	if totalTime < 0 {
-		if !h.isInternalSubStmt && ses != nil && h.stmt != nil {
-			ses.Infof(ctx, "negative cpu statement_id:%s, statement_type:%s", uuid.UUID(h.stmt.StatementID).String(), h.stmt.StatementType)
-		}
 		v2.GetTraceNegativeCUCounter("cpu").Inc()
 	} else {
 		statsByte.WithTimeConsumed(float64(totalTime))

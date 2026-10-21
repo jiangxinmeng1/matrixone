@@ -750,17 +750,13 @@ func typeInList(typ types.T, supported []types.T) bool {
 	return false
 }
 
-// mysqlNumericAggTypeCheck implements MySQL's numeric coercion for variance
-// and standard-deviation aggregates. JSON operands resolve to DOUBLE; SQL
-// binding supplies the aggregate warning conversion. Unlike SUM, these
-// aggregates also accept
-// string and temporal expressions and evaluate their numeric representation.
 // BIT's storage domain is unsigned, but its legacy aggregate state is not
 // widened. Bind through the existing UINT64 aggregate instead of changing the
 // interpretation of old BIT partial states or treating BIT width as precision.
 func sumAvgTypeCheck(inputs []types.Type) checkResult {
 	if len(inputs) == 1 && inputs[0].Oid == types.T_enum {
-		return newCheckResultWithCast(0, []types.Type{types.T_uint16.ToType()})
+		// MySQL consumes ENUM ordinals in the approximate aggregate domain.
+		return newCheckResultWithCast(0, []types.Type{types.T_float64.ToType()})
 	}
 	if len(inputs) == 1 && inputs[0].Oid == types.T_bit {
 		return newCheckResultWithCast(0, []types.Type{types.T_uint64.ToType()})
@@ -768,9 +764,17 @@ func sumAvgTypeCheck(inputs []types.Type) checkResult {
 	if len(inputs) == 1 && inputs[0].Oid == types.T_json {
 		return newCheckResultWithCast(0, []types.Type{types.T_float64.ToType()})
 	}
+	if len(inputs) == 1 && (inputs[0].Oid.IsMySQLString() || inputs[0].Oid.IsDateRelate()) {
+		return mysqlNumericAggTypeCheck(inputs)
+	}
+	// Preserve the existing numeric domains and bare NULL's UINT8 binding.
 	return fixedUnaryAggTypeCheck(inputs, SumSupportedTypes)
 }
 
+// mysqlNumericAggTypeCheck supplies MySQL numeric domains for statistical
+// aggregates. BOOL uses 0/1 and ENUM uses its ordinal. SUM/AVG only delegate
+// string and temporal inputs here, preserving their separate BOOL mode gate.
+// JSON resolves to DOUBLE; SQL binding supplies its warning conversion.
 func mysqlNumericAggTypeCheck(inputs []types.Type) checkResult {
 	if len(inputs) != 1 {
 		return newCheckResultWithFailure(failedAggParametersWrong)
@@ -778,6 +782,10 @@ func mysqlNumericAggTypeCheck(inputs []types.Type) checkResult {
 
 	t := inputs[0]
 	switch {
+	case t.Oid == types.T_bool:
+		return newCheckResultWithCast(0, []types.Type{types.T_int8.ToType()})
+	case t.Oid == types.T_enum:
+		return newCheckResultWithCast(0, []types.Type{types.T_uint16.ToType()})
 	case t.Oid == types.T_json:
 		return newCheckResultWithCast(0, []types.Type{types.T_float64.ToType()})
 	case t.Oid == types.T_any:
@@ -850,11 +858,14 @@ func ReturnFirstArgType(typs []types.Type) types.Type {
 var BitOpsSupportedTypes = []types.T{
 	types.T_uint8, types.T_uint16, types.T_uint32, types.T_uint64,
 	types.T_int8, types.T_int16, types.T_int32, types.T_int64,
-	types.T_binary, types.T_varbinary,
+	types.T_binary, types.T_varbinary, types.T_blob,
 	types.T_bit,
 }
 
 func bitOpsAggTypeCheck(_ []overload, inputs []types.Type) checkResult {
+	if len(inputs) == 1 && inputs[0].Oid == types.T_enum {
+		return newCheckResultWithCast(0, []types.Type{types.T_uint16.ToType()})
+	}
 	if len(inputs) == 1 && aggexec.IsBitwiseAggregateOperandTooWide(inputs[0]) {
 		return newCheckResultWithFailure(failedBitwiseAggregateOperandsSize)
 	}
@@ -862,7 +873,7 @@ func bitOpsAggTypeCheck(_ []overload, inputs []types.Type) checkResult {
 }
 
 var BitOpsReturnType = func(typs []types.Type) types.Type {
-	if typs[0].Oid == types.T_binary || typs[0].Oid == types.T_varbinary {
+	if typs[0].Oid == types.T_binary || typs[0].Oid == types.T_varbinary || typs[0].Oid == types.T_blob {
 		return typs[0]
 	}
 	return types.T_uint64.ToType()

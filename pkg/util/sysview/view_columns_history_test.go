@@ -31,6 +31,7 @@ func TestAdaptLegacyInformationSchemaColumnsDDL(t *testing.T) {
 		{"V46", InformationSchemaColumnsV46DDL, true},
 		{"V46 upgrade", InformationSchemaColumnsV46UpgradeDDL, true},
 		{"V58", InformationSchemaColumnsV58DDL(), true},
+		{"V100", InformationSchemaColumnsV100DDL(), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			adapted, ok := AdaptLegacyInformationSchemaColumnsDDL(tc.definition)
@@ -48,10 +49,34 @@ func TestAdaptLegacyInformationSchemaColumnsDDL(t *testing.T) {
 			require.Equal(t, adapted, lowerAdapted)
 		})
 	}
+	v109 := InformationSchemaColumnsV109DDL()
+	v109Adapted, ok := AdaptLegacyInformationSchemaColumnsDDL(v109)
+	require.True(t, ok)
+	require.Equal(t, v109, v109Adapted, "the derived v109 template must be retained exactly")
+	require.Contains(t, v109, "WHEN 4 then 'utf8'")
+	require.NotContains(t, v109, "like 'MEDIUMINT%'")
+	lowerV109 := strings.Replace(v109, "information_schema.COLUMNS", "information_schema.columns", 1)
+	lowerAdapted, ok := AdaptLegacyInformationSchemaColumnsDDL(lowerV109)
+	require.True(t, ok)
+	require.Equal(t, v109, lowerAdapted, "only the historical lowercase view name is normalized")
+	const v109DataType = "upper(mo_show_visible_bin(mc.atttyp,2)) = 'BOOL' then 'TINYINT' "
+	const v110DataType = v109DataType + "when upper(mo_show_visible_bin(mc.atttyp,3)) like 'MEDIUMINT%' then 'MEDIUMINT' "
+	require.Equal(t, strings.ReplaceAll(v109, v109DataType, v110DataType), InformationSchemaColumnsDDL)
+	require.False(t, IsInformationSchemaColumnsMigrationDDL(v109))
+
 	adapted, ok := AdaptLegacyInformationSchemaColumnsDDL(InformationSchemaColumnsV58DDL())
 	require.True(t, ok)
-	require.Equal(t, InformationSchemaColumnsDDL, adapted)
-	for _, unknown := range []string{"", "CREATE VIEW information_schema.COLUMNS AS SELECT 1", InformationSchemaColumnsDDL} {
+	// The current view knows native Unicode selector identities, while a
+	// persisted V58 definition must retain its historical projection.
+	require.NotEqual(t, InformationSchemaColumnsDDL, adapted)
+	require.NotContains(t, adapted, "WHEN 4 then")
+	require.NotContains(t, adapted, "WHEN 5 then")
+	adapted, ok = AdaptLegacyInformationSchemaColumnsDDL(InformationSchemaColumnsV100DDL())
+	require.True(t, ok)
+	require.Equal(t, InformationSchemaColumnsV100DDL(), adapted)
+	require.NotContains(t, adapted, "WHEN 4 then")
+	require.NotContains(t, adapted, "WHEN 5 then")
+	for _, unknown := range []string{"", "CREATE VIEW information_schema.COLUMNS AS SELECT 1", InformationSchemaColumnsDDL, v109 + " "} {
 		adapted, ok := AdaptLegacyInformationSchemaColumnsDDL(unknown)
 		require.False(t, ok)
 		require.Empty(t, adapted)
@@ -60,4 +85,9 @@ func TestAdaptLegacyInformationSchemaColumnsDDL(t *testing.T) {
 	require.True(t, IsCurrentInformationSchemaColumnsDDL(strings.Replace(InformationSchemaColumnsDDL,
 		"information_schema.COLUMNS", "information_schema.columns", 1)))
 	require.False(t, IsCurrentInformationSchemaColumnsDDL(InformationSchemaColumnsV58DDL()))
+	require.True(t, IsInformationSchemaColumnsMigrationDDL(InformationSchemaColumnsV100DDL()))
+	require.True(t, IsInformationSchemaColumnsMigrationDDL(strings.Replace(InformationSchemaColumnsV100DDL(),
+		"information_schema.COLUMNS", "information_schema.columns", 1)))
+	require.True(t, IsInformationSchemaColumnsMigrationDDL(InformationSchemaColumnsDDL))
+	require.False(t, IsInformationSchemaColumnsMigrationDDL(InformationSchemaColumnsV58DDL()))
 }

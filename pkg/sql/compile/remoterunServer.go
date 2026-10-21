@@ -251,7 +251,7 @@ func waitUntilPipelineBatchFlowDrained(
 	if connectionCtx != nil && connectionCtx.Err() != nil {
 		return moerr.NewStreamClosed(messageCtx)
 	}
-	if flow.wasStoppedByReceiver() && isScopeCancellationError(err) {
+	if flow.wasStoppedByReceiver() && process.IsPipelineCancellationError(err) {
 		return nil
 	}
 	return err
@@ -395,6 +395,7 @@ func handlePipelineMessage(receiver *messageReceiverOnServer) (err error) {
 		}
 		var allocationAttempt *statementAllocationAttempt
 		var allocationParticipant *remoteAllocationStatementParticipant
+		var boardOwnedByGroup bool
 		var allocationGroupKey string
 		var localAllocation resource.AllocationAccountTotals
 		var localAllocationQuality resource.QualityFlags
@@ -437,6 +438,10 @@ func handlePipelineMessage(receiver *messageReceiverOnServer) (err error) {
 					moerr.ConvertPanicError(receiver.messageCtx, recovered),
 				)
 			}
+			allocationParticipant.recordFailure(err)
+			if cause := allocationParticipant.failureCause(); cause != nil {
+				receiver.statementError = cause
+			}
 			// Capture operator and descendant facts before cleanup. The MPool
 			// snapshot intentionally follows Compile.clear so temporary execution
 			// allocations are released before LiveBytesAtSeal is measured. The
@@ -468,7 +473,8 @@ func handlePipelineMessage(receiver *messageReceiverOnServer) (err error) {
 					// owns the shared multi-CN board. Detach it before clear resets the
 					// fragment-local Compile state. A fragment rejected before it joins a
 					// group is terminal for the statement, so it closes its unowned board.
-					if allocationParticipant == nil {
+					if allocationParticipant == nil && !boardOwnedByGroup &&
+						sealUnownedRemoteAllocationStatementBoard(sharedMessageBoard) {
 						sharedMessageBoard.CloseAndDrain()
 					}
 					runCompile.MessageBoard = message.NewMessageBoard()
@@ -548,7 +554,7 @@ func handlePipelineMessage(receiver *messageReceiverOnServer) (err error) {
 				runCompile.remoteExecutionID,
 				runCompile.addr,
 			)
-			allocationParticipant, runErr = acquireRemoteAllocationStatementParticipant(
+			allocationParticipant, boardOwnedByGroup, runErr = acquireRemoteAllocationStatementParticipant(
 				allocationGroupKey,
 				runCompile.MessageBoard,
 				expectedFragments,
@@ -559,6 +565,9 @@ func handlePipelineMessage(receiver *messageReceiverOnServer) (err error) {
 				},
 			)
 			if runErr != nil {
+				if native, ok := runErr.(*moerr.Error); ok {
+					receiver.statementError = native
+				}
 				return runErr
 			}
 		}
@@ -838,6 +847,7 @@ type processHelper struct {
 	//analysisNodeList []int32
 	StmtId                     uuid.UUID
 	statementRuntimeIgnore     bool
+	statementRuntimeSelect     bool
 	planSnapshotTS             timestamp.Timestamp
 	hasPlanSnapshotTS          bool
 	planGenerationReused       bool
@@ -850,8 +860,9 @@ type processHelper struct {
 
 // messageReceiverOnServer supported a series methods to write back results.
 type messageReceiverOnServer struct {
-	messageCtx    context.Context
-	connectionCtx context.Context
+	statementError *moerr.Error // Immutable causal snapshot; cleanup diagnostics stay in handlerErr.
+	messageCtx     context.Context
+	connectionCtx  context.Context
 
 	messageId   uint64
 	messageTyp  pipeline.Method
@@ -1112,6 +1123,9 @@ func (receiver *messageReceiverOnServer) newCompile() (*Compile, error) {
 		txnId := txn.GetID()
 		stmtProfile := process.NewStmtProfile(uuid.UUID(txnId), pHelper.StmtId)
 		stmtProfile.SetStatementRuntimeProfile("", "", pHelper.statementRuntimeIgnore)
+		if pHelper.statementRuntimeSelect {
+			stmtProfile.SetStatementRuntimeProfile("Select", "DQL", pHelper.statementRuntimeIgnore)
+		}
 		proc.Base.StmtProfile = stmtProfile
 	}
 
@@ -1194,7 +1208,11 @@ func (receiver *messageReceiverOnServer) sendError(
 	message.SetMessageType(receiver.messageTyp)
 	message.AcceptedTeardownMode = receiver.acceptedTeardownMode
 	if errInfo != nil {
-		message.SetMoError(receiver.messageCtx, process.UnwrapPipelineFailure(errInfo))
+		wireErr := process.UnwrapPipelineFailure(errInfo)
+		if receiver.statementError != nil && !errors.Is(errInfo, mpool.ErrAllocationAccountInvariant) {
+			wireErr = receiver.statementError
+		}
+		message.SetMoError(receiver.messageCtx, wireErr)
 	}
 	if err = receiver.setTerminalAnalysis(message); err != nil {
 		return err
@@ -1402,6 +1420,7 @@ func generateProcessHelper(ctx context.Context, data []byte, cli client.TxnClien
 		txnClient:                  cli,
 		affectedRows:               procInfo.AffectedRows,
 		statementRuntimeIgnore:     procInfo.StatementRuntimeIgnore,
+		statementRuntimeSelect:     procInfo.StatementRuntimeSelect,
 		stringShuffleHashAlgorithm: stringShuffleHashAlgorithm,
 		remoteFragmentCounts:       maps.Clone(procInfo.RemoteFragmentCounts),
 	}

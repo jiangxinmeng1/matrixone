@@ -24,6 +24,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/buffer"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	commonutil "github.com/matrixorigin/matrixone/pkg/common/util"
@@ -101,6 +102,16 @@ func markInternalJSONMergeWarningContext(ctx context.Context) context.Context {
 		plan.JSONMergeWarningInternalReprepare,
 	)
 }
+
+// lockFreeStatementTree is carried on the statement tree of an internal
+// statement executed with WithDisableLock. SQL such a statement triggers
+// indirectly on the same transaction — partition-service metadata writes and
+// auto-increment column writes run on service-owned executors with fresh
+// statement options — must inherit the lock-free policy. Those nested catalog
+// writes address keys private to the in-flight preparation, so letting them
+// silently re-arm catalog locks would accumulate public ownership that
+// publication admission cannot certify as private preparation.
+type lockFreeStatementTree struct{}
 
 // NewSQLExecutor returns a internal used sql service. It can execute sql in current CN.
 func NewSQLExecutor(
@@ -349,7 +360,39 @@ func (exec *txnExecutor) Use(db string) {
 func (exec *txnExecutor) Exec(
 	sql string,
 	statementOption executor.StatementOption,
-) (executor.Result, error) {
+) (execResult executor.Result, retErr error) {
+	// Seal before returning to an owned or borrowed callback, even if it
+	// suppresses this error. Cleanup waits on the existing SQL-drain owner.
+	ownerTxn := exec.opts.Txn()
+	if exec.opts.ExistsTxn() && ownerTxn != nil && ownerTxn.Txn().IsPessimistic() {
+		if _, ok := ownerTxn.(client.DeferredTxnRollback); !ok {
+			return executor.Result{}, moerr.NewInternalError(exec.ctx, "borrowed pessimistic executor lacks deferred rollback ownership")
+		}
+	}
+	var sqlToken uint64
+	if ownerTxn != nil {
+		statementCtx, cancel := context.WithCancel(exec.ctx)
+		var err error
+		sqlToken, err = client.TryEnterRunSqlWithTokenAndSQL(ownerTxn, cancel, sql)
+		if err != nil {
+			cancel()
+			return executor.Result{}, err
+		}
+		originalCtx := exec.ctx
+		exec.ctx = statementCtx
+		defer func() { cancel(); exec.ctx = originalCtx }()
+	}
+	defer func() {
+		if moerr.MustRollbackTxn(retErr) && ownerTxn != nil {
+			if owner, ok := ownerTxn.(client.DeferredTxnRollback); ok {
+				owner.RollbackAfterRunningSQL(retErr)
+			}
+		}
+		if ownerTxn != nil {
+			ownerTxn.ExitRunSqlWithToken(sqlToken)
+		}
+	}()
+
 	parentCtx := exec.ctx
 	exec.ctx = markInternalJSONMergeWarningContext(
 		newInternalStatementContext(parentCtx))
@@ -358,6 +401,16 @@ func (exec *txnExecutor) Exec(
 		// long-lived transaction executor or build an unbounded context chain.
 		exec.ctx = parentCtx
 	}()
+
+	// A lock-free internal statement stays lock-free through the SQL it
+	// triggers on the same transaction: the nested service executors inherit
+	// the policy from the statement context instead of re-arming catalog
+	// locks for private-preparation catalog rows.
+	if statementOption.DisableLock() {
+		exec.ctx = context.WithValue(exec.ctx, lockFreeStatementTree{}, true)
+	} else if _, ok := exec.ctx.Value(lockFreeStatementTree{}).(bool); ok {
+		statementOption = statementOption.WithDisableLock()
+	}
 
 	// NOTE: This code is to restore tenantID information in the Context when temporarily switching tenants
 	// so that it can be restored to its original state after completing the task.
@@ -382,6 +435,12 @@ func (exec *txnExecutor) Exec(
 	if statementOption.IgnoreForeignKey() {
 		exec.ctx = context.WithValue(exec.ctx,
 			defines.IgnoreForeignKey{},
+			true)
+	}
+
+	if statementOption.TrustedCheckConstraintNames() {
+		exec.ctx = context.WithValue(exec.ctx,
+			defines.TrustedCheckConstraintNames{},
 			true)
 	}
 
@@ -428,6 +487,11 @@ func (exec *txnExecutor) Exec(
 	if err != nil {
 		return executor.Result{}, err
 	}
+	if rewriteOption := getInternalExecutorRewriteOption(exec.ctx); rewriteOption != nil {
+		// CTAS carries the effective policy as typed AST state from the outer
+		// statement. Never recover execution semantics from redacted originSQL.
+		attachRewriteOptionToStatement(stmts[0], rewriteOption)
+	}
 
 	// TODO(volgariver6): we got a duplicate code logic in `func (cwft *TxnComputationWrapper) Compile`,
 	// maybe we should fix it.
@@ -444,6 +508,8 @@ func (exec *txnExecutor) Exec(
 		}
 	}
 
+	var sequenceState *internalSequenceState
+	exec.ctx, sequenceState = consumeInternalSequenceState(exec.ctx)
 	proc := process.NewTopProcess(
 		exec.ctx,
 		exec.s.mp,
@@ -457,6 +523,7 @@ func (exec *txnExecutor) Exec(
 		nil,
 		exec.s.taskservice,
 	)
+	initInternalSequenceState(proc, exec.getDatabase(), sequenceState)
 	// Internal DML (including CTAS population) needs the same expression error
 	// policy as frontend DML, before planning can fold any constants.
 	initInternalStatementProfile(proc, stmts[0])
@@ -497,7 +564,11 @@ func (exec *txnExecutor) Exec(
 
 	prepared := false
 	if statementOption.HasParams() {
-		vec := statementOption.Params(exec.s.mp)
+		vec, err := statementOption.Params(exec.s.mp)
+		if err != nil {
+			proc.Free()
+			return executor.Result{}, err
+		}
 		proc.SetPrepareParams(vec)
 		prepared = true
 		defer vec.Free(proc.Mp())
@@ -505,6 +576,10 @@ func (exec *txnExecutor) Exec(
 
 	proc.Base.WaitPolicy = statementOption.WaitPolicy()
 	proc.Base.SessionInfo.TimeZone = exec.opts.GetTimeZone()
+	// A child SQL process does not inherit the parent's mutable SessionInfo.
+	// Install the explicitly propagated authenticated names before planning so
+	// SQL file admission and all downstream execution paths observe them.
+	proc.Base.SessionInfo.Account, proc.Base.SessionInfo.Role = statementOption.SessionIdentity()
 	proc.Base.SessionInfo.Buf = exec.s.buf
 	proc.Base.SessionInfo.StorageEngine = exec.s.eng
 	proc.Base.QueryClient = exec.s.qc
@@ -569,14 +644,15 @@ func (exec *txnExecutor) Exec(
 	}
 
 	c := exec.newCompile(proc, stmts[0], sql, receiveAt)
+	c.runSqlToken = sqlToken
 	c.SetOriginSQL(sql)
 	c.adjustTableExtraFunc = exec.opts.AdjustTableExtraFunc()
 	c.disableDropAutoIncrement = statementOption.DisableDropIncrStatement()
 	c.skipDataBranchReclaim = statementOption.SkipDataBranchReclaim()
 	c.keepAutoIncrement = statementOption.KeepAutoIncrement()
-	c.disableRetry = exec.opts.DisableIncrStatement()
 	c.ignorePublish = statementOption.IgnorePublish()
 	c.ignoreCheckExperimental = statementOption.IgnoreCheckExperimental()
+	c.skipIndexTaskRegistration = statementOption.SkipIndexTaskRegistration()
 	c.disableLock = statementOption.DisableLock()
 	c.prePipelineLockTableID = statementOption.PrePipelineLockTable()
 
@@ -680,6 +756,10 @@ func (exec *txnExecutor) Exec(
 		)
 	}
 
+	if sequenceState != nil {
+		state := captureSequenceStatementState(proc)
+		sequenceState.output = &state
+	}
 	result.LastInsertID = proc.GetStatementLastInsertID()
 	result.Batches = batches
 	result.AffectedRows = runResult.AffectRows

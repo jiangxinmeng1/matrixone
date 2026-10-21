@@ -30,6 +30,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/common/collation"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/config"
@@ -431,9 +432,7 @@ func TestBuildCreateTablePreservesTextCharset(t *testing.T) {
 func TestBuildCreateTableRejectsUnsupportedCollations(t *testing.T) {
 	for _, sql := range []string{
 		"create table t(v varchar(8)) collate utf8mb4_de_pb_0900_ai_ci",
-		"create table t(v varchar(8)) collate utf8mb4_unicode_ci",
 		"create table t(v varchar(8) collate utf8mb4_0900_bin)",
-		"create table t(v varchar(8) collate utf8_unicode_ci)",
 	} {
 		t.Run(sql, func(t *testing.T) {
 			stmt, err := parsers.ParseOne(t.Context(), dialect.MYSQL, sql, 1)
@@ -476,6 +475,116 @@ func TestBuildCreateTableAcceptsMySQL8DefaultCollationCompatibilityAlias(t *test
 	require.NoError(t, err)
 	require.NotContains(t, showSQL, "0900")
 	require.Contains(t, showSQL, "COLLATE utf8mb4_bin")
+}
+
+func TestBuildCreateTableAcceptsNativeUnicodeCollations(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		collation   string
+		wantCharset uint32
+	}{
+		{name: "utf8mb3", collation: "utf8_unicode_ci", wantCharset: uint32(types.CharsetUTF8MB3UnicodeCI)},
+		{name: "utf8mb4", collation: "utf8mb4_unicode_ci", wantCharset: uint32(types.CharsetUTF8MB4UnicodeCI)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, err := parsers.ParseOne(t.Context(), dialect.MYSQL,
+				"create table t(v varchar(8)) collate "+tc.collation, 1)
+			require.NoError(t, err)
+			defer stmt.Free()
+			p, err := BuildPlan(NewMockCompilerContext(false, newPlanTestProcess(t)), stmt, false)
+			require.NoError(t, err)
+			tableDef := p.GetDdl().GetCreateTable().GetTableDef()
+			require.Equal(t, tc.wantCharset, tableDef.DefaultCharset)
+			require.Equal(t, tc.wantCharset, tableDef.Cols[0].Typ.Charset)
+		})
+	}
+}
+
+func TestBuildCreateTableNativeUnicodeUniqueUsesVersionedKeyFormat(t *testing.T) {
+	stmt, err := parsers.ParseOne(t.Context(), dialect.MYSQL, `
+		create table t_native_unique (
+			v varchar(8) collate utf8mb4_unicode_ci unique,
+			n int,
+			unique key uq_vn (v, n)
+		)`, 1)
+	require.NoError(t, err)
+	defer stmt.Free()
+
+	ctx := NewMockCompilerContext(false, newPlanTestProcess(t))
+	p, err := BuildPlan(ctx, stmt, false)
+	require.NoError(t, err)
+	tableDef := p.GetDdl().GetCreateTable().GetTableDef()
+	require.Equal(t, uint32(collation.KeyFormatV1), tableDef.KeyFormat)
+	require.Len(t, tableDef.Indexes, 2)
+	require.Len(t, p.GetDdl().GetCreateTable().GetIndexTables(), 2)
+	for _, index := range tableDef.Indexes {
+		require.Equal(t, uint32(collation.KeyFormatV1), index.KeyFormat)
+		require.True(t, index.Unique)
+	}
+	for _, indexTable := range p.GetDdl().GetCreateTable().GetIndexTables() {
+		require.Equal(t, uint32(collation.KeyFormatV1), indexTable.KeyFormat)
+		require.NotNil(t, indexTable.Pkey)
+	}
+	// The one-part key is stored as an opaque binary comparison key. The
+	// composite key remains a packed opaque varlena value.
+	var onePart *TableDef
+	for _, indexTable := range p.GetDdl().GetCreateTable().GetIndexTables() {
+		if len(indexTable.Cols) > 0 && indexTable.Cols[0].Typ.Id == int32(types.T_varbinary) {
+			onePart = indexTable
+			break
+		}
+	}
+	require.NotNil(t, onePart)
+}
+
+func TestBuildCreateTableNativeUnicodeUniqueRejectsOtherIndexKinds(t *testing.T) {
+	stmt, err := parsers.ParseOne(t.Context(), dialect.MYSQL, `
+		create table t_native_unique_mixed (
+			v varchar(8) collate utf8mb4_unicode_ci unique,
+			n int,
+			key k_n (n)
+		)`, 1)
+	require.NoError(t, err)
+	defer stmt.Free()
+
+	_, err = BuildPlan(NewMockCompilerContext(false, newPlanTestProcess(t)), stmt, false)
+	require.ErrorContains(t, err, "cannot be combined with secondary or fulltext indexes")
+}
+
+func TestBuildCreateTableNativeUnicodeUniqueRejectsTypedExternalTables(t *testing.T) {
+	for _, engine := range []string{"datastream", "sql", "kafka"} {
+		t.Run(engine, func(t *testing.T) {
+			stmt, err := parsers.ParseOne(t.Context(), dialect.MYSQL, fmt.Sprintf(`
+				create external table t_native_unique_%s (
+					v varchar(8) collate utf8mb4_unicode_ci unique
+				) engine = %s`, engine, engine), 1)
+			require.NoError(t, err)
+			defer stmt.Free()
+
+			_, err = BuildPlan(NewMockCompilerContext(false, newPlanTestProcess(t)), stmt, false)
+			require.ErrorContains(t, err, "cannot create index on external table")
+		})
+	}
+}
+
+func TestBuildCreateTableNativeUnicodeUniqueRequiresAuthoringProtocol(t *testing.T) {
+	stmt, err := parsers.ParseOne(t.Context(), dialect.MYSQL,
+		"create table t_native_unique_gate (v varchar(8) collate utf8mb4_unicode_ci unique)", 1)
+	require.NoError(t, err)
+	defer stmt.Free()
+
+	proc := newPlanTestProcess(t)
+	rt := moruntime.ServiceRuntime(proc.GetService())
+	old, present := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+	defer func() {
+		if present {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, old)
+		}
+	}()
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion111)
+
+	_, err = BuildPlan(NewMockCompilerContext(false, proc), stmt, false)
+	require.ErrorContains(t, err, fmt.Sprintf("protocol version %d", defines.MORPCVersion114))
 }
 
 func TestBuildCreateTableAcceptsUTF32CompatibilityAliases(t *testing.T) {
@@ -523,7 +632,7 @@ func TestBuildCreateTableAcceptsUTF32CompatibilityAliases(t *testing.T) {
 
 func TestUnsupportedLegacyCollationExplainsDumpReplacement(t *testing.T) {
 	stmt, err := parsers.ParseOne(t.Context(), dialect.MYSQL,
-		"create table t(v varchar(8)) collate utf8mb4_unicode_ci", 1)
+		"create table t(v varchar(8)) collate utf8mb4_de_pb_0900_ai_ci", 1)
 	require.NoError(t, err)
 	defer stmt.Free()
 
@@ -1279,11 +1388,28 @@ func TestBuildCreateTableCheckConstraints(t *testing.T) {
 		return p.GetDdl().GetCreateTable().GetTableDef(), nil
 	}
 
+	t.Run("generated check names respect identifier length", func(t *testing.T) {
+		for _, length := range []int{58, 59, 64} {
+			name := strings.Repeat("t", length)
+			def, err := build("create table "+name+"(a int check(a>0))", false)
+			if length == 58 {
+				require.NoError(t, err)
+				require.Equal(t, name+"_chk_1", def.Checks[0].Name)
+			} else {
+				require.True(t, moerr.IsMoErrCode(err, moerr.ErrTooLongIdent), "%v", err)
+			}
+			// The table name itself is valid; an explicit short CHECK still works.
+			_, err = build("create table "+name+"(a int, constraint ck check(a>0))", false)
+			require.NoError(t, err)
+		}
+	})
+
 	t.Run("table check binds after all columns", func(t *testing.T) {
 		tableDef, err := build("create table t(a int, check (b > a), b int)", false)
 		require.NoError(t, err)
 		require.Len(t, tableDef.Checks, 1)
-		require.Equal(t, "__mo_chk_1", tableDef.Checks[0].Name)
+		// Unnamed CHECKs are named after their owning table, MySQL-style.
+		require.Equal(t, "t_chk_1", tableDef.Checks[0].Name)
 		require.Equal(t, int32(types.T_bool), tableDef.Checks[0].Check.Typ.Id)
 	})
 
@@ -2250,6 +2376,36 @@ func TestStableViewSQLWithExpandedStarsRejectsUnsupportedInputs(t *testing.T) {
 }
 
 func TestBuildCreateViewExplicitColumnList(t *testing.T) {
+	t.Run("dependent query keeps main output metadata", func(t *testing.T) {
+		const selectSQL = `select n.n_nationkey as k,
+			(select (select cast(n.n_nationkey as decimal(12,2)))) as v from nation n`
+		for _, prefix := range []string{"create view v (k,v) as ", "create table dependent_ctas as "} {
+			func() {
+				sql := prefix + selectSQL
+				ctx := &rootSQLCompilerContext{MockCompilerContext: NewMockCompilerContext(false, newPlanTestProcess(t)), rootSQL: sql}
+				stmt, err := parsers.ParseOne(t.Context(), dialect.MYSQL, sql, 1)
+				require.NoError(t, err)
+				defer stmt.Free()
+				p, err := BuildPlan(ctx, stmt, false)
+				require.NoError(t, err)
+				var cols []*plan.ColDef
+				if view := p.GetDdl().GetCreateView(); view != nil {
+					cols = view.TableDef.Cols
+				} else {
+					cols = p.GetDdl().GetCreateTable().TableDef.Cols
+				}
+				require.GreaterOrEqual(t, len(cols), 2)
+				require.Equal(t, "k", cols[0].Name)
+				require.Equal(t, int32(types.T_int32), cols[0].Typ.Id)
+				require.Equal(t, "v", cols[1].Name)
+				require.Equal(t, int32(types.T_decimal64), cols[1].Typ.Id)
+				require.Equal(t, int32(12), cols[1].Typ.Width)
+				require.Equal(t, int32(2), cols[1].Typ.Scale)
+				require.True(t, cols[1].Default.NullAbility)
+			}()
+		}
+	})
+
 	t.Run("applies explicit names", func(t *testing.T) {
 		const rootSQL = "create view v (`alias#one`, alias_two) as select 1, 2"
 		ctx := &rootSQLCompilerContext{
@@ -3668,14 +3824,31 @@ func TestBuildCreateTablePreservesSingleStatementSQL(t *testing.T) {
 }
 
 func TestBuildCreateTableRejectsCaseInsensitiveDuplicateColumns(t *testing.T) {
-	const rootSQL = "CREATE TABLE duplicate_column_case (Id INT, id INT)"
-	stmt, err := parsers.ParseOne(t.Context(), dialect.MYSQL, rootSQL, 0)
-	require.NoError(t, err)
-	defer stmt.Free()
+	for _, tc := range []struct {
+		name, left, right string
+		duplicate         bool
+	}{
+		{"ascii", "Id", "id", true},
+		{"kelvin", "K", "K", true},
+		{"sigma", "Σ", "ς", true},
+		{"long_s", "S", "ſ", true},
+		{"dotless_i", "I", "ı", false},
+		{"sharp_s", "ß", "ss", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rootSQL := fmt.Sprintf("CREATE TABLE duplicate_column_case (`%s` INT, `%s` INT)", tc.left, tc.right)
+			stmt, err := parsers.ParseOne(t.Context(), dialect.MYSQL, rootSQL, 0)
+			require.NoError(t, err)
+			defer stmt.Free()
 
-	_, err = BuildPlan(NewMockCompilerContext(false, newPlanTestProcess(t)), stmt, false)
-	require.Error(t, err)
-	require.True(t, moerr.IsMoErrCode(err, moerr.ErrDupFieldName), err)
+			_, err = BuildPlan(NewMockCompilerContext(false, newPlanTestProcess(t)), stmt, false)
+			if tc.duplicate {
+				require.True(t, moerr.IsMoErrCode(err, moerr.ErrDupFieldName), err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 func TestBuildCreateTableLikePersistsExpandedSQL(t *testing.T) {
@@ -4634,6 +4807,47 @@ func TestBuildCreateTableIdentifierLength(t *testing.T) {
 	moErr, ok := err.(*moerr.Error)
 	require.True(t, ok, "unexpected error type %T: %v", err, err)
 	require.Equal(t, moerr.ErrTooLongIdent, moErr.ErrorCode())
+
+	// Generated physical names may exceed the length limit, but cannot waive encoding.
+	tempCtx.rootSQL = "delete from temp_table"
+	invalidTempName := defines.GenTempTableName(tempCtx.GetProcess().GetSessionInfo().SessionId,
+		"database", strings.Repeat("t", MaxIdentifierLength)+"\xe3g")
+	invalidTempStmt, err := parsers.ParseOne(context.Background(), dialect.MYSQL,
+		fmt.Sprintf("create table `%s` (id int)", invalidTempName), 1)
+	require.NoError(t, err)
+	defer invalidTempStmt.Free()
+	_, err = BuildPlan(tempCtx, invalidTempStmt, false)
+	require.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), "%v", err)
+}
+
+func TestBuildCreateSequenceIdentifier(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		identifier string
+	}{
+		{"ASCII 63", strings.Repeat("a", MaxIdentifierLength-1)},
+		{"ASCII 64", strings.Repeat("a", MaxIdentifierLength)},
+		{"ASCII 65", strings.Repeat("a", MaxIdentifierLength+1)},
+		{"Unicode 64", strings.Repeat("表", MaxIdentifierLength)},
+		{"Unicode 65", strings.Repeat("表", MaxIdentifierLength+1)},
+		{"long legacy name", strings.Repeat("s", 189)},
+		{"literal replacement character", "seq_�"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := runOneStmt(NewMockOptimizer(false, newPlanTestProcess(t)), t,
+				fmt.Sprintf("create sequence `%s` start 30", tc.identifier))
+			require.NoError(t, err)
+			require.Equal(t, tc.identifier, p.GetDdl().GetCreateSequence().GetTableDef().GetName())
+		})
+	}
+	for _, name := range []string{"seq_\xe3g", "\x80", "\xe3\x81", "\xc0\xaf", "\xed\xa0\x80", "\xff", strings.Repeat("s", 189) + "\xe3g"} {
+		t.Run(fmt.Sprintf("malformed %q", name), func(t *testing.T) {
+			p, err := runOneStmt(NewMockOptimizer(false, newPlanTestProcess(t)), t,
+				fmt.Sprintf("create sequence `%s`", name))
+			require.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), "%v", err)
+			require.Nil(t, p)
+		})
+	}
 }
 
 func TestBuildCatalogIdentifierLength(t *testing.T) {
@@ -4649,6 +4863,7 @@ func TestBuildCatalogIdentifierLength(t *testing.T) {
 				return fmt.Sprintf("create database `%s`", name)
 			},
 		},
+		{name: "CTAS column", sql: func(name string) string { return fmt.Sprintf("create table t as select 1 as `%s`", name) }},
 		{
 			name: "view",
 			sql: func(name string) string {
@@ -4722,6 +4937,10 @@ func TestBuildCatalogIdentifierLength(t *testing.T) {
 			_, err := runOneStmt(NewMockOptimizer(false, newPlanTestProcess(t)), t, testCase.sql(validName))
 			require.NoError(t, err)
 		})
+		t.Run(testCase.name+" rejects malformed UTF-8", func(t *testing.T) {
+			_, err := runOneStmt(NewMockOptimizer(false, newPlanTestProcess(t)), t, testCase.sql("t_\xe3g"))
+			require.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), "%v", err)
+		})
 		t.Run(testCase.name+" rejects 65 characters", func(t *testing.T) {
 			_, err := runOneStmt(NewMockOptimizer(false, newPlanTestProcess(t)), t, testCase.sql(invalidName))
 			require.Error(t, err)
@@ -4783,6 +5002,19 @@ func TestBuildCreateTableAcceptsTextBlobDisplayLength(t *testing.T) {
 			require.Equal(t, int32(test.wantID), valueCol.Typ.Id)
 		})
 	}
+
+	t.Run("text int32 max with primary key", func(t *testing.T) {
+		plan, err := runOneStmt(NewMockOptimizer(false, newPlanTestProcess(t)), t,
+			"CREATE TABLE text_length(id INT PRIMARY KEY,body TEXT(2147483647))")
+		require.NoError(t, err)
+
+		tableDef := plan.GetDdl().GetCreateTable().GetTableDef()
+		bodyCol := FindColumn(tableDef.Cols, "body")
+		require.NotNil(t, bodyCol)
+		require.Equal(t, int32(types.T_text), bodyCol.Typ.Id)
+		require.NotNil(t, tableDef.GetPkey())
+		require.Equal(t, []string{"id"}, tableDef.GetPkey().GetNames())
+	})
 }
 
 func TestBuildCreateTableError(t *testing.T) {
@@ -4848,13 +5080,9 @@ func TestBuildCreateTableError(t *testing.T) {
 	runTestShouldError(mock, t, sqlerrs)
 }
 
-func TestBuildCreateTableRejectsMediumInt(t *testing.T) {
-	_, err := runOneStmt(NewMockOptimizer(false, newPlanTestProcess(t)), t, "CREATE TABLE t (m MEDIUMINT)")
-	require.Error(t, err)
-	require.True(t, moerr.IsMoErrCode(err, moerr.ErrNYI), err)
-	require.Contains(t, strings.ToLower(err.Error()), "mediumint")
-
-	_, err = runOneStmt(NewMockOptimizer(false, newPlanTestProcess(t)), t, "CREATE TABLE t (m INT)")
+func TestBuildCreateTableSupportsMediumInt(t *testing.T) {
+	_, err := runOneStmt(NewMockOptimizer(false, newPlanTestProcess(t)), t,
+		"CREATE TABLE t (m MEDIUMINT, mu MEDIUMINT UNSIGNED, i INT(24))")
 	require.NoError(t, err)
 }
 
@@ -5301,6 +5529,41 @@ func TestBuildPrefixIndexV2ProtocolGate(t *testing.T) {
 	require.NoError(t, err)
 	indexDef := logicPlan.GetDdl().GetCreateTable().GetTableDef().GetIndexes()[0]
 	require.Equal(t, map[string]int{"head:line": 4}, catalog.IndexPrefixLengthsFromParams(indexDef.IndexAlgoParams))
+}
+
+func TestMediumIntCatalogAuthoringProtocolFence(t *testing.T) {
+	mock := NewMockOptimizer(false, newPlanTestProcess(t))
+	proc := mock.CurrentContext().GetProcess()
+	rt := moruntime.ServiceRuntime(proc.GetService())
+	oldVersion, hadVersion := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
+	oldFloor, hadFloor := rt.GetGlobalVariables(moruntime.PersistedExpressionProtocolAuthoringFloor)
+	t.Cleanup(func() {
+		if hadVersion {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, oldVersion)
+		} else {
+			rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
+		}
+		if hadFloor {
+			rt.SetGlobalVariables(moruntime.PersistedExpressionProtocolAuthoringFloor, oldFloor)
+		} else if current, ok := rt.GetGlobalVariables(moruntime.PersistedExpressionProtocolAuthoringFloor); ok {
+			rt.CompareAndDeleteGlobalVariables(moruntime.PersistedExpressionProtocolAuthoringFloor, current)
+		}
+	})
+
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion109)
+	rt.SetGlobalVariables(moruntime.PersistedExpressionProtocolAuthoringFloor, defines.MORPCVersion110)
+	_, err := runOneStmt(mock, t, "CREATE TABLE mediumint_protocol_fence (m MEDIUMINT)")
+	require.ErrorContains(t, err, "protocol version 110")
+
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion110)
+	_, err = runOneStmt(mock, t, "CREATE TABLE mediumint_protocol_fence (m MEDIUMINT)")
+	require.NoError(t, err)
+
+	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion109)
+	_, err = runOneStmt(mock, t, "ALTER TABLE nation ADD COLUMN mu MEDIUMINT UNSIGNED")
+	require.ErrorContains(t, err, "protocol version 110")
+	_, err = runOneStmt(mock, t, "ALTER TABLE nation MODIFY COLUMN n_nationkey MEDIUMINT UNSIGNED")
+	require.ErrorContains(t, err, "protocol version 110")
 }
 
 func TestBuildCompositeIndexMarksEncodedKeyBinary(t *testing.T) {
@@ -6191,7 +6454,7 @@ func Test_buildTableDefs(t *testing.T) {
 		SubscriptionOption: nil,
 	}
 
-	ctx := &MockCompilerContext{}
+	ctx := NewMockOptimizer(false, newPlanTestProcess(t)).CurrentContext()
 
 	createTable := &plan.CreateTable{
 		Database: "db",
@@ -6550,6 +6813,11 @@ func TestCheckFkColsAreValidRecordsReferencedKey(t *testing.T) {
 		}
 	}
 
+	require.True(t, ForeignKeyReferencedIndexMatches(parent, []uint64{1}, "uq_parent_id"), "retained UNIQUE remains valid even when PRIMARY would win new selection")
+	require.False(t, ForeignKeyReferencedIndexMatches(parent, []uint64{1}, "missing"))
+	require.False(t, ForeignKeyReferencedIndexMatches(parent, []uint64{2}, "uq_parent_id"))
+	require.False(t, ForeignKeyReferencedIndexMatches(parent, []uint64{99}, "PRIMARY"))
+	require.False(t, ForeignKeyReferencedIndexMatches(parent, nil, "PRIMARY"))
 	fk := newFK("id")
 	require.NoError(t, checkFkColsAreValid(ctx, fk, parent))
 	require.Equal(t, "PRIMARY", fk.Def.ReferencedIndexName)
@@ -6738,7 +7006,11 @@ func TestCreateForeignKeyUsesLegacyCatalogBeforeTenantUpgrade(t *testing.T) {
 	var internalQueries []string
 	setPlanTestGlobalVariable(t, proc.GetService(), moruntime.InternalSQLExecutor,
 		executor.NewMemExecutor(func(sql string) (executor.Result, error) {
-			internalQueries = append(internalQueries, sql)
+			if strings.Contains(sql, catalog.MOForeignKeys) {
+				internalQueries = append(internalQueries, sql)
+			} else {
+				require.Contains(t, sql, catalog.MODatabaseDefaults)
+			}
 			return executor.Result{}, nil
 		}),
 	)
@@ -6809,5 +7081,21 @@ func TestForwardForeignKeyCatalogLifecycle(t *testing.T) {
 	require.Equal(t, "PRIMARY", resolved.Def.ReferencedIndexName)
 	require.Equal(t,
 		"update `mo_catalog`.`mo_foreign_keys` set referenced_index_name = 'PRIMARY' where db_name = 'db' and table_name = 'child' and constraint_name = 'fk_child_parent'",
-		getSqlForUpdateFkReferencedIndex("db", "child", "fk_child_parent", resolved.Def.ReferencedIndexName))
+		GetSqlForUpdateFkReferencedIndex("db", "child", "fk_child_parent", resolved.Def.ReferencedIndexName))
+}
+
+func TestValidateIdentifierEncoding(t *testing.T) {
+	for _, name := range []string{"t_\xe3g", "\x80", "\xe3\x81", "\xc0\xaf", "\xed\xa0\x80", "\xff"} {
+		err := validateIdentifier(context.Background(), name)
+		require.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), "%q: %v", name, err)
+	}
+	for _, name := range []string{"", "表", "replacement_�"} {
+		require.NoError(t, validateIdentifier(context.Background(), name))
+	}
+	mock := NewMockOptimizer(false, newPlanTestProcess(t))
+	mock.ctxt.SetContext(context.WithValue(mock.ctxt.GetContext(), defines.InternalExecutorKey{}, true))
+	for _, statement := range []string{"create table t_\xe3g (id int)", "create table `t_\xe3g` (id int)", "rename table nation to `t_\xe3g`", "alter table nation rename to `t_\xe3g`"} {
+		_, err := runOneStmt(mock, t, statement)
+		require.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidInput), "%q: %v", statement, err)
+	}
 }

@@ -30,7 +30,6 @@ import (
 const opName = "table_function"
 
 const (
-	FULLTEXT_INDEX_SCAN     = "fulltext_index_scan"
 	FULLTEXT_INDEX_TOKENIZE = "fulltext_index_tokenize"
 )
 
@@ -67,6 +66,9 @@ func (tableFunction *TableFunction) Call(proc *process.Process) (vm.CallResult, 
 				input, err := vm.ChildrenCall(tableFunction.GetChildren(0), proc, analyzer)
 				if err != nil {
 					return input, err
+				}
+				if input.Status == vm.ExecYield {
+					return input, nil
 				}
 				tableFunction.ctr.inputBatch = input.Batch
 				if input.Batch.IsDone() {
@@ -142,6 +144,8 @@ func (tableFunction *TableFunction) Prepare(proc *process.Process) error {
 	tblArg.ctr.retSchema = retSchema
 
 	switch tblArg.FuncName {
+	case "json_table":
+		tblArg.ctr.state, err = jsonTablePrepare(proc, tblArg)
 	case "unnest":
 		tblArg.ctr.state, err = unnestPrepare(proc, tblArg)
 	case "generate_series":
@@ -180,8 +184,6 @@ func (tableFunction *TableFunction) Prepare(proc *process.Process) error {
 		tblArg.ctr.state, err = viewColumnsPrepare(proc, tblArg)
 	case subscriptionTablesFunctionName, subscriptionColumnsFunctionName:
 		tblArg.ctr.state, err = subscriptionMetadataPrepare(proc, tblArg)
-	case "fulltext_index_scan":
-		tblArg.ctr.state, err = fulltextIndexScanPrepare(proc, tblArg)
 	case "fulltext_index_tokenize":
 		tblArg.ctr.state, err = fulltextIndexTokenizePrepare(proc, tblArg)
 	case "fulltext2_create":
@@ -194,12 +196,8 @@ func (tableFunction *TableFunction) Prepare(proc *process.Process) error {
 		tblArg.ctr.state, err = pluginPrepare(proc, tblArg)
 	case "hnsw_create":
 		tblArg.ctr.state, err = hnswCreatePrepare(proc, tblArg)
-	case "hnsw_search":
-		tblArg.ctr.state, err = hnswSearchPrepare(proc, tblArg)
 	case "ivf_create":
 		tblArg.ctr.state, err = ivfCreatePrepare(proc, tblArg)
-	case "fulltext2_search":
-		tblArg.ctr.state, err = fulltext2SearchPrepare(proc, tblArg)
 	case "parse_jsonl_data":
 		tblArg.ctr.state, err = parseJsonlDataPrepare(proc, tblArg)
 	case "parse_jsonl_file":
@@ -214,12 +212,8 @@ func (tableFunction *TableFunction) Prepare(proc *process.Process) error {
 		tblArg.ctr.state, err = loadFileChunksPrepare(proc, tblArg)
 	case "cagra_create":
 		tblArg.ctr.state, err = cagraCreatePrepare(proc, tblArg)
-	case "cagra_search":
-		tblArg.ctr.state, err = cagraSearchPrepare(proc, tblArg)
 	case "ivfpq_create":
 		tblArg.ctr.state, err = ivfpqCreatePrepare(proc, tblArg)
-	case "ivfpq_search":
-		tblArg.ctr.state, err = ivfpqSearchPrepare(proc, tblArg)
 	default:
 		tblArg.ctr.state = nil
 		err = moerr.NewNotSupported(proc.Ctx, fmt.Sprintf("table function %s is not supported", tblArg.FuncName))

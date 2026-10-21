@@ -3923,6 +3923,103 @@ func TestPreparedSignedNarrowingCacheGuard(t *testing.T) {
 	}
 }
 
+func TestPreparedDecimalIntegerConsumerCacheGuard(t *testing.T) {
+	for _, predicate := range []string{
+		"n_nationkey in (?, ?)",
+		"n_nationkey between ? and ?",
+		"n_nationkey = cast(? as signed)",
+	} {
+		t.Run(predicate, func(t *testing.T) {
+			base := plan2.NewMockCompilerContext(false, newPlanTestProcess(t))
+			_, table, err := base.Resolve("tpch", "nation", nil)
+			require.NoError(t, err)
+			for _, col := range table.Cols {
+				if col.Name == "n_nationkey" {
+					col.Typ.Id, col.Typ.Width, col.Typ.Scale = int32(types.T_decimal64), 12, 2
+				}
+			}
+			ctx := &preparedStatsTestCompiler{preparedTestCompiler: &preparedTestCompiler{CompilerContext: base, proc: base.GetProcess()}, table: table}
+			ses, prepared, cw, execCtx := newPreparedExecuteEnvForSQLWithCompilerContext(
+				t, 233, "select n_name from nation where "+predicate, ctx)
+			ctx.proc = cw.proc
+			t.Cleanup(func() {
+				cw.proc.SetPrepareParams(nil)
+				cw.releaseRuntimeCacheRetiredCompiles()
+				prepared.Close()
+			})
+			bind := func(values []string, nullAt int) {
+				t.Helper()
+				cw.proc.SetPrepareParams(nil)
+				if prepared.params != nil {
+					prepared.params.Free(cw.proc.Mp())
+				}
+				prepared.params = vector.NewVec(types.T_text.ToType())
+				prepared.ParamTypes = nil
+				for i, value := range values {
+					require.NoError(t, vector.AppendBytes(prepared.params, []byte(value), i == nullAt, cw.proc.Mp()))
+					prepared.ParamTypes = append(prepared.ParamTypes, byte(defines.MYSQL_TYPE_LONGLONG), 0)
+				}
+			}
+			execute := func() (*compile.Compile, *plan.Plan) {
+				t.Helper()
+				cw.discardRuntimeCacheCandidate()
+				comp, p, stmt, _, owned, err := initExecuteStmtParamWithResolverInSession(
+					execCtx, ses, ses, cw, nil, prepared.Name, ctx.Resolve, ctx)
+				if owned && stmt != nil {
+					stmt.Free()
+				}
+				require.NoError(t, err)
+				return comp, p
+			}
+			values := []string{"7"}
+			if strings.Count(predicate, "?") == 2 {
+				values = append(values, "8")
+			}
+			bind(values, -1)
+			_, nativePlan := execute()
+			require.Same(t, nativePlan, cw.runtimeCachePlan)
+			require.NotEmpty(t, cw.runtimeCacheDiagnostics)
+			cached := compile.NewCompile("", "", prepared.Sql, "", "", nil,
+				cw.proc, prepared.PrepareStmt, false, nil, time.Now())
+			installed := false
+			t.Cleanup(func() {
+				if !installed {
+					cached.FreeOperator()
+					cached.Release()
+				}
+			})
+			installed = cw.installRuntimeCacheCandidate(cached)
+			require.True(t, installed)
+			for pos := range values {
+				for _, value := range []string{"9", "10000000000", "-10000000000", "7"} {
+					current := append([]string(nil), values...)
+					current[pos] = value
+					bind(current, -1)
+					comp, p := execute()
+					if len(value) < 10 {
+						require.Same(t, cached, comp)
+						require.Same(t, nativePlan, p)
+					} else {
+						require.Nil(t, comp)
+						require.NotSame(t, nativePlan, p)
+						require.Nil(t, cw.runtimeCacheTarget, "wide values must not replace an admitted domain")
+					}
+					require.Same(t, cached, prepared.runtimeCompile)
+					require.Same(t, nativePlan, prepared.runtimePlan)
+				}
+				bind(values, pos)
+				comp, _ := execute()
+				require.Nil(t, comp, "NULL is a different source category")
+				require.Same(t, nativePlan, prepared.runtimePlan)
+				bind(values, -1)
+				comp, p := execute()
+				require.Same(t, cached, comp)
+				require.Same(t, nativePlan, p)
+			}
+		})
+	}
+}
+
 func BenchmarkInitExecuteStmtParamRepeatedTPCCArithmeticUpdate(b *testing.B) {
 	optimizer := plan2.NewMockOptimizer(false, newPlanTestProcess(b))
 	ses, prepareStmt, cw, execCtx := newPreparedExecuteEnvForSQLWithCompilerContext(
@@ -5526,6 +5623,8 @@ func TestInitExecuteStmtParamRebuildsWhenProtocolVersionChanges(t *testing.T) {
 		{name: "rollback", from: defines.MORPCVersion8, to: defines.MORPCVersion7},
 		{name: "numeric prefix upgrade", from: defines.MORPCVersion25, to: defines.MORPCVersion30},
 		{name: "numeric prefix rollback", from: defines.MORPCVersion30, to: defines.MORPCVersion25},
+		{name: "fractional interval upgrade", from: defines.MORPCVersion123, to: defines.MORPCVersion124},
+		{name: "fractional interval rollback", from: defines.MORPCVersion124, to: defines.MORPCVersion123},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			rt.SetGlobalVariables(moruntime.MOProtocolVersion, test.from)
@@ -6674,7 +6773,12 @@ func TestPreparedUserVariableStringDomainIsBoundPerStatement(t *testing.T) {
 				t.Helper()
 				stmt := tree.NewPrepareString("bound_variable", "select char_length(@bound_s), hex(left(@bound_s,1)), ord(@bound_s), @bound_s+0, "+
 					"char_length(coalesce(@bound_s,NULL)), hex(left(case when @bound_s is null then null else @bound_s end,1)), "+
-					"charset(@bound_s), collation(@bound_s)")
+					"charset(@bound_s), collation(@bound_s), "+
+					"hex(left(coalesce(case when @bound_s is null then null else @bound_s end,NULL),1)), "+
+					"hex(left(if(@bound_s is null,NULL,@bound_s),1)), "+
+					"hex(left(case when @bound_s is null then null else left(@bound_s,1) end,1)), "+
+					"hex(left(nullif(@bound_s,''),1)), "+
+					"hex(left(case when @bound_s is null then null else nullif(@bound_s,'') end,1))")
 				defer stmt.Free()
 				prepared, err := buildPlan(execCtx.reqCtx, ses, ses.txnCompileCtx, stmt)
 				require.NoError(t, err)
@@ -6684,7 +6788,7 @@ func TestPreparedUserVariableStringDomainIsBoundPerStatement(t *testing.T) {
 				t.Helper()
 				q := p.GetQuery()
 				projects := q.Nodes[q.Steps[len(q.Steps)-1]].ProjectList
-				require.Len(t, projects, 8)
+				require.Len(t, projects, 13)
 				for i, project := range projects {
 					func() {
 						executor, err := colexec.NewExpressionExecutor(cw.proc, project)
@@ -6692,8 +6796,9 @@ func TestPreparedUserVariableStringDomainIsBoundPerStatement(t *testing.T) {
 						defer executor.Free()
 						value, err := executor.Eval(cw.proc, []*batch.Batch{batch.EmptyForConstFoldBatch}, nil)
 						require.NoError(t, err)
-						require.Equal(t, isNull && i < 6, value.GetNulls().Contains(0))
-						if isNull && i < 6 {
+						isValue := i < 6 || i >= 8
+						require.Equal(t, isNull && isValue, value.GetNulls().Contains(0), "project %d: %s", i, project.String())
+						if isNull && isValue {
 							return
 						}
 						switch i {
@@ -6703,12 +6808,12 @@ func TestPreparedUserVariableStringDomainIsBoundPerStatement(t *testing.T) {
 								want = 3
 							}
 							require.Equal(t, want, vector.GetFixedAtNoTypeCheck[int64](value, 0))
-						case 1, 5:
+						case 1, 5, 8, 9, 10, 11, 12:
 							want := "E4BDA0"
 							if binary {
 								want = "E4"
 							}
-							require.Equal(t, want, value.GetStringAt(0))
+							require.Equal(t, want, value.GetStringAt(0), "project %d: %s", i, project.String())
 						case 2:
 							want := int64(0xe4bda0)
 							if binary {

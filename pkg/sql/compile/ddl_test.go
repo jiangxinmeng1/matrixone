@@ -967,7 +967,7 @@ func TestTableScopedDDLDatabaseEOBMapsToNoSuchTable(t *testing.T) {
 		c := newCompileWithStubEngine(t, eng, "drop table t2")
 		lockMoDb := gostub.Stub(&lockMoDatabase, func(_ *Compile, _ string, _ lock.LockMode) error { return nil })
 		defer lockMoDb.Reset()
-		err := c.withBroadDropLifecycle(func() error {
+		err := c.withDropLifecycle(dropLifecycleAdmission{}, func() error {
 			return dropTableScope(&plan2.DropTable{Database: "db1", Table: "t2"}).DropTable(c)
 		})
 		require.True(t, moerr.IsMoErrCode(err, moerr.ErrNoSuchTable))
@@ -1098,7 +1098,7 @@ func TestAdvanceCreateIndexSnapshotUsesRollingUpgradeFence(t *testing.T) {
 	proc.Base.TxnClient = txnClient
 	proc.Base.TxnOperator = txnOp
 
-	require.NoError(t, (&Compile{proc: proc}).advanceCreateIndexSnapshot())
+	require.NoError(t, (&Compile{proc: proc}).advanceIndexDDLSnapshot())
 }
 
 type testCreateIndexLogtailBarrier struct {
@@ -1145,18 +1145,18 @@ func TestAdvanceCreateIndexSnapshotFailsClosed(t *testing.T) {
 
 	t.Run("missing ordered barrier capability", func(t *testing.T) {
 		c, _ := newCompile(t, newStubEngine())
-		require.ErrorContains(t, c.advanceCreateIndexSnapshot(), "barrier is unavailable")
+		require.ErrorContains(t, c.advanceIndexDDLSnapshot(), "barrier is unavailable")
 	})
 
 	t.Run("ordered barrier failure", func(t *testing.T) {
 		c, _ := newCompile(t, newBarrier(wantErr))
-		require.ErrorIs(t, c.advanceCreateIndexSnapshot(), wantErr)
+		require.ErrorIs(t, c.advanceIndexDDLSnapshot(), wantErr)
 	})
 
 	t.Run("missing workspace", func(t *testing.T) {
 		c, txnOp := newCompile(t, newBarrier(nil))
 		txnOp.EXPECT().GetWorkspace().Return(nil)
-		require.ErrorContains(t, c.advanceCreateIndexSnapshot(), "missing workspace")
+		require.ErrorContains(t, c.advanceIndexDDLSnapshot(), "missing workspace")
 	})
 
 	t.Run("workspace advance failure", func(t *testing.T) {
@@ -1164,7 +1164,7 @@ func TestAdvanceCreateIndexSnapshotFailsClosed(t *testing.T) {
 		workspace := mock_frontend.NewMockWorkspace(gomock.NewController(t))
 		workspace.EXPECT().AdvanceSnapshot(gomock.Any(), frontier).Return(wantErr)
 		txnOp.EXPECT().GetWorkspace().Return(workspace)
-		require.ErrorIs(t, c.advanceCreateIndexSnapshot(), wantErr)
+		require.ErrorIs(t, c.advanceIndexDDLSnapshot(), wantErr)
 	})
 
 	t.Run("workspace remains at the frontier", func(t *testing.T) {
@@ -1173,7 +1173,7 @@ func TestAdvanceCreateIndexSnapshotFailsClosed(t *testing.T) {
 		workspace.EXPECT().AdvanceSnapshot(gomock.Any(), frontier).Return(nil)
 		txnOp.EXPECT().GetWorkspace().Return(workspace)
 		txnOp.EXPECT().SnapshotTS().Return(frontier)
-		require.ErrorContains(t, c.advanceCreateIndexSnapshot(), "did not advance past")
+		require.ErrorContains(t, c.advanceIndexDDLSnapshot(), "did not advance past")
 	})
 }
 
@@ -1674,6 +1674,24 @@ func TestScopeRestoreTemporaryCloneValidatesPhysicalDestination(t *testing.T) {
 }
 
 func TestScope_CreateView(t *testing.T) {
+	t.Run("replace_rc_without_database", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		proc := testutil.NewProcess(t)
+		proc.Ctx = defines.AttachAccountId(proc.Ctx, catalog.System_Account)
+		op := mock_frontend.NewMockTxnOperator(ctrl)
+		op.EXPECT().Txn().Return(txn.TxnMeta{Mode: txn.TxnMode_Pessimistic, Isolation: txn.TxnIsolation_RC}).AnyTimes()
+		proc.Base.TxnOperator = op
+		// No engine, lockservice or Snapshot calls are permitted: an empty
+		// database must be rejected before lifecycle admission has side effects.
+		eng := mock_frontend.NewMockEngine(ctrl)
+		proc.Base.LockService = mock_lock.NewMockLockService(ctrl)
+		scope := &Scope{Plan: &plan2.Plan{Plan: &plan2.Plan_Ddl{Ddl: &plan2.DataDefinition{
+			Definition: &plan2.DataDefinition_CreateView{CreateView: &plan2.CreateView{
+				Replace: true, TableDef: &plan2.TableDef{Name: "v"},
+			}},
+		}}}}
+		require.True(t, moerr.IsMoErrCode(scope.CreateView(&Compile{proc: proc, e: eng}), moerr.ErrNoDB))
+	})
 	tableDef := &plan.TableDef{
 		Name: "v1",
 		Cols: []*plan.ColDef{
@@ -2168,6 +2186,219 @@ func TestAlterViewPreservesLogicalID(t *testing.T) {
 	require.Equal(t, uint64(77), db.createCtx.Value(defines.LogicalIdKey{}))
 }
 
+func TestAlterViewUsesPlanDatabase(t *testing.T) {
+	// The planner resolves a schema-qualified ALTER VIEW target into the plan
+	// database. The executor must drop/recreate the view in that database
+	// rather than in the session's current database.
+	eng := newStubEngine()
+	target := newStubDatabase("target_db")
+	createErr := errors.New("stop after create is captured")
+	target.createErr = createErr
+	target.rels["v"] = &stubRelation{
+		name: "v", tableID: 101, tableDef: &plan2.TableDef{LogicalId: 77},
+	}
+	current := newStubDatabase("current_db")
+	// A same-named view in the current database must stay untouched.
+	current.rels["v"] = &stubRelation{name: "v", tableID: 202}
+	eng.dbs["target_db"] = target
+	eng.dbs["current_db"] = current
+
+	stubs := gostub.New()
+	defer stubs.Reset()
+	stubs.Stub(&lockMoDatabase, func(*Compile, string, lock.LockMode) error { return nil })
+	stubs.Stub(&lockMoTable, func(*Compile, string, string, lock.LockMode) error { return nil })
+	s := &Scope{Plan: &plan2.Plan{Plan: &plan2.Plan_Ddl{Ddl: &plan2.DataDefinition{
+		Definition: &plan2.DataDefinition_AlterView{AlterView: &plan2.AlterView{
+			Database: "target_db", TableDef: &plan2.TableDef{Name: "v"},
+		}},
+	}}}}
+
+	proc := testutil.NewProcess(t)
+	proc.Base.SessionInfo.Buf = buffer.New()
+	proc.Ctx = defines.AttachAccountId(context.Background(), sysAccountId)
+	c := NewCompile("test", "current_db", "alter view target_db.v as select 1", "", "", eng, proc, nil, false, nil, time.Now())
+	err := s.AlterView(c)
+	require.ErrorIs(t, err, createErr)
+	// The old view is dropped in the target database...
+	_, exists := target.rels["v"]
+	require.False(t, exists)
+	// ...and the replacement create is issued against the target database.
+	require.NotNil(t, target.createCtx)
+	// The same-named view in the current database is untouched.
+	require.Nil(t, current.createCtx)
+	require.Contains(t, current.rels, "v")
+	require.Equal(t, uint64(202), current.rels["v"].tableID)
+}
+
+func TestAlterViewEmptyDatabaseFallsBackToSession(t *testing.T) {
+	// A plan without a resolved database (empty AlterView.Database) must
+	// fall back to the session's current database for drop/recreate.
+	eng := newStubEngine()
+	current := newStubDatabase("current_db")
+	createErr := errors.New("stop after create is captured")
+	current.createErr = createErr
+	current.rels["v"] = &stubRelation{
+		name: "v", tableID: 303, tableDef: &plan2.TableDef{LogicalId: 88},
+	}
+	eng.dbs["current_db"] = current
+
+	stubs := gostub.New()
+	defer stubs.Reset()
+	stubs.Stub(&lockMoDatabase, func(*Compile, string, lock.LockMode) error { return nil })
+	stubs.Stub(&lockMoTable, func(*Compile, string, string, lock.LockMode) error { return nil })
+	s := &Scope{Plan: &plan2.Plan{Plan: &plan2.Plan_Ddl{Ddl: &plan2.DataDefinition{
+		Definition: &plan2.DataDefinition_AlterView{AlterView: &plan2.AlterView{
+			Database: "", TableDef: &plan2.TableDef{Name: "v"},
+		}},
+	}}}}
+
+	proc := testutil.NewProcess(t)
+	proc.Base.SessionInfo.Buf = buffer.New()
+	proc.Ctx = defines.AttachAccountId(context.Background(), sysAccountId)
+	c := NewCompile("test", "current_db", "alter view v as select 1", "", "", eng, proc, nil, false, nil, time.Now())
+	err := s.AlterView(c)
+	require.ErrorIs(t, err, createErr)
+	// The fallback selected the session database for drop and recreate.
+	_, exists := current.rels["v"]
+	require.False(t, exists)
+	require.NotNil(t, current.createCtx)
+}
+
+func TestCheckConstraintNamesAvailable(t *testing.T) {
+	ctx := context.Background()
+	db := newStubDatabase("db")
+	db.rels["sibling_a"] = &stubRelation{
+		name: "sibling_a",
+		tableDef: &plan2.TableDef{
+			Checks: []*plan2.CheckDef{{Name: "sibling_a_chk_1"}, {Name: "ck_positive"}},
+		},
+	}
+	db.rels["sibling_b"] = &stubRelation{
+		name:     "sibling_b",
+		tableDef: &plan2.TableDef{Checks: []*plan2.CheckDef{{Name: "sibling_b_chk_1"}}},
+	}
+	for _, flag := range []uint64{features.Partition, features.IndexTable} {
+		db.rels[fmt.Sprintf("physical_%d", flag)] = &stubRelation{
+			tableDef: &plan2.TableDef{FeatureFlag: flag, Checks: []*plan2.CheckDef{{Name: "borrowed_ck"}}},
+		}
+	}
+	// Physical children do not independently own their borrowed CHECK names.
+	require.NoError(t, checkConstraintNamesAvailable(ctx, db, "parent", []*plan2.CheckDef{{Name: "borrowed_ck"}}))
+
+	// No checks on the new table: nothing to validate.
+	require.NoError(t, checkConstraintNamesAvailable(ctx, db, "new_t", nil))
+	// Fresh names pass even when siblings own other constraints.
+	require.NoError(t, checkConstraintNamesAvailable(ctx, db, "new_t",
+		[]*plan2.CheckDef{{Name: "new_t_chk_1"}, {Name: "ck_limit"}}))
+	// Names compare case-insensitively, like MySQL.
+	require.NoError(t, checkConstraintNamesAvailable(ctx, db, "new_t",
+		[]*plan2.CheckDef{{Name: "NEWT"}}))
+	// Reusing a name from another table in the same database is rejected.
+	err := checkConstraintNamesAvailable(ctx, db, "new_t",
+		[]*plan2.CheckDef{{Name: "ck_positive"}})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "Duplicate check constraint name 'ck_positive'")
+	// Case-insensitive duplicate detection.
+	err = checkConstraintNamesAvailable(ctx, db, "new_t",
+		[]*plan2.CheckDef{{Name: "CK_POSITIVE"}})
+	require.Error(t, err)
+}
+
+func TestCheckConstraintNamesAvailableLegacySQL(t *testing.T) {
+	ctx := context.Background()
+	for _, checks := range [][]*plan2.CheckDef{nil, {nil}} {
+		db := newStubDatabase("db")
+		db.rels["legacy"] = &stubRelation{tableDef: &plan2.TableDef{
+			Checks:    checks,
+			Createsql: "create table legacy(x int check(x>0), constraint legacy_ck check(x<10))",
+		}}
+		for _, name := range []string{"__mo_chk_1", "LEGACY_CK"} {
+			err := checkConstraintNamesAvailable(ctx, db, "new_table", []*plan2.CheckDef{{Name: name}})
+			require.True(t, moerr.IsMoErrCode(err, moerr.ErrDuplicateCheckConstraintName), "%v", err)
+		}
+		require.NoError(t, checkConstraintNamesAvailable(ctx, db, "new_table", []*plan2.CheckDef{{Name: "fresh"}}))
+		require.NoError(t, checkConstraintNamesAvailable(ctx, db, "legacy", []*plan2.CheckDef{{Name: "legacy_ck"}}))
+	}
+	// Structured definitions remain authoritative over retained CREATE SQL.
+	db := newStubDatabase("db")
+	db.rels["structured"] = &stubRelation{tableDef: &plan2.TableDef{
+		Checks:    []*plan2.CheckDef{{Name: "current_ck"}},
+		Createsql: "create table structured(x int, constraint old_ck check(x>0))",
+	}}
+	for _, kind := range []string{catalog.SystemExternalRel, catalog.SystemViewRel, catalog.SystemSourceRel} {
+		db.rels[kind] = &stubRelation{tableDef: &plan2.TableDef{TableType: kind, Createsql: "stage://bucket/check.csv"}}
+	}
+	require.NoError(t, checkConstraintNamesAvailable(ctx, db, "new_table", []*plan2.CheckDef{{Name: "old_ck"}}))
+}
+
+func TestValidateRenamedCheckConstraintNames(t *testing.T) {
+	db := newStubDatabase("db")
+	eng := newStubEngine()
+	eng.dbs["db"] = db
+	c := &Compile{e: eng, proc: testutil.NewProcess(t), disableLock: true}
+	db.rels["t"] = &stubRelation{
+		name:     "t",
+		tableDef: &plan2.TableDef{Checks: []*plan2.CheckDef{{Name: "own_explicit_ck"}}},
+	}
+	db.rels["sibling"] = &stubRelation{
+		name:     "sibling",
+		tableDef: &plan2.TableDef{Checks: []*plan2.CheckDef{{Name: "u_chk_1"}}},
+	}
+
+	// Empty checks never block a rename.
+	require.NoError(t, c.validateRenamedCheckConstraintNames("db", "t", "u", nil))
+
+	// A plain generated name simply follows the table.
+	require.NoError(t, c.validateRenamedCheckConstraintNames("db", "t", "u2",
+		[]*plan2.CheckDef{{Name: "t_chk_1"}}))
+
+	// Same-table duplicate: the rewritten generated name lands on an
+	// explicit name owned by the table itself.
+	err := c.validateRenamedCheckConstraintNames("db", "t", "u",
+		[]*plan2.CheckDef{{Name: "t_chk_1"}, {Name: "u_chk_1"}})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "Duplicate check constraint name 'u_chk_1'")
+
+	// Cross-table duplicate: a sibling already owns the resulting name.
+	err = c.validateRenamedCheckConstraintNames("db", "t", "u",
+		[]*plan2.CheckDef{{Name: "t_chk_1"}})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "Duplicate check constraint name 'u_chk_1'")
+
+	// The renamed table's own pre-rename names never count as siblings.
+	require.NoError(t, c.validateRenamedCheckConstraintNames("db", "t", "v",
+		[]*plan2.CheckDef{{Name: "own_explicit_ck"}}))
+	// A legacy name shared with a sibling is inherited, not a new claim.
+	require.NoError(t, c.validateRenamedCheckConstraintNames("db", "t", "v",
+		[]*plan2.CheckDef{{Name: "u_chk_1"}}))
+}
+
+func TestComposeCheckNamesAcrossAlterActions(t *testing.T) {
+	checks := []*plan2.CheckDef{{Name: "t_chk_1"}, {Name: "explicit_ck"}}
+
+	// No rename-table action: the set is untouched.
+	qry := &plan2.AlterTable{}
+	require.Same(t, checks[0], composeCheckNamesAcrossAlterActions(qry, checks)[0])
+
+	// A rename-table action in the same ALTER composes the move into the set.
+	qry = &plan2.AlterTable{Actions: []*plan2.AlterTable_Action{
+		{Action: &plan2.AlterTable_Action_AlterName{AlterName: &plan2.AlterTableName{OldName: "t", NewName: "u"}}},
+		{Action: &plan2.AlterTable_Action_AlterRenameColumn{AlterRenameColumn: &plan2.AlterRenameColumn{OldName: "a", NewName: "b"}}},
+	}}
+	composed := composeCheckNamesAcrossAlterActions(qry, checks)
+	require.Equal(t, "u_chk_1", composed[0].Name)
+	require.Equal(t, "explicit_ck", composed[1].Name)
+
+	// Chained rename-table actions compose in order.
+	qry.Actions = append(qry.Actions,
+		&plan2.AlterTable_Action{Action: &plan2.AlterTable_Action_AlterName{AlterName: &plan2.AlterTableName{OldName: "u", NewName: "v"}}})
+	composed = composeCheckNamesAcrossAlterActions(qry, checks)
+	require.Equal(t, "v_chk_1", composed[0].Name)
+
+	// Empty input stays empty.
+	require.Empty(t, composeCheckNamesAcrossAlterActions(qry, nil))
+}
+
 func TestLockDroppedRelation(t *testing.T) {
 	retryErr := moerr.NewTxnNeedRetryNoCtx()
 	catalogErr := errors.New("catalog lock failed")
@@ -2350,19 +2581,22 @@ func TestAlterTableAddForeignKeyLocksDistinctParentData(t *testing.T) {
 	child := mock_frontend.NewMockRelation(ctrl)
 	parentOne := mock_frontend.NewMockRelation(ctrl)
 	parentTwo := mock_frontend.NewMockRelation(ctrl)
+	parentOne.EXPECT().GetTableID(gomock.Any()).Return(uint64(20))
+	parentTwo.EXPECT().GetTableID(gomock.Any()).Return(uint64(30))
 	child.EXPECT().GetTableID(gomock.Any()).Return(uint64(10)).AnyTimes()
 	child.EXPECT().GetExtraInfo().Return(&api.SchemaExtra{}).AnyTimes()
 
 	childDB := mock_frontend.NewMockDatabase(ctrl)
 	childDB.EXPECT().GetDatabaseId(gomock.Any()).Return("1").AnyTimes()
 	childDB.EXPECT().Relation(gomock.Any(), "child", gomock.Any()).Return(child, nil).AnyTimes()
-	childDB.EXPECT().Relation(gomock.Any(), "parent_one", gomock.Any()).Return(parentOne, nil).Times(1)
+	childDB.EXPECT().Relation(gomock.Any(), "parent_one", gomock.Any()).Return(parentOne, nil).Times(2)
+	childDB.EXPECT().Relation(gomock.Any(), "missing_parent", gomock.Any()).Return(nil, moerr.NewNoSuchTableNoCtx("child_db", "missing_parent"))
 	parentDB := mock_frontend.NewMockDatabase(ctrl)
-	parentDB.EXPECT().Relation(gomock.Any(), "parent_two", gomock.Any()).Return(parentTwo, nil).Times(1)
+	parentDB.EXPECT().Relation(gomock.Any(), "parent_two", gomock.Any()).Return(parentTwo, nil).Times(2)
 
 	eng := mock_frontend.NewMockEngine(ctrl)
 	eng.EXPECT().Database(gomock.Any(), "child_db", gomock.Any()).Return(childDB, nil).AnyTimes()
-	eng.EXPECT().Database(gomock.Any(), "parent_db", gomock.Any()).Return(parentDB, nil).Times(1)
+	eng.EXPECT().Database(gomock.Any(), "parent_db", gomock.Any()).Return(parentDB, nil).Times(2)
 
 	getConstraintDef := gostub.Stub(&GetConstraintDef,
 		func(context.Context, engine.Relation) (*engine.ConstraintDef, error) {
@@ -3442,7 +3676,7 @@ func TestDropTableSingleSkipsMissingFkTables(t *testing.T) {
 		ForeignTbl:           []uint64{42},
 		FkChildTblsReferToMe: []uint64{43},
 	}
-	err := c.withBroadDropLifecycle(func() error {
+	err := c.withDropLifecycle(dropLifecycleAdmission{}, func() error {
 		return dropTableScope(qry).DropTable(c)
 	})
 	require.NoError(t, err)
@@ -3567,28 +3801,122 @@ func TestTruncateLocksLifecycleBeforeTable(t *testing.T) {
 	require.Equal(t, []string{"lifecycle", "table", "storage", "barrier"}, order)
 }
 
+func TestTruncateLifecycleRCWaitPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		retained bool
+		cancel   bool
+	}{
+		{name: "fresh owner waits"},
+		{name: "fresh wait can be canceled", cancel: true},
+		{name: "retained owner fails promotion", retained: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			ctrl := gomock.NewController(t)
+			proc := testutil.NewProcess(t)
+			proc.Ctx = defines.AttachAccountId(ctx, catalog.System_Account)
+			proc.ReplaceTopCtx(proc.Ctx)
+			service := proc.GetService()
+			const registryID uint64 = 41
+			op := mock_frontend.NewMockTxnOperator(ctrl)
+			op.EXPECT().Txn().Return(txn.TxnMeta{
+				ID: []byte("truncate"), LockService: service,
+				Mode: txn.TxnMode_Pessimistic, Isolation: txn.TxnIsolation_RC,
+			}).AnyTimes()
+			op.EXPECT().TxnOptions().Return(txn.TxnOptions{}).AnyTimes()
+			op.EXPECT().CreateTS().Return(timestamp.Timestamp{}).AnyTimes()
+			var retained []lock.LockTable
+			if tc.retained {
+				retained = []lock.LockTable{{Table: registryID, Valid: true}}
+			}
+			op.EXPECT().Snapshot().Return(txn.CNTxnSnapshot{LockTables: retained}, nil)
+			var pending atomic.Int32
+			op.EXPECT().AddWaitLock(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(uint64, [][]byte, lock.LockOptions) uint64 { pending.Add(1); return 1 }).AnyTimes()
+			op.EXPECT().RemoveWaitLock(gomock.Any()).Do(func(uint64) { pending.Add(-1) }).AnyTimes()
+			op.EXPECT().AddLockTable(gomock.Any()).Return(nil).AnyTimes()
+			proc.Base.TxnOperator = op
+			ls := mock_lock.NewMockLockService(ctrl)
+			ls.EXPECT().GetConfig().Return(lockservice.Config{ServiceID: service}).AnyTimes()
+			ls.EXPECT().GetServiceID().Return(service).AnyTimes()
+			proc.Base.LockService = ls
+			eng := newStubEngine()
+			registry := newStubRelation(catalog.MO_FEATURE_REGISTRY)
+			registry.tableID = registryID
+			eng.dbs[catalog.MO_CATALOG].rels[catalog.MO_FEATURE_REGISTRY] = registry
+			db := newStubDatabase("test")
+			db.rels["t"] = newStubRelation("t")
+			// Indexed tables retain broad admission rather than scalar replacement.
+			db.rels["t"].tableDef = &plan2.TableDef{
+				TableType: catalog.SystemOrdinaryRel,
+				Indexes:   []*plan2.IndexDef{{IndexName: "idx"}},
+			}
+			eng.dbs["test"] = db
+			requested := make(chan struct{})
+			release := make(chan struct{})
+			stop := errors.New("gate owner released")
+			ls.EXPECT().Lock(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(ctx context.Context, table uint64, _ [][]byte, _ []byte, opts lock.LockOptions) (lock.Result, error) {
+					if table != registryID {
+						return lock.Result{LockedOn: lock.LockTable{Table: table, Group: opts.Group, Valid: true}}, nil
+					}
+					close(requested)
+					if opts.Mode != lock.LockMode_Exclusive {
+						return lock.Result{}, errors.New("TRUNCATE must retain exclusive admission")
+					}
+					if opts.Policy == lock.WaitPolicy_FastFail {
+						return lock.Result{}, moerr.NewLockConflict(ctx)
+					}
+					select {
+					case <-release:
+						return lock.Result{}, stop
+					case <-ctx.Done():
+						return lock.Result{}, ctx.Err()
+					}
+				}).AnyTimes()
+			c := &Compile{e: eng, proc: proc}
+			s := &Scope{Plan: &plan2.Plan{Plan: &plan2.Plan_Ddl{Ddl: &plan2.DataDefinition{
+				Definition: &plan2.DataDefinition_TruncateTable{TruncateTable: &plan2.TruncateTable{
+					Database: "test", Table: "t", TableId: 1,
+				}},
+			}}}}
+			result := make(chan error, 1)
+			var worker sync.WaitGroup
+			worker.Add(1)
+			defer func() { cancel(); worker.Wait() }()
+			go func() { defer worker.Done(); result <- s.TruncateTable(c) }()
+			select {
+			case <-requested:
+			case <-ctx.Done():
+				t.Fatal("TRUNCATE did not request lifecycle admission")
+			}
+			if tc.cancel {
+				cancel()
+			} else if !tc.retained {
+				close(release)
+			}
+			select {
+			case err := <-result:
+				if tc.retained {
+					require.True(t, moerr.IsMoErrCode(err, moerr.ErrLockConflict), "%v", err)
+				} else if tc.cancel {
+					require.ErrorIs(t, err, context.Canceled)
+				} else {
+					require.ErrorIs(t, err, stop)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("TRUNCATE did not leave admission after release/cancel")
+			}
+			require.Zero(t, pending.Load(), "admission must remove wait bookkeeping on every exit")
+		})
+	}
+}
+
 func TestAlterCopyAndTruncateSerializeBeforeTableLocks(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	ctrl := gomock.NewController(t)
-	eng := newStubEngine()
-	db := newStubDatabase("test")
-	db.rels["t"] = newStubRelation("t")
-	eng.dbs["test"] = db
-
-	newCompile := func(sql string) *Compile {
-		proc := testutil.NewProcess(t)
-		proc.Base.SessionInfo.Buf = buffer.New()
-		proc.Ctx = defines.AttachAccountId(ctx, catalog.System_Account)
-		proc.ReplaceTopCtx(proc.Ctx)
-		txnClient, txnOp := newTestTxnClientAndOpWithPessimistic(ctrl)
-		proc.Base.TxnClient = txnClient
-		proc.Base.TxnOperator = txnOp
-		return NewCompile("test", "test", sql, "", "", eng, proc, nil, false, nil, time.Now())
-	}
-	alterCompile := newCompile("alter table t add column a int")
-	defer alterCompile.Release()
-	truncateCompile := newCompile("truncate table t")
-	defer truncateCompile.Release()
 
 	var mu sync.Mutex
 	var order []string
@@ -3606,8 +3934,12 @@ func TestAlterCopyAndTruncateSerializeBeforeTableLocks(t *testing.T) {
 	var gateCalls atomic.Int32
 	stop := errors.New("stop after table lock")
 	exec := &recordingInternalSQLExecutor{mocker: func(sql string) (executor.Result, error) {
+		if sql == "insert into dept_copy select * from dept" {
+			record("alter physical")
+			return executor.Result{}, nil
+		}
 		if sql != databranchutils.LineageOwnerLifecyclePessimisticLockSQL() {
-			return executor.Result{}, fmt.Errorf("unexpected lifecycle SQL: %s", sql)
+			return executor.Result{}, nil
 		}
 		switch gateCalls.Add(1) {
 		case 1:
@@ -3633,6 +3965,15 @@ func TestAlterCopyAndTruncateSerializeBeforeTableLocks(t *testing.T) {
 			return executor.Result{}, errors.New("unexpected lifecycle lock")
 		}
 	}}
+	alterScope, alterCompile := newAlterCopyPessimisticGateConcurrencyFixture(
+		t, ctrl, exec, "alter-truncate", 0,
+	)
+	defer alterCompile.Release()
+	truncateCompile := NewCompile(
+		"test", "test", "truncate table dept", "", "", alterCompile.e, alterCompile.proc,
+		nil, false, nil, time.Now(),
+	)
+	defer truncateCompile.Release()
 	rt := moruntime.ServiceRuntime(alterCompile.proc.GetService())
 	previous, hadPrevious := rt.GetGlobalVariables(moruntime.InternalSQLExecutor)
 	rt.SetGlobalVariables(moruntime.InternalSQLExecutor, exec)
@@ -3660,14 +4001,9 @@ func TestAlterCopyAndTruncateSerializeBeforeTableLocks(t *testing.T) {
 	})
 	defer lockTableStub.Reset()
 
-	alterScope := &Scope{Plan: &plan2.Plan{Plan: &plan2.Plan_Ddl{Ddl: &plan2.DataDefinition{
-		Definition: &plan2.DataDefinition_AlterTable{AlterTable: &plan2.AlterTable{
-			Database: "test", TableDef: &plan2.TableDef{Name: "t"},
-		}},
-	}}}}
 	truncateScope := &Scope{Plan: &plan2.Plan{Plan: &plan2.Plan_Ddl{Ddl: &plan2.DataDefinition{
 		Definition: &plan2.DataDefinition_TruncateTable{TruncateTable: &plan2.TruncateTable{
-			Database: "test", Table: "t", TableId: 1,
+			Database: "test", Table: "dept", TableId: 1,
 		}},
 	}}}}
 	var workers sync.WaitGroup
@@ -3723,7 +4059,8 @@ func TestAlterCopyAndTruncateSerializeBeforeTableLocks(t *testing.T) {
 	got := append([]string(nil), order...)
 	mu.Unlock()
 	require.Equal(t, []string{
-		"alter gate", "alter database", "alter table", "truncate gate", "truncate table",
+		"alter physical", "alter gate", "alter database",
+		"alter table", "truncate gate", "truncate table",
 	}, got)
 }
 

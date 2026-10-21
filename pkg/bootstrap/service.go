@@ -35,6 +35,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/partitionservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
+	"github.com/matrixorigin/matrixone/pkg/pb/txn"
 	"github.com/matrixorigin/matrixone/pkg/predefine"
 	"github.com/matrixorigin/matrixone/pkg/shardservice"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
@@ -247,7 +248,7 @@ func (s *service) execBootstrapWithRetry(ctx context.Context) error {
 		// The transaction body returned before Commit was attempted. Retrying the
 		// complete transaction is safe and retains the already-acquired owner
 		// privilege.
-		if err := waitBootstrapRetry(ctx); err != nil {
+		if err := waitBootstrapRetry(ctx, bootstrapRetryInterval); err != nil {
 			return err
 		}
 	}
@@ -286,7 +287,7 @@ func (s *service) reconcileUncertainBootstrapTxn(ctx context.Context) error {
 			s.completeBootstrap()
 			return nil
 		}
-		if err := waitBootstrapRetry(ctx); err != nil {
+		if err := waitBootstrapRetry(ctx, bootstrapRetryInterval); err != nil {
 			return err
 		}
 	}
@@ -298,14 +299,14 @@ func (s *service) checkAlreadyBootstrappedWithRetry(ctx context.Context) (bool, 
 		if err == nil || !isBootstrapRetryableError(err) {
 			return ok, err
 		}
-		if err := waitBootstrapRetry(ctx); err != nil {
+		if err := waitBootstrapRetry(ctx, bootstrapRetryInterval); err != nil {
 			return false, err
 		}
 	}
 }
 
-func waitBootstrapRetry(ctx context.Context) error {
-	timer := time.NewTimer(bootstrapRetryInterval)
+func waitBootstrapRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -472,13 +473,29 @@ func initPreprocessSQL(ctx context.Context, txn executor.TxnExecutor, finalVersi
 // ingress opens. Reconciliation on every startup also repairs a crash between
 // the prerequisite commit and this phase, without a separate completion marker.
 func InitSystemViews(ctx context.Context, exec executor.SQLExecutor) error {
+	// Replacing a published view crosses the lineage lifecycle writer barrier.
+	// Own that transaction explicitly; do not change the cluster's user default.
 	opts := executor.Options{}.WithWaitCommittedLogApplied().
-		WithTimeZone(time.Local).WithAccountID(catalog.System_Account)
+		WithTimeZone(time.Local).WithAccountID(catalog.System_Account).
+		WithTxnMode(txn.TxnMode_Pessimistic).WithTxnIsolation(txn.TxnIsolation_RC)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		err := exec.ExecTxn(ctx, func(txn executor.TxnExecutor) error {
+			// Publish the v118 TABLES consumer only after admission, atomically
+			// with the derived-schema completion views. A retry after an uncertain
+			// commit can safely reconcile both definitions again.
+			for _, sql := range []string{
+				"DROP VIEW IF EXISTS information_schema.TABLES",
+				sysview.InformationSchemaTablesV118DDL,
+			} {
+				result, err := txn.Exec(sql, executor.StatementOption{})
+				result.Close()
+				if err != nil {
+					return err
+				}
+			}
 			return motrace.InitSchemaViewsWithTxn(ctx, txn)
 		}, opts)
 		if err == nil || !isSystemViewRetryableError(err) {
@@ -486,7 +503,7 @@ func InitSystemViews(ctx context.Context, exec executor.SQLExecutor) error {
 		}
 		// An uncertain commit is safe to reconcile: the next transaction reads the
 		// actual object set before issuing any idempotent CREATE IF NOT EXISTS.
-		if err := waitBootstrapRetry(ctx); err != nil {
+		if err := waitBootstrapRetry(ctx, bootstrapRetryInterval); err != nil {
 			return err
 		}
 	}

@@ -138,6 +138,12 @@ func (obj *baseObject) Rows() (int, error) {
 }
 
 func (obj *baseObject) TryUpgrade() (err error) {
+	// Empty appendable shells are dropped by flush without writing a snapshot
+	// file. Old snapshots can still visit them, so retain their memory node
+	// instead of routing those readers to an object that does not exist.
+	if isUnwrittenAppendable(obj.meta.Load()) {
+		return nil
+	}
 	node := obj.node.Load()
 	if node.IsPersisted() {
 		return
@@ -152,6 +158,15 @@ func (obj *baseObject) TryUpgrade() (err error) {
 		node.Unref()
 	}
 	return
+}
+
+func isUnwrittenAppendable(meta *catalog.ObjectEntry) bool {
+	stats := meta.GetObjectStats()
+	extent := stats.Extent()
+	return meta.IsAppendable() && extent.Alg() == 0 && extent.Offset() == 0 &&
+		extent.Length() == 0 && extent.OriginSize() == 0 &&
+		stats.Rows() == 0 && stats.BlkCnt() == 0 &&
+		stats.Size() == 0 && stats.OriginSize() == 0
 }
 
 func (obj *baseObject) GetMeta() any { return obj.meta.Load() }
@@ -694,6 +709,10 @@ func (obj *baseObject) GetValue(
 		if err != nil {
 			return
 		}
+		if bat == nil || row < 0 || row >= bat.Length() {
+			err = moerr.NewNotFoundNoCtx()
+			return
+		}
 		defer bat.Close()
 		err = txn.GetStore().FillInWorkspaceDeletes(
 			obj.meta.Load().AsCommonID(), &bat.Deletes, uint64(0))
@@ -714,6 +733,10 @@ func (obj *baseObject) GetValue(
 	err = obj.Scan(
 		ctx, &bat, txn, readSchema, blkOffset, []int{col}, mp)
 	if err != nil {
+		return
+	}
+	if bat == nil || row < 0 || row >= bat.Length() {
+		err = moerr.NewNotFoundNoCtx()
 		return
 	}
 	isNull = bat.Vecs[0].IsNull(row)

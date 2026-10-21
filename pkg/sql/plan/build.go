@@ -18,6 +18,7 @@ import (
 	"context"
 	"reflect"
 	gotrace "runtime/trace"
+	"slices"
 	"strings"
 	"time"
 
@@ -578,11 +579,57 @@ func buildExplainPlan(ctx CompilerContext, stmt tree.Statement, isPrepareStmt bo
 }
 
 func buildExplainAnalyze(ctx CompilerContext, stmt *tree.ExplainAnalyze, isPrepareStmt bool) (*Plan, error) {
+	if err := validateExplainOptions(ctx.GetContext(), stmt.Options, "ANALYZE"); err != nil {
+		return nil, err
+	}
 	return buildExplainPlan(ctx, stmt.Statement, isPrepareStmt)
 }
 
 func buildExplainPhyPlan(ctx CompilerContext, stmt *tree.ExplainPhyPlan, isPrepareStmt bool) (*Plan, error) {
+	if err := validateExplainOptions(ctx.GetContext(), stmt.Options, "PHYPLAN"); err != nil {
+		return nil, err
+	}
 	return buildExplainPlan(ctx, stmt.Statement, isPrepareStmt)
+}
+
+func validateExplainOptions(ctx context.Context, options []tree.OptionElem, mode string) error {
+	seen := make(map[string]struct{}, len(options))
+	formatJSON := false
+	analyze := false
+	phyplan := false
+	check := false
+	for _, option := range options {
+		name := strings.ToLower(strings.TrimSpace(option.Name))
+		if _, exists := seen[name]; exists {
+			return moerr.NewInvalidInputf(ctx, "duplicate explain option '%s'", option.Name)
+		}
+		seen[name] = struct{}{}
+
+		value := strings.Trim(strings.TrimSpace(option.Value), "'\"")
+		switch name {
+		case tree.FormatOption:
+			formatJSON = strings.EqualFold(value, "JSON")
+		case tree.AnalyzeOption:
+			analyze = strings.EqualFold(value, "NULL") || strings.EqualFold(value, "TRUE")
+		case tree.PhyPlanOption:
+			phyplan = strings.EqualFold(value, "NULL") || strings.EqualFold(value, "TRUE")
+		case tree.CheckOption:
+			check = true
+		}
+	}
+	if !formatJSON {
+		return nil
+	}
+	if mode == "ANALYZE" || analyze {
+		return moerr.NewNotSupported(ctx, "EXPLAIN ANALYZE FORMAT=JSON is not supported")
+	}
+	if mode == "PHYPLAN" || phyplan {
+		return moerr.NewNotSupported(ctx, "EXPLAIN PHYPLAN FORMAT=JSON is not supported")
+	}
+	if check {
+		return moerr.NewNotSupported(ctx, "EXPLAIN FORMAT=JSON does not support CHECK")
+	}
+	return nil
 }
 
 func selectHasExportParam(stmt tree.SelectStatement) bool {
@@ -660,6 +707,9 @@ func BuildPlan(ctx CompilerContext, stmt tree.Statement, isPrepareStmt bool) (re
 		applySQLSelectLimit(stmt.Select, queryPlan)
 		return queryPlan, nil
 	case *tree.ExplainStmt:
+		if err := validateExplainOptions(ctx.GetContext(), stmt.Options, ""); err != nil {
+			return nil, err
+		}
 		queryPlan, err := buildExplainPlan(ctx, stmt.Statement, isPrepareStmt)
 		if err != nil {
 			return nil, err
@@ -698,6 +748,8 @@ func BuildPlan(ctx CompilerContext, stmt tree.Statement, isPrepareStmt bool) (re
 		return buildRollbackTransaction(stmt, ctx)
 	case *tree.CreateDatabase:
 		return buildCreateDatabase(stmt, ctx)
+	case *tree.AlterDatabase:
+		return buildAlterDatabase(stmt, ctx)
 	case *tree.DropDatabase:
 		return buildDropDatabase(stmt, ctx)
 	case *tree.CreateTable:
@@ -884,7 +936,7 @@ func selectHasExplicitTopLevelLimit(stmt *tree.Select) bool {
 // GetResultColumnsFromPlan
 func GetResultColumnsFromPlan(p *Plan) []*ColDef {
 	getResultColumnsByProjectionlist := func(query *Query) []*ColDef {
-		step := len(query.Steps) - 1
+		step := int(query.MainOutputStep())
 		if query.HasReturning {
 			if query.ReturningStep < 0 || int(query.ReturningStep) >= len(query.Steps) {
 				return nil
@@ -896,6 +948,9 @@ func GetResultColumnsFromPlan(p *Plan) []*ColDef {
 			return nil
 		}
 		columns := make([]*ColDef, len(lastNode.ProjectList))
+		// Only BOOLEAN wire metadata consumes expression kind. Keep all other
+		// result types on the existing origin/key path.
+		var kinds *resultColumnKinds
 		for idx, expr := range lastNode.ProjectList {
 			columns[idx] = &ColDef{
 				Name: query.Headings[idx],
@@ -909,7 +964,18 @@ func GetResultColumnsFromPlan(p *Plan) []*ColDef {
 				}
 			}
 
-			if source := findResultColumnSource(query, query.Steps[step], expr); source != nil {
+			source := findResultColumnSource(query, query.Steps[step], expr)
+			if expr.Typ.Id == int32(types.T_bool) {
+				if source != nil {
+					columns[idx].ResultColumnKind = plan.ResultColumnKind_RESULT_COLUMN_KIND_STORED
+				} else {
+					if kinds == nil {
+						kinds = newResultColumnKinds(query)
+					}
+					columns[idx].ResultColumnKind = kinds.kind(query.Steps[step], expr)
+				}
+			}
+			if source != nil {
 				if columns[idx].TblName == "" {
 					columns[idx].TblName = source.tableName
 				}
@@ -1015,8 +1081,8 @@ func findResultColumnSourceAtNode(
 		return nil
 	}
 
-	if node.NodeType == plan.Node_VECTOR_INDEX_SCAN {
-		// VECTOR_INDEX_SCAN's TableDef describes the synthetic result schema
+	if node.NodeType == plan.Node_INDEX_SEARCH_SCAN {
+		// INDEX_SEARCH_SCAN's TableDef describes the synthetic result schema
 		// (pkid, score, and optional included columns), not the source table.
 		// Resolve its output slots through the typed vector-index specification
 		// so a pkid or included column carries the same metadata as a regular
@@ -1031,7 +1097,7 @@ func findResultColumnSourceAtNode(
 				vectorRef = sourceExpr.GetCol()
 			}
 		}
-		return resultColumnSourceFromVectorIndexScan(node.VectorIndexScan, node.TableDef, vectorRef.ColPos)
+		return resultColumnSourceFromIndexSearchScan(node.IndexSearchScan, node.TableDef, vectorRef.ColPos)
 	}
 
 	if node.TableDef != nil && isResultColumnSourceNode(node.NodeType) {
@@ -1115,30 +1181,11 @@ func findResultColumnSourceAtJoin(
 		return nil
 	}
 
-	projectedRef := ref
-	childIdx := -1
-	projected := resultColumnProjectionByIdentity(node, ref)
-	if preferLocal && ref.RelPos == 0 && ref.ColPos >= 0 && int(ref.ColPos) < len(node.ProjectList) {
-		projected = node.ProjectList[ref.ColPos]
+	route := resultColumnRouteAtJoin(query, node, ref, preferLocal)
+	if route.computed || route.childExpr != nil && route.childExpr.GetCol() == nil {
+		return nil
 	}
-	if projected != nil {
-		if col := projected.GetCol(); col != nil {
-			projectedRef = col
-			// JOIN ProjectList entries use RelPos 0/1 to identify the
-			// corresponding child and ColPos to identify that child's output
-			// slot. This is a local remapping, not a source-table position.
-			if projectedRef.RelPos >= 0 && int(projectedRef.RelPos) < len(node.Children) {
-				childIdx = int(projectedRef.RelPos)
-				if childRef := resultColumnJoinChildProjectionRef(query, node, childIdx, projectedRef.ColPos); childRef != nil {
-					projectedRef = childRef
-				}
-			}
-		}
-	}
-
-	if childIdx < 0 {
-		childIdx = resultColumnJoinChildByBinding(query, node, projectedRef)
-	}
+	projectedRef, childIdx := route.ref, route.childIdx
 	if childIdx >= 0 && childIdx < len(node.Children) {
 		candidate := findResultColumnSourceAtNode(
 			query,
@@ -1175,12 +1222,85 @@ func findResultColumnSourceAtJoin(
 	return resultColumnSourceAfterJoin(found, node, foundChild)
 }
 
+type resultColumnJoinRoute struct {
+	projected *plan.Expr
+	ref       *plan.ColRef
+	childIdx  int
+	childExpr *plan.Expr
+	// computed belongs to the JOIN itself, rather than to a forwarded input.
+	computed bool
+}
+
+// resultColumnRouteAtJoin owns the JOIN projection contract for origin/key,
+// synthetic-score and computed-value provenance. A local JOIN output first
+// resolves through ProjectList; its ColRef then identifies one child by RelPos
+// and one output of that child by ColPos. Preserve the full child expression
+// so value provenance can follow computations without restoring key metadata.
+func resultColumnRouteAtJoin(query *plan.Query, node *plan.Node, ref *plan.ColRef, preferLocal bool) resultColumnJoinRoute {
+	var projected *plan.Expr
+	if node != nil && ref != nil {
+		projected = resultColumnProjectionByIdentity(node, ref)
+		if preferLocal && ref.RelPos == 0 && ref.ColPos >= 0 && int(ref.ColPos) < len(node.ProjectList) {
+			projected = node.ProjectList[ref.ColPos]
+		}
+	}
+	route := resultColumnRouteJoinProjection(query, node, projected, ref)
+	if !route.computed && route.childIdx < 0 {
+		route.childIdx = resultColumnJoinChildByBinding(query, node, route.ref)
+	}
+	return route
+}
+
+// A selected projection already owns its source reference. Share routing with
+// origin lookup without reinterpreting that reference as another output slot.
+func resultColumnRouteJoinProjection(query *plan.Query, node *plan.Node, projected *plan.Expr, ref *plan.ColRef) resultColumnJoinRoute {
+	route := resultColumnJoinRoute{projected: projected, ref: ref, childIdx: -1}
+	if query == nil || node == nil || ref == nil {
+		return route
+	}
+	if route.projected != nil {
+		route.ref = route.projected.GetCol()
+		if route.ref == nil {
+			route.computed = true
+			return route
+		}
+	}
+	// insertMarkJoin owns one boolean marker at (bindingTag,0), remapped by
+	// remapAllColRefs to (-1,0). It has no child source. Check the JOIN's own
+	// reference before following a child: a forwarded AGG grouping slot may
+	// also use (-1,0), but is still a stored value rather than this marker.
+	if node.JoinType == plan.Node_MARK && route.ref.ColPos == 0 &&
+		(route.ref.RelPos == -1 || slices.Contains(node.BindingTags, route.ref.RelPos)) {
+		route.computed = true
+		return route
+	}
+	if route.projected != nil {
+		if col := route.ref; col.RelPos >= 0 && int(col.RelPos) < len(node.Children) {
+			route.childIdx = int(col.RelPos)
+			route.childExpr = resultColumnJoinChildProjection(query, node, route.childIdx, col.ColPos)
+			if childRef := route.childExpr.GetCol(); childRef != nil {
+				route.ref = childRef
+			}
+		}
+	}
+	return route
+}
+
 func resultColumnJoinChildProjectionRef(
 	query *plan.Query,
 	node *plan.Node,
 	childIdx int,
 	colPos int32,
 ) *plan.ColRef {
+	return resultColumnJoinChildProjection(query, node, childIdx, colPos).GetCol()
+}
+
+func resultColumnJoinChildProjection(
+	query *plan.Query,
+	node *plan.Node,
+	childIdx int,
+	colPos int32,
+) *plan.Expr {
 	if query == nil || node == nil || childIdx < 0 || childIdx >= len(node.Children) || colPos < 0 {
 		return nil
 	}
@@ -1192,7 +1312,7 @@ func resultColumnJoinChildProjectionRef(
 	if int(colPos) >= len(child.ProjectList) {
 		return nil
 	}
-	return child.ProjectList[colPos].GetCol()
+	return child.ProjectList[colPos]
 }
 
 func resultColumnJoinChildByBinding(query *plan.Query, node *plan.Node, ref *plan.ColRef) int {

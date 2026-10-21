@@ -118,7 +118,7 @@ func (partition *Partition) prepareTopN(proc *process.Process) (err error) {
 	for i := range partitionExprs {
 		partitionExprs[i] = partition.OrderBySpecs[i].Expr
 	}
-	orderSpecs := partition.OrderBySpecs[partition.PartitionByCount:]
+	orderSpecs := nonLiteralOrderSpecs(partition.OrderBySpecs[partition.PartitionByCount:])
 	orderExprs := make([]*plan.Expr, len(orderSpecs))
 	for i := range orderExprs {
 		orderExprs[i] = orderSpecs[i].Expr
@@ -173,6 +173,9 @@ func (partition *Partition) prepareTopN(proc *process.Process) (err error) {
 		// In particular, native float comparison is not a strict weak order for
 		// NaNs and can make the heap discard rows from the SQL-order prefix.
 		ctr.compares[i] = compare.NewOrder(typ, desc, nullsLast)
+		if ctr.compares[i] == nil {
+			return moerr.NewNotSupported(proc.Ctx, "unsupported partition Top-N order type "+typ.Oid.String())
+		}
 	}
 	return nil
 }
@@ -184,6 +187,9 @@ func (partition *Partition) callTopN(proc *process.Process) (vm.CallResult, erro
 			result, err := vm.ChildrenCall(partition.GetChildren(0), proc, partition.OpAnalyzer)
 			if err != nil {
 				return result, err
+			}
+			if result.Status == vm.ExecYield {
+				return result, nil
 			}
 			if result.Batch == nil {
 				if err, canceled := vm.CancelCheck(proc); canceled {

@@ -194,6 +194,7 @@ func dupOperatorWithContext(sourceOp vm.Operator, index int, maxParallel int, du
 		op.DedupBuildKeepLast = t.DedupBuildKeepLast
 		op.OnDuplicateAction = t.OnDuplicateAction
 		op.DedupColTypes = t.DedupColTypes
+		op.DedupKeyExprs = t.DedupKeyExprs
 		op.DedupColName = t.DedupColName
 		op.DelColIdx = t.DelColIdx
 		op.DedupDeleteMarkerColIdx = t.DedupDeleteMarkerColIdx
@@ -437,10 +438,6 @@ func dupOperatorWithContext(sourceOp vm.Operator, index int, maxParallel int, du
 		op.Params = t.Params
 		op.IsSingle = t.IsSingle
 		op.Limit = t.Limit
-		op.RuntimeFilterSpecs = t.RuntimeFilterSpecs
-		op.IndexReaderParam = t.IndexReaderParam
-		op.FulltextSourceRef = t.FulltextSourceRef
-		op.FulltextIndexRef = t.FulltextIndexRef
 		op.SetInfo(&info)
 		if op.FuncName == "generate_series" {
 			op.GenerateSeriesCtrNumState(t.OffsetTotal[index][0], t.OffsetTotal[index][1], t.GetGenerateSeriesCtrNumStateStep(), t.OffsetTotal[index][0])
@@ -651,7 +648,7 @@ func dupOperatorWithContext(sourceOp vm.Operator, index int, maxParallel int, du
 		op.ApplyType = t.ApplyType
 		op.Result = t.Result
 		op.Typs = t.Typs
-		op.VectorIndexScan = plan2.DeepCopyVectorIndexScan(t.VectorIndexScan)
+		op.IndexSearchScan = plan2.DeepCopyIndexSearchScan(t.IndexSearchScan)
 		op.VectorAttrs = slices.Clone(t.VectorAttrs)
 		op.TxnOffset = t.TxnOffset
 		if t.TableFunction != nil {
@@ -663,10 +660,6 @@ func dupOperatorWithContext(sourceOp vm.Operator, index int, maxParallel int, du
 			op.TableFunction.Params = t.TableFunction.Params
 			op.TableFunction.IsSingle = t.TableFunction.IsSingle
 			op.TableFunction.Limit = t.TableFunction.Limit
-			op.TableFunction.RuntimeFilterSpecs = t.TableFunction.RuntimeFilterSpecs
-			op.TableFunction.IndexReaderParam = t.TableFunction.IndexReaderParam
-			op.TableFunction.FulltextSourceRef = t.TableFunction.FulltextSourceRef
-			op.TableFunction.FulltextIndexRef = t.TableFunction.FulltextIndexRef
 			op.TableFunction.SetInfo(&info)
 		}
 		op.SetInfo(&info)
@@ -709,6 +702,7 @@ func dupOperatorWithContext(sourceOp vm.Operator, index int, maxParallel int, du
 		op.DedupBuildKeepLast = t.DedupBuildKeepLast
 		op.DedupColName = t.DedupColName
 		op.DedupColTypes = t.DedupColTypes
+		op.DedupKeyExprs = t.DedupKeyExprs
 		op.UpdateColIdxList = t.UpdateColIdxList
 		op.UpdateColExprList = t.UpdateColExprList
 		op.HasODKUAffectedRows = t.HasODKUAffectedRows
@@ -750,6 +744,7 @@ func dupOperatorWithContext(sourceOp vm.Operator, index int, maxParallel int, du
 		op.InputKeysUnique = t.InputKeysUnique
 		op.DedupColName = t.DedupColName
 		op.DedupColTypes = t.DedupColTypes
+		op.DedupKeyExprs = t.DedupKeyExprs
 		op.UpdateColIdxList = t.UpdateColIdxList
 		op.UpdateColExprList = t.UpdateColExprList
 		op.DelColIdx = t.DelColIdx
@@ -977,7 +972,7 @@ func constructLockOp(node *plan.Node, eng engine.Engine) (*lockop.LockOp, error)
 			partitionColPos = target.PartitionColIdxInBat
 		}
 		typ := plan2.MakeTypeByPlan2Type(target.PrimaryColTyp)
-		arg.AddLockTargetWithMode(target.GetTableId(), target.GetObjRef(), target.GetMode(), target.GetPrimaryColIdxInBat(), typ, partitionColPos, target.GetRefreshTsIdxInBat(), target.GetLockRows(), target.GetLockTableAtTheEnd())
+		arg.AddLockTargetWithPolicy(target.GetTableId(), target.GetObjRef(), target.GetMode(), target.GetPrimaryColIdxInBat(), typ, partitionColPos, target.GetRefreshTsIdxInBat(), target.GetLockRows(), target.GetLockTableAtTheEnd(), target.GetNoWait(), target.GetSkipLocked())
 	}
 	for _, target := range node.LockTargets {
 		if target.LockTable {
@@ -1531,13 +1526,8 @@ func constructTableFunction(node *plan.Node, qry *plan.Query) *table_function.Ta
 	arg.FuncName = node.TableDef.TblFunc.Name
 	arg.Params = node.TableDef.TblFunc.Param
 	arg.IsSingle = node.TableDef.TblFunc.IsSingle
-	arg.FulltextSourceRef = node.TableDef.TblFunc.FulltextSourceRef
-	arg.FulltextIndexRef = node.TableDef.TblFunc.FulltextIndexRef
 	arg.ScanSnapshot = node.ScanSnapshot
 	arg.Limit = node.Limit
-	// probe side runtime filter specs
-	arg.RuntimeFilterSpecs = node.RuntimeFilterProbeList
-	arg.IndexReaderParam = node.IndexReaderParam
 	return arg
 }
 
@@ -1637,6 +1627,7 @@ func constructDedupJoin(node *plan.Node, leftTypes, rightTypes []types.Type, pro
 	arg.OnDuplicateAction = node.OnDuplicateAction
 	arg.DedupColName = node.DedupColName
 	arg.DedupColTypes = node.DedupColTypes
+	arg.DedupKeyExprs = node.DedupKeyExprs
 	arg.DelColIdx = -1
 	arg.DedupDeleteMarkerColIdx = -1
 	if node.DedupJoinCtx != nil {
@@ -1741,6 +1732,7 @@ func constructRightDedupJoin(node *plan.Node, leftTypes, rightTypes []types.Type
 	arg.InputKeysUnique = node.DedupInputKeysUnique
 	arg.DedupColName = node.DedupColName
 	arg.DedupColTypes = node.DedupColTypes
+	arg.DedupKeyExprs = node.DedupKeyExprs
 	arg.DelColIdx = -1
 	if node.DedupJoinCtx != nil {
 		arg.UpdateColIdxList = node.DedupJoinCtx.UpdateColIdxList
@@ -2651,6 +2643,7 @@ func constructBroadcastHashBuild(op vm.Operator, proc *process.Process, mcpu int
 		ret.OnDuplicateAction = arg.OnDuplicateAction
 		ret.DedupColName = arg.DedupColName
 		ret.DedupColTypes = arg.DedupColTypes
+		ret.DedupKeyExprs = arg.DedupKeyExprs
 		ret.DelColIdx = arg.DelColIdx
 		ret.DedupDeleteMarkerColIdx = arg.DedupDeleteMarkerColIdx
 		ret.DedupDeleteKeepColIdxList = arg.DedupDeleteKeepColIdxList
@@ -2669,6 +2662,7 @@ func constructBroadcastHashBuild(op vm.Operator, proc *process.Process, mcpu int
 		ret.OnDuplicateAction = arg.OnDuplicateAction
 		ret.DedupColName = arg.DedupColName
 		ret.DedupColTypes = arg.DedupColTypes
+		ret.DedupKeyExprs = arg.DedupKeyExprs
 		ret.DelColIdx = arg.DelColIdx
 		if len(arg.RuntimeFilterSpecs) > 0 {
 			ret.RuntimeFilterSpec = arg.RuntimeFilterSpecs[0]
@@ -2720,6 +2714,7 @@ func constructShuffleHashBuild(node *plan.Node, op vm.Operator, proc *process.Pr
 		ret.OnDuplicateAction = arg.OnDuplicateAction
 		ret.DedupColName = arg.DedupColName
 		ret.DedupColTypes = arg.DedupColTypes
+		ret.DedupKeyExprs = arg.DedupKeyExprs
 		ret.DelColIdx = arg.DelColIdx
 		ret.DedupDeleteMarkerColIdx = arg.DedupDeleteMarkerColIdx
 		ret.DedupDeleteKeepColIdxList = arg.DedupDeleteKeepColIdxList
@@ -2738,6 +2733,7 @@ func constructShuffleHashBuild(node *plan.Node, op vm.Operator, proc *process.Pr
 		ret.OnDuplicateAction = arg.OnDuplicateAction
 		ret.DedupColName = arg.DedupColName
 		ret.DedupColTypes = arg.DedupColTypes
+		ret.DedupKeyExprs = arg.DedupKeyExprs
 		ret.DelColIdx = arg.DelColIdx
 		if len(arg.RuntimeFilterSpecs) > 0 {
 			ret.RuntimeFilterSpec = plan2.DeepCopyRuntimeFilterSpec(arg.RuntimeFilterSpecs[0])
@@ -2788,14 +2784,11 @@ func constructJoinCondition(expr *plan.Expr, proc *process.Process) (*plan.Expr,
 			},
 		}
 	}
-	e, ok := expr.Expr.(*plan.Expr_F)
-	if !ok || !plan2.IsEqualFunc(e.F.Func.GetObj()) {
+	if !plan2.IsEquiJoinCondition(expr) {
 		panic(moerr.NewNYIf(proc.GetTopContext(), "join condition '%s'", expr))
 	}
-	if exprRelPos(e.F.Args[0]) == 1 {
-		return e.F.Args[1], e.F.Args[0]
-	}
-	return e.F.Args[0], e.F.Args[1]
+	args := expr.GetF().Args
+	return args[0], args[1]
 }
 
 func constructApply(n, right *plan.Node, applyType int, proc *process.Process) *apply.Apply {
@@ -2811,8 +2804,8 @@ func constructApply(n, right *plan.Node, applyType int, proc *process.Process) *
 	arg.ApplyType = applyType
 	arg.Result = result
 	arg.Typs = rightTyps
-	if right.NodeType == plan.Node_VECTOR_INDEX_SCAN {
-		arg.VectorIndexScan = plan2.DeepCopyVectorIndexScan(right.VectorIndexScan)
+	if right.NodeType == plan.Node_INDEX_SEARCH_SCAN {
+		arg.IndexSearchScan = plan2.DeepCopyIndexSearchScan(right.IndexSearchScan)
 		arg.VectorAttrs = make([]string, len(right.TableDef.Cols))
 		for i, col := range right.TableDef.Cols {
 			arg.VectorAttrs[i] = col.GetOriginCaseName()
@@ -2831,7 +2824,7 @@ func constructTableScan(node *plan.Node) *table_scan.TableScan {
 	return table_scan.NewArgument().WithTypes(types)
 }
 
-func constructValueScan(proc *process.Process, node *plan.Node) (*value_scan.ValueScan, error) {
+func constructValueScan(proc *process.Process, node *plan.Node, allocations ...*vector.AllocationAccountSelection) (*value_scan.ValueScan, error) {
 	op := value_scan.NewArgument()
 	if node == nil {
 		return op, nil
@@ -2853,17 +2846,31 @@ func constructValueScan(proc *process.Process, node *plan.Node) (*value_scan.Val
 	}
 
 	for i, col := range node.RowsetData.Cols {
-		vec := vector.NewVec(plan2.MakeTypeByPlan2Type(node.TableDef.Cols[i].Typ))
+		typ := plan2.MakeTypeByPlan2Type(node.TableDef.Cols[i].Typ)
+		var vec *vector.Vector
+		if len(allocations) > 0 && allocations[0] != nil {
+			var err error
+			vec, err = vector.NewOffHeapVecWithTypeAndAllocation(typ, allocations[0])
+			if err != nil {
+				op.Free(proc, true, err)
+				op.Release()
+				return nil, err
+			}
+		} else {
+			vec = vector.NewVec(typ)
+		}
 		op.Batchs[0].Vecs[i] = vec
 		for j, rowsetExpr := range col.Data {
 			get, err := rule.GetConstantValue2(proc, rowsetExpr.Expr, vec)
 			if err != nil {
-				op.Batchs[0].Clean(proc.Mp())
+				op.Free(proc, true, err)
+				op.Release()
 				return nil, err
 			}
 			if !get {
-				rowsetExpr.RowPos = int32(j)
-				rowsetData.Cols[i].Data = append(rowsetData.Cols[i].Data, rowsetExpr)
+				bound := *rowsetExpr
+				bound.RowPos = int32(j)
+				rowsetData.Cols[i].Data = append(rowsetData.Cols[i].Data, &bound)
 			}
 		}
 	}
@@ -2876,40 +2883,17 @@ func extraJoinConditions(exprs []*plan.Expr) (*plan.Expr, []*plan.Expr) {
 	exprs = colexec.SplitAndExprs(exprs)
 	eqConds := make([]*plan.Expr, 0, len(exprs))
 	notEqConds := make([]*plan.Expr, 0, len(exprs))
-	for i, expr := range exprs {
-		if e, ok := expr.Expr.(*plan.Expr_F); ok {
-			if !plan2.IsEqualFunc(e.F.Func.GetObj()) {
-				notEqConds = append(notEqConds, exprs[i])
-				continue
-			}
-			lpos, rpos := plan2.HasColExpr(e.F.Args[0], -1), plan2.HasColExpr(e.F.Args[1], -1)
-			if lpos == -1 || rpos == -1 || (lpos == rpos) {
-				notEqConds = append(notEqConds, exprs[i])
-				continue
-			}
-			eqConds = append(eqConds, exprs[i])
+	for _, expr := range exprs {
+		if plan2.IsEquiJoinCondition(expr) {
+			eqConds = append(eqConds, expr)
 		} else {
-			notEqConds = append(notEqConds, exprs[i])
+			notEqConds = append(notEqConds, expr)
 		}
 	}
 	if len(notEqConds) == 0 {
 		return nil, eqConds
 	}
 	return colexec.RewriteFilterExprList(notEqConds), eqConds
-}
-
-func exprRelPos(expr *plan.Expr) int32 {
-	switch e := expr.Expr.(type) {
-	case *plan.Expr_Col:
-		return e.Col.RelPos
-	case *plan.Expr_F:
-		for i := range e.F.Args {
-			if relPos := exprRelPos(e.F.Args[i]); relPos >= 0 {
-				return relPos
-			}
-		}
-	}
-	return -1
 }
 
 func constructPostDml(node *plan.Node, eng engine.Engine) *postdml.PostDml {

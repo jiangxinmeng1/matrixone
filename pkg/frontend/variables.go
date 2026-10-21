@@ -1193,8 +1193,18 @@ func canonicalSystemVariableName(name string) string {
 		return transactionIsolationSystemVariable
 	case transactionReadOnlySystemVariableAlias:
 		return transactionReadOnlySystemVariable
+	case "innodb_lock_wait_timeout":
+		return "lock_wait_timeout"
 	}
 	return name
+}
+
+func init() {
+	// The compatibility spelling shares the native scope, validator and default.
+	// SystemVariables resolves both names to the same lock_wait_timeout state.
+	alias := gSysVarsDefs["lock_wait_timeout"]
+	alias.Name = "innodb_lock_wait_timeout"
+	gSysVarsDefs[alias.Name] = alias
 }
 
 func isTransactionIsolationSystemVariable(name string) bool {
@@ -2312,8 +2322,12 @@ var gSysVarsDefs = map[string]SystemVariable{
 		Default:           "",
 	},
 	"information_schema_stats_expiry": {
-		Name:              "information_schema_stats_expiry",
-		Scope:             ScopeGlobal,
+		Name: "information_schema_stats_expiry",
+		// MySQL 8.0 declares this variable in both global and session
+		// scopes, and tools like mysqldump issue
+		// `SET SESSION information_schema_stats_expiry=0`.
+		// Rejecting the session-scope assignment breaks mysqldump.
+		Scope:             ScopeBoth,
 		Dynamic:           true,
 		SetVarHintApplies: false,
 		Type:              InitSystemVariableIntType("information_schema_stats_expiry", 0, 86400, false),
@@ -3817,6 +3831,14 @@ var gSysVarsDefs = map[string]SystemVariable{
 		Type:              InitSystemVariableStringType("version_compile_zlib"),
 		Default:           "",
 	},
+	"window_partition_algorithm": {
+		Name:              "window_partition_algorithm",
+		Scope:             ScopeSession,
+		Dynamic:           true,
+		SetVarHintApplies: false,
+		Type:              InitSystemSystemEnumType("window_partition_algorithm", "COST", "SORT", "HASH"),
+		Default:           "SORT",
+	},
 	"windowing_use_high_precision": {
 		Name:              "windowing_use_high_precision",
 		Scope:             ScopeBoth,
@@ -3862,6 +3884,14 @@ var gSysVarsDefs = map[string]SystemVariable{
 	// TODO(retire-txn-trace, #29249): remove this declaration and its inert-setting
 	// tests once the rollback window excludes collector-bearing versions and
 	// client/session initialization no longer sends this setting.
+	"mo_sirius_campaign_evidence": {
+		Name:              "mo_sirius_campaign_evidence",
+		Scope:             ScopeSession,
+		Dynamic:           true,
+		SetVarHintApplies: false,
+		Type:              InitSystemVariableBoolType("mo_sirius_campaign_evidence"),
+		Default:           int64(0),
+	},
 	"disable_txn_trace": {
 		Name:              "disable_txn_trace",
 		Scope:             ScopeSession,
@@ -4458,14 +4488,6 @@ var gSysVarsDefs = map[string]SystemVariable{
 		SetVarHintApplies: false,
 		Type:              InitSystemVariableIntType("max_dop", 0, math.MaxInt32, false),
 		Default:           int64(0),
-	},
-	"sidecar_url": {
-		Name:              "sidecar_url",
-		Scope:             ScopeBoth,
-		Dynamic:           true,
-		SetVarHintApplies: false,
-		Type:              InitSystemVariableStringType("sidecar_url"),
-		Default:           "",
 	},
 }
 

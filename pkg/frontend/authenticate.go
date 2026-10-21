@@ -68,6 +68,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/stage"
 	"github.com/matrixorigin/matrixone/pkg/stage/stageutil"
 	"github.com/matrixorigin/matrixone/pkg/taskservice"
+	"github.com/matrixorigin/matrixone/pkg/util/fault"
 	"github.com/matrixorigin/matrixone/pkg/util/metric/mometric"
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/util/sysview"
@@ -75,6 +76,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace"
 	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace/statistic"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
+	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
 type TenantInfo struct {
@@ -938,6 +940,7 @@ var (
 		"mo_user_defined_function":    0,
 		"mo_stored_procedure":         0,
 		"mo_mysql_compatibility_mode": 0,
+		catalog.MODatabaseDefaults:    0,
 		"mo_stages":                   0,
 		catalog.MOAutoIncrTable:       0,
 		"mo_sessions":                 0,
@@ -979,6 +982,7 @@ var (
 		"mo_user_defined_function":      0,
 		"mo_stored_procedure":           0,
 		"mo_mysql_compatibility_mode":   0,
+		catalog.MODatabaseDefaults:      0,
 		catalog.MOAutoIncrTable:         0,
 		"mo_indexes":                    0,
 		"mo_table_partitions":           0,
@@ -1039,6 +1043,7 @@ var (
 		MoCatalogMoRolePrivsDDL,
 		MoCatalogMoUserDefinedFunctionDDL,
 		MoCatalogMoMysqlCompatibilityModeDDL,
+		catalog.MoDatabaseDefaultsDDL,
 		MoCatalogMoSnapshotsDDL,
 		MoCatalogMoPubsDDL,
 		MoCatalogMoSubsDDL,
@@ -1571,6 +1576,8 @@ const (
 	deleteRoleFromMoRoleGrantFormat = `delete from mo_catalog.mo_role_grant where granted_id = %d or grantee_id = %d;`
 
 	deleteRoleFromMoRolePrivsFormat = `delete from mo_catalog.mo_role_privs where role_id = %d;`
+
+	deleteRoleFromMoRoleRuleFormat = `delete from mo_catalog.mo_role_rule where role_id = %d;`
 
 	// grant ownership on database
 	grantOwnershipOnDatabaseFormat = "grant ownership on database `%s` to `%s`;"
@@ -2225,6 +2232,7 @@ func getSqlForCheckViewMetaWithSnapshot(
 
 func getSqlForDeleteRole(roleId int64) []string {
 	return []string{
+		fmt.Sprintf(deleteRoleFromMoRoleRuleFormat, roleId),
 		fmt.Sprintf(deleteRoleFromMoRoleFormat, roleId),
 		fmt.Sprintf(deleteRoleFromMoUserGrantFormat, roleId),
 		fmt.Sprintf(deleteRoleFromMoRoleGrantFormat, roleId, roleId),
@@ -3738,6 +3746,11 @@ func doSwitchRole(ctx context.Context, ses *Session, sr *tree.SetRole) (err erro
 		// then, reset secondary role to none
 		account.SetUseSecondaryRole(false)
 		ses.InvalidatePrivilegeCache()
+		// Resolve the new active role's mandatory row rules before leaving the
+		// role switch. If the request was captured under an empty role, this
+		// current-policy check invalidates old handles only when the new role has
+		// rules; a failed load is treated as unknown and fails closed.
+		ses.refreshRewritePolicyAndValidatePrepared(ctx)
 		// SET ROLE validated membership in the transaction above, but a session
 		// with privilege caching disabled must not leave a grant decision behind
 		// for a later OFF -> ON transition to reuse after REVOKE.
@@ -3831,6 +3844,9 @@ func doCreateStage(ctx context.Context, ses *Session, cs *tree.CreateStage) (err
 		credentials = formatCredentials(cs.Credentials)
 
 		StageStatus = "in_use"
+		if cs.Status.Exist {
+			StageStatus = cs.Status.Option.String()
+		}
 
 		if cs.Comment.Exist {
 			comment = cs.Comment.Comment
@@ -3933,9 +3949,10 @@ func doCheckFilePath(ctx context.Context, ses *Session, ep *tree.ExportParam) (e
 
 	if ok {
 		ses.ep.userConfig.StageFilePath = filePath
+	} else {
+		filePath = ep.FilePath
 	}
-
-	return
+	return process.AuthorizeSQLFileAccess(ses.proc, filePath)
 }
 
 func doAlterStage(ctx context.Context, ses *Session, as *tree.AlterStage) (err error) {
@@ -4343,6 +4360,10 @@ func doDropAccount(ctx context.Context, bh BackgroundExec, ses *Session, da *dro
 
 		ses.Infof(ctx, "dropAccount %s sql: %s", da.Name, dropMoMysqlCompatibilityModeSql)
 		// drop table mo_mysql_compatibility_mode
+		rtnErr = bh.Exec(deleteCtx, "drop table if exists mo_catalog.mo_database_defaults")
+		if rtnErr != nil {
+			return rtnErr
+		}
 		rtnErr = bh.Exec(deleteCtx, dropMoMysqlCompatibilityModeSql)
 		if rtnErr != nil {
 			return rtnErr
@@ -4699,6 +4720,7 @@ func doDropUser(ctx context.Context, ses *Session, du *tree.DropUser) (err error
 func doDropRole(ctx context.Context, ses *Session, dr *tree.DropRole) (err error) {
 	var vr *verifiedRole
 	var sql string
+	var roleDeleted bool
 	account := ses.GetTenantInfo()
 	err = normalizeNamesOfRoles(ctx, dr.Roles)
 	if err != nil {
@@ -4713,8 +4735,14 @@ func doDropRole(ctx context.Context, ses *Session, dr *tree.DropRole) (err error
 	err = bh.Exec(ctx, "begin;")
 	defer func() {
 		err = finishTxn(ctx, bh, err)
+		if err == nil && roleDeleted {
+			invalidateRoleRuleCaches(ses)
+		}
 	}()
 	if err != nil {
+		return err
+	}
+	if err = lockRoleRuleLifecycleInBackground(ctx, bh); err != nil {
 		return err
 	}
 
@@ -4736,10 +4764,11 @@ func doDropRole(ctx context.Context, ses *Session, dr *tree.DropRole) (err error
 			}
 		}
 
-		// step2 : delete mo_role
-		// step3 : delete mo_user_grant
-		// step4 : delete mo_role_grant
-		// step5 : delete mo_role_privs
+		// step2 : delete role rewrite rules
+		// step3 : delete mo_role
+		// step4 : delete mo_user_grant
+		// step5 : delete mo_role_grant
+		// step6 : delete mo_role_privs
 		if vr == nil {
 			continue
 		}
@@ -4758,6 +4787,7 @@ func doDropRole(ctx context.Context, ses *Session, dr *tree.DropRole) (err error
 				return err
 			}
 		}
+		roleDeleted = true
 	}
 
 	return err
@@ -6509,6 +6539,12 @@ func determinePrivilegeSetOfStatement(stmt tree.Statement) *privilege {
 		typs = append(typs, PrivilegeTypeCreateDatabase, PrivilegeTypeAccountAll /*, PrivilegeTypeAccountOwnership*/)
 		needMatchedRole = true
 		writeDatabaseTargets = append(writeDatabaseTargets, string(st.Name))
+	case *tree.AlterDatabase:
+		objType = objectTypeDatabase
+		typs = append(typs, PrivilegeTypeAlterObject, PrivilegeTypeDatabaseAll, PrivilegeTypeDatabaseOwnership)
+		writeDatabaseAndTableDirectly = true
+		dbName = string(st.Name)
+		writeDatabaseTargets = append(writeDatabaseTargets, dbName)
 	case *tree.DropDatabase:
 		typs = append(typs, PrivilegeTypeDropDatabase, PrivilegeTypeAccountAll /*, PrivilegeTypeAccountOwnership*/)
 		writeDatabaseAndTableDirectly = true
@@ -6528,7 +6564,12 @@ func determinePrivilegeSetOfStatement(stmt tree.Statement) *privilege {
 	case *tree.Use:
 		typs = append(typs, PrivilegeTypeConnect, PrivilegeTypeAccountAll /*, PrivilegeTypeAccountOwnership*/)
 		canExecInRestricted = true
-	case *tree.ShowTables, *tree.ShowCreateTable, *tree.ShowColumns, *tree.ShowCreateView, *tree.ShowCreateDatabase,
+	case *tree.ShowTables, *tree.ShowCreateTable, *tree.ShowColumns:
+		objType = objectTypeDatabase
+		typs = append(typs, PrivilegeTypeShowTables, PrivilegeTypeDatabaseAll, PrivilegeTypeDatabaseOwnership)
+		dbName, _, _, _ = showMetadataTarget(stmt)
+		canExecInRestricted = true
+	case *tree.ShowCreateView, *tree.ShowCreateDatabase,
 		*tree.ShowCreatePublications:
 		objType = objectTypeDatabase
 		typs = append(typs, PrivilegeTypeShowTables, PrivilegeTypeDatabaseAll, PrivilegeTypeDatabaseOwnership)
@@ -8226,16 +8267,19 @@ func determineUserHasPrivilegeSet(ctx context.Context, ses *Session, priv *privi
 		}
 	}
 
-	var backgroundExecOptions []*BackgroundExecOption
+	backgroundExecOption := &BackgroundExecOption{}
 	if roleGrantNeedsCheck && !roleGrantCached {
 		// Active role membership is external authorization state. Revalidate it
 		// in a private RC transaction so a user transaction opened before REVOKE
 		// cannot continue authorizing through its older catalog snapshot.
-		backgroundExecOptions = append(backgroundExecOptions, &BackgroundExecOption{
-			forcePessimisticRC: true,
-		})
+		backgroundExecOption.forcePessimisticRC = true
 	}
-	bh := ses.GetBackgroundExec(ctx, backgroundExecOptions...)
+	backgroundExecOption, err = authorizationReadOption(ctx, ses, backgroundExecOption)
+	if err != nil {
+		return false, stats, err
+	}
+	_, _, _ = fault.TriggerFaultInDomainWithContext(ctx, fault.DomainFrontend, "authorization_before_grant_read")
+	bh := ses.GetBackgroundExec(ctx, backgroundExecOption)
 	defer func() {
 		stats = bh.GetExecStatsArray()
 		bh.Close()
@@ -8517,7 +8561,11 @@ func validateActiveRoleGrantForAuthorization(
 
 	// WITH GRANT OPTION authorization can bypass the general privilege walk,
 	// but must use the same latest-committed membership semantics.
-	bh := ses.GetBackgroundExec(ctx, &BackgroundExecOption{forcePessimisticRC: true})
+	readOption, err := authorizationReadOption(ctx, ses, &BackgroundExecOption{forcePessimisticRC: true})
+	if err != nil {
+		return false, stats, err
+	}
+	bh := ses.GetBackgroundExec(ctx, readOption)
 	defer func() {
 		stats = bh.GetExecStatsArray()
 		bh.Close()
@@ -8712,7 +8760,11 @@ func determineUserCanGrantRolesToOthers(ctx context.Context, ses *Session, fromR
 	}
 
 	// step2: decide the current user
-	bh := ses.GetBackgroundExec(ctx)
+	readOption, err := authorizationReadOption(ctx, ses, &BackgroundExecOption{})
+	if err != nil {
+		return false, stats, err
+	}
+	bh := ses.GetBackgroundExec(ctx, readOption)
 	defer func() {
 		stats = bh.GetExecStatsArray()
 		bh.Close()
@@ -8822,6 +8874,16 @@ func authenticateUserCanExecuteStatementWithObjectTypeAccountAndDatabase(ctx con
 		ok, delta, err = authenticateMultiDropTableTargets(ctx, ses, st)
 		stats.Add(&delta)
 		return ok, stats, err
+	}
+
+	// Only a normal denial may use object visibility. Errors (including revoked
+	// active-role membership) have already returned above.
+	if !ok && ses.GetFromRealUser() && ses.GetTenantInfo() != nil {
+		if _, _, _, supported := showMetadataTarget(stmt); supported {
+			allowed, delta, err := authenticateShowMetadata(ctx, ses, stmt)
+			stats.Add(&delta)
+			return allowed, stats, err
+		}
 	}
 
 	// double check privilege of drop table
@@ -9401,7 +9463,15 @@ func authenticateCreateTableAsSelectSourcePrivilege(
 
 	// Rebuild source-select plan and reuse normal table-scan privilege extraction,
 	// instead of manually parsing AST table references.
-	sourcePlan, err := buildPlan(ctx, ses, ses.GetTxnCompileCtx(), st.AsSource)
+	compilerContext := ses.GetTxnCompileCtx()
+	originalContext := compilerContext.GetContext()
+	planningContext := originalContext
+	if planningContext == nil {
+		planningContext = ctx
+	}
+	compilerContext.SetContext(plan2.WithJSONMergeWarningOrigin(planningContext, plan2.JSONMergeWarningInternalReprepare))
+	defer compilerContext.SetContext(originalContext)
+	sourcePlan, err := buildPlan(ctx, ses, compilerContext, plan2.DeepCopySelect(st.AsSource))
 	if err != nil {
 		return false, stats, err
 	}
@@ -10056,7 +10126,11 @@ func determineUserCanGrantPrivilegesToOthers(ctx context.Context, ses *Session, 
 	// step1: normalize the names of roles and users
 	// step2: decide the current user
 	account := ses.GetTenantInfo()
-	bh := ses.GetBackgroundExec(ctx)
+	readOption, err := authorizationReadOption(ctx, ses, &BackgroundExecOption{})
+	if err != nil {
+		return false, stats, err
+	}
+	bh := ses.GetBackgroundExec(ctx, readOption)
 	defer func() {
 		stats = bh.GetExecStatsArray()
 		bh.Close()
@@ -10303,8 +10377,8 @@ func authenticateUserCanExecuteStatementWithObjectTypeNone(ctx context.Context, 
 		}
 
 		checkBackUpStartPrivilege := func() (bool, error) {
-			// only the moAdmin can execute the backup statement
-			return tenant.IsSysTenant(), nil
+			// Backup operates on server-owned files and requires system authority.
+			return verifyAccountCanExecMoCtrl(tenant), nil
 		}
 
 		checkCdcTaskPrivilege := func() (bool, error) {
@@ -10890,12 +10964,14 @@ func createTablesInMoCatalogOfGeneralTenant2(bh BackgroundExec, ca *createAccoun
 
 	start1 := time.Now()
 
-	// create tables for the tenant
+	// Only these binary-owned catalog declarations use internal DDL admission;
+	// do not pass the marker to the tenant's subsequent data or user statements.
+	internalDDL := context.WithValue(newTenantCtx, defines.InternalExecutorKey{}, true)
 	for _, sql := range createSqls {
 		if isSysOnlyDb(sql) {
 			continue
 		}
-		if err = bh.Exec(newTenantCtx, sql); err != nil {
+		if err = bh.Exec(internalDDL, sql); err != nil {
 			return err
 		}
 	}
@@ -11013,9 +11089,14 @@ func createTablesInInformationSchemaOfGeneralTenant(ctx context.Context, bh Back
 	var err error
 	protocol := protocolVersionForTenantInitialization(service)
 	if protocol >= defines.MORPCVersion100 {
-		// A new CN can already speak 96 while an older CN still serves the
-		// cluster. Do not persist a View using a function that peer cannot plan.
-		if err := requireCommonViewColumnsProtocol(ctx, bh); err != nil {
+		// A new CN can already speak a newer protocol while an older CN still
+		// serves the cluster. Do not persist a View using a function that peer
+		// cannot plan.
+		requiredProtocol := defines.MORPCVersion100
+		if protocol >= defines.MORPCVersion109 {
+			requiredProtocol = defines.MORPCVersion109
+		}
+		if err := requireCommonViewColumnsProtocol(ctx, bh, requiredProtocol); err != nil {
 			return err
 		}
 	}
@@ -11037,7 +11118,7 @@ func createTablesInInformationSchemaOfGeneralTenant(ctx context.Context, bh Back
 	return err
 }
 
-func requireCommonViewColumnsProtocol(ctx context.Context, bh BackgroundExec) error {
+func requireCommonViewColumnsProtocol(ctx context.Context, bh BackgroundExec, requiredProtocol int64) error {
 	bh.ClearExecResultSet()
 	// This fixed cluster probe is system-authored; subsequent tenant DDL keeps its original identity.
 	probeCtx := defines.AttachAccount(ctx, catalog.System_Account, catalog.System_User, catalog.System_Role)
@@ -11049,13 +11130,13 @@ func requireCommonViewColumnsProtocol(ctx context.Context, bh BackgroundExec) er
 		return err
 	}
 	if len(results) == 0 || results[0].GetRowCount() == 0 {
-		return versions.CheckProtocolVersionResponse("", defines.MORPCVersion100)
+		return versions.CheckProtocolVersionResponse("", requiredProtocol)
 	}
 	encoded, err := results[0].GetString(ctx, 0, 0)
 	if err != nil {
 		return err
 	}
-	return versions.CheckProtocolVersionResponse(encoded, defines.MORPCVersion100)
+	return versions.CheckProtocolVersionResponse(encoded, requiredProtocol)
 }
 
 func protocolVersionForTenantInitialization(service string) int64 {

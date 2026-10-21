@@ -750,13 +750,6 @@ type FrontendParameters struct {
 	// including mysql protocol handshake, checking user, loading session variables
 	ConnectTimeout toml.Duration `toml:"connectTimeout" user_setting:"advanced"`
 
-	// SidecarURL is the DuckDB sidecar HTTP endpoint for offloading queries
-	// via /*+ SIDECAR */ or /*+ SIDECAR GPU */ hints.
-	// When set, this becomes the default for the sidecar_url session variable.
-	// Can be overridden per-session with SET sidecar_url = '...' or
-	// globally for new sessions with SET GLOBAL sidecar_url = '...'.
-	SidecarURL string `toml:"sidecarUrl" user_setting:"advanced"`
-
 	Iceberg   IcebergParameters   `toml:"iceberg" user_setting:"advanced"`
 	MongoDB   MongoDBParameters   `toml:"mongodb" user_setting:"advanced"`
 	ArrowLoad ArrowLoadParameters `toml:"arrow-load" user_setting:"advanced"`
@@ -1008,6 +1001,9 @@ type ObservabilityParameters struct {
 	// LongQueryTime default is 0.0 sec. if 0.0f, record every query. Record with exec time longer than LongQueryTime.
 	LongQueryTime float64 `toml:"long-query-time" user_setting:"advanced"`
 
+	// Legacy keeps old readers usable during a rolling upgrade.
+	StatementDiagnosticsFormat string `toml:"statement-diagnostics-format" user_setting:"advanced"`
+
 	// MetricExportInterval default is 15 sec.
 	MetricExportInterval int `toml:"metric-export-interval"`
 
@@ -1121,6 +1117,7 @@ func NewObservabilityParameters() *ObservabilityParameters {
 		EnableTraceDebug:                   false,
 		TraceExportInterval:                defaultTraceExportInterval,
 		LongQueryTime:                      defaultLongQueryTime,
+		StatementDiagnosticsFormat:         "compact-v1",
 		MetricExportInterval:               defaultMetricExportInterval,
 		MetricGatherInterval:               defaultMetricGatherInterval,
 		MetricInternalGatherInterval:       toml.Duration{},
@@ -1288,6 +1285,9 @@ func (op *ObservabilityParameters) resetConfigByOld() {
 		defaultMetricUpdateStorageUsageInterval,
 		op.MetricUpdateStorageUsageIntervalV12.Duration)
 	// part statement_info
+	if op.StatementDiagnosticsFormat == "" {
+		op.StatementDiagnosticsFormat = "compact-v1"
+	}
 	resetBoolConfig(&op.EnableStmtMerge, false, op.EnableStmtMergeV12)
 	resetBoolConfig(&op.DisableStmtAggregation, false, op.DisableStmtAggregationV12)
 	resetDurationConfig(&op.AggregationWindow.Duration, defaultAggregationWindow, op.AggregationWindowV12.Duration)

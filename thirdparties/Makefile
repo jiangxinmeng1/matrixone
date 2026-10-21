@@ -61,8 +61,8 @@ ONNX_VERSION=1.26.0
 ONNX_REPO_COMMIT=655365097e21c4df0f82337063f9a12b66700593
 ONNX_BASE_URL=https://github.com/matrixorigin/thirdparty/raw/$(ONNX_REPO_COMMIT)/onnxrt/$(ONNX_VERSION)
 # GitHub's media endpoint serves the same immutable Git LFS objects directly.
-# It is used only after the primary endpoint times out and is still verified by
-# the platform-specific SHA-256 below.
+# It is used only after a primary timeout or HTTP failure and is still verified
+# by the platform-specific SHA-256 below.
 ONNX_FALLBACK_BASE_URL=https://media.githubusercontent.com/media/matrixorigin/thirdparty/$(ONNX_REPO_COMMIT)/onnxrt/$(ONNX_VERSION)
 # The MatrixOne CI builder image ships these pinned artifacts. Keep this a
 # versioned directory so a base-image update cannot accidentally satisfy a
@@ -163,8 +163,18 @@ install/include/usearch.h: install/include/fp16.h install/include/simsimd/simsim
 	cp -r $(FP16_DIR)/* $(USEARCH_DIR)/fp16
 	cp -r $(SIMSIMD_DIR)/* $(USEARCH_DIR)/simsimd
 	cp -r $(STRINGZILLA_DIR)/* $(USEARCH_DIR)/stringzilla
+# usearch compiles with -march=native, which tunes the artifact to the build
+# host's CPU. On a release/CI builder that is not the deployment target this
+# bakes in instructions the target may not implement. x86 is pinned to a haswell
+# baseline; arm64 must likewise drop to the portable armv8-a baseline -- without
+# this an arm64 image built on an SVE-capable host (modern Graviton/Ampere/
+# Neoverse) emits SVE into libusearch_c and SIGILLs on any arm64 CPU without SVE,
+# e.g. Apple Silicon under Docker (#30413). SVE on genuinely-SVE hardware belongs
+# behind SimSIMD runtime dispatch (MO_CL_SIMSIMD=1), never a static -march.
 	@if $(CC) -march=haswell -E - < /dev/null > /dev/null 2>&1; then \
 		sed -i -e "s/march=native/march=haswell/g" $(USEARCH_DIR)/CMakeLists.txt; \
+	elif $(CC) -march=armv8-a -E - < /dev/null > /dev/null 2>&1; then \
+		sed -i -e "s/march=native/march=armv8-a/g" $(USEARCH_DIR)/CMakeLists.txt; \
 	fi
 	(cd $(USEARCH_DIR) && cmake -B build $(USEARCH_CMAKE_FLAG) && cmake --build build --config Release)
 ifeq ($(UNAME_S),darwin)

@@ -144,7 +144,16 @@ const (
 	ErrInvalidBitwiseOperandsSize uint16 = 20336
 	// ErrCannotConvertString preserves MySQL's binary-to-text conversion error
 	// when a character function receives invalid UTF-8 bytes.
-	ErrCannotConvertString uint16 = 20337
+	ErrCannotConvertString    uint16 = 20337
+	ErrIllegalMixOfCollations uint16 = 20338
+	ErrUnknownCollation       uint16 = 20339
+	// ErrInvalidJSONPathWildcard preserves MySQL's ER_INVALID_JSON_PATH_WILDCARD
+	// contract without reusing main's codes or the digest dependency's 20338/20339.
+	ErrInvalidJSONPathWildcard  uint16 = 20340
+	ErrCollationCharsetMismatch uint16 = 20341
+	// ErrDuplicateCheckConstraintName reports a CHECK constraint name already
+	// used by another table in the same schema (MySQL 3822).
+	ErrDuplicateCheckConstraintName uint16 = 20342
 
 	// Group 4: unexpected state and io errors
 	ErrInvalidState                             uint16 = 20400
@@ -229,6 +238,10 @@ const (
 	// field-duplicate code introduced on main.
 	ErrWrongNumberOfColumnsInSelect uint16 = 20478
 	ErrTooLongIdent                 uint16 = 20479
+	ErrTooBigFieldLength            uint16 = 20480
+	// ErrNeedReprepare is returned when a prepared statement depends on
+	// session state that has been invalidated and must not be executed again.
+	ErrNeedReprepare uint16 = 20481
 
 	// Group 5: rpc errors
 	//
@@ -345,6 +358,9 @@ const (
 	ErrRemoteLockWaitTimeout uint16 = 20709
 	// ErrLockWaitTimeout a lock waiter exceeded its configured wait budget
 	ErrLockWaitTimeout uint16 = 20710
+	// ErrLockNowait is a settled NOWAIT row-lock conflict. Unlike ErrLockConflict,
+	// this is a statement error and does not by itself abort the transaction.
+	ErrLockNowait uint16 = 20711
 
 	// Group 8: partition
 	ErrPartitionFunctionIsNotAllowed       uint16 = 20801
@@ -468,34 +484,36 @@ var errorMsgRefer = map[uint16]moErrorMsgItem{
 	ErrGroupConcatCut:              {ER_CUT_VALUE_GROUP_CONCAT, []string{"HY000"}, "%s"},
 
 	// Group 3: invalid input
-	ErrBadConfig:            {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "invalid configuration: %s"},
-	ErrInvalidInput:         {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "invalid input: %s"},
-	ErrSyntaxError:          {ER_SYNTAX_ERROR, []string{"42000"}, "SQL syntax error: %s"},
-	ErrParseError:           {ER_PARSE_ERROR, []string{"42000"}, "SQL parser error: %s"},
-	ErrConstraintViolation:  {ER_CHECK_CONSTRAINT_VIOLATED, []string{MySQLDefaultSqlState}, "constraint violation: %s"},
-	ErrDuplicate:            {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "tae data: duplicate"},
-	ErrRoleGrantedToSelf:    {ER_ROLE_GRANTED_TO_ITSELF, []string{MySQLDefaultSqlState}, "cannot grant role %s to %s"},
-	ErrDuplicateEntry:       {ER_DUP_ENTRY, []string{"23000"}, "Duplicate entry '%s' for key '%s'"},
-	ErrWrongValueCountOnRow: {ER_WRONG_VALUE_COUNT_ON_ROW, []string{"21S01"}, "Column count doesn't match value count at row %d"},
-	ErrBadFieldError:        {ER_BAD_FIELD_ERROR, []string{"42S22"}, "Unknown column '%s' in '%s'"},
-	ErrWrongDatetimeSpec:    {ER_WRONG_DATETIME_SPEC, []string{MySQLDefaultSqlState}, "wrong date/time format specifier: %s"},
-	ErrUpgrateError:         {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "CN upgrade table or view '%s.%s' under tenant '%s:%d' reports error: %s"},
-	ErrUnsupportedDML:       {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "unsupported DML: %s"},
-	ErrOperandColumns:       {ER_OPERAND_COLUMNS, []string{"21000"}, "Operand should contain %d column(s)"},
-	ErrSubqueryNo1Row:       {ER_SUBQUERY_NO_1_ROW, []string{"21000"}, "Subquery returns more than 1 row"},
-	ErrInvalidTypeForJSON:   {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "Invalid data type for JSON data in argument %d to function %s; a JSON string or JSON type is required."},
-	ErrInvalidJSONCharset:   {ER_INVALID_JSON_CHARSET, []string{"22032"}, "Cannot create a JSON value from a string with CHARACTER SET '%s'."},
-	ErrUnknownStmtHandler:   {ER_UNKNOWN_STMT_HANDLER, []string{MySQLDefaultSqlState}, "Unknown prepared statement handler (%s) given to %s"},
-	ErrViewWrongList:        {ER_VIEW_WRONG_LIST, []string{MySQLDefaultSqlState}, "In definition of view, derived table or common table expression, SELECT list and column names list have different column counts"},
-	ErrWrongArguments:       {ER_WRONG_ARGUMENTS, []string{MySQLDefaultSqlState}, "Incorrect arguments to %s"},
-	ErrDerivedMustHaveAlias: {ER_DERIVED_MUST_HAVE_ALIAS, []string{"42000"}, "Every derived table must have its own alias"},
-	ErrWrongUsage:           {ER_WRONG_USAGE, []string{MySQLDefaultSqlState}, "Incorrect usage of %s and %s"},
-	ErrUpdateTableUsed:      {ER_UPDATE_TABLE_USED, []string{MySQLDefaultSqlState}, "You can't specify target table '%-.192s' for update in FROM clause"},
-	ErrWindowInvalidUse:     {ER_WINDOW_INVALID_WINDOW_FUNC_USE, []string{"HY000"}, "You cannot use the window function '%s' in this context"},
-	ErrViewSelectTmpTable:   {ER_VIEW_SELECT_TMPTABLE, []string{MySQLDefaultSqlState}, "View's SELECT refers to a temporary table '%-.192s'"},
-	ErrTooManyRows:          {ER_TOO_MANY_ROWS, []string{"42000"}, "Result consisted of more than one row"},
-	ErrCantChangeTxn:        {ER_CANT_CHANGE_TX_CHARACTERISTICS, []string{"25001"}, "Transaction characteristics can't be changed while a transaction is in progress"},
-	ErrInvalidGroupFuncUse:  {ER_INVALID_GROUP_FUNC_USE, []string{MySQLDefaultSqlState}, "Invalid use of group function"},
+	ErrBadConfig:                    {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "invalid configuration: %s"},
+	ErrInvalidInput:                 {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "invalid input: %s"},
+	ErrSyntaxError:                  {ER_SYNTAX_ERROR, []string{"42000"}, "SQL syntax error: %s"},
+	ErrParseError:                   {ER_PARSE_ERROR, []string{"42000"}, "SQL parser error: %s"},
+	ErrConstraintViolation:          {ER_CHECK_CONSTRAINT_VIOLATED, []string{MySQLDefaultSqlState}, "constraint violation: %s"},
+	ErrDuplicateCheckConstraintName: {ER_CHECK_CONSTRAINT_DUP_NAME, []string{MySQLDefaultSqlState}, "Duplicate check constraint name '%-.192s'"},
+	ErrDuplicate:                    {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "tae data: duplicate"},
+	ErrRoleGrantedToSelf:            {ER_ROLE_GRANTED_TO_ITSELF, []string{MySQLDefaultSqlState}, "cannot grant role %s to %s"},
+	ErrDuplicateEntry:               {ER_DUP_ENTRY, []string{"23000"}, "Duplicate entry '%s' for key '%s'"},
+	ErrWrongValueCountOnRow:         {ER_WRONG_VALUE_COUNT_ON_ROW, []string{"21S01"}, "Column count doesn't match value count at row %d"},
+	ErrBadFieldError:                {ER_BAD_FIELD_ERROR, []string{"42S22"}, "Unknown column '%s' in '%s'"},
+	ErrWrongDatetimeSpec:            {ER_WRONG_DATETIME_SPEC, []string{MySQLDefaultSqlState}, "wrong date/time format specifier: %s"},
+	ErrUpgrateError:                 {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "CN upgrade table or view '%s.%s' under tenant '%s:%d' reports error: %s"},
+	ErrUnsupportedDML:               {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "unsupported DML: %s"},
+	ErrOperandColumns:               {ER_OPERAND_COLUMNS, []string{"21000"}, "Operand should contain %d column(s)"},
+	ErrSubqueryNo1Row:               {ER_SUBQUERY_NO_1_ROW, []string{"21000"}, "Subquery returns more than 1 row"},
+	ErrInvalidTypeForJSON:           {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "Invalid data type for JSON data in argument %d to function %s; a JSON string or JSON type is required."},
+	ErrInvalidJSONCharset:           {ER_INVALID_JSON_CHARSET, []string{"22032"}, "Cannot create a JSON value from a string with CHARACTER SET '%s'."},
+	ErrUnknownStmtHandler:           {ER_UNKNOWN_STMT_HANDLER, []string{MySQLDefaultSqlState}, "Unknown prepared statement handler (%s) given to %s"},
+	ErrViewWrongList:                {ER_VIEW_WRONG_LIST, []string{MySQLDefaultSqlState}, "In definition of view, derived table or common table expression, SELECT list and column names list have different column counts"},
+	ErrWrongArguments:               {ER_WRONG_ARGUMENTS, []string{MySQLDefaultSqlState}, "Incorrect arguments to %s"},
+	ErrDerivedMustHaveAlias:         {ER_DERIVED_MUST_HAVE_ALIAS, []string{"42000"}, "Every derived table must have its own alias"},
+	ErrWrongUsage:                   {ER_WRONG_USAGE, []string{MySQLDefaultSqlState}, "Incorrect usage of %s and %s"},
+	ErrUpdateTableUsed:              {ER_UPDATE_TABLE_USED, []string{MySQLDefaultSqlState}, "You can't specify target table '%-.192s' for update in FROM clause"},
+	ErrWindowInvalidUse:             {ER_WINDOW_INVALID_WINDOW_FUNC_USE, []string{"HY000"}, "You cannot use the window function '%s' in this context"},
+	ErrViewSelectTmpTable:           {ER_VIEW_SELECT_TMPTABLE, []string{MySQLDefaultSqlState}, "View's SELECT refers to a temporary table '%-.192s'"},
+	ErrTooManyRows:                  {ER_TOO_MANY_ROWS, []string{"42000"}, "Result consisted of more than one row"},
+	ErrCantChangeTxn:                {ER_CANT_CHANGE_TX_CHARACTERISTICS, []string{"25001"}, "Transaction characteristics can't be changed while a transaction is in progress"},
+	ErrInvalidGroupFuncUse:          {ER_INVALID_GROUP_FUNC_USE, []string{MySQLDefaultSqlState}, "Invalid use of group function"},
+	ErrInvalidJSONPathWildcard:      {ER_INVALID_JSON_PATH_WILDCARD, []string{"42000"}, "In this situation, path expressions may not contain the * and ** tokens or an array range."},
 	// Maps to MySQL's ER_FT_MATCHING_KEY_NOT_FOUND (1191), which rejects the same no-index
 	// CREATE / ALTER / CREATE OR REPLACE VIEW, so clients see the code and text they expect.
 	ErrFtMatchingKeyNotFound:               {ER_FT_MATCHING_KEY_NOT_FOUND, []string{MySQLDefaultSqlState}, FtMatchingKeyNotFoundMsg},
@@ -504,6 +522,9 @@ var errorMsgRefer = map[uint16]moErrorMsgItem{
 	ErrInvalidBitwiseAggregateOperandsSize: {ER_INVALID_BITWISE_AGGREGATE_OPERANDS_SIZE, []string{MySQLDefaultSqlState}, "Aggregate bitwise functions cannot accept arguments longer than 511 bytes; consider using the SUBSTRING() function"},
 	ErrInvalidBitwiseOperandsSize:          {ER_INVALID_BITWISE_OPERANDS_SIZE, []string{MySQLDefaultSqlState}, "Binary operands of bitwise operators must be of equal length"},
 	ErrCannotConvertString:                 {ER_CANNOT_CONVERT_STRING, []string{MySQLDefaultSqlState}, "Cannot convert string '%.64s' from %s to %s"},
+	ErrIllegalMixOfCollations:              {ER_CANT_AGGREGATE_2COLLATIONS, []string{MySQLDefaultSqlState}, "Illegal mix of collations (%s,%s) and (%s,%s) for operation '%s'"},
+	ErrUnknownCollation:                    {ER_UNKNOWN_COLLATION, []string{MySQLDefaultSqlState}, "Unknown collation: '%s'"},
+	ErrCollationCharsetMismatch:            {ER_COLLATION_CHARSET_MISMATCH, []string{"42000"}, "COLLATION '%s' is not valid for CHARACTER SET '%s'"},
 	ErrWrongParamCountToNativeFct:          {ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT, []string{"42000"}, "Incorrect parameter count in the call to native function '%-.192s'"},
 	ErrAESInvalidIV:                        {ER_AES_INVALID_IV, []string{"HY000"}, "The initialization vector supplied to %s is too short. Must be at least %d bytes long"},
 	ErrUserLockWrongName:                   {ER_USER_LOCK_WRONG_NAME, []string{"42000"}, "Incorrect user-level lock name '%-.192s'."},
@@ -586,8 +607,10 @@ var errorMsgRefer = map[uint16]moErrorMsgItem{
 	ErrTableMustHaveAVisibleColumn:              {ER_TABLE_MUST_HAVE_A_VISIBLE_COLUMN, []string{MySQLDefaultSqlState}, "A table must have at least one visible column."},
 	ErrMaxPreparedStmtCountReached:              {ER_MAX_PREPARED_STMT_COUNT_REACHED, []string{"42000"}, "Can't create more than max_prepared_stmt_count statements (current value: %d)"},
 	ErrFieldSpecifiedTwice:                      {ER_FIELD_SPECIFIED_TWICE, []string{"42000"}, "Column '%-.192s' specified twice"},
+	ErrTooBigFieldLength:                        {ER_TOO_BIG_FIELDLENGTH, []string{"42000"}, "Column length too big for column '%s' (max = %d); use BLOB or TEXT instead"},
 	ErrWrongNumberOfColumnsInSelect:             {ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, []string{"21000"}, "The used SELECT statements have a different number of columns"},
 	ErrTooLongIdent:                             {ER_TOO_LONG_IDENT, []string{"42000", "S1009"}, "Identifier name '%-.100s' is too long"},
+	ErrNeedReprepare:                            {ER_NEED_REPREPARE, []string{"HY000"}, "Prepared statement needs to be re-prepared"},
 
 	// Group 5: rpc errors
 	ErrRPCTimeout:   {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "rpc timeout"},
@@ -664,6 +687,7 @@ var errorMsgRefer = map[uint16]moErrorMsgItem{
 	ErrCannotCommitOnInvalidCN: {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "cannot commit a orphan transaction on invalid cn"},
 	ErrRemoteLockWaitTimeout:   {ER_UNKNOWN_ERROR, []string{MySQLDefaultSqlState}, "remote lock wait timeout"},
 	ErrLockWaitTimeout:         {ER_LOCK_WAIT_TIMEOUT, []string{MySQLDefaultSqlState}, "Lock wait timeout exceeded; try restarting transaction"},
+	ErrLockNowait:              {ER_LOCK_NOWAIT, []string{"HY000"}, "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set."},
 
 	// Group 8: partition
 	ErrPartitionFunctionIsNotAllowed:       {ER_PARTITION_FUNCTION_IS_NOT_ALLOWED, []string{MySQLDefaultSqlState}, "This partition function is not allowed"},
@@ -1173,6 +1197,18 @@ func NewInvalidInput(ctx context.Context, msg string) *Error {
 	return newError(ctx, ErrInvalidInput, msg)
 }
 
+func NewIllegalMixOfCollations(ctx context.Context, left, leftRank, right, rightRank, operation string) *Error {
+	return newError(ctx, ErrIllegalMixOfCollations, left, leftRank, right, rightRank, operation)
+}
+
+func NewUnknownCollation(ctx context.Context, name string) *Error {
+	return newError(ctx, ErrUnknownCollation, name)
+}
+
+func NewCollationCharsetMismatch(ctx context.Context, name, charset string) *Error {
+	return newError(ctx, ErrCollationCharsetMismatch, name, charset)
+}
+
 // NewFtMatchingKeyNotFound reports a MATCH() AGAINST() that no FULLTEXT index can serve.
 // Use this rather than a hand-rolled invalid-input: the restore paths identify the refusal
 // by code (see pkg/frontend/snapshot.go) and must not depend on the wording.
@@ -1223,6 +1259,10 @@ func NewInvalidBitwiseAggregateOperandsSize(ctx context.Context) *Error {
 	return newError(ctx, ErrInvalidBitwiseAggregateOperandsSize)
 }
 
+func NewInvalidJSONPathWildcard(ctx context.Context) *Error {
+	return newError(ctx, ErrInvalidJSONPathWildcard)
+}
+
 func NewInvalidBitwiseOperandsSize(ctx context.Context) *Error {
 	return newError(ctx, ErrInvalidBitwiseOperandsSize)
 }
@@ -1245,6 +1285,10 @@ func NewCharacterSetMismatch(ctx context.Context, left, right, function string) 
 
 func NewUnknownStmtHandler(ctx context.Context, name, operation string) *Error {
 	return newError(ctx, ErrUnknownStmtHandler, name, operation)
+}
+
+func NewNeedReprepare(ctx context.Context) *Error {
+	return newError(ctx, ErrNeedReprepare)
 }
 
 func NewSyntaxErrorf(ctx context.Context, format string, args ...any) *Error {
@@ -1271,6 +1315,12 @@ func NewConstraintViolationf(ctx context.Context, format string, args ...any) *E
 
 func NewConstraintViolation(ctx context.Context, msg string) *Error {
 	return newError(ctx, ErrConstraintViolation, msg)
+}
+
+// NewDuplicateCheckConstraintName reports MySQL's ER_CHECK_CONSTRAINT_DUP_NAME
+// (3822): another table in the same schema already uses the CHECK name.
+func NewDuplicateCheckConstraintName(ctx context.Context, name string) *Error {
+	return newError(ctx, ErrDuplicateCheckConstraintName, name)
 }
 
 func NewUnsupportedDML(ctx context.Context, format string, args ...any) *Error {
@@ -1981,6 +2031,10 @@ func NewErrTooManyKeys(ctx context.Context, k any) *Error {
 
 func NewErrTooManyKeyParts(ctx context.Context, k any) *Error {
 	return newError(ctx, ErrTooManyKeyParts, k)
+}
+
+func NewTooBigFieldLength(ctx context.Context, column string, maxLength int32) *Error {
+	return newError(ctx, ErrTooBigFieldLength, column, maxLength)
 }
 
 func NewErrWrongColumnName(ctx context.Context, k any) *Error {

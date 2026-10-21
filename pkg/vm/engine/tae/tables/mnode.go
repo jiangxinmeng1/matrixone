@@ -368,6 +368,55 @@ func (node *memoryNode) GetDuplicatedRows(
 	return
 }
 
+func (node *memoryNode) GetDuplicatedRowsByRowVisibility(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	from, to types.TS,
+	keys containers.Vector,
+	keysZM index.ZM,
+	rowIDs containers.Vector,
+	mp *mpool.MPool,
+) (err error) {
+	node.object.RLock()
+	defer node.object.RUnlock()
+	return node.getDuplicatedRowsByRowVisibilityLocked(
+		ctx, txn, from, to, keys, keysZM, rowIDs, mp)
+}
+
+func (node *memoryNode) getDuplicatedRowsByRowVisibilityLocked(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	from, to types.TS,
+	keys containers.Vector,
+	keysZM index.ZM,
+	rowIDs containers.Vector,
+	mp *mpool.MPool,
+) (err error) {
+	blkID := objectio.NewBlockidWithObjectID(node.object.meta.Load().ID(), 0)
+	rowVisible := func(row uint32) (bool, error) {
+		appendnode := node.object.appendMVCC.GetAppendNodeByRowLocked(row)
+		if appendnode == nil || appendnode.IsAborted() {
+			return false, nil
+		}
+		if appendnode.Prepare == txnif.UncommitTS {
+			return false, nil
+		}
+		visible, _ := appendnode.PreparedIn(from, to)
+		return visible, nil
+	}
+	return node.pkIndex.GetDuplicatedRowsWithRowVisibility(
+		ctx,
+		keys.GetDownstreamVector(),
+		keysZM,
+		&blkID,
+		rowIDs.GetDownstreamVector(),
+		rowVisible,
+		node.checkConflictLocked(txn),
+		nil,
+		mp,
+	)
+}
+
 func (node *memoryNode) checkConflictLocked(
 	txn txnif.TxnReader,
 ) func(row uint32) error {
