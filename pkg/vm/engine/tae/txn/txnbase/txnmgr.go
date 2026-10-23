@@ -31,6 +31,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/txn/clock"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
@@ -650,9 +651,11 @@ func (mgr *TxnManager) on1PCApply(op *OpTxn) {
 	switch op.Op {
 	case OpCommit:
 		isAbort = false
+		applyStarted := time.Now()
 		if err = op.Txn.ApplyCommit(); err != nil {
 			panic(err)
 		}
+		v2.TxnApplyCommitDurationHistogram.Observe(time.Since(applyStarted).Seconds())
 	case OpRollback:
 		isAbort = true
 		if err = op.Txn.ApplyRollback(); err != nil {
