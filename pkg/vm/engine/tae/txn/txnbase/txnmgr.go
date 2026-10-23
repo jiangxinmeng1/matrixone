@@ -655,7 +655,10 @@ func (mgr *TxnManager) on1PCApply(op *OpTxn) {
 		if err = op.Txn.ApplyCommit(); err != nil {
 			panic(err)
 		}
-		v2.TxnApplyCommitDurationHistogram.Observe(time.Since(applyStarted).Seconds())
+		// Match the Preparing tracer's population: heartbeat transactions are excluded.
+		if !op.Txn.GetStore().IsHeartbeat() {
+			v2.TxnApplyCommitDurationHistogram.Observe(time.Since(applyStarted).Seconds())
+		}
 	case OpRollback:
 		isAbort = true
 		if err = op.Txn.ApplyRollback(); err != nil {
