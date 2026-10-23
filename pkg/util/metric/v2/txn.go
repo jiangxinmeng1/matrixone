@@ -403,6 +403,8 @@ var (
 	TxnPrepareWalDurationHistogram     = txnTNSideDurationHistogram.WithLabelValues("4-PrepareWal")
 	TxnPreparedWaitDurationHistogram   = txnTNSideDurationHistogram.WithLabelValues("5-PreparedWait")
 	TxnPreparedDurationHistogram       = txnTNSideDurationHistogram.WithLabelValues("6-Prepared")
+	// Measured around AsyncTxn.ApplyCommit only, excluding WAL wait and DoneApply.
+	TxnApplyCommitDurationHistogram = txnTNSideDurationHistogram.WithLabelValues("apply_commit")
 
 	txnS3TombstoneCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
