@@ -367,3 +367,15 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 这是**3/3 轮**可控复现的已确认写入不可读。直接风险是错误的未来水位一旦被接受，就会提前删除随后成功返回的 WAL；即使上层调用方应保证水位正确，LogService 不应在当前日志尾部之外接受会影响未来写入的截断。建议在 Raft 状态机应用截断命令时使用同一条命令的 `e.Index` 验证 `requestedLSN <= e.Index`，并返回可识别的参数错误；仅在客户端先查 latest 再检查有并发竞态，不能作为唯一保护。精确允许边界还应覆盖 `requestedLSN == e.Index` 与当前数据日志尾部的区别。
 
 远端证据在 `future-truncate-20261104.{before,plan,truncate,watermark,append,from-first.read,from-first.err,after-watermark.read}`、`future-truncate-paced-20261104.*`、`future-repeat-20261104.log` 和目录 `future-repeat-20261104/`，以及三个节点的 `stdout.log`。重复脚本为 `test/logservice-chaos/reproduce_future_truncate.py`；它限定只能作用于这套隔离目录。测试结束时最新 LSN 已超过故障注入水位，三个节点仍运行；此前被提前压缩的测试 payload 无法恢复。
+
+## 追加实验：落后副本恢复与下一台故障交叠（2026-11-04 16:50–16:59）
+
+这组只使用已确认写入以内的 Truncate 水位。在 node1/2/3 三投票成员的隔离集群持续运行同一个 Append→Read 客户端；每次只杀一台，待它原目录启动后立即杀另一台，始终保留至少两台进程，并在过程中按已读回的进度推进截断。用单地址客户端分别读回三个副本、比较 SHA256，并核对截断后尚保留的客户端确认记录。首次脚本试跑在首个下线后等待“新增超过 100 条”的 20 秒条件上提前结束，自动恢复节点；该轮没有执行交叠，不计入以下结果。另一轮精确 leader 注入第一次因 `SIGKILL` 发出后马上检查进程数，撞到目标进程尚未退出而提前结束；已恢复节点并改成等待 `/proc` 中进程实际退出，此轮也不计入完成的 leader 窗口。
+
+| 时间线 | 客户端与截断 | 最终读回 |
+|---|---|---|
+| 三轮连续交叠：node1→node2、node2→node3、node3→node1；前一台刚启动约 0.3 秒即杀后一台，各保持约 12 秒 | **544/544** 次写读成功；Append/Read 各重试 1 次；7 次合法 Truncate 成功。第三轮在已成功 Append 的 Read 上等待约 **59.891 秒**后 `timeout`，重试成功，最大整轮 **61.310 秒**，属于 #32148 已记录的旧连接长尾。 | 水位 10923 后，86 条保留的确认记录按 LSN/payload 核对通过，三地址 SHA256 同为 `bed717760d6e023e14b1589238ced8ea2d0d88554a65e78be166e7c008544ad6`；保留区间无重复 payload。 |
+| node1 下线期间继续写入和截断；重启后观察到数据 shard 开始恢复 Raft snapshot，再杀 node2；**这轮未校验 node2 是 leader** | **230/230** 次写读成功；Append 重试 1 次，Read 重试 0；最大整轮 **4.116 秒**，7 次 Truncate 成功。 | 水位 11217 后，49 条保留记录核对通过，三地址 SHA256 同为 `da97088d287f264e517e276b2b53c42d1ec16322599c6539a964cd96f707dbe6`。 |
+| node3 下线约 27 秒内持续写入和截断，重启后在 **16:58:18.393** 观察到数据 shard 开始恢复 Raft snapshot index **11513**；随即确认 node2 仍是数据 leader，再杀 node2，约 12 秒后恢复 | **218/218** 次写读成功；故障边缘 Append 出现两次 EOF、一次约 **5.301 秒**的 `context deadline exceeded`，重试后成功；Read 重试 0；最大整轮 **6.777 秒**，7 次 Truncate 成功。 | 水位 11630 后，42 条保留记录核对通过，三地址 SHA256 同为 `b2b17ae2207b5c388a59bf0e85fb28ac14869b2fb98e4d18f01f3f228d87f8a5`；保留区间无重复 payload。数据与 HAKeeper 恢复三成员。 |
+
+最后一轮在 leader 下线时，刚恢复的 node3 正开始安装新 snapshot，观察到客户端短暂重试，但未出现最终错误或已确认记录丢失。这里的“两台存活”是进程数保证；刚重启的副本尚未追上时，不能把两进程等同于持续可提交的两票。最终三节点运行，原始证据在 51 的同一目录：`overlap2-20261104.{load,progress,node{1,2,3}.read}`、`restore-cut-20261104.*`、`restore-leader-cut2-20261104.*`、三台 `stdout.log`，以及对应注入脚本 `overlap2-20261104.py`、`restore-cut-20261104.py`、`restore-leader-cut2-20261104.py`。这组未发现新的独立缺陷；约一分钟 Read 长尾已由 #32148 跟踪。
