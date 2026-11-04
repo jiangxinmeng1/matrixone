@@ -333,3 +333,15 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 使用 `test/logservice-chaos/reproduce_cold_restart.py` 在上述隔离目录重复三轮。每轮先确认三进程均运行并保存 9451 起的读回基线，再同时停掉 node1、node2、node3，等待 Dragonboat 目录锁释放，将先前备份的**原始** `mo-logservice.metadata.before-cold-recovery` 复制回 node1/node2（保留 Raft 文件与原配置不变），随后以原配置启动三个节点。每轮 node1/node2 都在启动阶段记录 `panic: shard already exist` 并退出，node3 保持运行：**3/3 轮、两台各 3/3 次**。这组重复排除了前述测试脚本过早启动时遇到的 `failed to lock data directory` 干扰；该干扰轮不计入复现。随后每轮停 node3、恢复事先保存的仅含当前 ID 的 metadata，使用临时 `bootstrap-cluster=false` 配置重启三节点，三地址恢复可用；从 9451 起的 351 条读回与基线 SHA256 `bb28f629f8e5fa5378904365d1c64fab8f1cc3e806df9b06b4db64e2a733c5ac` 在三轮均一致。最后三进程运行、两个 shard 的多数派恢复。原始失败 metadata 及代码流程证据均保留。
 
 完整输出在远端 `cold-repeat-verified2-20261104.log` 和 node1/node2 的 `stdout.log`；重复命令：`python3 /home/mo/jxm/logservice-chaos-20261103-d61a7206/reproduce_cold_restart.py /home/mo/jxm/logservice-chaos-20261103-d61a7206 --rounds 3`。脚本只适用于这个隔离目录，运行前要求三节点都在线，并依赖原始 metadata 备份。
+
+### 补充测试：历史 ID 数量与冷启动顺序（2026-11-04 15:44–15:48）
+
+为明确 #32151 的触发边界，在同一隔离集群追加三组；每次停机前读取 LSN 9451 起的保留区间作基线，测试后用三地址核对成员表。所有手工 metadata 替换只发生在已经停止的测试进程上，保留原备份及 Raft 文件。
+
+| 本地 metadata 与启动顺序 | 实测结果 |
+|---|---|
+| node1、node2 都只含当前 ID；三节点全部停止，然后三台都用**原始 `bootstrap-cluster=true` 配置**启动 | 三台均保持运行，数据与 HAKeeper shard 的三地址成员表一致。LSN 9451 起读回与停机前 SHA256 均为 `bb28f629f8e5fa5378904365d1c64fab8f1cc3e806df9b06b4db64e2a733c5ac`；新增 3 条写入成功（LSN 9838–9840）。这排除了“仅因为原始 bootstrap 配置就无法冷启动”的解释。 |
+| **只有 node1** 恢复历史 ID `131073`、`374786`；全停后先启动 node1，约 4 秒后再启动干净的 node2、node3 | node1 首次启动 `panic: shard already exist`；node2/node3 后续组成两票，数据与 HAKeeper shard 均可查询，两票上新增 3 条写入（LSN 9844–9846）并读回正确。再用**未手工清理的同一份 node1 metadata**重启 node1 时，它从在线同伴识别并跳过两个历史 ID，原三成员表恢复；启动日志还显示 `BootstrapHAKeeper` 跳过初始旧 ID。说明有两票在线时原目录可自恢复，但冷启动期间单个失败进程仍会退出。 |
+| node1、node2 都恢复历史 ID；全停后**先启动干净 node3，等 5 秒**，再启动 node1/node2 | node3 单票查询数据 shard 返回 `shard not found`；node1、node2 随后均 `panic: shard already exist`，集群无法形成多数派。只让一台干净节点先上线，不足以提供这条启动自检所需的可用成员视图。恢复 node1/node2 的干净 metadata 后，三节点再次正常；LSN 9451 起读回与本轮停机前 SHA256 同为 `ddd3c72e073de64a5a4793dc1f229392e44f4f006caa60b39e9731a38d5f3850`，又新增 3 条写入成功（LSN 9852–9854）。 |
+
+最终三个 RPC 地址对两个 shard 均返回原三投票成员；从 LSN 9838 起分别经 node1/node2/node3 单地址读回的 SHA256 全为 `bccf299444cd5a8911e76f72948ed86ce283310b854521854b98042352b3f815`。远端证据为 `cold-matrix-20261104.*`、各节点 `stdout.log`、原始 `mo-logservice.metadata.before-cold-recovery`。这个矩阵强化了 #32151 的根因边界：关键是本地同 shard 多 ID 与启动时缺少可用同伴视图的组合；它不说明所有正常三节点冷启动都会失败。
