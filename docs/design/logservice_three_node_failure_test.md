@@ -142,6 +142,8 @@ leader 故障的长尾集中在 `mo-path-leader/000010`：首次尝试 156 毫�
 
 ### 缺陷记录：旧目录可短暂启动已移除的初始 HAKeeper 副本
 
+跟踪：[matrixorigin/matrixone#32135](https://github.com/matrixorigin/matrixone/issues/32135)。
+
 **状态与触发前提。** 已在上述 51 隔离集群复现，尚未修复。node0 原配置仍为 `bootstrap-cluster=true`，`init-hakeeper-members` 指定初始 HAKeeper ID **131072**；旧磁盘保留该 ID 的 Dragonboat Raft 文件。HAKeeper 曾对 131072 下发 `L/Kill`，使其不再出现在 node0 的 `mo-logservice.metadata` 中；其后 node0 的新 HAKeeper 副本也被移至空目录 node3。启动前，当前 HAKeeper shard 0 的三成员为 node1 `385028`、node2 `395265`、node3 `477186`，均不含 node0 或 131072；node0 处于停止状态。**仅有原始 bootstrap 配置还在，不足以复现；必须同时满足“初始 ID 已从本地 metadata 删除、当前 shard 已迁出、旧 Raft 文件仍在”这组条件。**
 
 **复现步骤。** 在独立三副本测试集群中先使 node0 长下线，等 HAKeeper 将其原始 ID 131072 从当前成员表移除；恢复 node0 后等待 `L/Kill ...:0:131072:0` 的本地 metadata 清理完成。再次让 node0 长下线，启动空目录替补并等它获得新的 HAKeeper 副本，使 node0 不再承载当前 shard 0。保留 node0 原配置和原数据目录，在另外三个投票节点正常运行时重启 node0。对本次已形成上述前提的隔离目录，直接执行：
@@ -218,7 +220,7 @@ python3 "$root/reproduce_bootstrap_zombie.py" "$root" \
 
 ## 缺陷记录：存活两票时在途 Append 仍等待单次 1 分钟超时（2026-11-04）
 
-跟踪：[matrixorigin/matrixone#32131](https://github.com/matrixorigin/matrixone/issues/32131)。
+跟踪：[matrixorigin/matrixone#32133](https://github.com/matrixorigin/matrixone/issues/32133)。
 
 **复现条件与步骤。** 使用上一节的全新集群、默认 5 分钟 store 过期阈值，三个数据与 HAKeeper 投票副本均正常。以三个 RPC 地址启动 `chaos-client -op cycle -count 0 -try-timeout 1m -retry-window 3m`，对唯一 payload 连续执行 Append→Read；用宿主机 `ss -tnp` 找到该客户端当前保持的 TCP 连接，确认目标是三副本中的一台后，用 `netns.sh <目录> down <节点号>` 双向隔离**这个已连接节点** 75 秒，另外两节点保持互通。恢复网络并等三地址再次显示原三成员表后，重新读取当前客户端连接，轮换目标重复。若隔离的是无客户端连接的节点，不能据此判定是否复现本问题。网络隔离脚本的 `down`/`up` 只操作本轮命名空间的 veth；没有停止其余节点。
 
@@ -228,7 +230,7 @@ python3 "$root/reproduce_bootstrap_zombie.py" "$root" \
 
 ## 缺陷记录：30 秒阈值下健康 Raft 节点被误判过期并收到关停命令（2026-11-04）
 
-跟踪：[matrixorigin/matrixone#32132](https://github.com/matrixorigin/matrixone/issues/32132)。
+跟踪：[matrixorigin/matrixone#32134](https://github.com/matrixorigin/matrixone/issues/32134)。
 
 **环境和复现步骤。** 三套互相独立的空目录三节点集群分别保存在 51 的 `logservice-chaos-heartbeat-repeat{,2,3}-20261104/`，端口基数依次为 56600、56700、56800；各配置 `log-store-timeout = "30s"`，每节点独立网络命名空间。先启动持续三地址 Append→Read 客户端，确认 HAKeeper shard 有三票。隔离当前 HAKeeper leader 约 90 秒、恢复并等待三地址重新看到三成员；记录新的 leader 和各节点在其命名空间内 `ss -tnp` 的 HAKeeper RPC 连接。再隔离**新 leader 或其 HAKeeper 客户端仍连接的节点**约 80–90 秒，始终保留另两台进程及相互网络；每轮记录健康节点的 `failed to send log service heartbeat`、`syshealth/check.go` 的 `Expired logStore info`、HAKeeper 的 `L/shutdown` 生成与服务进程实际退出。第二次隔离前确认存活节点的客户端确实连着将被隔离的地址，是这组复现的关键前提。
 
