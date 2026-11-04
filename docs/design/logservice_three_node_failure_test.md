@@ -354,6 +354,8 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 
 ## 新缺陷：Truncate 接受未来 LSN，之后确认的写入会被快照压缩（2026-11-04 16:16–16:18）
 
+跟踪：[matrixorigin/matrixone#32159](https://github.com/matrixorigin/matrixone/issues/32159)。
+
 **前提与 API 边界。** 仍在上述仅供测试的三副本数据 shard 1 上，用直接 LogService 客户端先查询 `GetLatestLsn()`，然后提交大于 latest 的 `Truncate(target)`。这是刻意构造的越界调用；本次没有 TN/CN，尚未证明正常 TN 会发出未来水位。客户端接口称 truncate 指定 LSN（含该位置）以释放空间；服务端 `store.truncateLog` 只提交命令，`stateMachine.handleTruncateLsn` 只验证相对旧水位单调递增，没有检查当前已应用 index。随后合法的 Append 仍成功返回 `lsn <= target`。snapshot worker 看到已提交的未来水位，就可以导入覆盖这些新记录的 snapshot，并物理压缩它们。直接读取早期记录在快照导入之前曾成功，导入之后三个地址都返回 `invalid log range`。
 
 | 轮次 | Truncate 前 latest → 请求水位 | 已确认但随后三地址不可读的记录 | 水位外仍可读的确认记录 | 结果 |
