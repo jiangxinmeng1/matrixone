@@ -35,6 +35,7 @@ func retryPause(attempt int) {
 func runCycle(
 	client logservice.Client, prefix string, count int,
 	tryTimeout, retryWindow time.Duration, progressFile, stopFile string,
+	pauseReadSeq int, readReadyFile, readReleaseFile string,
 ) error {
 	var appendRetries, readRetries int
 	var maxCycle time.Duration
@@ -73,6 +74,27 @@ func runCycle(
 				return fmt.Errorf("append seq=%d failed after %d attempts and %s: %w", seq, attempt, time.Since(cycleStarted), err)
 			}
 			retryPause(attempt)
+		}
+		if seq == pauseReadSeq {
+			if readReadyFile == "" || readReleaseFile == "" {
+				return fmt.Errorf("paused Read requires both ready and release files")
+			}
+			if err := os.WriteFile(readReadyFile, []byte(fmt.Sprintf("seq=%d lsn=%d\n", seq, index)), 0o644); err != nil {
+				return err
+			}
+			fmt.Printf("read_paused time=%s seq=%d lsn=%d\n", time.Now().Format(time.RFC3339Nano), seq, index)
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				if _, err := os.Stat(readReleaseFile); err == nil {
+					break
+				} else if !os.IsNotExist(err) {
+					return err
+				}
+				if time.Now().After(deadline) {
+					return fmt.Errorf("timed out waiting to release Read seq=%d", seq)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
 		}
 
 		readStarted := time.Now()

@@ -289,3 +289,19 @@ node1 下线后，数据 shard 由 node2 领导，HAKeeper 仍由 node0 领导�
 持续三地址客户端最终 **555/555** 次写读成功，Append 重试 0、Read 重试 1、最大整轮 61.623 秒；另一个两地址客户端 100/100 次成功。最终 `Truncate(426)` 位点确认，三地址从 LSN 427 读回逐行一致，前者仍保留的 **347 条**确认记录按 LSN/payload 核对通过，保留区间无重复 payload。两地址客户端的 100 条均早于截断位点，由其运行中的逐次 Append→Read 校验覆盖，最终读回已不能再次核对这些被截断记录。没有观察到数据丢失、最终读写错误或三成员恢复失败。
 
 原始证据在该目录的 `leader-snapshot-crash.load`、`.progress`、`leader-snapshot-survivors.load`、`final-hakeeper.status`、`final-data.status`、`final.node{0,1,2}.read` 及三个节点的 `stdout.log`；监听脚本为 `snapshot-crash-watch.py`。复算：`python3 analyze_cycle.py leader-snapshot-crash.load --read-log final.node0.read --min-lsn 427 --prefix leader-snapshot-crash-20261104`。测试后已停三进程并撤销测试网络命名空间，保留目录和日志。
+
+## 追加实验：Read 旧连接黑洞中的快速重试对照（2026-11-04）
+
+**代码路径。** `pkg/logservice/service.go` 的 `handleRead` 直接调用 `store.queryLog`；它不决定客户端换地址。`pkg/logservice/client.go` 的 `managedClient.Read` 在 RPC 出错后 `resetClient`，但仅对 shard-not-found 错误在该层自行重试；普通 `EOF`、调用超时会交给调用方。建连时给 MORPC 的 `WithBackendReadTimeout` 传 **0**，没有额外的 backend 读超时来提前判定旧 TCP 黑洞。TN WAL 回放的 `logservicedriver.readFromBackend` 对每次 Read 使用 `DefaultOneTryTimeout = 1m`，失败后指数退避重试，总时限按 `MaxTimeout` 在每次失败后检查，默认 3 分钟并非严格墙钟截止。因此黑洞连接在没有 TCP/服务端早期错误时等到调用方的 1 分钟 deadline 才切换，是**当前实现的结果**；它不说明两票没有服务能力。
+
+**受控注入。** 在 `test/logservice-chaos/client` 增加仅供测试的 `-pause-read-seq`、`-read-ready-file`、`-read-release-file` 参数，使同一 `logservice.NewClient` 在 Append 已成功并拿到 LSN 后、Read 尚未发出时暂停。用宿主机 `ss -tnp` 确认该客户端持有的 TCP 目标，双向断开该目标节点的测试 veth，再放行 Read。每次只隔离一台，另外两台始终存活且互通；完成后恢复网络。这个实验的 2 秒设置是**直接测试客户端参数**，没有修改 MO/TN 的生产默认值。此前真实 leader 崩溃时的一次 Read 等待 60 秒的结果见上一节。
+
+| 客户端单次超时 | 已连接且被隔离的地址 | 首次 Read 的结果 | Read 阶段从放行到核对成功 | 结果 |
+|---|---|---|---|---|
+| 2 秒，第一轮 | node0 `198.18.51.10:57101` | 2000.734 ms 后 `context deadline exceeded` | **3204.537 ms** | 第二次 Read 成功，LSN 789 核对正确。 |
+| 2 秒，第二轮 | node2 `198.18.51.12:57121` | 2000.961 ms 后 `context deadline exceeded` | **3330.323 ms** | 第二次 Read 成功，LSN 945 核对正确。 |
+| 默认 1 分钟对照 | node2 `198.18.51.12:57121` | 60000.428 ms 后 `context deadline exceeded` | **60291.560 ms** | 第二次 Read 成功，LSN 949 核对正确。 |
+
+三轮 Append 均在断网前成功，Read 均在断网后发起并仅重试一次，无最终错误。客户端的整轮 `total_ms` **包含人工暂停**，不能用它估算故障恢复耗时；上表的 `read_ms` 从真正开始 Read 才计时。在无故障网络上，同一 2 秒配置的另外 **150/150** 次 Append→Read 均零重试，最大整轮 **638.310 ms**；这只是本测试负载下的阴性对照，不能证明 2 秒适合所有生产负载。恢复三节点后，从 LSN 789 的三地址读回逐行一致，三条受控请求的 payload 分别在 LSN 789、945、949 核对通过。
+
+证据保存在 `/home/mo/jxm/logservice-chaos-snapshot-leader-20261104/`：`fast-read-{2s,2s-b,60s}.{ready,release,fault,load,stderr}`、`fast-read-baseline.load`、`fast-read-final.node{0,1,2}.read` 和 `chaos-client-fast`。测试脚本修改在 `test/logservice-chaos/client/{main,cycle}.go`。再次核对后已停测试节点并撤销网络命名空间，日志和数据保留。

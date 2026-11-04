@@ -31,8 +31,8 @@ import (
 func main() {
 	runtime.SetupServiceBasedRuntime("logservice-chaos", runtime.DefaultRuntime())
 	defer runtime.CompareAndDeleteServiceBasedRuntime("logservice-chaos", runtime.DefaultRuntime())
-	var addresses, operation, prefix, progressFile, stopFile string
-	var count int
+	var addresses, operation, prefix, progressFile, stopFile, readReadyFile, readReleaseFile string
+	var count, pauseReadSeq int
 	var first, lsn, shard uint64
 	var tryTimeout, maxRetryWindow time.Duration
 	flag.StringVar(&addresses, "addresses", "127.0.0.1:32001", "comma-separated Logservice RPC addresses")
@@ -46,6 +46,9 @@ func main() {
 	flag.DurationVar(&maxRetryWindow, "retry-window", 3*time.Minute, "retry continuation window for load, matching MO WAL default")
 	flag.StringVar(&progressFile, "progress-file", "", "atomically updated verified LSN for cycle")
 	flag.StringVar(&stopFile, "stop-file", "", "stop cycle after the current verified record when this file exists")
+	flag.IntVar(&pauseReadSeq, "pause-read-seq", -1, "cycle sequence to pause after Append and before Read")
+	flag.StringVar(&readReadyFile, "read-ready-file", "", "write the acknowledged LSN here before a paused Read")
+	flag.StringVar(&readReleaseFile, "read-release-file", "", "resume the paused Read when this file exists")
 	flag.Parse()
 	targets := strings.Split(addresses, ",")
 	if operation == "status" {
@@ -113,7 +116,8 @@ func main() {
 			}
 		}
 	case "cycle":
-		err = runCycle(client, prefix, count, tryTimeout, maxRetryWindow, progressFile, stopFile)
+		err = runCycle(client, prefix, count, tryTimeout, maxRetryWindow, progressFile, stopFile,
+			pauseReadSeq, readReadyFile, readReleaseFile)
 		if err != nil {
 			fmt.Printf("final_error time=%s err=%q\n", time.Now().Format(time.RFC3339Nano), err.Error())
 		}
