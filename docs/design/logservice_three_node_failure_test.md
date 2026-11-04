@@ -382,6 +382,8 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 
 ## 新缺陷：导出请求超时后完成，正式 snapshot 目录绕过运行中清理（2026-11-04 17:02–17:05）
 
+跟踪：[matrixorigin/matrixone#32161](https://github.com/matrixorigin/matrixone/issues/32161)。
+
 **真实时序窗口。** 三副本均在线，仅对 node3 普通副本注入约 5 秒 `SIGSTOP`/`SIGCONT`，其他两台继续服务。外部 `inotify` 监听数据 shard 的 `snapshot-<index>-<replica>.generating` 创建事件，在 Dragonboat 刚开始导出时暂停 node3。并行客户端只做正常 Append→Read 和**不超过已确认 LSN** 的 Truncate；没有手工创建或修改 snapshot 目录内容。重现脚本 `test/logservice-chaos/pause_snapshot_export.py` 固定只检查并暂停这套隔离集群的 node3 `mo-service`。每轮先启动监听，再通过合法 Truncate 腾出导出配额并运行写读负载。
 
 | 轮次 | 暂停与返回 | 磁盘及后续清理 |
