@@ -199,3 +199,19 @@ python3 "$root/reproduce_bootstrap_zombie.py" "$root" \
 **再次观察到控制面风险。** 第二轮 node4、node5 虽已组成两票并继续写读，10:49:02 的 `syshealth.Check` 仍将三个含副本的 store 都列为过期，并生成对三个 store 的 `L/shutdown`。node4、node5 在该窗口分别记录 12、20 次 LogService 心跳失败。由于测试配置将 log store 过期阈值设为 **30 秒**（生产默认 5 分钟），这再次复现的是加速阈值下的控制面问题；本轮在客户端完成数据核对后停止测试进程，未等待这些关停命令全部投递，不能声称三节点都实际退出。
 
 证据保存在同一远端目录的 `dual-follower-20261104.*`、`dual-leader-20261104.*` 和 `node-{1,4,5}/stdout.log`。复算两轮分别用 `python3 analyze_cycle.py dual-follower-20261104.load --read-log dual-follower-20261104.node1.read --min-lsn 4151 --prefix dual-follower-20261104`、`python3 analyze_cycle.py dual-leader-20261104.load --read-log dual-leader-20261104.node4.read --min-lsn 4501 --prefix dual-leader-20261104`。已停止本轮隔离进程并撤销其网络命名空间；旧目录与日志保留。
+
+## 追加实验：全新三副本集群的故障组合与默认过期阈值（2026-11-04）
+
+另建完全独立的隔离集群 `/home/mo/jxm/logservice-chaos-fresh-20261104/`，三个空数据目录和三个网络命名空间分别使用 `198.18.51.10:56501`、`.11:56511`、`.12:56521`；`log-store-timeout` 使用默认的 **5 分钟**。数据 shard 1 的三投票 ID 为 node0 `262147`、node1 `262146`、node2 `262145`；HAKeeper shard 0 对应 `131072`、`131073`、`131074`。客户端按 MO WAL 的单次 1 分钟超时、3 分钟继续重试口径，连续执行唯一 payload 的 Append→Read 精确核对。
+
+第一轮先将当时的 HAKeeper leader node2 **双向隔离 70 秒**，数据与控制面均由 node0、node1 保持两票；隔离期间 `Truncate(50)`、`Truncate(200)` 成功。恢复网络后，再同时杀数据 leader node1 与 HAKeeper leader node0，**8 秒后仅恢复 node0**，node1 继续下线约 70 秒；两票期间 `Truncate(400)` 成功，数据 shard 出现 snapshot 导出。node1 最后恢复，三地址均返回原始三成员表。持续客户端 **901/901** 轮成功，Append 底层重试 3 次（`EOF`、`context deadline exceeded`、`timeout` 各一次），Read 重试 0 次，最大整轮 **11.779 秒**，无最终错误。截断位点 400 后，三地址单独读回逐行一致，514 条仍保留的已确认记录按 LSN/payload 核对通过；`seq=497` 的同一 payload 出现在 LSN 511、514，说明重试后可能产生物理重复。
+
+第二轮在持续写读时，并发发起 `Truncate(700)`，随即同时杀 node0、node1，**25 秒只留 node2 一票**；先恢复 node1，使 node1、node2 两票持续运行约 30 秒，再恢复 node0。并发 truncate 返回连接超时，位点仍为 400，因此不能视为已提交；恢复两票后的再次 `Truncate(700)` 成功，查询位点为 700。客户端 **464/464** 轮最终成功，Append 底层重试 5 次（一次 `EOF`、四次 `timeout`），Read 重试 0 次，最大整轮 **29.373 秒**，无最终错误。三地址从 LSN 701 读回逐行一致，464 条已确认记录按 LSN/payload 核对通过；故障边缘 `seq=58` 的同一 payload 占 LSN 985、990。所有节点恢复后，三地址均返回原始三成员表。这一轮验证了暂失多数派时重试会等待、恢复两票后写读与截断可继续，并再次观察到“已提交但回包不确定”的重复物理记录。
+
+两轮没有观察到 `L/shutdown`；这是 5 分钟过期阈值下最长 70 秒故障的结果，不能推断超过阈值后的行为。证据为远端该目录的 `fresh-default-20261104.*`、`quorum-gap-20261104.*`、`node-{0,1,2}/stdout.log`。复算分别执行 `python3 analyze_cycle.py fresh-default-20261104.load --read-log fresh-default-20261104.node0.read --min-lsn 401 --prefix fresh-default-20261104` 和 `python3 analyze_cycle.py quorum-gap-20261104.load --read-log quorum-gap-20261104.node0.read --min-lsn 701 --prefix quorum-gap-20261104`。
+
+第三轮在全新持续客户端运行时，将当时**同时担任数据与 HAKeeper leader** 的 node2 双向网络隔离 **330 秒**（11:03:19–11:08:49），跨越 5 分钟的 log store 过期阈值；node0、node1 始终保持网络互通并成为两个 shard 的新 leader/投票成员。隔离期间 `Truncate(1000)` 成功且查询位点为 1000。约两分钟时，node0、node1 的地址发现查询暂时只列出两成员；仅凭该视图不能认定 Raft 已提交成员移除。恢复网络后，三地址的数据与 HAKeeper shard 查询**均重新列出原始三个 ID**，没有看到新 ID 或旧 ID 的额外投票成员。
+
+持续客户端 **1765/1765** 轮成功，Append/Read 底层重试均为 0，最大整轮 **2.612 秒**，p50/p95/p99 为 **179/317/645 毫秒**；从 LSN 1001 开始的三地址读回逐行一致，1765 条仍保留的已确认记录按 LSN/payload 核对通过，保留区间没有重复 payload。node0、node1 在整个隔离期间持续写读，日志未见 `L/shutdown` 或 LogService 心跳失败；最终三个节点日志均未见 `L/shutdown`。这次**没有复现**前述 30 秒阈值下的错误关停，但只覆盖这一种全新集群、一个 leader 隔离时序，不能排除其他长故障时触发。隔离节点恢复后，其单地址读回与另外两台完全一致。
+
+第三轮证据为同一远端目录的 `expiry-default-20261104.load`、`.progress`、`.network`、`.restored`、`.node{0,1,2}.read` 及三个节点日志。复算：`python3 analyze_cycle.py expiry-default-20261104.load --read-log expiry-default-20261104.node0.read --min-lsn 1001 --prefix expiry-default-20261104`。读回与状态核对后，已停止这套新集群的三个进程并撤销网络命名空间；测试日志和数据目录保留。
