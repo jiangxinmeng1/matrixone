@@ -215,3 +215,25 @@ python3 "$root/reproduce_bootstrap_zombie.py" "$root" \
 持续客户端 **1765/1765** 轮成功，Append/Read 底层重试均为 0，最大整轮 **2.612 秒**，p50/p95/p99 为 **179/317/645 毫秒**；从 LSN 1001 开始的三地址读回逐行一致，1765 条仍保留的已确认记录按 LSN/payload 核对通过，保留区间没有重复 payload。node0、node1 在整个隔离期间持续写读，日志未见 `L/shutdown` 或 LogService 心跳失败；最终三个节点日志均未见 `L/shutdown`。这次**没有复现**前述 30 秒阈值下的错误关停，但只覆盖这一种全新集群、一个 leader 隔离时序，不能排除其他长故障时触发。隔离节点恢复后，其单地址读回与另外两台完全一致。
 
 第三轮证据为同一远端目录的 `expiry-default-20261104.load`、`.progress`、`.network`、`.restored`、`.node{0,1,2}.read` 及三个节点日志。复算：`python3 analyze_cycle.py expiry-default-20261104.load --read-log expiry-default-20261104.node0.read --min-lsn 1001 --prefix expiry-default-20261104`。读回与状态核对后，已停止这套新集群的三个进程并撤销网络命名空间；测试日志和数据目录保留。
+
+## 缺陷记录：存活两票时在途 Append 仍等待单次 1 分钟超时（2026-11-04）
+
+**复现条件与步骤。** 使用上一节的全新集群、默认 5 分钟 store 过期阈值，三个数据与 HAKeeper 投票副本均正常。以三个 RPC 地址启动 `chaos-client -op cycle -count 0 -try-timeout 1m -retry-window 3m`，对唯一 payload 连续执行 Append→Read；用宿主机 `ss -tnp` 找到该客户端当前保持的 TCP 连接，确认目标是三副本中的一台后，用 `netns.sh <目录> down <节点号>` 双向隔离**这个已连接节点** 75 秒，另外两节点保持互通。恢复网络并等三地址再次显示原三成员表后，重新读取当前客户端连接，轮换目标重复。若隔离的是无客户端连接的节点，不能据此判定是否复现本问题。网络隔离脚本的 `down`/`up` 只操作本轮命名空间的 veth；没有停止其余节点。
+
+**三次连续结果。** 同一个客户端依次连接 node1、node2、node0 时隔离对应节点，受影响的 `seq=79/235/378` 第一次 Append 分别在 **60001.127/60000.663/60001.011 毫秒**后返回 `context deadline exceeded`；重连后同一逻辑循环总耗时分别 **60.505/60.520/61.325 秒**，均最终写读成功。隔离期间另两台的 `latest` 继续推进。全程 491 次循环最终成功、Append 底层重试 3 次、Read 重试 0 次；三地址最终读回逐行一致，491 条已确认记录按 LSN/payload 核对通过。三次未知结果的首次写入实际也已提交：同一 payload 分别占 LSN **3263/3267、3423/3427、3570/3573**。因此这里是已确认的可用性长尾与未知结果重试导致物理重复；本轮没有 TN/CN，不能直接断言 SQL 重复执行或 SQL 层同等延迟。
+
+**机制与预期。** Logservice 客户端复用现有 MORPC 连接；数据客户端设置 `WithBackendReadTimeout(0)`，在网络黑洞中可等到本次调用的 1 分钟 context 超时才关闭连接并重新发现其他副本。两票可用且已能推进 LSN 时，请求不应被旧连接无条件拖到调用方的整段超时；同时必须保留 Append “超时但可能已提交”的语义，修复后的重试不能仅凭超时判为未写入。证据在 51 的 `/home/mo/jxm/logservice-chaos-fresh-20261104/`：`tail-repeat-a-20261104.load`、`.progress`、`.node{0,1,2}.read`、`tail-repeat-{a,b,c}-20261104.restored` 和节点日志。复算：`python3 analyze_cycle.py tail-repeat-a-20261104.load --read-log tail-repeat-a-20261104.node0.read --min-lsn 1001 --prefix tail-repeat-a-20261104`。这次**3/3 个已连接目标**复现长尾；未测试所有网络故障形式。
+
+## 缺陷记录：30 秒阈值下健康 Raft 节点被误判过期并收到关停命令（2026-11-04）
+
+**环境和复现步骤。** 三套互相独立的空目录三节点集群分别保存在 51 的 `logservice-chaos-heartbeat-repeat{,2,3}-20261104/`，端口基数依次为 56600、56700、56800；各配置 `log-store-timeout = "30s"`，每节点独立网络命名空间。先启动持续三地址 Append→Read 客户端，确认 HAKeeper shard 有三票。隔离当前 HAKeeper leader 约 90 秒、恢复并等待三地址重新看到三成员；记录新的 leader 和各节点在其命名空间内 `ss -tnp` 的 HAKeeper RPC 连接。再隔离**新 leader 或其 HAKeeper 客户端仍连接的节点**约 80–90 秒，始终保留另两台进程及相互网络；每轮记录健康节点的 `failed to send log service heartbeat`、`syshealth/check.go` 的 `Expired logStore info`、HAKeeper 的 `L/shutdown` 生成与服务进程实际退出。第二次隔离前确认存活节点的客户端确实连着将被隔离的地址，是这组复现的关键前提。
+
+| 独立目录 | 第一次隔离（单独未误关停） | 第二阶段命中的连接与故障 | 健康节点误判和结果 |
+|---|---|---|---|
+| `heartbeat-repeat-20261104` | 原 HAKeeper leader node1 90 秒；恢复后另隔离已成普通副本的 node1 80 秒，均未误关停 | HAKeeper leader node2；确认 node0 的客户端 TCP 连接 node2，再隔离 node2 90 秒 | node0 心跳连续失败；11:29:32 过期检查列出**存活 node0** 和隔离 node2，并为三个 store 生成 `L/shutdown`；node1 收到命令并于 11:29:40 完成进程关停。 |
+| `heartbeat-repeat2-20261104` | 原 leader node1 90 秒，node0/node2 仅各两次心跳失败，未误关停 | 新 leader node2；确认 node0/node1 的客户端 TCP 均连接 node2，再隔离 node2 90 秒 | node0/node1 心跳连续失败；11:34:11 过期检查列出**存活 node0** 和隔离 node2，为三 store 生成 `L/shutdown`；node1 于 11:34:19 完成进程关停。 |
+| `heartbeat-repeat3-20261104` | 原 leader node2 90 秒，node0/node1 仅 2/3 次心跳失败，未误关停 | 新 leader node0；确认 node0 的客户端仍连接普通副本 node1，再隔离 node1 90 秒 | node0/node2 心跳连续失败；11:39:20 过期检查列出**存活 node0** 和隔离 node1，为三 store 生成 `L/shutdown`；**一直未被隔离的 node2** 于 11:39:30 完成进程关停。 |
+
+**稳定性与影响。** 三套独立集群在记录到持续指向故障地址的客户端连接并进行第二阶段隔离后 **3/3 复现**；单次 leader 隔离的对照均未复现，故“任意一票断网 90 秒”并不是充分的复现描述。HAKeeper 的 Raft 两票与数据写读在误判前仍能推进，但共享心跳客户端的请求持续超时，健康 store 的心跳在 30 秒阈值内没有送达新 leader；`syshealth.Check` 随后可错误关停健康节点，进一步减少可用票数。`shouldResetHAKeeperClient` 对调用方 `context.DeadlineExceeded` 不重置共享客户端，与观察到的持续旧连接相符；还需要连接级追踪确认每次请求的完整路由。三轮均使用**加速的 30 秒配置**；前一节的 5 分钟阈值、330 秒隔离没有复现关停，不能声称生产默认阈值必然触发。
+
+远端三目录分别保留 `heartbeat-repeat*.isolated`、`.restored`、`.network`、`.load`、`node-*/stdout.log`；第三套还保留 `heartbeat-repeat3b-20261104.preconnection`。可用 `grep 'failed to send log service heartbeat\|Expired logStore info\|L/shutdown\|Shutdown complete' node-*/stdout.log` 复核时间线。测试结束后已停止这三套隔离集群的测试进程并撤销网络命名空间，证据目录保留。
