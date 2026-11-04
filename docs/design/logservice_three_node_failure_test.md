@@ -379,3 +379,16 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 | node3 下线约 27 秒内持续写入和截断，重启后在 **16:58:18.393** 观察到数据 shard 开始恢复 Raft snapshot index **11513**；随即确认 node2 仍是数据 leader，再杀 node2，约 12 秒后恢复 | **218/218** 次写读成功；故障边缘 Append 出现两次 EOF、一次约 **5.301 秒**的 `context deadline exceeded`，重试后成功；Read 重试 0；最大整轮 **6.777 秒**，7 次 Truncate 成功。 | 水位 11630 后，42 条保留记录核对通过，三地址 SHA256 同为 `b2b17ae2207b5c388a59bf0e85fb28ac14869b2fb98e4d18f01f3f228d87f8a5`；保留区间无重复 payload。数据与 HAKeeper 恢复三成员。 |
 
 最后一轮在 leader 下线时，刚恢复的 node3 正开始安装新 snapshot，观察到客户端短暂重试，但未出现最终错误或已确认记录丢失。这里的“两台存活”是进程数保证；刚重启的副本尚未追上时，不能把两进程等同于持续可提交的两票。最终三节点运行，原始证据在 51 的同一目录：`overlap2-20261104.{load,progress,node{1,2,3}.read}`、`restore-cut-20261104.*`、`restore-leader-cut2-20261104.*`、三台 `stdout.log`，以及对应注入脚本 `overlap2-20261104.py`、`restore-cut-20261104.py`、`restore-leader-cut2-20261104.py`。这组未发现新的独立缺陷；约一分钟 Read 长尾已由 #32148 跟踪。
+
+## 新缺陷：导出请求超时后完成，正式 snapshot 目录绕过运行中清理（2026-11-04 17:02–17:05）
+
+**真实时序窗口。** 三副本均在线，仅对 node3 普通副本注入约 5 秒 `SIGSTOP`/`SIGCONT`，其他两台继续服务。外部 `inotify` 监听数据 shard 的 `snapshot-<index>-<replica>.generating` 创建事件，在 Dragonboat 刚开始导出时暂停 node3。并行客户端只做正常 Append→Read 和**不超过已确认 LSN** 的 Truncate；没有手工创建或修改 snapshot 目录内容。重现脚本 `test/logservice-chaos/pause_snapshot_export.py` 固定只检查并暂停这套隔离集群的 node3 `mo-service`。每轮先启动监听，再通过合法 Truncate 腾出导出配额并运行写读负载。
+
+| 轮次 | 暂停与返回 | 磁盘及后续清理 |
+|---|---|---|
+| 1 | 监听到 `snapshot-0000000000002DB1-477185.generating`（index **11697**）后暂停 5 秒；恢复时 `SyncRequestSnapshot` 返回 `timeout`，node3 日志 **17:02:08.764** 记录 `request export snapshot failed`，没有 index 11697 的 `export snapshot success`。 | Dragonboat 随后生成恰含 `.gbsnap` 和 `snapshot.metadata` 的**有效正式目录** index 11697。`Truncate(11800)` 后 node3 正常导入 index **11785**，该更旧的目录仍在。 |
+| 2 | 再次监听到 index **11993** 的 `.generating`，暂停 5 秒；node3 日志 **17:04:07.264** 再次报 `request export snapshot failed: timeout`，没有 index 11993 的成功登记。 | 第二个有效正式目录 index 11993 出现。随后 `Truncate(12150)`，node3 正常导入 index **12048**；index 11697、11993 两目录**均仍留在磁盘**。 |
+
+这是**2/2 次**受控暂停后“超时却迟到完成、未被运行中 snapshot manager 登记”的复现。最后 node3 数据 shard 的正式导出目录有 **7 个**，超过该测试配置的 `max-exported-snapshot=4`；其中至少上述两个目录在更高 index 的正常导入后仍存在。`store.exportSnapshot` 在 `SyncRequestSnapshot` 返回错误时直接退出，只有成功响应才调用 `snapshotMgr.Add`；`snapshotMgr.Remove` 只遍历内存登记的项目。运行中没有对目录做重新扫描；`snapshotMgr.Init` 在副本启动时会扫描，因此**尚不能断言跨重启仍泄漏**。已经证实的是，进程持续运行且不断出现此类超时/迟到完成时，磁盘正式目录数可绕过配置配额并随事件累积；本测试的 snapshot 很小，未量化生产数据量下的磁盘增长，也未发现读写错误或 WAL 丢失。
+
+两轮正常客户端分别完成 **300/300**、**200/200** 次 Append→Read，重试均为 0。最终水位 12150 后，第二轮保留的 42 条确认记录按 LSN/payload 核对通过，三地址读回 SHA256 均为 `d3aa32f0ee28946f1815bdbc0fbbf35ace81f077569f0c80242261ef43609042`，保留区间无重复 payload；数据 shard 三成员恢复正常。原始证据在 51 同一隔离目录：`pause-snapshot-round{1,2}.log`、`late-export-pause{,2}-20261104.load`、`late-export-pause2-20261104.node{1,2,3}.read`、node3 `stdout.log`，以及磁盘上两个有效正式目录。该问题不同于 #32144 的**带额外标记文件的无效正式目录**；这里两个目录内容有效，问题是请求超时导致运行中管理器没有登记它们。
