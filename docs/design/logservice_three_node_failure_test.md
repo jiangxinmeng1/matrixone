@@ -263,3 +263,15 @@ python3 "$root/reproduce_bootstrap_zombie.py" "$root" \
 第二阶段结束时，node0、node2 的节点日志分别累计记录 **139、102 次** LogService 心跳失败，但未生成 `L/shutdown`。约 6 分钟时 node1 仍隔离，`ss` 显示 node0 的 HAKeeper 客户端已改连存活的 node2；两台的失败计数随后停止增加。全轮持续客户端 **2800/2800** 次写读成功，Append/Read 底层重试均为 0，最大整轮 **3.945 秒**。恢复 node1 后三地址的数据与 HAKeeper shard 均重新列出原始三个 ID；从截断位点 120 后分别读回逐行一致，2800 条已确认记录按 LSN/payload 通过，保留区间无重复 payload。此轮**没有复现** 30 秒加速阈值下的误关停；只能说明这一组 5 分钟阈值、两阶段时序中，客户端最终切换到存活地址。不能据此推断任意默认配置网络故障都安全。
 
 证据保存在 `/home/mo/jxm/logservice-chaos-quota1-20261104/` 的 `default-expiry-stage{1,2}.{isolated,restored,network}`、`default-expiry-stage2.preconnection`、`default-expiry-targeted-20261104.load`、`default-expiry-targeted.node{0,1,2}.read` 以及节点日志。复算：`python3 analyze_cycle.py default-expiry-targeted-20261104.load --read-log default-expiry-targeted.node0.read --min-lsn 121 --prefix default-expiry-targeted-20261104`。核对后已停这套集群的三个进程并撤销网络命名空间，证据目录保留。
+
+## 追加实验：真实导出崩溃形成无效 snapshot 目录（2026-11-04）
+
+**复现方式。** 重新启动前述 `/home/mo/jxm/logservice-chaos-boundary-20261104/` 三副本集群，保持 node0、node2 两票在线。在 node1 的 `exported-snapshot/shard-1/replica-262146/` 目录上用 Linux `inotify` 监听创建和移入事件，收到 `snapshot-<index>-262146.generating` 或其重命名为正式 `snapshot-<index>` 的事件后，立即对 node1 的 `mo-service` 发送 `SIGKILL`。监听脚本保存在远端同目录的 `snapshot-crash-watch.py`；通过把截断位点推进到已有导出快照的 index，触发下一次导出。这是进程崩溃注入，没有人工创建或修改 snapshot 内容，且从头到尾至少两票存活。
+
+**两种中断窗口。** 第一次在 `snapshot-00000000000001C2-262146.generating`（index 450）创建时杀掉 node1，留下**空的临时目录**；原数据目录重启后该临时目录被清理，node1 成功重新导出 index 450，未出现同 index 持续拒绝。这符合 Dragonboat 先写 `*.generating`、完成后才重命名的实现，因此不能把之前人工创建的**空正式目录**视作已由普通进程崩溃复现。
+
+随后两次将中断点改为正式目录的 `IN_MOVED_TO` 事件，分别命中 index **453**（`snapshot-00000000000001C5`）和 **569**（`snapshot-0000000000000239`）。两次杀进程后正式目录都实际含三个文件：`snapshot-<index>.gbsnap`、`snapshot.metadata`、`dragonboat.snapshot.message`。最后一个是 Dragonboat 在提交后尚未来得及删除的标记文件；LogService 的 `snapshotItem.Valid` 要求恰好两个文件，`snapshotManager.Init` 又忽略加入无效快照时的错误。原目录重启后，坏目录仍在，node1 的同 index 导出连续返回 `request rejected`：第一次 **26 次**（14:04:19–14:04:48），第二次 **18 次**（14:06:28–14:06:48）。这是两次独立导出窗口的 **2/2 正式目录残留与重启后持续拒绝**；监听式杀进程控制了具体时机，不代表随机重启也有同样概率。
+
+**影响与恢复。** 第一次正式目录残留时，在没有新业务写入的约 29 秒内 node1 未成功导出；继续写入 100 条后，应用 index 前进，node1 从 index 455 起重新成功导出，坏目录仍留在磁盘。三地址从 LSN 451 读回逐行一致，100 条确认写入按 LSN/payload 核对通过；随后 `Truncate(500)` 成功，node1 导入 index 459 快照，三地址从 501 读回一致，54 条仍保留的确认写入核对通过。第二次重启后仍可在三地址查询到原三成员表。已证实的是静默 shard 的同 index 导出会持续拒绝、错误日志和坏目录不会自愈；**没有观察到数据丢失或本次有写入后的截断失败**。更长时间静默时的磁盘占用影响未量化。
+
+证据在 51 的 `/home/mo/jxm/logservice-chaos-boundary-20261104/`：监听脚本、`node-1/stdout.log`、`real-snapshot-crash-20261104.append`、`real-snapshot-crash.node{0,1,2}.read`、`real-snapshot-crash-after-truncate.node{0,1,2}.read`，以及 node1 磁盘上的两个带标记文件的正式目录。复算：`python3 /home/mo/jxm/logservice-chaos-fresh-20261104/verify.py --min-lsn 451 real-snapshot-crash.node0.read real-snapshot-crash-20261104.append`，再以 `--min-lsn 501` 核对截断后读回。测试后已停三进程并撤销测试网络命名空间，保留磁盘现场。
