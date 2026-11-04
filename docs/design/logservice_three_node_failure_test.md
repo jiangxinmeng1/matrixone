@@ -243,3 +243,23 @@ python3 "$root/reproduce_bootstrap_zombie.py" "$root" \
 **稳定性与影响。** 三套独立集群在记录到持续指向故障地址的客户端连接并进行第二阶段隔离后 **3/3 复现**；单次 leader 隔离的对照均未复现，故“任意一票断网 90 秒”并不是充分的复现描述。HAKeeper 的 Raft 两票与数据写读在误判前仍能推进，但共享心跳客户端的请求持续超时，健康 store 的心跳在 30 秒阈值内没有送达新 leader；`syshealth.Check` 随后可错误关停健康节点，进一步减少可用票数。`shouldResetHAKeeperClient` 对调用方 `context.DeadlineExceeded` 不重置共享客户端，与观察到的持续旧连接相符；还需要连接级追踪确认每次请求的完整路由。三轮均使用**加速的 30 秒配置**；前一节的 5 分钟阈值、330 秒隔离没有复现关停，不能声称生产默认阈值必然触发。
 
 远端三目录分别保留 `heartbeat-repeat*.isolated`、`.restored`、`.network`、`.load`、`node-*/stdout.log`；第三套还保留 `heartbeat-repeat3b-20261104.preconnection`。可用 `grep 'failed to send log service heartbeat\|Expired logStore info\|L/shutdown\|Shutdown complete' node-*/stdout.log` 复核时间线。测试结束后已停止这三套隔离集群的测试进程并撤销网络命名空间，证据目录保留。
+
+## 追加实验：读取边界、不完整快照目录与配额超时（2026-11-04）
+
+另建 5 分钟过期阈值的独立三副本集群 `/home/mo/jxm/logservice-chaos-boundary-20261104/`，三个 RPC 地址为 `198.18.51.10:56901`、`.11:56911`、`.12:56921`。确认三地址均为数据 shard 三成员后，顺序写入 100 条，最后一条用户记录 LSN 105，随后 `latest=106`。三地址从 105 读取均返回该条，从 106、107、110 读取均正常返回空结果；从远超尾部的 1000 读取均返回 `invalid log range`。这只是本次直接客户端的接口边界观察，不能据此断定远未来 LSN 请求必须成功。
+
+在 `Truncate(50)` 后，三节点各导出 index 123 的快照。杀普通副本 node1，在其 `exported-snapshot/shard-1/replica-262146/` 下人为创建空目录 `snapshot-000000000000007C`（index 124），保留真正的 index 123 快照，再用原数据目录重启 node1。node1 仍回到原三成员表，但在静默 shard 上从 12:00:42 起，每次截断 tick 的 `SyncRequestSnapshot` 都返回 `request rejected`；另外两节点继续成功导出。测试专用空目录于 12:01:20 移除后，node1 于 12:01:22 成功导出 index 124。第二次同法创建空 index 125 目录：重启后再次出现拒绝；**保留**该空目录并继续写入 200 条时，快照导出绕过该 index，在更高 index 成功，空目录仍留在磁盘。`Truncate(200)` 后三节点均完成 snapshot 导入，三地址从 201 读回逐行一致，125 条仍保留的确认记录按 LSN/payload 通过。这个注入证明最终导出目标目录的残留物可阻塞静默 shard 的同 index 重试；**尚未证明正常进程崩溃会形成相同的空最终目录**，不能直接归因于已测的真实 crash 窗口。`snapshotManager.Init` 对扫描到的无效目录忽略 `snapshots.add` 的错误，因而不会在启动时清理或显式拒绝这类残留。
+
+在同一集群导出配额为 4、node1 恰有四个有效快照 index 328–331 时，将 node1 双向隔离 **30 秒**，保留 node0、node2 两票。node1 的 `getTruncatedLsn` 读取超时一次，配额逃生分支删除最新的 index **331**，保留 328–330；恢复网络后继续写入 100 条并 `Truncate(350)`，三节点均再次导出并导入快照。从 351 的三地址读回逐行一致，83 条仍保留的确认记录按 LSN/payload 通过，查询截断位点为 350。
+
+为覆盖源码中 `MaxExportedSnapshot=1` 的独立分支，又建 `/home/mo/jxm/logservice-chaos-quota1-20261104/`（端口 `57001/57011/57021`，5 分钟 store 过期阈值）。三节点写入 100 条并 `Truncate(50)` 后各有唯一 index 107 导出快照；隔离 node1 30 秒，触发一次 `getTruncatedLsn` 超时，日志**没有** `DropNewest`，磁盘仍保留唯一快照。恢复网络、再写 100 条和 `Truncate(120)` 后三节点均完成导入，从 121 起三地址读回一致，88 条仍保留的确认记录按 LSN/payload 通过。本轮未测在隔离持续数小时且只有一个快照时 WAL 的空间增长上限。
+
+上述两目录留有 `read-boundary-*`、`partial-snapshot*`、`partial-load-*`、`quota-partition-*`、`quota1-partition-*`、`quota-recovery*` 及各节点日志；可用 `verify.py --min-lsn <截断位点+1> <单地址读回> <写入日志...>` 重做确认记录核对。`boundary` 集群核对后已停进程并撤销网络命名空间，日志和数据目录保留。
+
+## 追加实验：默认 5 分钟阈值的定向 HAKeeper 连接隔离（2026-11-04）
+
+沿用上述 `max-exported-snapshot=1` 的隔离集群，但此轮只验证控制面心跳；`log-store-timeout` 为 **5 分钟**。启动持续三地址 Append→Read 客户端后，先双向隔离 HAKeeper leader node0 **90 秒**（12:09:08–12:10:38），node1、node2 当选新 leader 并保持两票。恢复 node0 和三成员视图后，确认新 leader node2 的 HAKeeper 客户端 TCP 仍连接普通副本 node1；再隔离 node1 **390 秒**（12:11:08–12:17:38），始终保持 node0、node2 进程及相互网络在线。这次满足此前 30 秒阈值误关停测试的“新 leader 客户端仍连接故障地址”前提，而不仅是简单隔离 leader。
+
+第二阶段结束时，node0、node2 的节点日志分别累计记录 **139、102 次** LogService 心跳失败，但未生成 `L/shutdown`。约 6 分钟时 node1 仍隔离，`ss` 显示 node0 的 HAKeeper 客户端已改连存活的 node2；两台的失败计数随后停止增加。全轮持续客户端 **2800/2800** 次写读成功，Append/Read 底层重试均为 0，最大整轮 **3.945 秒**。恢复 node1 后三地址的数据与 HAKeeper shard 均重新列出原始三个 ID；从截断位点 120 后分别读回逐行一致，2800 条已确认记录按 LSN/payload 通过，保留区间无重复 payload。此轮**没有复现** 30 秒加速阈值下的误关停；只能说明这一组 5 分钟阈值、两阶段时序中，客户端最终切换到存活地址。不能据此推断任意默认配置网络故障都安全。
+
+证据保存在 `/home/mo/jxm/logservice-chaos-quota1-20261104/` 的 `default-expiry-stage{1,2}.{isolated,restored,network}`、`default-expiry-stage2.preconnection`、`default-expiry-targeted-20261104.load`、`default-expiry-targeted.node{0,1,2}.read` 以及节点日志。复算：`python3 analyze_cycle.py default-expiry-targeted-20261104.load --read-log default-expiry-targeted.node0.read --min-lsn 121 --prefix default-expiry-targeted-20261104`。核对后已停这套集群的三个进程并撤销网络命名空间，证据目录保留。
