@@ -345,3 +345,23 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 | node1、node2 都恢复历史 ID；全停后**先启动干净 node3，等 5 秒**，再启动 node1/node2 | node3 单票查询数据 shard 返回 `shard not found`；node1、node2 随后均 `panic: shard already exist`，集群无法形成多数派。只让一台干净节点先上线，不足以提供这条启动自检所需的可用成员视图。恢复 node1/node2 的干净 metadata 后，三节点再次正常；LSN 9451 起读回与本轮停机前 SHA256 同为 `ddd3c72e073de64a5a4793dc1f229392e44f4f006caa60b39e9731a38d5f3850`，又新增 3 条写入成功（LSN 9852–9854）。 |
 
 最终三个 RPC 地址对两个 shard 均返回原三投票成员；从 LSN 9838 起分别经 node1/node2/node3 单地址读回的 SHA256 全为 `bccf299444cd5a8911e76f72948ed86ce283310b854521854b98042352b3f815`。远端证据为 `cold-matrix-20261104.*`、各节点 `stdout.log`、原始 `mo-logservice.metadata.before-cold-recovery`。这个矩阵强化了 #32151 的根因边界：关键是本地同 shard 多 ID 与启动时缺少可用同伴视图的组合；它不说明所有正常三节点冷启动都会失败。
+
+## 追加实验：落后副本通过 Raft snapshot 追赶（2026-11-04 16:13–16:15）
+
+在原隔离三副本集群，启动三地址持续 Append→Read 客户端，普通副本 node1 下线时最后确认 LSN 约 9882。node2、node3 两票持续写读，先 `Truncate(9850)` 释放旧导出快照配额，再将已核对写入之后的水位推进到 9910；两票分别导入数据 shard snapshot index **9901**、**9900**，均已越过 node1 下线前位置。随后在 node1 尚未超过 30 秒测试过期阈值时按原目录重启，Dragonboat 日志记录它从本地 snapshot 7826 恢复、收到并恢复 leader 传来的 snapshot **9900**。它的本地截断 worker 随后还记录了一次旧导出快照 index 9589 的“导入成功”；这条日志并未证明活动恢复点倒退：再杀并启动 node1 后，Dragonboat 仍从 index **9900** 恢复。
+
+客户端 **350/350** 次 Append→Read 最终成功，Append/Read 重试均为 0，最大单轮约 **1.114 秒**。截断水位 9910 后，从 9911 读取的 node1 数据与 node2 在 node1 第二次重启前的基线 SHA256 同为 `dae4dcff2fcfd2ff0b23d7ba631cb58c9bf799378122ba2da2e7ebe23f975907`；三个 RPC 地址仍返回原三成员。证据在远端 `catchup-20261104.load`、`.progress`、`.before-restart.read`、`.after-restart.read` 与 node1–3 日志。这个用例证明本轮真实跨越物理压缩点的副本追赶成功，没有发现新的数据错误。
+
+## 新缺陷：Truncate 接受未来 LSN，之后确认的写入会被快照压缩（2026-11-04 16:16–16:18）
+
+**前提与 API 边界。** 仍在上述仅供测试的三副本数据 shard 1 上，用直接 LogService 客户端先查询 `GetLatestLsn()`，然后提交大于 latest 的 `Truncate(target)`。这是刻意构造的越界调用；本次没有 TN/CN，尚未证明正常 TN 会发出未来水位。客户端接口称 truncate 指定 LSN（含该位置）以释放空间；服务端 `store.truncateLog` 只提交命令，`stateMachine.handleTruncateLsn` 只验证相对旧水位单调递增，没有检查当前已应用 index。随后合法的 Append 仍成功返回 `lsn <= target`。snapshot worker 看到已提交的未来水位，就可以导入覆盖这些新记录的 snapshot，并物理压缩它们。直接读取早期记录在快照导入之前曾成功，导入之后三个地址都返回 `invalid log range`。
+
+| 轮次 | Truncate 前 latest → 请求水位 | 已确认但随后三地址不可读的记录 | 水位外仍可读的确认记录 | 结果 |
+|---|---:|---:|---:|---|
+| 初次手动注入 | 10245 → 10263 | 第一条 10249；另有 10251、10255、10258、10260、10262 均已成功 Append | 10265、10268 | 三节点分别导入 index 10255–10263 附近的正式 snapshot；从 10249 读取三地址均报 `invalid log range`。 |
+| 独立重复 1 | 10276 → 10294 | 10281 | 10297 | 9 次 Append 均成功；三地址从 10281 均报 `invalid log range`，从 10297 均能读到对应 payload。 |
+| 独立重复 2 | 10313 → 10331 | 10318 | 10333 | 9 次 Append 均成功；三地址从 10318 均报 `invalid log range`，从 10333 均能读到对应 payload。 |
+
+这是**3/3 轮**可控复现的已确认写入不可读。直接风险是错误的未来水位一旦被接受，就会提前删除随后成功返回的 WAL；即使上层调用方应保证水位正确，LogService 不应在当前日志尾部之外接受会影响未来写入的截断。建议在 Raft 状态机应用截断命令时使用同一条命令的 `e.Index` 验证 `requestedLSN <= e.Index`，并返回可识别的参数错误；仅在客户端先查 latest 再检查有并发竞态，不能作为唯一保护。精确允许边界还应覆盖 `requestedLSN == e.Index` 与当前数据日志尾部的区别。
+
+远端证据在 `future-truncate-20261104.{before,plan,truncate,watermark,append,from-first.read,from-first.err,after-watermark.read}`、`future-truncate-paced-20261104.*`、`future-repeat-20261104.log` 和目录 `future-repeat-20261104/`，以及三个节点的 `stdout.log`。重复脚本为 `test/logservice-chaos/reproduce_future_truncate.py`；它限定只能作用于这套隔离目录。测试结束时最新 LSN 已超过故障注入水位，三个节点仍运行；此前被提前压缩的测试 payload 无法恢复。
