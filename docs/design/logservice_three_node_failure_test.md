@@ -266,6 +266,8 @@ python3 "$root/reproduce_bootstrap_zombie.py" "$root" \
 
 ## 追加实验：真实导出崩溃形成无效 snapshot 目录（2026-11-04）
 
+跟踪：[matrixorigin/matrixone#32144](https://github.com/matrixorigin/matrixone/issues/32144)。
+
 **复现方式。** 重新启动前述 `/home/mo/jxm/logservice-chaos-boundary-20261104/` 三副本集群，保持 node0、node2 两票在线。在 node1 的 `exported-snapshot/shard-1/replica-262146/` 目录上用 Linux `inotify` 监听创建和移入事件，收到 `snapshot-<index>-262146.generating` 或其重命名为正式 `snapshot-<index>` 的事件后，立即对 node1 的 `mo-service` 发送 `SIGKILL`。监听脚本保存在远端同目录的 `snapshot-crash-watch.py`；通过把截断位点推进到已有导出快照的 index，触发下一次导出。这是进程崩溃注入，没有人工创建或修改 snapshot 内容，且从头到尾至少两票存活。
 
 **两种中断窗口。** 第一次在 `snapshot-00000000000001C2-262146.generating`（index 450）创建时杀掉 node1，留下**空的临时目录**；原数据目录重启后该临时目录被清理，node1 成功重新导出 index 450，未出现同 index 持续拒绝。这符合 Dragonboat 先写 `*.generating`、完成后才重命名的实现，因此不能把之前人工创建的**空正式目录**视作已由普通进程崩溃复现。
