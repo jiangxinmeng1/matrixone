@@ -184,3 +184,18 @@ python3 "$root/reproduce_bootstrap_zombie.py" "$root" \
 **控制面附带发现。** 第二次隔离前，node4 已于 10:36:19 当选 HAKeeper leader；第二次隔离期间，node4 日志在 10:37:20–10:38:03 连续记录 **18 次** LogService 心跳失败，仍反复尝试隔离中的 node1 HAKeeper 地址。尽管 node4、node5 的进程及数据 Raft 两票在运行，HAKeeper 的 `syshealth.Check` 于 10:38:03 将含副本的三个 store 都列为过期，并为六个曾出现的 store 生成 `L/shutdown`。node5 在 10:38:42 收到命令，10:38:47 开始主动退出；客户端 `seq=334` 的 `EOF` 与此时间重合。node1、node4 未收到退出命令，仍继续提供两票写读；10:41:33 主动重启 node5 后，三地址再次返回原三成员表。代码中 HAKeeper 客户端在调用方 `context.DeadlineExceeded` 时不会重置共享连接；结合这次持续发往 node1 的日志，心跳路由未在过期阈值内稳定切到存活 leader 是合理解释，仍需用连接级跟踪确认全部重试路径。**本测试把 log store 过期阈值设为 30 秒，生产默认是 5 分钟**；本轮只证明这一加速配置下的行为，尚未证明默认阈值也会触发关停。
 
 证据保存在 `/home/mo/jxm/logservice-chaos-netns-long-20261103-d61a7206/` 的 `latency-20261104-a.load`、`.progress`、`.node1.read`、`.node4.read`、`latency-20261104-post.append`、`.read` 与 `node-{1,4,5}/stdout.log`。复算：`python3 analyze_cycle.py latency-20261104-a.load --read-log latency-20261104-a.node4.read --min-lsn 3230 --prefix latency-20261104-a`。测试后已停止这套隔离进程并撤销其网络命名空间；日志与数据目录保留。
+
+## 追加实验：两副本短时下线，再恢复到只缺一票（2026-11-04 10:45–10:49）
+
+重新启动隔离集群 node1、node4、node5，故障前数据 shard 1 与 HAKeeper shard 0 都有三个投票副本、leader 均在 node1。每轮启动持续 Append→Read 客户端后，同时 `SIGKILL` 两个测试节点，约 **5 秒**后仅恢复其中一个；在另一节点仍下线、只剩两票期间继续写读并执行 truncate。单副本继续下线阶段分别持续约 **46 秒、39 秒**，随后才恢复最后一个进程。用前一轮相同的每次 1 分钟超时和 3 分钟继续重试口径；两轮均为各 350 笔顺序写读，实际下线/恢复时间由 `node.sh` 与远端日志记录。
+
+| 场景 | 失去多数派 → 恢复两票 | 客户端与数据核对 | 两票上的 truncate、snapshot |
+|---|---|---|---|
+| 两个普通副本 node4、node5 下线，恢复 node4，node5 继续下线 | 10:45:58 两台下线，10:46:03 恢复 node4；node1 仍是 leader | 350/350 次最终成功；故障边缘 `seq=17` 先 `EOF`，再约 4.85 秒 `timeout`，第三次成功；最大整轮 **8.059 秒**，无最终错误。三个地址恢复后读取逐行一致，350 笔确认记录按 LSN/payload 通过；同一 payload 在 LSN **4205、4209** 各有一条物理记录。 | node5 继续下线时 `Truncate(4150)` 成功，查询位点 4150；node5 稍后恢复，三个地址均返回原三成员表。 |
+| 数据与 HAKeeper leader node1 加普通副本 node4 下线，恢复 node4，node1 继续下线 | 10:47:56 两台下线，10:48:01 恢复 node4；数据 shard 改由 node4 领导，HAKeeper shard 改由 node5 领导 | 350/350 次最终成功，底层重试 **0** 次；受影响的 `seq=27` Append 等待 **8.350 秒**后直接成功，最大整轮 **8.352 秒**。node4、node5 单地址读取逐行一致，350 笔确认记录按 LSN/payload 通过，保留区间无重复 payload。 | node1 继续下线时 `Truncate(4500)` 成功，查询位点 4500；node4、node5 随后均记录数据 shard snapshot 导出。 |
+
+这两轮说明短时两票下线时请求可能报错或等待，恢复一票形成 2/3 多数派后持续写读、截断和 snapshot 能继续；`EOF` 后重试的写入仍要按内容对账，不能假定第一次没有提交。第二轮 node1 约 39 秒后重启，观察窗口内它的两个 shard 查询均为 `ok=false`，node4/node5 的查询视图只列出两票；该视图可能因 gossip 过期而暂时遗漏 node1，不能据此断言 Raft 成员变更已提交。本轮没有验证 node1 最终重新出现在三地址的查询视图。
+
+**再次观察到控制面风险。** 第二轮 node4、node5 虽已组成两票并继续写读，10:49:02 的 `syshealth.Check` 仍将三个含副本的 store 都列为过期，并生成对三个 store 的 `L/shutdown`。node4、node5 在该窗口分别记录 12、20 次 LogService 心跳失败。由于测试配置将 log store 过期阈值设为 **30 秒**（生产默认 5 分钟），这再次复现的是加速阈值下的控制面问题；本轮在客户端完成数据核对后停止测试进程，未等待这些关停命令全部投递，不能声称三节点都实际退出。
+
+证据保存在同一远端目录的 `dual-follower-20261104.*`、`dual-leader-20261104.*` 和 `node-{1,4,5}/stdout.log`。复算两轮分别用 `python3 analyze_cycle.py dual-follower-20261104.load --read-log dual-follower-20261104.node1.read --min-lsn 4151 --prefix dual-follower-20261104`、`python3 analyze_cycle.py dual-leader-20261104.load --read-log dual-leader-20261104.node4.read --min-lsn 4501 --prefix dual-leader-20261104`。已停止本轮隔离进程并撤销其网络命名空间；旧目录与日志保留。
