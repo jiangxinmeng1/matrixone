@@ -307,3 +307,29 @@ node1 下线后，数据 shard 由 node2 领导，HAKeeper 仍由 node0 领导�
 三轮 Append 均在断网前成功，Read 均在断网后发起并仅重试一次，无最终错误。客户端的整轮 `total_ms` **包含人工暂停**，不能用它估算故障恢复耗时；上表的 `read_ms` 从真正开始 Read 才计时。在无故障网络上，同一 2 秒配置的另外 **150/150** 次 Append→Read 均零重试，最大整轮 **638.310 ms**；这只是本测试负载下的阴性对照，不能证明 2 秒适合所有生产负载。恢复三节点后，从 LSN 789 的三地址读回逐行一致，三条受控请求的 payload 分别在 LSN 789、945、949 核对通过。
 
 证据保存在 `/home/mo/jxm/logservice-chaos-snapshot-leader-20261104/`：`fast-read-{2s,2s-b,60s}.{ready,release,fault,load,stderr}`、`fast-read-baseline.load`、`fast-read-final.node{0,1,2}.read` 和 `chaos-client-fast`。测试脚本修改在 `test/logservice-chaos/client/{main,cycle}.go`。再次核对后已停测试节点并撤销网络命名空间，日志和数据保留。
+
+## 追加实验：单副本恢复与三副本整组冷重启（2026-11-04 15:09–15:15）
+
+**目的与前提。** 在原独立测试集群 `/home/mo/jxm/logservice-chaos-20261103-d61a7206/` 中核实单副本、整组三副本重启分别如何使用已导入的正式 snapshot。起始时 node1、node2、node3 均为两个 shard 的投票成员；数据 shard 1 的成员分别为 `385027`、`395266`、`477185`，leader 在 node2；HAKeeper shard 0 的成员分别为 `385028`、`395265`、`477186`。起始 `TruncatedLsn=7621`，`latest=9285`。本轮没有清空任何 Raft 目录。
+
+**单副本恢复。** 三地址客户端以唯一 payload 连续做 500 次 Append→Read，期间将普通副本 node3 `SIGKILL` 约 10 秒，再从原目录启动。node1、node2 保持在线。恢复后三个地址仍返回原数据成员表；负载最终 `500/500` 次成功、Append 底层 `EOF` 重试 1 次、Read 重试 0 次，无最终错误。整轮 p50/p95/p99 为 **162/245/587 ms**，最大 **1.102 s**。负载期间 `Truncate(9450)` 成功，查询水位为 9450。此段测试说明单副本从旧目录重启后可继续追赶，但没有证明它必须走 snapshot 安装而非保留日志回放。
+
+**整组冷重启发现的启动故障。** 500 次结束后，从 9451 读取保留区间作基线（338 条用户记录），同时 `SIGKILL` 三个进程；确认三进程全停后，以原配置和原目录依次启动。node3 留在运行状态，但 node1 和 node2 启动后不到一秒均退出，两个 RPC 地址拒绝连接，node3 单票不能组成多数派；客户端连接超时。这是本轮**未被正常请求重试掩盖的集群不可用错误**，不是数据快照损坏。
+
+node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：node1 为 `131073`、`374786`、当前 `385028`；node2 为 `131074`、当前 `395265`。冷启动时其他地址尚未提供成员表，`checkZombieReplicas` 的自检无权威回复，按当前实现将这些历史记录都暂当有效；`startReplicas` 先启动旧 shard 0 ID，再尝试在同一 NodeHost 启动当前 shard 0 ID，返回 `shard already exist`，`cmd/mo-service` 在 `NewService` 错误处 panic。两台都记录了上述 panic，且各自 HAKeeper 旧 ID 曾在退出前从本地 Raft 文件回放。**仅把配置中的 `bootstrap-cluster` 设为 `false` 再试，仍然发生同样 panic**；故障发生在 `NewService/startReplicas`，早于后续 bootstrap 路径。对应代码在 `pkg/logservice/store.go` 的 `checkZombieReplicas`、`startReplicas`。该实验只有这一次整组冷重启，尚未在全新集群复测概率。
+
+**隔离环境恢复与校验。** 为避免丢失原证据，先将 node1/node2 的 metadata 各备份为 `mo-logservice.metadata.before-cold-recovery`，用 `test/logservice-chaos/recover_metadata.py` 仅保留停机前已核实的当前 HAKeeper 与数据副本 ID；没有更改 Raft 日志或 snapshot 文件。使用 `bootstrap-cluster=false` 的临时配置重启 node1/node2 后，三个进程均存活，两个 shard 的三地址成员表恢复一致，截断水位仍为 9450。Dragonboat 日志明确显示数据副本从**已导入的正式 snapshot** 恢复：node1 index **7826**、node2 **7825**、node3 **8464**；之后重放日志。三个单地址从 9451 的读回均与停机前 338 条基线逐字节相同（SHA256 `d4818258a14706d89e791699c4a5b0609f125787f7e92cdf64acd664d0c322bd`），338 条仍保留的确认记录按 LSN/payload 全部通过，没有重复 payload。恢复后新写入 10 条（LSN 9801–9810）均成功并读回正确。
+
+**对照冷重启。** 保留原 metadata 备份，再将过滤后的三个测试节点全部停下并按临时配置冷启动第二轮。这次三个进程均保持运行，数据与 HAKeeper shard 的三地址成员表均一致；从 9451 读回的三份结果与第二次停机前基线完全相同（SHA256 `de4113707e5da6b657c937fb0e952c38be179febb11e17a4561b0078816c4cb7`），又成功追加 3 条（LSN 9819–9821）。这支持“历史 ID 与启动自检不可用的组合导致第一次失败”的判断；但第二轮还使用了临时 `bootstrap-cluster=false`，不能单独量化配置因素对其他启动路径的影响。第一次只把这个值改成 `false`、而未过滤 metadata 时仍 panic。
+
+**影响与边界。** 已证实的缺陷是：当历史副本 ID 仍在本地 metadata，且整个控制面同停导致启动自检暂时不可用时，多个 LogStore 可因同 shard 重复启动而退出，从而无法自行形成多数派。单节点重启、旧目录替补测试不能覆盖这一冷启动前提。手工过滤 metadata 只用于这个隔离测试集群的恢复，不是建议的线上修复方式；需要在启动逻辑中解决无权威成员表时同 shard 多 ID 的选择，并保护真正首次建群的恢复路径。
+
+远端证据：`restart-20261104.load`、`.progress`、`.before.read`、`.node{1,2,3}.read`、`.clean-before.read`、`.clean-node{1,2,3}.read`、对应 `node-{1,2,3}/stdout.log`，以及两份 `mo-logservice.metadata.before-cold-recovery`。复算：`python3 analyze_cycle.py restart-20261104.load --read-log restart-20261104.node1.read --min-lsn 9451 --prefix restart-20261104`。测试结束时 node1、node2、node3 均运行；node1/node2 目前使用临时 `bootstrap-cluster=false` 配置，原始 TOML 未修改。
+
+### 稳定复现：三轮整组冷启动（2026-11-04 15:26–15:28）
+
+跟踪：[matrixorigin/matrixone#32151](https://github.com/matrixorigin/matrixone/issues/32151)。
+
+使用 `test/logservice-chaos/reproduce_cold_restart.py` 在上述隔离目录重复三轮。每轮先确认三进程均运行并保存 9451 起的读回基线，再同时停掉 node1、node2、node3，等待 Dragonboat 目录锁释放，将先前备份的**原始** `mo-logservice.metadata.before-cold-recovery` 复制回 node1/node2（保留 Raft 文件与原配置不变），随后以原配置启动三个节点。每轮 node1/node2 都在启动阶段记录 `panic: shard already exist` 并退出，node3 保持运行：**3/3 轮、两台各 3/3 次**。这组重复排除了前述测试脚本过早启动时遇到的 `failed to lock data directory` 干扰；该干扰轮不计入复现。随后每轮停 node3、恢复事先保存的仅含当前 ID 的 metadata，使用临时 `bootstrap-cluster=false` 配置重启三节点，三地址恢复可用；从 9451 起的 351 条读回与基线 SHA256 `bb28f629f8e5fa5378904365d1c64fab8f1cc3e806df9b06b4db64e2a733c5ac` 在三轮均一致。最后三进程运行、两个 shard 的多数派恢复。原始失败 metadata 及代码流程证据均保留。
+
+完整输出在远端 `cold-repeat-verified2-20261104.log` 和 node1/node2 的 `stdout.log`；重复命令：`python3 /home/mo/jxm/logservice-chaos-20261103-d61a7206/reproduce_cold_restart.py /home/mo/jxm/logservice-chaos-20261103-d61a7206 --rounds 3`。脚本只适用于这个隔离目录，运行前要求三节点都在线，并依赖原始 metadata 备份。
