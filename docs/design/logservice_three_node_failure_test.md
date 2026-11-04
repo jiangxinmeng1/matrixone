@@ -277,3 +277,15 @@ python3 "$root/reproduce_bootstrap_zombie.py" "$root" \
 **影响与恢复。** 第一次正式目录残留时，在没有新业务写入的约 29 秒内 node1 未成功导出；继续写入 100 条后，应用 index 前进，node1 从 index 455 起重新成功导出，坏目录仍留在磁盘。三地址从 LSN 451 读回逐行一致，100 条确认写入按 LSN/payload 核对通过；随后 `Truncate(500)` 成功，node1 导入 index 459 快照，三地址从 501 读回一致，54 条仍保留的确认写入核对通过。第二次重启后仍可在三地址查询到原三成员表。已证实的是静默 shard 的同 index 导出会持续拒绝、错误日志和坏目录不会自愈；**没有观察到数据丢失或本次有写入后的截断失败**。更长时间静默时的磁盘占用影响未量化。
 
 证据在 51 的 `/home/mo/jxm/logservice-chaos-boundary-20261104/`：监听脚本、`node-1/stdout.log`、`real-snapshot-crash-20261104.append`、`real-snapshot-crash.node{0,1,2}.read`、`real-snapshot-crash-after-truncate.node{0,1,2}.read`，以及 node1 磁盘上的两个带标记文件的正式目录。复算：`python3 /home/mo/jxm/logservice-chaos-fresh-20261104/verify.py --min-lsn 451 real-snapshot-crash.node0.read real-snapshot-crash-20261104.append`，再以 `--min-lsn 501` 核对截断后读回。测试后已停三进程并撤销测试网络命名空间，保留磁盘现场。
+
+## 追加实验：数据 leader 导出崩溃与独立 HAKeeper leader（2026-11-04）
+
+另建独立隔离集群 `/home/mo/jxm/logservice-chaos-snapshot-leader-20261104/`，三个数据和 HAKeeper 投票副本，默认 5 分钟 store 过期阈值，`max-exported-snapshot=1`，RPC 端口 57101/57111/57121。先短时重启 node2，使 **HAKeeper shard 0 的 leader 在 node0**、**数据 shard 1 的 leader 在 node1**，三地址均确认两个 shard 仍有三成员。写入 100 条 seed 后启动持续三地址 Append→Read 客户端；对数据 leader node1 的导出父目录监听 `IN_MOVED_TO`，在 index **157** 的正式目录刚由 `*.generating` 重命名时给 node1 发 `SIGKILL`。node0、node2 一直存活且互通；node1 的目录确实留下 `dragonboat.snapshot.message`、`snapshot.metadata` 和 `.gbsnap` 三文件，与上一轮普通副本故障的残留形态相同。
+
+node1 下线后，数据 shard 由 node2 领导，HAKeeper 仍由 node0 领导；两票期间 `Truncate(150)` 成功。另起仅连接 node0/node2 的客户端完成 **100/100** 次 Append→Read，零重试，最大整轮 **0.550 秒**。原三地址客户端在故障边缘 `seq=46` 已成功 Append 到 LSN 158，随后的 **Read 等待约 60.001 秒**才返回 `EOF`，重试后核对成功；这一轮从 Append 到读回共 **61.623 秒**。这把已记录的旧连接 1 分钟长尾扩展到 Read 路径；不是两票失去提交能力，也没有最终客户端错误。恢复 node1 后两个 shard 的三地址视图均重新列出原三个 ID，坏的 index 157 目录仍留在磁盘；持续写入使应用 index 前进，node1 后来成功导出 index 426。
+
+本轮还观察到导出请求超时后的**迟到完成**：node1 恢复追赶时，14:26:55 与 14:26:58 的 `SyncRequestSnapshot` 分别返回 `timeout`，但紧接着磁盘上出现了内容各为 `.gbsnap` 和 `snapshot.metadata` 两文件的有效正式目录 index **400**、**414**；LogService 没有对这两次记录“导出成功”，随后只登记了成功响应的 index 426。执行 `Truncate(426)` 后，node1 导入并删除 index 426，但 index 400/414 仍在磁盘，说明本轮运行中它们未随已登记快照清理。再次重启 node1 后，启动扫描拾取这些目录并导入 index 414，index 400/414 随即被清理；带标记文件的无效 index 157 目录仍保留。这个**单次恢复窗口**表明超时后迟到完成可能暂时绕过 `max-exported-snapshot=1` 的内存配额并留下未登记目录；尚未测量长期不重启时能否持续累积，暂不单列新缺陷。
+
+持续三地址客户端最终 **555/555** 次写读成功，Append 重试 0、Read 重试 1、最大整轮 61.623 秒；另一个两地址客户端 100/100 次成功。最终 `Truncate(426)` 位点确认，三地址从 LSN 427 读回逐行一致，前者仍保留的 **347 条**确认记录按 LSN/payload 核对通过，保留区间无重复 payload。两地址客户端的 100 条均早于截断位点，由其运行中的逐次 Append→Read 校验覆盖，最终读回已不能再次核对这些被截断记录。没有观察到数据丢失、最终读写错误或三成员恢复失败。
+
+原始证据在该目录的 `leader-snapshot-crash.load`、`.progress`、`leader-snapshot-survivors.load`、`final-hakeeper.status`、`final-data.status`、`final.node{0,1,2}.read` 及三个节点的 `stdout.log`；监听脚本为 `snapshot-crash-watch.py`。复算：`python3 analyze_cycle.py leader-snapshot-crash.load --read-log final.node0.read --min-lsn 427 --prefix leader-snapshot-crash-20261104`。测试后已停三进程并撤销测试网络命名空间，保留目录和日志。
