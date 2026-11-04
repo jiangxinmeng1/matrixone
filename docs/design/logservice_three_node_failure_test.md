@@ -394,3 +394,19 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 这是**2/2 次**受控暂停后“超时却迟到完成、未被运行中 snapshot manager 登记”的复现。最后 node3 数据 shard 的正式导出目录有 **7 个**，超过该测试配置的 `max-exported-snapshot=4`；其中至少上述两个目录在更高 index 的正常导入后仍存在。`store.exportSnapshot` 在 `SyncRequestSnapshot` 返回错误时直接退出，只有成功响应才调用 `snapshotMgr.Add`；`snapshotMgr.Remove` 只遍历内存登记的项目。运行中没有对目录做重新扫描；`snapshotMgr.Init` 在副本启动时会扫描，因此**尚不能断言跨重启仍泄漏**。已经证实的是，进程持续运行且不断出现此类超时/迟到完成时，磁盘正式目录数可绕过配置配额并随事件累积；本测试的 snapshot 很小，未量化生产数据量下的磁盘增长，也未发现读写错误或 WAL 丢失。
 
 两轮正常客户端分别完成 **300/300**、**200/200** 次 Append→Read，重试均为 0。最终水位 12150 后，第二轮保留的 42 条确认记录按 LSN/payload 核对通过，三地址读回 SHA256 均为 `d3aa32f0ee28946f1815bdbc0fbbf35ace81f077569f0c80242261ef43609042`，保留区间无重复 payload；数据 shard 三成员恢复正常。原始证据在 51 同一隔离目录：`pause-snapshot-round{1,2}.log`、`late-export-pause{,2}-20261104.load`、`late-export-pause2-20261104.node{1,2,3}.read`、node3 `stdout.log`，以及磁盘上两个有效正式目录。该问题不同于 #32144 的**带额外标记文件的无效正式目录**；这里两个目录内容有效，问题是请求超时导致运行中管理器没有登记它们。
+
+## 追加实验：复用真实 TN WAL driver，未启动 TN/CN（2026-11-04 17:24–17:35）
+
+**环境与入口。** 另建独立三投票副本集群 `/home/mo/jxm/logservice-driver-chaos-20261104/`，节点 RPC 分别为 `127.0.0.1:57401/57411/57421`，HAKeeper store 过期阈值采用默认 5 分钟。只启动三个 LogService 进程；没有启动 TN 或 CN。测试程序 `test/logservice-chaos/tn_driver_probe/main.go` 直接构造 `logservicedriver.NewLogServiceDriver`，使用实际 `logservice.NewClient` 配置、`driver.Replay`、`driver.Append`、`Entry.WaitDone` 和 `driver.Truncate`；每次写入一条带唯一 payload 的正常编码 WAL entry。每个新写入进程先执行 `ReplayForWrite`，独立核对进程执行 `ReplayForRead`。这覆盖 TN 的 WAL driver 到 LogService 的网络、重试和 DSN 回放路径，不模拟 TN 上层事务或 checkpoint。
+
+| 时间线 | 实际 driver 结果 |
+|---|---|
+| 三节点健康基线，写入后关闭 driver，再起新 driver 回放 | 20 条确认写入、20 条顺序回放，DSN 1–20。 |
+| 持续写入并由 driver 每 25 条提出合法截断，普通副本 node1 下线后恢复；恢复约 0.3 秒又杀数据 leader node0，约 12 秒后恢复 | 所有写入最终确认，两个阶段共推进到 DSN 462；一次 `WAL-Commit-Append` 内部重试 2 次，耗时 **6.280 秒**。driver 的异步截断推进至物理 PSN 454，三地址从 PSN 455 的直接读回 SHA256 相同。新 driver 回放保留的 DSN 392–462，共 71 条，与确认 payload 逐条一致。两个节点进程始终在运行，但刚恢复节点是否已追上不能仅由进程数保证。 |
+| 持续写入时用 `ss -tnp` 确认 driver 进程实际连到数据 leader node2，再将 node2 `SIGSTOP` 70 秒，node0/node1 继续运行；90 秒自动 `SIGCONT` 作为安全兜底 | 暂停前确认到 DSN 525。下一次 `Append` 经默认单次约 **1 分钟**超时后，由 driver 重连并成功确认 DSN 526，单条 `WaitDone` **60.629 秒**；在 node2 仍暂停时确认进度已到 DSN 566。恢复 node2 后继续写至 DSN 617，driver 无最终错误。新进程回放 DSN 392–617 共 226 条，连续且与确认 payload 一致。 |
+
+对 `driver-baseline.load`、`driver-fault-a-20261104.load`、`driver-fault-b-20261104.load`、`driver-pause-connected-20261104.load`、`driver-pause-connected2-20261104.load` 的确认清单去重核对，累计 **617 个 DSN**；最新截断水位之后的 **226 条**全部与独立回放一致，无 DSN 缺口或 payload 不一致。`driver-pause-connected-20261104` 是首次暂停脚本发现进程同时打开两个地址连接后安全退出的预备轮，**未注入故障**，其中已确认的写入仍计入清单。真实暂停轮在注入前按当前数据 leader 选择已连接的地址。`replayer.go` 的 `context canceled` 收尾日志发生在独立回放完成且关闭 driver 时，`replay_done` 正常结束，并非本轮回放失败。
+
+**结论与限制。** 本轮在 driver 层验证了普通副本下线、刚恢复节点与 leader 下线交叠、合法截断及 snapshot 导出/导入、已连接 leader 停顿超过单次请求超时、关闭后重新回放。没有发现最终 WAL 写入或回放错误；**60.629 秒写入长尾仍然存在**，与已记录的 1 分钟默认尝试超时一致，说明不能把“有两票可服务”等同于客户端低延迟。`Truncate` 的正常路径未发出越过已确认 DSN 的未来水位；这个实验不能证明真实 TN 的 checkpoint 水位选择、事务可见性、HAKeeper TN 心跳或 SQL 行为。故障注入为进程 `SIGKILL`/`SIGSTOP`，不包含这套 driver 集群上的网络分区。
+
+证据在 51 的上述目录：`driver-*.load`、`driver-*.replay`、`driver-*.progress`、`driver-fault-run-b.py`、`driver-pause-connected2.py`、`verify-tn-driver.py` 和三个 `node-*/stdout.log`。核对程序为 `test/logservice-chaos/tn_driver_probe/verify.py`。所有暂停进程已恢复，三个测试 LogService 节点在本轮结束时运行。
