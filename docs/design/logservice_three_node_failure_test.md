@@ -292,6 +292,8 @@ node1 下线后，数据 shard 由 node2 领导，HAKeeper 仍由 node0 领导�
 
 ## 追加实验：Read 旧连接黑洞中的快速重试对照（2026-11-04）
 
+跟踪：[Read 长尾缺陷 matrixorigin/matrixone#32148](https://github.com/matrixorigin/matrixone/issues/32148)；同类 Append 长尾见 #32133。
+
 **代码路径。** `pkg/logservice/service.go` 的 `handleRead` 直接调用 `store.queryLog`；它不决定客户端换地址。`pkg/logservice/client.go` 的 `managedClient.Read` 在 RPC 出错后 `resetClient`，但仅对 shard-not-found 错误在该层自行重试；普通 `EOF`、调用超时会交给调用方。建连时给 MORPC 的 `WithBackendReadTimeout` 传 **0**，没有额外的 backend 读超时来提前判定旧 TCP 黑洞。TN WAL 回放的 `logservicedriver.readFromBackend` 对每次 Read 使用 `DefaultOneTryTimeout = 1m`，失败后指数退避重试，总时限按 `MaxTimeout` 在每次失败后检查，默认 3 分钟并非严格墙钟截止。因此黑洞连接在没有 TCP/服务端早期错误时等到调用方的 1 分钟 deadline 才切换，是**当前实现的结果**；它不说明两票没有服务能力。
 
 **受控注入。** 在 `test/logservice-chaos/client` 增加仅供测试的 `-pause-read-seq`、`-read-ready-file`、`-read-release-file` 参数，使同一 `logservice.NewClient` 在 Append 已成功并拿到 LSN 后、Read 尚未发出时暂停。用宿主机 `ss -tnp` 确认该客户端持有的 TCP 目标，双向断开该目标节点的测试 veth，再放行 Read。每次只隔离一台，另外两台始终存活且互通；完成后恢复网络。这个实验的 2 秒设置是**直接测试客户端参数**，没有修改 MO/TN 的生产默认值。此前真实 leader 崩溃时的一次 Read 等待 60 秒的结果见上一节。
