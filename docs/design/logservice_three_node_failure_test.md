@@ -410,3 +410,18 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 **结论与限制。** 本轮在 driver 层验证了普通副本下线、刚恢复节点与 leader 下线交叠、合法截断及 snapshot 导出/导入、已连接 leader 停顿超过单次请求超时、关闭后重新回放。没有发现最终 WAL 写入或回放错误；**60.629 秒写入长尾仍然存在**，与已记录的 1 分钟默认尝试超时一致，说明不能把“有两票可服务”等同于客户端低延迟。`Truncate` 的正常路径未发出越过已确认 DSN 的未来水位；这个实验不能证明真实 TN 的 checkpoint 水位选择、事务可见性、HAKeeper TN 心跳或 SQL 行为。故障注入为进程 `SIGKILL`/`SIGSTOP`，不包含这套 driver 集群上的网络分区。
 
 证据在 51 的上述目录：`driver-*.load`、`driver-*.replay`、`driver-*.progress`、`driver-fault-run-b.py`、`driver-pause-connected2.py`、`verify-tn-driver.py` 和三个 `node-*/stdout.log`。核对程序为 `test/logservice-chaos/tn_driver_probe/verify.py`。所有暂停进程已恢复，三个测试 LogService 节点在本轮结束时运行。
+
+### 已连接副本暂停的独立复测（2026-11-04 17:43–17:47）
+
+为确认上述 60 秒长尾不是单次偶发，在同一独立集群再次分别启动全新的 TN WAL driver 写入进程。每轮先写入至少 31 条，用 `ss -tnp` 找到**该 driver 进程实际持有的 LogService TCP 连接**，再将连接目标 node1 `SIGSTOP` 70 秒；另两台继续运行。脚本安排 90 秒后的自动 `SIGCONT`，并在 `finally` 中再次保证恢复。第二轮注入前查询数据 shard 三成员表，明确 node1 为**普通副本**，leader 为 node2。
+
+| 轮次 | 暂停前确认进度 | 受阻的下一条写入 | 恢复目标节点前的进度 | 进程结束 |
+|---|---:|---|---:|---:|
+| A：已连接 node1 | DSN 680 | DSN 681，driver 内部重试 1 次，`WaitDone` **60.587 秒** | DSN 724 | DSN 775，正常退出 |
+| B：已连接普通副本 node1，数据 leader 为 node2 | DSN 806 | DSN 807，driver 内部重试 1 次，`WaitDone` **60.648 秒** | DSN 848 | DSN 899，正常退出 |
+
+两轮均在 node1 仍暂停时重新推进写入，说明另两台能够服务；长尾来自这个 driver 对**已连接但不响应的地址**等待完整单次超时，并非整个 Raft shard 连续 60 秒不能提交。最终全新 driver 回放连续 DSN **392–899** 共 508 条；其中本次两轮保留完整确认清单的 **DSN 650–899 共 250 条**逐条匹配 payload、无缺口。A 轮第一次脚本预检查发现所选 leader 地址没有该进程的连接后安全退出，未注入故障；它已确认的 DSN 618–649 后被同名前缀第二次运行覆盖了日志，故不纳入 250 条清单核对，也不将其当作故障轮。三台 LogService 进程最终均运行。
+
+**判断。** 当前代码在 `pkg/logservice/client.go` 建连时传给 MORPC `WithBackendReadTimeout(0)`；`managedClient.Append` 要等请求返回错误才 `resetClient`，TN driver 的 `wrappedClient.Append` 则给每次尝试 `DefaultOneTryTimeout = 1m`。对不响应但 TCP 未断开的地址，等约一分钟才重试符合当前超时配置；但在另外两票已可继续写入的场景下，单条 TN WAL 写入仍被拖至一分钟，属于可用性长尾缺陷。调整时要保留“超时的 Append 可能已提交”的未知结果语义，不能简单盲目并发重提而忽略重复物理日志。该机制已有 [#32133](https://github.com/matrixorigin/matrixone/issues/32133) 跟踪，本次不建重复 issue。
+
+原始证据在 51 的 `driver-tail-repro-{a,b}.{py,timeline}`、`driver-tail-repro-{a,b}-20261104.load`、`driver-tail-repro-final.replay`。两轮均使用真实 `tn-driver-probe`，没有启动 TN/CN。
