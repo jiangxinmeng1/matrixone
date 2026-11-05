@@ -425,3 +425,33 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 **判断。** 当前代码在 `pkg/logservice/client.go` 建连时传给 MORPC `WithBackendReadTimeout(0)`；`managedClient.Append` 要等请求返回错误才 `resetClient`，TN driver 的 `wrappedClient.Append` 则给每次尝试 `DefaultOneTryTimeout = 1m`。对不响应但 TCP 未断开的地址，等约一分钟才重试符合当前超时配置；但在另外两票已可继续写入的场景下，单条 TN WAL 写入仍被拖至一分钟，属于可用性长尾缺陷。调整时要保留“超时的 Append 可能已提交”的未知结果语义，不能简单盲目并发重提而忽略重复物理日志。该机制已有 [#32133](https://github.com/matrixorigin/matrixone/issues/32133) 跟踪，本次不建重复 issue。
 
 原始证据在 51 的 `driver-tail-repro-{a,b}.{py,timeline}`、`driver-tail-repro-{a,b}-20261104.load`、`driver-tail-repro-final.replay`。两轮均使用真实 `tn-driver-probe`，没有启动 TN/CN。
+
+### 超时重试、合法截断与旧 leader 恢复交叠（2026-11-04 17:53–17:55）
+
+继续在同一三副本集群启动真实 TN WAL driver；每确认 10 条便调用一次 `driver.Truncate(已确认 DSN - 20)`。用 `ss -tnp` 和实时 shard 状态确认 driver 连到数据 leader node2 后，将 node2 `SIGSTOP` 80 秒；另外两台继续运行，110 秒自动 `SIGCONT` 兜底。暂停前最后确认 DSN 930，下一条 DSN 931 的 `WaitDone` **60.833 秒**，`WAL-Commit-Append` 记录内部重试 1 次。node2 仍暂停时，driver 已确认到 DSN 987；`Wal-Truncate-Execute` 在该窗口继续成功，合法截断意图越过 DSN 931。node2 恢复后继续写到 DSN 1038，driver 正常退出，远端物理截断水位为 PSN **1170**。
+
+新 driver 回放保留 DSN **1010–1038** 共 29 条，与本轮 139 条确认写入清单中的对应 payload 逐条一致；三地址从 PSN 1171 读回 SHA256 均为 `8a63def3313bb50d71a67cb398e26a69125858c6e8be25eaa2739fdd6735fc41`，数据 shard 三成员视图一致。早先三次 1 分钟超时重试在截断前的回放日志中明确记录三对物理副本：DSN 526 对应 PSN 613/616，DSN 681 对应 785/788，DSN 807 对应 916/918；`Wal-Replay-Duplicate-Entry` 跳过后一个副本。这是**真实 driver 路径下的物理重复日志**，不是重复的逻辑 DSN 或 SQL 执行；本轮截断没有导致保留区间丢失或重放重复。
+
+随后将三个测试节点全部 `SIGKILL`，按原磁盘目录冷启动。启动脚本首次立即重启 node0 时碰到旧 PID 尚未释放，`node.sh` 自身拒绝启动；核实旧进程已退出后重试成功，node1/node2 已启动。这是注入脚本的 PID 文件时序，不是 LogService panic。三个节点随后都恢复原三成员；Dragonboat 数据 shard 分别从本地 snapshot index **1124/1130/1056**（node0/1/2）恢复。独立 driver 仍回放 DSN 1010–1038 并与确认清单一致；再起新 driver 写入 **30/30** 条到 DSN 1068，三地址从保留物理区间读回 SHA256 均为 `6327a107023a9dc243b1aa9e9697540bc9bb959040a89c3a1c7da5bb6ed13f51`。这轮没有历史 HAKeeper 多 ID，因此不能拿它否定前文 #32151 的特定冷启动条件。
+
+### driver 在异步 Truncate 意图后崩溃（2026-11-04 17:58）
+
+新 driver 写入 10 条至 DSN 1078；它刚记录 `truncate_intent dsn=1058`，后台 worker 已计算 `psn-intent=1242`、尚未记录远端 `Wal-Truncate-Execute` 时，对**测试 driver 进程**发 `SIGKILL`，三台 LogService 不停。远端水位仍为 PSN **1170**，说明这个尚未完成的异步截断意图没有持久化；新 driver 回放 DSN **1010–1078** 共 69 条，包括刚确认的 10 条。再起 driver 写入 50 条并继续按合法 DSN 截断，远端水位升至 PSN **1326**；最终独立回放 DSN **1109–1128** 共 20 条，与本轮所有保留的确认 payload 一致。
+
+`driver.Truncate` 在当前代码里先更新内存意图并入队，再由后台 worker 转为物理 PSN 调用远端；因此返回成功不表示远端水位已经推进。本次进程崩溃导致**多保留 WAL**，没有观察到已确认记录丢失。测试未启动 TN，未覆盖上层 checkpoint 重放如何重新提交该意图。证据在 51 的 `driver-late-duplicate.*`、`driver-cold-restart.*`、`driver-post-cold.*`、`driver-truncate-crash.*`、`driver-after-truncate-crash.*` 及节点日志。测试结束时三个 LogService 节点运行。
+
+## 新缺陷：迟到的同 DSN 物理副本跨越截断水位后，TN WAL driver 回放失败（2026-11-05）
+
+**入口与受控时序。** 仍不启动 TN/CN，测试程序直接使用真实 `logservicedriver.NewLogServiceDriver`、`ReplayForWrite/Read`、`Append`、`WaitDone` 和 `Truncate`。为了确定旧请求是在目标节点停顿后才发出，探针新增仅测试用的 `-pause-before-seq` 文件握手；为了确定唯一连接，设 `-max-client 1`，但始终保留三个 LogService 发现地址。在第 31 条已确认、下一条尚未发出时暂停**当前已连接的普通副本**，放行下一条 Append，观察 5 秒无确认进度后杀掉旧 driver 进程。目标副本仍停顿时，新 driver 完成回放并写入 30 条；恢复旧副本后，旧请求迟到，形成与新 driver 第一条写入**相同 DSN、不同 payload** 的第二条物理日志。接着用新 driver 写入 10 条，只提出一次合法 `Truncate(当前已确认 DSN - 20)`，使物理水位恰好处于两个副本之间；再启动独立 driver 回放。
+
+| 独立隔离集群 | 先到的已确认新记录 / 迟到的旧记录 | 合法截断与结果 |
+|---|---|---|
+| 原 driver 集群 `/home/mo/jxm/logservice-driver-chaos-20261104/`，RPC 57401/57411/57421 | DSN **1679**：新 payload `driver-prepaused-e-new-20261105/000000` 在 PSN **1978**；旧进程未收到确认的 payload `driver-prepaused-e-old-20261105/000031` 在较晚的 PSN **2008**（随后回放写 skip 记录，原始读回显示旧 payload 于 PSN 2011）。截断前新 driver 顺序回放至 DSN 1708；日志记录跳过后一份 `Wal-Replay-Duplicate-Entry`。 | 新增 10 条并调用 `driver.Truncate(1698)`；实际水位 PSN **1997**，落在两个副本之间。全新 driver 回放先把旧 payload 当作 DSN 1679，接着报 **`internal error: dsn 1680 not found`**，进程退出码 2。 |
+| 全新独立集群 `/home/mo/jxm/logservice-driver-repro-20261105/`，RPC 57601/57611/57621，独立磁盘、UUID、deployment-id 32105 | DSN **155**：新 payload `driver-prepaused-fresh4-new-20261105/000000` 在 PSN **168**，旧未确认 payload `driver-prepaused-fresh4-old-20261105/000031` 迟到于 PSN **198**。截断前新 driver 顺序回放至 DSN 184，记录跳过后一份。 | 新增 10 条并调用 `driver.Truncate(174)`；实际水位 PSN **187**。全新 driver 回放先输出旧 payload 为 DSN 155，接着报 **`internal error: dsn 156 not found`**，进程退出码 2。 |
+| 第三套全新隔离集群 `/home/mo/jxm/logservice-driver-repro2-20261105/`，RPC 57801/57811/57821，独立磁盘、UUID、deployment-id 32106；使用仓库自动脚本 | DSN **63**：先到的已确认新记录在 PSN **70**，迟到副本在 PSN **100**；截断前回放至 DSN 92 且跳过迟到副本。 | 新增 10 条并调用 `driver.Truncate(82)`；实际水位 PSN **89**。新 driver 回放先输出旧 payload `stable1-attempt2-old/000031` 为 DSN 63，接着报 **`internal error: dsn 64 not found`**，进程退出码 2。 |
+
+这是**三套独立集群各一次、3/3 次命中目标时序后同样故障**，第三轮由 `test/logservice-chaos/tn_driver_probe/reproduce_orphan_truncate.py` 自动执行并检查旧 payload 与 `dsn not found` 错误。自动脚本首次候选连接落在 leader，未注入；第二次连到普通副本并复现。全新集群还有一个阴性对照：旧请求发往暂停的**leader**时，leader 切换后没有形成迟到物理副本，driver 回放正常；它不计入成功复现次数。其他选择连接地址未命中的预检查轮也在注入前安全退出。
+
+**代码判断。** `logservicedriver/replayer.go` 只在同一次回放仍能读到先到副本时，才用 DSN 范围去掉迟到副本。`info.go` 的 `getNextValidPSN` 与 `isToTruncate` 根据已登记的有效 PSN→DSN 映射选物理截断点；本轮它在旧副本前停下，却已经截掉有效的先到副本。新进程从 LogService 的物理水位之后开始回放，没有可用的已确认副本或足够的持久化逻辑水位来识别迟到副本，因而先应用旧 payload，随后在已截掉的后续 DSN 处报错。这不需要未来水位或无效输入；两个 `Truncate` 目标都落后于已确认的最大 DSN 20 条。直接影响是同一份真实 TN WAL driver 不能完成重启回放，而且截断后读取范围中不再有已确认的第一份 payload。本测试没有启动 TN/CN，尚未测 SQL 可用性或 Raft snapshot 导入后的物理文件清理；不据此声称 SQL 已重复执行。
+
+原始证据：原集群的 `driver-prepaused-e-*`、`driver-intermediate-cut.{load,replay,rawread}`；第二集群的 `driver-prepaused-fresh4-*`、`driver-fresh-intermediate-cut.{load,replay,rawread}`；第三集群的 `stable1.*`、`stable1-attempt2-*`，以及各集群三个 `node-*/stdout.log`。三个故障现场均保留，且没有继续向故障 shard 写入。

@@ -9,6 +9,7 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--replay", type=Path, required=True)
+    parser.add_argument("--min-dsn", type=int, default=0)
     parser.add_argument("loads", nargs="+", type=Path)
     args = parser.parse_args()
 
@@ -30,7 +31,7 @@ def main():
     replay = []
     for line in args.replay.read_text(errors="replace").splitlines():
         match = re.match(r"replay dsn=(\d+) payload=(\S+)", line)
-        if match:
+        if match and int(match[1]) >= args.min_dsn:
             replay.append((int(match[1]), match[2]))
     if not replay:
         raise AssertionError("empty replay")

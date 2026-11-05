@@ -17,25 +17,34 @@ import (
 )
 
 func main() {
-	var addresses, mode, prefix, progressFile, stopFile string
-	var count, truncateEvery, truncateLag int
+	var addresses, mode, prefix, progressFile, stopFile, pauseReadyFile, pauseReleaseFile string
+	var count, truncateEvery, truncateLag, maxClient, pauseBeforeSeq int
 	flag.StringVar(&addresses, "addresses", "", "three comma-separated LogService addresses")
 	flag.StringVar(&mode, "mode", "cycle", "cycle or replay")
 	flag.StringVar(&prefix, "prefix", "driver-probe", "payload prefix")
 	flag.StringVar(&progressFile, "progress-file", "", "atomic acknowledged DSN progress file")
 	flag.StringVar(&stopFile, "stop-file", "", "stop after current acknowledged entry")
+	flag.StringVar(&pauseReadyFile, "pause-ready-file", "", "write this file before the selected append")
+	flag.StringVar(&pauseReleaseFile, "pause-release-file", "", "wait for this file before the selected append")
 	flag.IntVar(&count, "count", 0, "number of entries; zero means until stop file exists")
 	flag.IntVar(&truncateEvery, "truncate-every", 0, "request driver DSN truncate every N acks")
 	flag.IntVar(&truncateLag, "truncate-lag", 50, "keep at least this many acknowledged DSNs")
+	flag.IntVar(&maxClient, "max-client", 2, "maximum TN WAL driver clients")
+	flag.IntVar(&pauseBeforeSeq, "pause-before-seq", -1, "pause before the selected append")
 	flag.Parse()
-	if addresses != "127.0.0.1:57401,127.0.0.1:57411,127.0.0.1:57421" {
+	if addresses != "127.0.0.1:57401,127.0.0.1:57411,127.0.0.1:57421" &&
+		addresses != "127.0.0.1:57601,127.0.0.1:57611,127.0.0.1:57621" &&
+		addresses != "127.0.0.1:57801,127.0.0.1:57811,127.0.0.1:57821" {
 		panic("use only the dedicated three-node driver test cluster")
 	}
 	if mode != "cycle" && mode != "replay" {
 		panic("invalid mode")
 	}
-	if count < 0 || truncateEvery < 0 || truncateLag < 1 {
+	if count < 0 || truncateEvery < 0 || truncateLag < 1 || maxClient < 1 || pauseBeforeSeq < -1 {
 		panic("invalid count or truncate setting")
+	}
+	if pauseBeforeSeq >= 0 && (pauseReadyFile == "" || pauseReleaseFile == "") {
+		panic("pause files required for pause-before-seq")
 	}
 
 	const sid = "tn-driver-chaos"
@@ -47,7 +56,7 @@ func main() {
 	}
 	cfg := logservicedriver.NewConfig(sid,
 		logservicedriver.WithConfigOptClientConfig(sid, clientCfg),
-		logservicedriver.WithConfigOptMaxClient(2),
+		logservicedriver.WithConfigOptMaxClient(maxClient),
 		logservicedriver.WithConfigOptClientBufSize(1<<20),
 	)
 	d := logservicedriver.NewLogServiceDriver(&cfg)
@@ -91,6 +100,17 @@ func main() {
 			if _, err := os.Stat(stopFile); err == nil {
 				fmt.Printf("summary cycles=%d last_dsn=%d\n", seq, d.GetDSN())
 				return
+			}
+		}
+		if seq == pauseBeforeSeq {
+			if err := os.WriteFile(pauseReadyFile, []byte(fmt.Sprintf("%d %d\n", seq, d.GetDSN())), 0o644); err != nil {
+				panic(err)
+			}
+			for {
+				if _, err := os.Stat(pauseReleaseFile); err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
 			}
 		}
 		payload := fmt.Sprintf("%s/%06d", prefix, seq)
