@@ -512,3 +512,11 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 同一独立三副本集群和 TN WAL driver 默认 100 client。测试进程顺序确认 20 条 user WAL 后调用 `RangeCheckpoint(1,1153)`，checkpoint intent 已提交并返回 ACK；driver 后台计算出的物理截断目标为 PSN **6923**。测试屏障只在后台新建的 LogService 客户端已连接、首次 `Truncate` RPC 发送前暂停。`ss -tnp` 显示该进程共持有 101 条到三地址的数据连接，新建连接（最高 fd 106）指向普通副本 node2；暂停 node2 后放行 `Truncate`，另两票运行。两存活地址直接查询截断位点立即返回旧值 **3612**，最新 LSN 可读；测试进程的 `summary cycles=20` 已输出，但后台截断和正常 `Close` 一直未完成。
 
 在 node2 **仍暂停**时，首次尝试的默认 3 分钟 context 到期；该 context 在测试屏障前已创建，因此屏障等待也占其中一小段。`Wal-Truncate-Execute` 最终记录 `retry-times=1`、总耗时 **3m0.529s**，第二次尝试换到存活地址后成功将物理截断位点从 **3612** 推进到 **6923**。`Wal-Truncate-By-PSN` 删除 15 个旧 PSN 映射，进程随后正常退出。原始证据：`truncate-tail-a.log` 和节点日志；故障副本已恢复。这再次说明两票能提供服务时，单条旧 TCP 连接仍可消耗整个 `MaxTimeout=3m`。该物理截断是后台工作，不能把 3 分钟直接换算为单笔事务提交延迟；可观察影响是 WAL 清理滞后及本轮正常 `Close` 等待。`driver.Close` 的 4 分钟 deadline 在调用 `truncateQueue.Stop()` 之前建立，`Stop()` 本身没有剩余时间约束；持续失败时理论等待可更久，但本轮只观察到 3 分钟。与 #32235 同属过长的旧连接失败检测，暂不另建同根因 issue。
+
+## 追加验证：单普通副本 RPC 网络黑洞时的 TN WAL 回放（2026-11-05 15:35–15:42）
+
+继续使用上述独立集群、TN 的 `wal.NewLogserviceHandle` 和默认 100 client。每轮先创建包含三地址的客户端池，在 `ReplayForWrite` 前的测试屏障停住；确认数据 shard 当前 leader 后，只对一台**普通副本**的测试 RPC 端口添加本机 `iptables OUTPUT DROP`，再放行回放。三台 LogService 进程始终运行，另外两台的端口没有阻断。注入规则有独立 comment、进程退出时删除，并有延迟自动删除保险；两轮结束后核对 OUTPUT 链均无测试规则。可重复脚本为 `test/logservice-chaos/tn_driver_probe/reproduce_replay_network.py`，只针对该独立集群的 `58201/58211/58221` 端口。
+
+两次命中故障窗口时目标均为普通副本 node0。故障期间，用另外两地址直接查询 `GetTruncatedLsn` 返回 PSN **6923**，`GetLatestLsn` 返回约 **7803**，确认两票仍能提供数据服务。`replay-net-4.log` 中首次 `Wal-Get-Truncate` 在 **2m32.150s** 后成功，`retry-times=1`；`replay-net2-2.log` 中为 **2m32.116s**，同样重试一次后成功。日志记录指向被阻断端口的 `dial tcp4 ... i/o timeout`；本机规则计数确有丢弃流量。完整回放分别耗时 **152.154s**、**152.119s**，两次均正常退出，回放出的 10 条保留 user LSN/payload 与网络恢复后的健康对照逐条一致；健康对照完整回放 **280.795ms**。未命中已连接目标的预选轮次没有计入故障复现。
+
+这与普通副本 `SIGSTOP` 的两轮 **180 秒后首次取水位失败**不同：网络 DROP 两轮在约 152 秒收到 TCP 错误，driver 才能重建连接并成功；进程暂停时直到 driver 的 3 分钟期限都未收到足以切换的错误。两种故障均说明**两票可用时，回放仍因旧连接等待远超 1 分钟**。本轮没有发现记录丢失或最终回放错误，归入现有 [#32235](https://github.com/matrixorigin/matrixone/issues/32235) 的连接故障检测问题，不另建 issue。原始证据保留在 51 的 `replay-net-4.log`、`replay-net2-2.log`、`replay-net-control.log` 和三节点日志。
