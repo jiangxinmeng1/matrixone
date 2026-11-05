@@ -573,3 +573,5 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 **判断。** Raft 在只剩一票的 6 秒内不能提交是预期行为；多数派恢复后，个别旧提议仍等满客户端单次 1 分钟期限而阻塞 WAL 写入，不是 Raft 多数派协议必然要求。当前 `wrappedClient.Append` 的单次固定 1 分钟期限既不可在 TN `NewLogserviceHandle` 配置，也不会因为其他写入已经恢复而提前重试；总 `MaxTimeout=3m` 只在每次尝试结束后检查，并非严格总上限。需要一个能及时处理服务端失去 leader/提议悬挂的有限重试策略，同时把先前 Append 的结果视为**未知**，保留同 DSN 去重/回放正确性。这里的直接证据是 TN WAL driver 的长尾与服务端提议 timeout；没有启动真实 TN/CN，也未测 SQL 事务延迟。此路径不同于 #32133 的已连接失联节点，也不同于 #32148 的 Read 长尾。
 
 原始证据保留在 51 上 `/home/mo/jxm/logservice-tail-quorum-20261105/`：`quorum-tail-{a,b,c,d,fast-a,fast-b,fast-healthy}.{log,timeline,replay}`（不存在的组合仅以实际文件为准）、三个 `node-*/stdout.log`、`quorum-tail-fast-current.mapping`。快速版的唯一生产代码差异保留在临时 worktree `/tmp/mo-logservice-fast-retry-20261105/`，完成后将移除该临时目录，测试二进制和日志保留在 51。
+
+独立缺陷跟踪：[matrixorigin/matrixone#32246](https://github.com/matrixorigin/matrixone/issues/32246)，已指派 `jiangxinmeng1`。该 issue 只跟踪存活节点上在途 `SyncPropose` 的 1 分钟尾延迟；不把 2 秒测试值当作生产修复建议。
