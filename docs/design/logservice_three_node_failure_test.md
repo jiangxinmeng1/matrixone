@@ -442,6 +442,8 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 
 ## 新缺陷：迟到的同 DSN 物理副本跨越截断水位后，TN WAL driver 回放失败（2026-11-05）
 
+跟踪：[matrixorigin/matrixone#32220](https://github.com/matrixorigin/matrixone/issues/32220)，已指派给 `jiangxinmeng1`。
+
 **入口与受控时序。** 仍不启动 TN/CN，测试程序直接使用真实 `logservicedriver.NewLogServiceDriver`、`ReplayForWrite/Read`、`Append`、`WaitDone` 和 `Truncate`。为了确定旧请求是在目标节点停顿后才发出，探针新增仅测试用的 `-pause-before-seq` 文件握手；为了确定唯一连接，设 `-max-client 1`，但始终保留三个 LogService 发现地址。在第 31 条已确认、下一条尚未发出时暂停**当前已连接的普通副本**，放行下一条 Append，观察 5 秒无确认进度后杀掉旧 driver 进程。目标副本仍停顿时，新 driver 完成回放并写入 30 条；恢复旧副本后，旧请求迟到，形成与新 driver 第一条写入**相同 DSN、不同 payload** 的第二条物理日志。接着用新 driver 写入 10 条，只提出一次合法 `Truncate(当前已确认 DSN - 20)`，使物理水位恰好处于两个副本之间；再启动独立 driver 回放。
 
 | 独立隔离集群 | 先到的已确认新记录 / 迟到的旧记录 | 合法截断与结果 |
@@ -455,3 +457,5 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 **代码判断。** `logservicedriver/replayer.go` 只在同一次回放仍能读到先到副本时，才用 DSN 范围去掉迟到副本。`info.go` 的 `getNextValidPSN` 与 `isToTruncate` 根据已登记的有效 PSN→DSN 映射选物理截断点；本轮它在旧副本前停下，却已经截掉有效的先到副本。新进程从 LogService 的物理水位之后开始回放，没有可用的已确认副本或足够的持久化逻辑水位来识别迟到副本，因而先应用旧 payload，随后在已截掉的后续 DSN 处报错。这不需要未来水位或无效输入；两个 `Truncate` 目标都落后于已确认的最大 DSN 20 条。直接影响是同一份真实 TN WAL driver 不能完成重启回放，而且截断后读取范围中不再有已确认的第一份 payload。本测试没有启动 TN/CN，尚未测 SQL 可用性或 Raft snapshot 导入后的物理文件清理；不据此声称 SQL 已重复执行。
 
 原始证据：原集群的 `driver-prepaused-e-*`、`driver-intermediate-cut.{load,replay,rawread}`；第二集群的 `driver-prepaused-fresh4-*`、`driver-fresh-intermediate-cut.{load,replay,rawread}`；第三集群的 `stable1.*`、`stable1-attempt2-*`，以及各集群三个 `node-*/stdout.log`。三个故障现场均保留，且没有继续向故障 shard 写入。
+
+**冷重启与写模式验证。** 第三套故障集群保留原磁盘，三个 LogService 进程全部 `SIGKILL` 后从原目录重新启动，三进程均存活；新 driver 的 `ReplayForRead` 仍先回放旧 payload 为 DSN 63，再报 `dsn 64 not found` 并退出码 2。随后只启动 `-mode cycle -count 1` 的测试探针，它先走真实 `ReplayForWrite`；这一模式同样在上述错误处退出码 2，**没有发出新 Append**。这证明故障状态跨整组冷重启保留，且阻断 driver 的正常写入初始化。第三套证据增加 `bug-cold-restart.timeline`、`bug-after-cold.replay`、`bug-write-mode.replay`。
