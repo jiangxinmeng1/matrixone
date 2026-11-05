@@ -505,7 +505,7 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 
 此处没有新的错误类型；它把已有 [Read 长尾缺陷 #32148](https://github.com/matrixorigin/matrixone/issues/32148) 的证据扩展到 **TN WAL 启动回放**，不另建重复 issue。代码中 `readFromBackend` 给每次 `Read` 默认 1 分钟 deadline，只有 RPC 退出后 `managedClient.Read` 才重置旧连接；后台轮询可借别的 pooled client 正常运行，不能让被卡住的这次 Read 提前换地址。
 
-**另外一处代码风险，尚未列为缺陷。** `truncateFromRemote` 调用 `clientPool.GetOnFly()` 后只特别处理 `ErrClientPoolClosed`；如果新 LogService 客户端因为网络故障返回其他错误，返回的 client 为 nil，随后的 `client.wrapped.Truncate` 会 panic。一个临时同包单测用“初始客户端成功、checkpoint 时新客户端创建失败”的工厂可确定性触发该 panic。真实 TN 的 factory 默认单次连接超时 30 秒，pool 默认在 5 分钟检查窗口内重试，此窗口不是严格墙钟上限；本轮未在 51 上持续制造这一时长的网络故障，也未证明生产会在这个窗口仍继续发出 checkpoint 截断，所以先记录为待验证风险。
+**另外一处代码风险已在 51 上复现。** `truncateFromRemote` 调用 `clientPool.GetOnFly()` 后只特别处理 `ErrClientPoolClosed`；其他建连错误会返回 nil client，后续解引用导致 panic。完整的两轮 TN WAL driver 复现和无故障对照见文末“新缺陷：后台物理 Truncate 建连失败导致 TN WAL 进程 panic”。
 
 ## 追加验证：两票可用时 checkpoint 物理 Truncate 延迟 3 分钟（2026-11-05 15:23–15:26）
 
@@ -575,3 +575,18 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 原始证据保留在 51 上 `/home/mo/jxm/logservice-tail-quorum-20261105/`：`quorum-tail-{a,b,c,d,fast-a,fast-b,fast-healthy}.{log,timeline,replay}`（不存在的组合仅以实际文件为准）、三个 `node-*/stdout.log`、`quorum-tail-fast-current.mapping`。快速版的唯一生产代码差异保留在临时 worktree `/tmp/mo-logservice-fast-retry-20261105/`，完成后将移除该临时目录，测试二进制和日志保留在 51。
 
 独立缺陷跟踪：[matrixorigin/matrixone#32246](https://github.com/matrixorigin/matrixone/issues/32246)，已指派 `jiangxinmeng1`。该 issue 只跟踪存活节点上在途 `SyncPropose` 的 1 分钟尾延迟；不把 2 秒测试值当作生产修复建议。
+
+## 新缺陷：后台物理 Truncate 建连失败导致 TN WAL 进程 panic（2026-11-05 17:34–17:47）
+
+**环境和入口。** 51 上另建空盘三投票副本集群 `/home/mo/jxm/logservice-newconn-failure-20261105/`，数据 shard 1，RPC 为 `127.0.0.1:58201/58211/58221`。测试程序 `test/logservice-chaos/tn_driver_probe/concurrent_probe/main.go` 用 TN 的 `wal.NewLogserviceHandle`、`ReplayForWrite`、`AppendEntry(GroupUserTxn)`、`RangeCheckpoint(1,end,files...)`，默认 `ClientMaxCount=100`、默认建连重试参数。checkpoint 水位只来自连续已确认的 user LSN，始终落后已确认前缀 40–50 条。没有启动真实 TN/CN 或 TAE checkpoint 文件生成；但经过的是实际 TN WAL driver 的后台 `doTruncate` 路径，而非直接调用内部函数。
+
+**精确故障注入。** 每轮等 WAL 探针完成回放、预建客户端池并写出 `*.ready`；首轮用 `ss` 确认到三个 LogService RPC 地址已有 ESTABLISHED 连接。随后在 51 的 `OUTPUT` 链插入仅匹配目的 `127.0.0.1`、目的端口 `58201,58211,58221`、TCP SYN 首包的 DROP 规则，并释放探针开始写入。现有连接与三个 LogService 进程及其 Raft 通信仍工作；只有新建到测试 RPC 端口的 TCP 连接失败。每轮有 10 分钟自动撤销规则的保险脚本，结束时手动删除并检查规则为空。此注入模拟“现有连接可用，新连接无法建立”的网络窗口；并未模拟整台 LogService 节点下线。
+
+| 轮次 | 现有连接上的已确认操作 | 后台建连及结果 |
+|---|---|---|
+| A | 新空盘；32 协程各写 10 条，**320/320** ACK；checkpoint intent 到 user LSN 62、181、270，均 `WaitDone` 成功 | 首次 `Wal-Truncate-Prepare` 计划截到物理 PSN 211；`GetOnFly` 的新客户端建连持续得到 `rpc timeout`。约 **5m0.633s** 后重试窗口结束，进程以 nil pointer panic；堆栈指向 `truncateFromRemote:178`，并在 deferred `(*wrappedClient).Putback(0x0)` 再次 panic。物理截断位点仍为 0。 |
+| B | 撤规则后新 WAL 实例先成功回放 A 的 320 条记录；16 协程各写 10 条，**160/160** ACK；checkpoint intent 到 user LSN 363、440，均成功 | 相同 SYN 阻断；`Wal-Truncate-Prepare` 计划截到物理 PSN 581。约 **5m0.632s** 后同一 `rpc timeout`、同一 `truncateFromRemote:178` 与 nil `Putback` 堆栈再次崩溃；物理截断仍为 0。 |
+
+**无故障对照及恢复。** 删除阻断规则后，同一三副本及旧磁盘上的新 WAL 实例 `ReplayForWrite` 成功，从 user LSN 480 继续；再确认 **160/160** 条写入及两次 checkpoint。后台 `Wal-Truncate-Execute` 分别约 1.091 秒、0.307 秒成功，LogService 物理截断位点推进到 PSN 954。再起新实例回放成功，报告 `ready lsn=640 checkpointed=600`；本次没有观察到 WAL 数据损坏。服务端三个副本在两轮注入期间均保持正常状态。原始证据为该目录的 `probe.log`、`probe-b.log`、`control.log`、`replay-check.log` 与 `node-*/stdout.log`。
+
+**代码原因与影响。** `clientPool.GetOnFly()` 建连失败明确返回 `(nil, err)`；`truncateFromRemote` 仅在 `err == ErrClientPoolClosed` 时返回，对普通网络超时继续 `defer client.Putback()` 并访问 `client.wrapped.Truncate`。因此后台截断 goroutine 的 panic 会终止整个 TN 进程，尽管当时 WAL 写入和 checkpoint intent 已成功，三个 LogService 副本也可用。默认 5 分钟重试使错误潜伏。预期是在任何新客户端创建失败时将错误返回给 `doTruncate`，记录失败并允许以后重试物理截断，不能 panic。此测试证明了 TN WAL driver 进程的崩溃路径；没有声称已在真实 TN 服务进程中复现 SQL 层故障。
