@@ -440,7 +440,7 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 
 `driver.Truncate` 在当前代码里先更新内存意图并入队，再由后台 worker 转为物理 PSN 调用远端；因此返回成功不表示远端水位已经推进。本次进程崩溃导致**多保留 WAL**，没有观察到已确认记录丢失。测试未启动 TN，未覆盖上层 checkpoint 重放如何重新提交该意图。证据在 51 的 `driver-late-duplicate.*`、`driver-cold-restart.*`、`driver-post-cold.*`、`driver-truncate-crash.*`、`driver-after-truncate-crash.*` 及节点日志。测试结束时三个 LogService 节点运行。
 
-## 新缺陷：迟到的同 DSN 物理副本跨越截断水位后，TN WAL driver 回放失败（2026-11-05）
+## 受控 driver 缺陷：迟到的同 DSN 物理副本跨越截断水位后回放失败（2026-11-05）
 
 跟踪：[matrixorigin/matrixone#32220](https://github.com/matrixorigin/matrixone/issues/32220)，已指派给 `jiangxinmeng1`。
 
@@ -459,3 +459,5 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 原始证据：原集群的 `driver-prepaused-e-*`、`driver-intermediate-cut.{load,replay,rawread}`；第二集群的 `driver-prepaused-fresh4-*`、`driver-fresh-intermediate-cut.{load,replay,rawread}`；第三集群的 `stable1.*`、`stable1-attempt2-*`，以及各集群三个 `node-*/stdout.log`。三个故障现场均保留，且没有继续向故障 shard 写入。
 
 **冷重启与写模式验证。** 第三套故障集群保留原磁盘，三个 LogService 进程全部 `SIGKILL` 后从原目录重新启动，三进程均存活；新 driver 的 `ReplayForRead` 仍先回放旧 payload 为 DSN 63，再报 `dsn 64 not found` 并退出码 2。随后只启动 `-mode cycle -count 1` 的测试探针，它先走真实 `ReplayForWrite`；这一模式同样在上述错误处退出码 2，**没有发出新 Append**。这证明故障状态跨整组冷重启保留，且阻断 driver 的正常写入初始化。第三套证据增加 `bug-cold-restart.timeline`、`bug-after-cold.replay`、`bug-write-mode.replay`。
+
+**真实 TN 可达性边界（代码复查）。** 本实验使用了 TN 的 `logservicedriver` 实现，但没有启动 TN，也没有执行 TAE checkpoint。TN 的 `factory.go` 将 LogService client factory 交给 TAE WAL；`wal/store.go` 创建这个 driver，`db/replay.go` 会在正常写入前切到 `ReplayForWrite`。同一 TN store 原地重启时，`tnservice/store_metadata.go` 从本地恢复 shard 的 `ReplicaID`，`store.go` 按该记录启动，`factory.go` 用该 ID 配置新 LogService 客户端。LogService `rsm.go` 按 leaseholder ID 校验用户写入；**换成新 ID 的迁移**可能拒绝旧请求，**沿用同一 ID 的重启**没有额外进程代际栅栏。这个代码链只说明受控同 ID 场景有意义，**仍不能证明真实 TN 会在旧请求滞留期间完成新实例回放、写入和 checkpoint 截断**。正常 TN 的截断由已提交 checkpoint 推导 DSN 后在 `wal/checkpoint.go` 调用 `driver.Truncate`；探针直接调用 `driver.Truncate`，只验证了目标在已确认 DSN 内，没有模拟 checkpoint 的生成时序。探针还将 client pool 上限设为 1 以确定唯一连接，而 TN 默认上限是 100；没有用默认池配置复现完整交错。因此 #32220 的已证实范围是**受控 driver 时序下的回放失败**，生产 TN 生命周期可达性及 SQL 影响仍待验证，不能把它归咎于 LogService 违反协议。
