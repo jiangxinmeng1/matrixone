@@ -590,3 +590,5 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 **无故障对照及恢复。** 删除阻断规则后，同一三副本及旧磁盘上的新 WAL 实例 `ReplayForWrite` 成功，从 user LSN 480 继续；再确认 **160/160** 条写入及两次 checkpoint。后台 `Wal-Truncate-Execute` 分别约 1.091 秒、0.307 秒成功，LogService 物理截断位点推进到 PSN 954。再起新实例回放成功，报告 `ready lsn=640 checkpointed=600`；本次没有观察到 WAL 数据损坏。服务端三个副本在两轮注入期间均保持正常状态。原始证据为该目录的 `probe.log`、`probe-b.log`、`control.log`、`replay-check.log` 与 `node-*/stdout.log`。
 
 **代码原因与影响。** `clientPool.GetOnFly()` 建连失败明确返回 `(nil, err)`；`truncateFromRemote` 仅在 `err == ErrClientPoolClosed` 时返回，对普通网络超时继续 `defer client.Putback()` 并访问 `client.wrapped.Truncate`。因此后台截断 goroutine 的 panic 会终止整个 TN 进程，尽管当时 WAL 写入和 checkpoint intent 已成功，三个 LogService 副本也可用。默认 5 分钟重试使错误潜伏。预期是在任何新客户端创建失败时将错误返回给 `doTruncate`，记录失败并允许以后重试物理截断，不能 panic。此测试证明了 TN WAL driver 进程的崩溃路径；没有声称已在真实 TN 服务进程中复现 SQL 层故障。
+
+独立缺陷跟踪：[matrixorigin/matrixone#32248](https://github.com/matrixorigin/matrixone/issues/32248)，已指派 `jiangxinmeng1`。
