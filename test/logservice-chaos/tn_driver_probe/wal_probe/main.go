@@ -1,0 +1,137 @@
+// A standalone probe using the same WAL StoreImpl entry points as TN TAE.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/logservice"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/logservicedriver"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/wal"
+)
+
+func main() {
+	var addresses, mode, prefix, readyFile, releaseFile, progressFile string
+	var count, pauseBeforeSeq int
+	var checkpointLag uint64
+	flag.StringVar(&addresses, "addresses", "", "three test LogService addresses")
+	flag.StringVar(&mode, "mode", "cycle", "cycle or replay")
+	flag.StringVar(&prefix, "prefix", "wal-probe", "unique payload prefix")
+	flag.StringVar(&readyFile, "pause-ready-file", "", "write this file before selected AppendEntry")
+	flag.StringVar(&releaseFile, "pause-release-file", "", "wait for this file before selected AppendEntry")
+	flag.StringVar(&progressFile, "progress-file", "", "atomic last acknowledged seq and LSN")
+	flag.IntVar(&count, "count", 0, "number of user entries; zero means continue until killed")
+	flag.IntVar(&pauseBeforeSeq, "pause-before-seq", -1, "pause before this AppendEntry")
+	flag.Uint64Var(&checkpointLag, "checkpoint-lag", 0, "after writes, checkpoint through user LSN latest minus lag")
+	flag.Parse()
+	if addresses != "127.0.0.1:58001,127.0.0.1:58011,127.0.0.1:58021" {
+		panic("use only the dedicated WAL StoreImpl test cluster")
+	}
+	if mode != "cycle" && mode != "replay" {
+		panic("invalid mode")
+	}
+	if count < 0 || pauseBeforeSeq < -1 ||
+		(pauseBeforeSeq >= 0 && (readyFile == "" || releaseFile == "")) {
+		panic("invalid count or pause settings")
+	}
+
+	const sid = "tn-wal-store-probe"
+	runtime.SetupServiceBasedRuntime(sid, runtime.DefaultRuntime())
+	defer runtime.CompareAndDeleteServiceBasedRuntime(sid, runtime.DefaultRuntime())
+	clientCfg := logservice.ClientConfig{
+		LogShardID:       1,
+		TNReplicaID:      100,
+		ServiceAddresses: strings.Split(addresses, ","),
+	}
+	factory := func() (logservice.Client, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		return logservice.NewClient(ctx, sid, clientCfg)
+	}
+	w := wal.NewLogserviceHandle(logservicedriver.LogServiceClientFactory(factory), 0)
+	defer func() {
+		if err := w.Close(); err != nil {
+			fmt.Fprintln(os.Stderr, "wal close:", err)
+			os.Exit(1)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := w.Replay(ctx, func(group uint32, lsn uint64, payload []byte, _ uint16, _ any) driver.ReplayEntryState {
+		if group == wal.GroupUserTxn {
+			fmt.Printf("replay lsn=%d payload=%s\n", lsn, payload)
+		}
+		return driver.RE_Nomal
+	}, func() driver.ReplayMode { return driver.ReplayMode_ReplayForWrite }, nil); err != nil {
+		panic(fmt.Sprintf("wal replay: %v", err))
+	}
+	fmt.Printf("replay_done user_lsn=%d checkpointed=%d truncated_dsn=%d\n",
+		w.GetLSNWatermark(), w.GetCheckpointed(), w.GetTruncated())
+	if mode == "replay" {
+		return
+	}
+
+	for seq := 0; count == 0 || seq < count; seq++ {
+		if seq == pauseBeforeSeq {
+			if err := os.WriteFile(readyFile, []byte(fmt.Sprintf("%d %d\n", seq, w.GetLSNWatermark())), 0o644); err != nil {
+				panic(err)
+			}
+			for {
+				if _, err := os.Stat(releaseFile); err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		payload := fmt.Sprintf("%s/%06d", prefix, seq)
+		e := entry.GetBase()
+		e.SetType(entry.IOET_WALEntry_Test)
+		if err := e.SetPayload([]byte(payload)); err != nil {
+			panic(err)
+		}
+		start := time.Now()
+		lsn, err := w.AppendEntry(wal.GroupUserTxn, e)
+		if err != nil {
+			panic(fmt.Sprintf("wal append seq=%d: %v", seq, err))
+		}
+		if err := e.WaitDone(); err != nil {
+			panic(fmt.Sprintf("wal completion seq=%d lsn=%d: %v", seq, lsn, err))
+		}
+		fmt.Printf("ack seq=%d lsn=%d payload=%s elapsed_ms=%.3f\n",
+			seq, lsn, payload, float64(time.Since(start).Microseconds())/1000)
+		if progressFile != "" {
+			tmp := progressFile + ".tmp"
+			if err := os.WriteFile(tmp, []byte(fmt.Sprintf("%d %d\n", seq, lsn)), 0o644); err != nil {
+				panic(err)
+			}
+			if err := os.Rename(tmp, progressFile); err != nil {
+				panic(err)
+			}
+		}
+	}
+	if checkpointLag > 0 {
+		latest := w.GetLSNWatermark()
+		if latest <= checkpointLag {
+			panic("checkpoint lag is beyond latest user LSN")
+		}
+		end := latest - checkpointLag
+		e, err := w.RangeCheckpoint(0, end)
+		if err != nil {
+			panic(fmt.Sprintf("range checkpoint %d: %v", end, err))
+		}
+		if err := e.WaitDone(); err != nil {
+			panic(fmt.Sprintf("checkpoint completion %d: %v", end, err))
+		}
+		fmt.Printf("checkpoint_ack end_lsn=%d checkpointed=%d truncated_dsn=%d\n",
+			end, w.GetCheckpointed(), w.GetTruncated())
+	}
+	fmt.Printf("summary cycles=%d user_lsn=%d\n", count, w.GetLSNWatermark())
+}
