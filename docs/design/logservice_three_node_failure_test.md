@@ -471,3 +471,18 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 **旧 WAL 进程强杀后再起新进程：未复现迟到写入。** 每轮在旧进程已确认 31 条后暂停一个副本，释放下一笔写入，等 2 秒确认该写入无 ACK，再 `SIGKILL` 旧进程；新进程回放并确认 20–30 条，随后恢复副本、再起独立进程回放。默认 100 client 下，先后共 **13 次写入确实卡住的窗口**：`old-a`、`kill-race-{5,6,8,11,13,14,15,21,23,27,28,30}`。其中第二组脚本的 8 次（`13,14,15,21,23,27,28,30`）在每轮查询 leader 后只选择普通副本；`old-a` 也在暂停前确认是普通副本。所有 13 次恢复后的回放都没有发现旧进程未确认的第 32 条记录，新实例回放成功。其他连接未命中暂停副本的预选轮次不计入。原始日志保留在同一目录。
 
 **结论与缺口。** 代码中 TN 正常关闭会先停止接收新 RPC，等待已接受 handler，再关闭 replica/WAL；`StoreImpl.Close` 等待 append 队列，driver `Close` 等待已接受的 committer。原地重启会从本地 metadata 沿用 ReplicaID，但这并不证明两个可写 TN 实例会同时存活。当前测试只在强行并存时复现错序，在强杀再恢复的默认连接池实验中未复现旧请求迟到。因此仍不能证实 #32220 所需的真实 TN 故障切换请求顺序，按提问者要求关闭该 issue；保留日志与测试程序作为后续发现真实同 ID 并存路径时的证据。
+
+## 追加验证：单 TN WAL 实例与 LogService 节点故障（2026-11-05 14:24–14:36）
+
+继续使用独立集群 `/home/mo/jxm/logservice-tnwal-lifecycle-20261105/`，三个旧盘副本 RPC 为 `127.0.0.1:58201/58211/58221`。探针仍通过 TN 实际的 `wal.NewLogserviceHandle`、`ReplayForWrite`、`AppendEntry(GroupUserTxn)`、`RangeCheckpoint` 调用默认 100 client 的 driver；每个进程先回放，写入按 user LSN 和唯一 payload 记录 ACK。每轮恢复后另起进程回放，把 checkpointed user LSN 之后每条已 ACK 记录的 LSN/payload 与回放逐条比较。每个交接点先停止旧 WAL 进程，**没有让两个同 ID 写实例并存**。
+
+| 时间线 | 结果 |
+|---|---|
+| 单 WAL 实例持续写入、每 20 条 ACK 后 checkpoint 最近 10 条之前的范围；先杀 leader 15 秒并从旧盘恢复，再杀普通副本 15 秒并恢复；随后强杀 WAL 进程 | 旧进程 ACK 341 条，checkpoint intent 17 次。新实例 `ReplayForWrite` 成功，checkpointed=330，水位之后 11 条已确认记录逐条一致；另有 1 条在强杀后可见、此前未获 ACK，符合未知提交结果。最大已确认 Append 延迟 6.337 秒，driver 内部有 2 次重试。证据：`lifecycle-a.log`、`lifecycle-recover-a.log`。 |
+| 单 WAL 实例在第二次 `RangeCheckpoint` 已返回、尚未 `WaitDone` 时强杀 | kill 时前 40 条用户写入已 ACK，第二次 checkpoint intent 指向 user LSN 372；新进程回放确认该 intent 已提交，checkpointed=372，水位之后 10 条已确认记录逐条一致。证据：`lifecycle-b.log`、`lifecycle-recover-b.log`、`lifecycle-b.ckp-ready`。 |
+| 单 WAL 实例持续写入并 checkpoint，三个 LogService 进程短停 8 秒后均从原盘冷启动 | WAL 进程存活并继续运行，最终 ACK 250 条、完成 12 次 checkpoint intent。一次底层 `WAL-Commit-Append` 重试 6 次、耗时 13.173 秒；完成后又通过同一 WAL 实例继续写入。证据：`lifecycle-c.log`。 |
+| 单 WAL 实例持续写入和 checkpoint，轮流杀 leader 6 秒、普通副本 4 秒、重新选出的 leader 6 秒、普通副本 4 秒，每次只停一台 | ACK 250 条、完成 12 次 checkpoint intent。第三个窗口 leader 下线期间 ACK 暂停，恢复后继续；最终独立回放 checkpointed=862，水位之后 20 条已确认记录逐条一致。最大已确认 Append 延迟 6.575 秒。证据：`lifecycle-d.log`、`lifecycle-d.faults`、`lifecycle-recover-d.log`。 |
+| 旧 WAL 进程在第 32 次写入前暂停；先杀数据 leader，再释放旧写入并立即强杀旧 WAL 进程；保持另两个副本运行，启动新 WAL 进程完成回放、80 条写入和 4 次 checkpoint，最后恢复旧 leader | 新实例从 user LSN 913 回放并推进到 993；最终独立回放 checkpointed=983，水位之后 10 条已确认记录逐条一致。旧进程未确认的第 32 条未被观察为迟到写入。证据：`lifecycle-e-old.log`、`lifecycle-e-new.log`、`lifecycle-e-final.replay`。 |
+| 单 WAL 实例用 `RangeCheckpoint(1,end,files...)` 的双记录形式，每 15 条写入 checkpoint；期间暂停 leader 25 秒，之后杀普通副本 10 秒，均恢复 | ACK 150 条，10 次 checkpoint intent 成功，最终回放 checkpointed=1138，水位之后 5 条已确认记录逐条一致。最大已确认 Append 延迟 3.454 秒。证据：`lifecycle-f.log`、`lifecycle-f.replay`。 |
+
+最后一轮的 `files...` 是测试 marker 路径，目的是覆盖 TAE checkpoint 使用的 `GroupCKP` 加 `GroupFiles` WAL 编码顺序；没有生成真实 TAE checkpoint 文件，也没有执行 TAE 的文件加载、事务回放或 SQL 查询。因此本节证明的是实际 TN WAL driver 在这些故障时间线中的写入、截断和回放行为，不能代替完整 TN 端到端恢复。所有已确认且未被 checkpoint 覆盖的记录在独立回放中逐条一致；本轮没有发现新缺陷。

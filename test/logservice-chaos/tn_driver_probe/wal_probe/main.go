@@ -19,8 +19,11 @@ import (
 
 func main() {
 	var addresses, mode, prefix, readyFile, releaseFile, progressFile string
-	var count, pauseBeforeSeq int
+	var checkpointReadyFile, checkpointReleaseFile string
+	var count, pauseBeforeSeq, checkpointEvery, pauseAtCheckpoint int
 	var checkpointLag uint64
+	var writeDelay time.Duration
+	var checkpointFiles bool
 	flag.StringVar(&addresses, "addresses", "", "three test LogService addresses")
 	flag.StringVar(&mode, "mode", "cycle", "cycle or replay")
 	flag.StringVar(&prefix, "prefix", "wal-probe", "unique payload prefix")
@@ -29,16 +32,24 @@ func main() {
 	flag.StringVar(&progressFile, "progress-file", "", "atomic last acknowledged seq and LSN")
 	flag.IntVar(&count, "count", 0, "number of user entries; zero means continue until killed")
 	flag.IntVar(&pauseBeforeSeq, "pause-before-seq", -1, "pause before this AppendEntry")
-	flag.Uint64Var(&checkpointLag, "checkpoint-lag", 0, "after writes, checkpoint through user LSN latest minus lag")
+	flag.Uint64Var(&checkpointLag, "checkpoint-lag", 0, "checkpoint through user LSN latest minus lag")
+	flag.IntVar(&checkpointEvery, "checkpoint-every", 0, "checkpoint after every N acknowledged user entries")
+	flag.IntVar(&pauseAtCheckpoint, "pause-at-checkpoint", -1, "pause after dispatching checkpoint number N, zero-based")
+	flag.StringVar(&checkpointReadyFile, "checkpoint-ready-file", "", "write this file after checkpoint dispatch")
+	flag.StringVar(&checkpointReleaseFile, "checkpoint-release-file", "", "wait for this file before checkpoint WaitDone")
+	flag.DurationVar(&writeDelay, "write-delay", 0, "delay after each acknowledged user entry")
+	flag.BoolVar(&checkpointFiles, "checkpoint-files", false, "append a GroupFiles marker using the TAE checkpoint WAL form")
 	flag.Parse()
-	if addresses != "127.0.0.1:58001,127.0.0.1:58011,127.0.0.1:58021" {
+	if addresses != "127.0.0.1:58001,127.0.0.1:58011,127.0.0.1:58021" &&
+		addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" {
 		panic("use only the dedicated WAL StoreImpl test cluster")
 	}
 	if mode != "cycle" && mode != "replay" {
 		panic("invalid mode")
 	}
-	if count < 0 || pauseBeforeSeq < -1 ||
-		(pauseBeforeSeq >= 0 && (readyFile == "" || releaseFile == "")) {
+	if count < 0 || pauseBeforeSeq < -1 || checkpointEvery < 0 || pauseAtCheckpoint < -1 || writeDelay < 0 ||
+		(pauseBeforeSeq >= 0 && (readyFile == "" || releaseFile == "")) ||
+		(pauseAtCheckpoint >= 0 && (checkpointReadyFile == "" || checkpointReleaseFile == "")) {
 		panic("invalid count or pause settings")
 	}
 
@@ -79,6 +90,39 @@ func main() {
 		return
 	}
 
+	checkpointNumber := 0
+	checkpoint := func() {
+		latest := w.GetLSNWatermark()
+		if latest <= checkpointLag {
+			return
+		}
+		end := latest - checkpointLag
+		var files []string
+		if checkpointFiles {
+			files = []string{fmt.Sprintf("probe-checkpoint/%s/%d", prefix, end)}
+		}
+		e, err := w.RangeCheckpoint(1, end, files...)
+		if err != nil {
+			panic(fmt.Sprintf("range checkpoint %d: %v", end, err))
+		}
+		if checkpointNumber == pauseAtCheckpoint {
+			if err := os.WriteFile(checkpointReadyFile, []byte(fmt.Sprintf("%d\n", end)), 0o644); err != nil {
+				panic(err)
+			}
+			for {
+				if _, err := os.Stat(checkpointReleaseFile); err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		checkpointNumber++
+		if err := e.WaitDone(); err != nil {
+			panic(fmt.Sprintf("checkpoint completion %d: %v", end, err))
+		}
+		fmt.Printf("checkpoint_ack end_lsn=%d checkpointed=%d truncated_dsn=%d\n",
+			end, w.GetCheckpointed(), w.GetTruncated())
+	}
 	for seq := 0; count == 0 || seq < count; seq++ {
 		if seq == pauseBeforeSeq {
 			if err := os.WriteFile(readyFile, []byte(fmt.Sprintf("%d %d\n", seq, w.GetLSNWatermark())), 0o644); err != nil {
@@ -116,22 +160,15 @@ func main() {
 				panic(err)
 			}
 		}
+		if checkpointEvery > 0 && (seq+1)%checkpointEvery == 0 {
+			checkpoint()
+		}
+		if writeDelay > 0 {
+			time.Sleep(writeDelay)
+		}
 	}
-	if checkpointLag > 0 {
-		latest := w.GetLSNWatermark()
-		if latest <= checkpointLag {
-			panic("checkpoint lag is beyond latest user LSN")
-		}
-		end := latest - checkpointLag
-		e, err := w.RangeCheckpoint(0, end)
-		if err != nil {
-			panic(fmt.Sprintf("range checkpoint %d: %v", end, err))
-		}
-		if err := e.WaitDone(); err != nil {
-			panic(fmt.Sprintf("checkpoint completion %d: %v", end, err))
-		}
-		fmt.Printf("checkpoint_ack end_lsn=%d checkpointed=%d truncated_dsn=%d\n",
-			end, w.GetCheckpointed(), w.GetTruncated())
+	if checkpointLag > 0 && checkpointEvery == 0 {
+		checkpoint()
 	}
 	fmt.Printf("summary cycles=%d user_lsn=%d\n", count, w.GetLSNWatermark())
 }
