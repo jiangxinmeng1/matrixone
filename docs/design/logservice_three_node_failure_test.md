@@ -539,3 +539,18 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 原始证据在 51 上述三个独立目录：`concurrent-fault-a.{log,timeline,replay}`、`concurrent-post-checkpoint.{log,replay}`、`map-stress.{log,mapping}`、`map-stress-checkpoint.log`、`map-stress-after.{mapping,replay}`、`clean2-stress.log`、`clean2-before.{mapping,replay}`、`clean2-checkpoint.log`、`clean2-after.{mapping,replay}`，以及三个目录的节点日志。未继续向失败 shard 写入。
 
 **原盘冷重启验证。** 保留第三套无故障复现的三个数据目录，停止全部 LogService 进程后按原盘重启。首次重启脚本只等监听端口释放，node1 旧进程尚在退出、PID 仍存活，脚本自身拒绝启动 node1；这次部分启动未计入验证，并终止了等待多数派的探针。确认旧进程退出后启动 node1/node2，三地址均报告数据 shard 有 leader 且三成员可见。新 WAL 实例 `ReplayForWrite` 仍在同一 `dsn 3111 not found` 处退出码 2；失败状态跨整组三副本原盘冷重启保留。证据：`clean2-after-cold-retry.replay` 与节点日志。该过程没有新 WAL 写入。
+
+## 追加验证：单 WAL 实例持续写入期间并行 checkpoint 与节点故障（2026-11-05 16:33–16:42）
+
+**入口与安全水位。** 扩展 `concurrent_probe`：仍只有一个 `wal.NewLogserviceHandle`、默认 100 client；32/64 个协程持续调用 `AppendEntry(GroupUserTxn)` 和 `WaitDone`。另一个协程每累计约 300/400 条 ACK 调用一次 `RangeCheckpoint(1,end,files...)`，并等待 checkpoint entry 完成。它维护**从起始水位连续已确认**的 user LSN 前缀，始终让 `end` 至少落后该前缀 100 条；不把已分配但未确认的 LSN 用作 checkpoint 水位。每轮结束时再补一个合法 checkpoint，并等后台物理 Truncate 完成。TN 的事务 WAL 写入口在 `txnimpl/cmdmgr.go`，checkpoint executor 的 WAL 入口在 `db/checkpoint/executor.go`；本探针仍不包含实际 TAE checkpoint 文件生成、事务应用或 SQL。
+
+| 时间线 | 写入与 checkpoint | 新实例回放 / 物理核对 |
+|---|---|---|
+| 三副本健康对照；64 协程 × 60 条 | **3840/3840** ACK；10 次 checkpoint intent，远端物理截断成功；最终 user LSN 3840、checkpointed 3740。 | `ReplayForWrite` 成功，保留区间无错误。证据 `liveckp-control.{log,replay}`。 |
+| 32 协程 × 80 条；普通副本停 8 秒并恢复，稍后当前 leader 停 8 秒并恢复，任一时刻至少两进程运行 | **2560/2560** ACK；7 次 checkpoint intent 与物理截断成功；最终 user LSN 6400、checkpointed 6300。leader 故障触发原有约 1 分钟 Append 重试长尾。 | 回放成功；checkpoint 之后 **100/100** 条确认记录的 LSN/payload 与新实例回放一致。证据 `liveckp-fault-a.{log,timeline,replay}`。 |
+| 32 协程 × 80 条；将当时 leader 的**测试 RPC 端口**用 `iptables OUTPUT DROP` 黑洞 12 秒，其他两地址保持可读，规则随后删除 | 黑洞期间 ACK 226→230，存活地址直接 `GetTruncatedLsn=3212`；最终 **2560/2560** ACK、7 次 checkpoint intent 和物理截断成功。最慢一组 Append 约 **13.3 秒**后成功，本轮未耗尽 1 分钟期限。 | 回放成功；checkpoint 之后 **100/100** 条确认记录逐条一致。规则已清理。证据 `liveckp-leader-rpc-blackhole.{log,timeline,replay}`。这里仅阻断客户端到 leader 的 RPC，**没有**隔离 Raft 复制网络。 |
+| 32 协程 × 60 条；在 ACK 276 时同时杀当时的 leader node2 与普通副本 node0，6 秒后原盘恢复，随后继续写入与 checkpoint | 两票短暂失去时 ACK 停在 276，恢复后最终 **1920/1920** ACK、7 次 checkpoint intent 和物理截断成功；有一次 Append 在多数派恢复后仍等 **60.519 秒**才重试成功。最终 user LSN 10880、checkpointed 10780。 | 新实例先读到残留的 checkpoint 范围内 user LSN **10773、10774**，随后 `dsn 10833 not found`，退出码 2。物理扫描核对 checkpoint 后 **100/100** 条已确认记录仍在且 payload 一致；同时残留 4 条已 checkpoint 的旧记录。这与 [#32240](https://github.com/matrixorigin/matrixone/issues/32240) 的“旧 DSN 空洞阻断后续回放”同一签名，暂不另建 issue。证据 `liveckp-two-down.{log,timeline,replay,mapping}`。 |
+
+这轮说明持续写入与并行 checkpoint 在健康、单节点下线及单端口网络黑洞场景都可完成并恢复；短时两副本下线后再次遇到 #32240 的边界依赖回放失败。它没有证明两节点同时失去时仍可提交：该 6 秒窗口本来就没有多数派。所有 checkpoint 水位均来自连续 ACK 前缀，失败轮也没有发现未被 checkpoint 覆盖的确认记录在物理日志中丢失。远端目录 `/home/mo/jxm/logservice-liveckp-20261105/` 保留完整原始证据。
+
+从各轮 `ack elapsed_ms` 独立统计，最大单条确认延迟依次为健康 **1.823 秒**、单节点下线 **61.091 秒**、leader RPC 黑洞 **13.308 秒**、两节点短停 **60.519 秒**；各轮最大 checkpoint intent `WaitDone` 为 **1.784、0.845、0.316、1.043 秒**。这些是本次注入与负载下的观测值，不是超时上界。

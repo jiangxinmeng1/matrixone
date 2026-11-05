@@ -25,9 +25,12 @@ func main() {
 	workers := flag.Int("workers", 32, "concurrent appenders")
 	perWorker := flag.Int("per-worker", 30, "entries per appender")
 	delay := flag.Duration("delay", 20*time.Millisecond, "delay between entries per appender")
+	checkpointEvery := flag.Int("checkpoint-every-acks", 0, "issue a checkpoint after each N acknowledged entries; zero disables")
+	checkpointLag := flag.Uint64("checkpoint-lag", 100, "keep this many contiguous acknowledged user LSNs")
+	checkpointFiles := flag.Bool("checkpoint-files", false, "include a GroupFiles marker as TN does")
 	flag.Parse()
 	if *addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" ||
-		*workers <= 0 || *workers > 100 || *perWorker <= 0 || *delay < 0 {
+		*workers <= 0 || *workers > 100 || *perWorker <= 0 || *delay < 0 || *checkpointEvery < 0 {
 		panic("invalid isolated cluster or workload settings")
 	}
 
@@ -62,6 +65,59 @@ func main() {
 	fmt.Printf("ready lsn=%d checkpointed=%d\n", w.GetLSNWatermark(), w.GetCheckpointed())
 
 	var acked atomic.Int64
+	var ackMu sync.Mutex
+	ackLSNs := make(map[uint64]struct{})
+	contiguous := w.GetLSNWatermark()
+	workersDone := make(chan struct{})
+	checkpointDone := make(chan error, 1)
+	if *checkpointEvery > 0 {
+		go func() {
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
+			last := w.GetCheckpointed()
+			nextCount := int64(*checkpointEvery)
+			for {
+				finished := false
+				select {
+				case <-ticker.C:
+				case <-workersDone:
+					finished = true
+				}
+				count := acked.Load()
+				if count >= nextCount || finished {
+					ackMu.Lock()
+					end := contiguous
+					ackMu.Unlock()
+					if end > *checkpointLag {
+						end -= *checkpointLag
+						if end > last {
+							var files []string
+							if *checkpointFiles {
+								files = []string{fmt.Sprintf("probe-checkpoint/%s/%d", *prefix, end)}
+							}
+							began := time.Now()
+							e, err := w.RangeCheckpoint(1, end, files...)
+							if err == nil {
+								err = e.WaitDone()
+							}
+							if err != nil {
+								checkpointDone <- fmt.Errorf("checkpoint end=%d: %w", end, err)
+								return
+							}
+							fmt.Printf("checkpoint_ack end_lsn=%d ack_count=%d elapsed_ms=%.3f\n",
+								end, count, float64(time.Since(began).Microseconds())/1000)
+							last = end
+						}
+					}
+					nextCount = count + int64(*checkpointEvery)
+				}
+				if finished {
+					checkpointDone <- nil
+					return
+				}
+			}
+		}()
+	}
 	var wg sync.WaitGroup
 	errors := make(chan error, *workers)
 	start := make(chan struct{})
@@ -87,6 +143,16 @@ func main() {
 					errors <- fmt.Errorf("worker=%d seq=%d lsn=%d: %w", worker, seq, lsn, err)
 					return
 				}
+				ackMu.Lock()
+				ackLSNs[lsn] = struct{}{}
+				for {
+					if _, ok := ackLSNs[contiguous+1]; !ok {
+						break
+					}
+					contiguous++
+					delete(ackLSNs, contiguous)
+				}
+				ackMu.Unlock()
 				count := acked.Add(1)
 				fmt.Printf("ack count=%d lsn=%d payload=%s elapsed_ms=%.3f\n",
 					count, lsn, payload, float64(time.Since(began).Microseconds())/1000)
@@ -98,12 +164,21 @@ func main() {
 	}
 	close(start)
 	wg.Wait()
+	close(workersDone)
+	var checkpointErr error
+	if *checkpointEvery > 0 {
+		checkpointErr = <-checkpointDone
+		if checkpointErr != nil {
+			fmt.Fprintln(os.Stderr, "checkpoint error:", checkpointErr)
+		}
+	}
 	close(errors)
 	for err := range errors {
 		fmt.Fprintln(os.Stderr, "append error:", err)
 	}
-	fmt.Printf("summary acked=%d expected=%d user_lsn=%d\n", acked.Load(), *workers**perWorker, w.GetLSNWatermark())
-	if acked.Load() != int64(*workers**perWorker) {
+	fmt.Printf("summary acked=%d expected=%d user_lsn=%d contiguous=%d\n",
+		acked.Load(), *workers**perWorker, w.GetLSNWatermark(), contiguous)
+	if checkpointErr != nil || acked.Load() != int64(*workers**perWorker) {
 		os.Exit(2)
 	}
 }
