@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
@@ -17,10 +18,57 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/wal"
 )
 
+type faultHookClient struct {
+	logservice.Client
+	once            *sync.Once
+	ready           string
+	release         string
+	truncateOnce    *sync.Once
+	truncateReady   string
+	truncateRelease string
+}
+
+func (c *faultHookClient) GetTruncatedLsn(ctx context.Context) (logservice.Lsn, error) {
+	lsn, err := c.Client.GetTruncatedLsn(ctx)
+	if err == nil && c.ready != "" {
+		c.once.Do(func() {
+			if err := os.WriteFile(c.ready, []byte(fmt.Sprintf("%d\n", lsn)), 0o644); err != nil {
+				panic(err)
+			}
+			for {
+				if _, err := os.Stat(c.release); err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+	return lsn, err
+}
+
+func (c *faultHookClient) Truncate(ctx context.Context, lsn logservice.Lsn) error {
+	if c.truncateReady != "" {
+		c.truncateOnce.Do(func() {
+			if err := os.WriteFile(c.truncateReady, []byte(fmt.Sprintf("%d\n", lsn)), 0o644); err != nil {
+				panic(err)
+			}
+			for {
+				if _, err := os.Stat(c.truncateRelease); err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+	return c.Client.Truncate(ctx, lsn)
+}
+
 func main() {
 	var addresses, mode, prefix, readyFile, releaseFile, progressFile string
 	var checkpointReadyFile, checkpointReleaseFile string
 	var replayReadyFile, replayReleaseFile string
+	var readReadyFile, readReleaseFile string
+	var truncateReadyFile, truncateReleaseFile string
 	var count, pauseBeforeSeq, checkpointEvery, pauseAtCheckpoint int
 	var checkpointLag uint64
 	var writeDelay, replayTimeout time.Duration
@@ -40,6 +88,10 @@ func main() {
 	flag.StringVar(&checkpointReleaseFile, "checkpoint-release-file", "", "wait for this file before checkpoint WaitDone")
 	flag.StringVar(&replayReadyFile, "replay-ready-file", "", "write this file after client pool creation, before replay")
 	flag.StringVar(&replayReleaseFile, "replay-release-file", "", "wait for this file before replay")
+	flag.StringVar(&readReadyFile, "read-ready-file", "", "write this file after first successful GetTruncatedLsn, before replay Read")
+	flag.StringVar(&readReleaseFile, "read-release-file", "", "wait for this file before replay Read")
+	flag.StringVar(&truncateReadyFile, "truncate-ready-file", "", "write this file before the first physical Truncate RPC")
+	flag.StringVar(&truncateReleaseFile, "truncate-release-file", "", "wait for this file before the first physical Truncate RPC")
 	flag.DurationVar(&replayTimeout, "replay-timeout", 3*time.Minute, "overall replay context deadline")
 	flag.DurationVar(&writeDelay, "write-delay", 0, "delay after each acknowledged user entry")
 	flag.BoolVar(&checkpointFiles, "checkpoint-files", false, "append a GroupFiles marker using the TAE checkpoint WAL form")
@@ -54,7 +106,9 @@ func main() {
 	if count < 0 || pauseBeforeSeq < -1 || checkpointEvery < 0 || pauseAtCheckpoint < -1 || writeDelay < 0 || replayTimeout <= 0 ||
 		(pauseBeforeSeq >= 0 && (readyFile == "" || releaseFile == "")) ||
 		(pauseAtCheckpoint >= 0 && (checkpointReadyFile == "" || checkpointReleaseFile == "")) ||
-		((replayReadyFile == "") != (replayReleaseFile == "")) {
+		((replayReadyFile == "") != (replayReleaseFile == "")) ||
+		((readReadyFile == "") != (readReleaseFile == "")) ||
+		((truncateReadyFile == "") != (truncateReleaseFile == "")) {
 		panic("invalid count or pause settings")
 	}
 
@@ -66,10 +120,19 @@ func main() {
 		TNReplicaID:      100,
 		ServiceAddresses: strings.Split(addresses, ","),
 	}
+	var readHookOnce sync.Once
+	var truncateHookOnce sync.Once
 	factory := func() (logservice.Client, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()
-		return logservice.NewClient(ctx, sid, clientCfg)
+		client, err := logservice.NewClient(ctx, sid, clientCfg)
+		if err != nil || (readReadyFile == "" && truncateReadyFile == "") {
+			return client, err
+		}
+		return &faultHookClient{
+			Client: client, once: &readHookOnce, ready: readReadyFile, release: readReleaseFile,
+			truncateOnce: &truncateHookOnce, truncateReady: truncateReadyFile, truncateRelease: truncateReleaseFile,
+		}, nil
 	}
 	w := wal.NewLogserviceHandle(logservicedriver.LogServiceClientFactory(factory), 0)
 	defer func() {

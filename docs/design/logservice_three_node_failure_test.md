@@ -496,3 +496,19 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 **代码路径与影响。** `logservicedriver/replayer.go:initReadWatermarks` 在回放初始化首先调用 `getTruncatedPSNFromBackend`；后者从默认 100 client 池取一个已有连接，对 `GetTruncatedLsn` 单次设置 `MaxTimeout=3m`。`pkg/logservice/client.go` 的数据客户端设置 `WithBackendReadTimeout(0)`，只有 RPC 报错后 `managedClient` 才关闭旧连接；所以无响应但 TCP 仍建立的副本会耗尽整段 3 分钟。driver 在失败后检查 `time.Since(start) > MaxTimeout`，此时不再试另一连接，直接把错误交给回放。TAE 的 `ReplayWal` 使用这条 WAL 路径，`ReplayCtl.StopForWrite` 会把回放错误交给晋升流程；因此该实验已证明 WAL 初始化失败，**尚未启动真实 TN 进程来量化服务层重启或 SQL 影响**。预期是当另外两票已经能提供截断位点和日志时，旧连接失效应触发有限时间内换地址继续回放，不能把单个失联副本的 3 分钟超时直接当作整组不可用。该路径与 #32133/#32148 已记录的 Append/Read 60 秒长尾有相同的连接失效机制，但首次回放的 3 分钟后直接失败是独立的启动后果。
 
 跟踪缺陷：[matrixorigin/matrixone#32235](https://github.com/matrixorigin/matrixone/issues/32235)。
+
+## 追加验证：两票可用时 TN WAL 回放首次 Read 的 1 分钟长尾（2026-11-05 15:12–15:19）
+
+**对照。** 在创建 WAL driver 的 100 client 池**之前**暂停一台普通副本，另外两票运行；新实例仍通过三地址 `ReplayForWrite` 成功，driver 创建 739.555 毫秒，`GetTruncatedLsn` 119.833 毫秒，完整回放 121.560 毫秒。这说明故障前已有旧连接是长尾的关键条件，而不是只要三地址列表中含一台坏节点就会卡住。证据：`replay-cold-pool-follower-down.log`。
+
+**故障交错。** 测试探针仅在首次 `GetTruncatedLsn` 成功后、回放首次 `Read` 前设置屏障；其余仍通过原始 `logservice.NewClient` 与 TN 默认 WAL driver 运行。每轮先让客户端池连三地址，查询当前 leader 后暂停一台普通副本，再放行 Read。未命中当前 Read 连接的预选轮次约 4 秒内完成；命中的两轮 `read-tail-6`、`read-tail2-10` 均暂停 node1，另两票继续运行。独立 `GetLatestLsn` 从存活地址立即成功，driver 的后台截断位点轮询也每 5 秒从其他连接成功返回。两轮 `Wal-Replay-Info.read-duration` 分别为 **1m0.603s**、**1m0.338s**，完整 `ReplayForWrite` 分别为 **61.102s**、**60.810s**；超时重连后回放成功，LSN/payload 未出现不一致。原始证据保留在 51 同一目录下的 `read-tail-6.log`、`read-tail2-10.log`；复现脚本为 `test/logservice-chaos/tn_driver_probe/reproduce_read_tail.py`。
+
+此处没有新的错误类型；它把已有 [Read 长尾缺陷 #32148](https://github.com/matrixorigin/matrixone/issues/32148) 的证据扩展到 **TN WAL 启动回放**，不另建重复 issue。代码中 `readFromBackend` 给每次 `Read` 默认 1 分钟 deadline，只有 RPC 退出后 `managedClient.Read` 才重置旧连接；后台轮询可借别的 pooled client 正常运行，不能让被卡住的这次 Read 提前换地址。
+
+**另外一处代码风险，尚未列为缺陷。** `truncateFromRemote` 调用 `clientPool.GetOnFly()` 后只特别处理 `ErrClientPoolClosed`；如果新 LogService 客户端因为网络故障返回其他错误，返回的 client 为 nil，随后的 `client.wrapped.Truncate` 会 panic。一个临时同包单测用“初始客户端成功、checkpoint 时新客户端创建失败”的工厂可确定性触发该 panic。真实 TN 的 factory 默认单次连接超时 30 秒，pool 默认在 5 分钟检查窗口内重试，此窗口不是严格墙钟上限；本轮未在 51 上持续制造这一时长的网络故障，也未证明生产会在这个窗口仍继续发出 checkpoint 截断，所以先记录为待验证风险。
+
+## 追加验证：两票可用时 checkpoint 物理 Truncate 延迟 3 分钟（2026-11-05 15:23–15:26）
+
+同一独立三副本集群和 TN WAL driver 默认 100 client。测试进程顺序确认 20 条 user WAL 后调用 `RangeCheckpoint(1,1153)`，checkpoint intent 已提交并返回 ACK；driver 后台计算出的物理截断目标为 PSN **6923**。测试屏障只在后台新建的 LogService 客户端已连接、首次 `Truncate` RPC 发送前暂停。`ss -tnp` 显示该进程共持有 101 条到三地址的数据连接，新建连接（最高 fd 106）指向普通副本 node2；暂停 node2 后放行 `Truncate`，另两票运行。两存活地址直接查询截断位点立即返回旧值 **3612**，最新 LSN 可读；测试进程的 `summary cycles=20` 已输出，但后台截断和正常 `Close` 一直未完成。
+
+在 node2 **仍暂停**时，首次尝试的默认 3 分钟 context 到期；该 context 在测试屏障前已创建，因此屏障等待也占其中一小段。`Wal-Truncate-Execute` 最终记录 `retry-times=1`、总耗时 **3m0.529s**，第二次尝试换到存活地址后成功将物理截断位点从 **3612** 推进到 **6923**。`Wal-Truncate-By-PSN` 删除 15 个旧 PSN 映射，进程随后正常退出。原始证据：`truncate-tail-a.log` 和节点日志；故障副本已恢复。这再次说明两票能提供服务时，单条旧 TCP 连接仍可消耗整个 `MaxTimeout=3m`。该物理截断是后台工作，不能把 3 分钟直接换算为单笔事务提交延迟；可观察影响是 WAL 清理滞后及本轮正常 `Close` 等待。`driver.Close` 的 4 分钟 deadline 在调用 `truncateQueue.Stop()` 之前建立，`Stop()` 本身没有剩余时间约束；持续失败时理论等待可更久，但本轮只观察到 3 分钟。与 #32235 同属过长的旧连接失败检测，暂不另建同根因 issue。
