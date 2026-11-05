@@ -20,9 +20,10 @@ import (
 func main() {
 	var addresses, mode, prefix, readyFile, releaseFile, progressFile string
 	var checkpointReadyFile, checkpointReleaseFile string
+	var replayReadyFile, replayReleaseFile string
 	var count, pauseBeforeSeq, checkpointEvery, pauseAtCheckpoint int
 	var checkpointLag uint64
-	var writeDelay time.Duration
+	var writeDelay, replayTimeout time.Duration
 	var checkpointFiles bool
 	flag.StringVar(&addresses, "addresses", "", "three test LogService addresses")
 	flag.StringVar(&mode, "mode", "cycle", "cycle or replay")
@@ -37,6 +38,9 @@ func main() {
 	flag.IntVar(&pauseAtCheckpoint, "pause-at-checkpoint", -1, "pause after dispatching checkpoint number N, zero-based")
 	flag.StringVar(&checkpointReadyFile, "checkpoint-ready-file", "", "write this file after checkpoint dispatch")
 	flag.StringVar(&checkpointReleaseFile, "checkpoint-release-file", "", "wait for this file before checkpoint WaitDone")
+	flag.StringVar(&replayReadyFile, "replay-ready-file", "", "write this file after client pool creation, before replay")
+	flag.StringVar(&replayReleaseFile, "replay-release-file", "", "wait for this file before replay")
+	flag.DurationVar(&replayTimeout, "replay-timeout", 3*time.Minute, "overall replay context deadline")
 	flag.DurationVar(&writeDelay, "write-delay", 0, "delay after each acknowledged user entry")
 	flag.BoolVar(&checkpointFiles, "checkpoint-files", false, "append a GroupFiles marker using the TAE checkpoint WAL form")
 	flag.Parse()
@@ -47,9 +51,10 @@ func main() {
 	if mode != "cycle" && mode != "replay" {
 		panic("invalid mode")
 	}
-	if count < 0 || pauseBeforeSeq < -1 || checkpointEvery < 0 || pauseAtCheckpoint < -1 || writeDelay < 0 ||
+	if count < 0 || pauseBeforeSeq < -1 || checkpointEvery < 0 || pauseAtCheckpoint < -1 || writeDelay < 0 || replayTimeout <= 0 ||
 		(pauseBeforeSeq >= 0 && (readyFile == "" || releaseFile == "")) ||
-		(pauseAtCheckpoint >= 0 && (checkpointReadyFile == "" || checkpointReleaseFile == "")) {
+		(pauseAtCheckpoint >= 0 && (checkpointReadyFile == "" || checkpointReleaseFile == "")) ||
+		((replayReadyFile == "") != (replayReleaseFile == "")) {
 		panic("invalid count or pause settings")
 	}
 
@@ -74,18 +79,30 @@ func main() {
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	if replayReadyFile != "" {
+		if err := os.WriteFile(replayReadyFile, []byte("ready\n"), 0o644); err != nil {
+			panic(err)
+		}
+		for {
+			if _, err := os.Stat(replayReleaseFile); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), replayTimeout)
 	defer cancel()
+	replayStart := time.Now()
 	if err := w.Replay(ctx, func(group uint32, lsn uint64, payload []byte, _ uint16, _ any) driver.ReplayEntryState {
 		if group == wal.GroupUserTxn {
 			fmt.Printf("replay lsn=%d payload=%s\n", lsn, payload)
 		}
 		return driver.RE_Nomal
 	}, func() driver.ReplayMode { return driver.ReplayMode_ReplayForWrite }, nil); err != nil {
-		panic(fmt.Sprintf("wal replay: %v", err))
+		panic(fmt.Sprintf("wal replay after %s: %v", time.Since(replayStart), err))
 	}
-	fmt.Printf("replay_done user_lsn=%d checkpointed=%d truncated_dsn=%d\n",
-		w.GetLSNWatermark(), w.GetCheckpointed(), w.GetTruncated())
+	fmt.Printf("replay_done user_lsn=%d checkpointed=%d truncated_dsn=%d elapsed_ms=%.3f\n",
+		w.GetLSNWatermark(), w.GetCheckpointed(), w.GetTruncated(), float64(time.Since(replayStart).Microseconds())/1000)
 	if mode == "replay" {
 		return
 	}

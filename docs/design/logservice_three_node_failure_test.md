@@ -486,3 +486,11 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 | 单 WAL 实例用 `RangeCheckpoint(1,end,files...)` 的双记录形式，每 15 条写入 checkpoint；期间暂停 leader 25 秒，之后杀普通副本 10 秒，均恢复 | ACK 150 条，10 次 checkpoint intent 成功，最终回放 checkpointed=1138，水位之后 5 条已确认记录逐条一致。最大已确认 Append 延迟 3.454 秒。证据：`lifecycle-f.log`、`lifecycle-f.replay`。 |
 
 最后一轮的 `files...` 是测试 marker 路径，目的是覆盖 TAE checkpoint 使用的 `GroupCKP` 加 `GroupFiles` WAL 编码顺序；没有生成真实 TAE checkpoint 文件，也没有执行 TAE 的文件加载、事务回放或 SQL 查询。因此本节证明的是实际 TN WAL driver 在这些故障时间线中的写入、截断和回放行为，不能代替完整 TN 端到端恢复。所有已确认且未被 checkpoint 覆盖的记录在独立回放中逐条一致；本轮没有发现新缺陷。
+
+## 缺陷记录：两票可用时 TN WAL 回放获取截断位点等待 3 分钟并失败（2026-11-05 14:52–14:59）
+
+**环境。** 继续使用上述三副本独立集群及已经写入的真实 WAL driver 记录，数据 shard 1 始终保持三投票成员。新启动的 WAL 进程仍使用 TN 的 `wal.NewLogserviceHandle`、默认 `ClientMaxCount=100`、实际 `logservice.NewClient` 三地址客户端，并执行 `StoreImpl.Replay(ReplayForWrite)`。测试探针新增“创建完 100 个客户端连接、调用 Replay 前暂停”屏障，以只在故障注入时改变时序；`-replay-timeout 6m` 只放宽测试程序的外层 context，**driver 内部仍是默认 `MaxTimeout=3m`**。独立复现脚本 `test/logservice-chaos/tn_driver_probe/reproduce_replay_tail.py` 会查当前 leader，只暂停一个普通副本，另两票始终运行；脚本保证最终 `SIGCONT`，且设置自动恢复保险。
+
+**结果。** 两轮均先建立 WAL 客户端池，然后暂停一个它已连接的普通副本，放行回放。第一轮暂停 node0，第二轮暂停 node2；两次均在约 3 秒内确认回放未完成。期间从另外两个地址分别直接调用 `GetTruncatedLsn`，均立即成功返回 `3612`；第一轮的 `GetLatestLsn` 也成功。这证明不是 Raft 多数派或截断位点本身不可用。两轮 `Wal-Get-Truncate` 最终分别在 **3m0.000644s**、**3m0.000224s** 返回 `context deadline exceeded`，`retry-times=1`，整个 `ReplayForWrite` 退出码 2，没有读取或应用任何 WAL 记录。恢复普通副本后，健康对照回放 **229.536 毫秒**完成，水位与预期一致。原始证据：`replay-tail-1.log`、`replay-tail-9.log`、`replay-tail-control.log` 及三节点 `stdout.log`；两个失败轮次均在节点暂停时用存活地址独立验证了截断位点可读。
+
+**代码路径与影响。** `logservicedriver/replayer.go:initReadWatermarks` 在回放初始化首先调用 `getTruncatedPSNFromBackend`；后者从默认 100 client 池取一个已有连接，对 `GetTruncatedLsn` 单次设置 `MaxTimeout=3m`。`pkg/logservice/client.go` 的数据客户端设置 `WithBackendReadTimeout(0)`，只有 RPC 报错后 `managedClient` 才关闭旧连接；所以无响应但 TCP 仍建立的副本会耗尽整段 3 分钟。driver 在失败后检查 `time.Since(start) > MaxTimeout`，此时不再试另一连接，直接把错误交给回放。TAE 的 `ReplayWal` 使用这条 WAL 路径，`ReplayCtl.StopForWrite` 会把回放错误交给晋升流程；因此该实验已证明 WAL 初始化失败，**尚未启动真实 TN 进程来量化服务层重启或 SQL 影响**。预期是当另外两票已经能提供截断位点和日志时，旧连接失效应触发有限时间内换地址继续回放，不能把单个失联副本的 3 分钟超时直接当作整组不可用。该路径与 #32133/#32148 已记录的 Append/Read 60 秒长尾有相同的连接失效机制，但首次回放的 3 分钟后直接失败是独立的启动后果。
