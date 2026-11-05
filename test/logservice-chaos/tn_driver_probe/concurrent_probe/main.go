@@ -19,6 +19,18 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/wal"
 )
 
+type tracedClient struct{ logservice.Client }
+
+func (c *tracedClient) Append(ctx context.Context, rec logservice.LogRecord) (logservice.Lsn, error) {
+	start := time.Now()
+	lsn, err := c.Client.Append(ctx, rec)
+	if err != nil || time.Since(start) > 3*time.Second {
+		fmt.Printf("backend_append lsn=%d elapsed_ms=%.3f err=%v\n",
+			lsn, float64(time.Since(start).Microseconds())/1000, err)
+	}
+	return lsn, err
+}
+
 func main() {
 	addresses := flag.String("addresses", "", "three dedicated test LogService RPC addresses")
 	prefix := flag.String("prefix", "concurrent", "unique payload prefix")
@@ -28,9 +40,13 @@ func main() {
 	checkpointEvery := flag.Int("checkpoint-every-acks", 0, "issue a checkpoint after each N acknowledged entries; zero disables")
 	checkpointLag := flag.Uint64("checkpoint-lag", 100, "keep this many contiguous acknowledged user LSNs")
 	checkpointFiles := flag.Bool("checkpoint-files", false, "include a GroupFiles marker as TN does")
+	startReady := flag.String("start-ready-file", "", "write this file after replay and before worker Append calls")
+	startRelease := flag.String("start-release-file", "", "wait for this file before worker Append calls")
+	traceBackend := flag.Bool("trace-backend-append", false, "log slow or failed individual LogService Append attempts")
 	flag.Parse()
 	if *addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" ||
-		*workers <= 0 || *workers > 100 || *perWorker <= 0 || *delay < 0 || *checkpointEvery < 0 {
+		*workers <= 0 || *workers > 100 || *perWorker <= 0 || *delay < 0 || *checkpointEvery < 0 ||
+		(*startReady == "") != (*startRelease == "") {
 		panic("invalid isolated cluster or workload settings")
 	}
 
@@ -43,7 +59,11 @@ func main() {
 	factory := func() (logservice.Client, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		return logservice.NewClient(ctx, sid, clientCfg)
+		client, err := logservice.NewClient(ctx, sid, clientCfg)
+		if err != nil || !*traceBackend {
+			return client, err
+		}
+		return &tracedClient{Client: client}, nil
 	}
 	w := wal.NewLogserviceHandle(logservicedriver.LogServiceClientFactory(factory), 0)
 	defer func() {
@@ -161,6 +181,17 @@ func main() {
 				}
 			}
 		}(worker)
+	}
+	if *startReady != "" {
+		if err := os.WriteFile(*startReady, []byte("ready\n"), 0o644); err != nil {
+			panic(err)
+		}
+		for {
+			if _, err := os.Stat(*startRelease); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 	close(start)
 	wg.Wait()

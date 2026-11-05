@@ -554,3 +554,22 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 这轮说明持续写入与并行 checkpoint 在健康、单节点下线及单端口网络黑洞场景都可完成并恢复；短时两副本下线后再次遇到 #32240 的边界依赖回放失败。它没有证明两节点同时失去时仍可提交：该 6 秒窗口本来就没有多数派。所有 checkpoint 水位均来自连续 ACK 前缀，失败轮也没有发现未被 checkpoint 覆盖的确认记录在物理日志中丢失。远端目录 `/home/mo/jxm/logservice-liveckp-20261105/` 保留完整原始证据。
 
 从各轮 `ack elapsed_ms` 独立统计，最大单条确认延迟依次为健康 **1.823 秒**、单节点下线 **61.091 秒**、leader RPC 黑洞 **13.308 秒**、两节点短停 **60.519 秒**；各轮最大 checkpoint intent `WaitDone` 为 **1.784、0.845、0.316、1.043 秒**。这些是本次注入与负载下的观测值，不是超时上界。
+
+## 新缺陷：短时失去多数派时在途 Append 的服务端提议等待整整 1 分钟（2026-11-05 17:16–17:26）
+
+**与既有旧连接长尾的区别。** #32133 的连接网络隔离让客户端已连接副本不响应；本轮在一个**仍存活的 LogService 节点**上观察到 `store.append` 的 `SyncPropose` 最终返回 Dragonboat `timeout`。测试仍是一个 TN WAL handle、默认 100 client、三地址；单次 Append 的 driver 默认期限由 `DefaultOneTryTimeout = 1m` 给出。另两节点只是同时停 **6 秒**，原盘恢复后大量其他 Append 已经确认，但在故障边缘发出的某些旧提议直到其原请求期限耗尽才结束。LogService `store.propose` 对 `ErrShardNotReady` / `ErrSystemBusy` 会重试，对最终 `ErrTimeout` 直接返回；`managedClient.Append` 仅在 RPC 出错后重置连接，`wrappedClient.Append` 也只有拿到错误后才重试。
+
+**发起时机对照。** 新空盘三副本集群 `/home/mo/jxm/logservice-tail-quorum-20261105/`。测试探针加“已创建默认 100 client、回放完毕，尚未发起第一笔 Append”文件屏障。先杀当前 leader 与一普通副本、再释放 32 条并发 Append、6 秒后恢复，两轮分别保留普通副本或 leader 为唯一存活节点。两轮 **32/32** 条均确认，完成约 **9.07 / 8.88 秒**，没有 60 秒长尾。其中一轮首个 backend 调用先收到 connection refused，另一轮首个 backend 调用在约 5 秒收到 context deadline；都能在恢复后较快重试或完成。这说明“短时两节点下线”本身不必然产生 60 秒长尾，**故障边缘的在途请求**是关键窗口。证据：`quorum-tail-{a,b}.{log,timeline}`。
+
+**默认期限的在途窗口。** `reproduce_quorum_tail.py` 在同一个 WAL handle 上用 32 协程 × 60 条持续写入，并行按连续 ACK 前缀每约 300 条做合法 checkpoint。确认约 250 条时同时杀 leader 与一普通副本，6 秒后原盘恢复；只在这个短窗口内失去多数派。两轮 `quorum-tail-{c,d}` 均 **1920/1920** 条 ACK、7 次 checkpoint intent 与物理截断成功，独立 `ReplayForWrite` 成功，最终保留的 **100/100** 条确认记录逐条匹配。
+
+| 默认轮次 | 多数派恢复及其他写入 | 在途调用及最终 ACK |
+|---|---|---|
+| C | 17:17:12 下线两台、17:17:18 恢复；17:17:19 已有其他 Append 成功 | sole survivor node2 于 17:18:12 记录 `propose failed: timeout`；测试包装器记录该底层 Append **59.889 秒**后返回 `timeout`，driver 重试 1 次，单条最大确认 **60.325 秒**。 |
+| D | 17:19:34 下线两台、17:19:40 恢复；其他请求继续成功 | 3 条底层 Append 分别约 **59.803 秒**后返回 `timeout`，driver 重试后单条最大确认 **61.071 秒**。 |
+
+**快速重试反事实。** 在独立的临时构建 worktree 中，**仅把测试版** `DefaultOneTryTimeout` 从 1 分钟改为 2 秒，复制同一探针并构建另一二进制；没有改动或推送生产代码。对相同的“持续写入、两台短停 6 秒”控制流程，`quorum-tail-fast-{a,b}` 均 **1920/1920** 条 ACK，最大单条确认分别 **11.621、9.608 秒**，新进程回放成功，最后保留的 **100/100** 条记录逐条一致。测试版两轮分别出现 **65、44** 次底层约 2 秒的 `timeout`，由 driver 重试；无故障快速版 `quorum-tail-fast-healthy` **1920/1920** 条 ACK、0 次底层 timeout、最大确认 **1.509 秒**。2 秒阈值仅用于证明更短期限可以明显缩短该时间线，不表示它适合所有生产负载；过短期限会增加未知提交结果和重复物理 Append 的机会，必须评估正常尾延迟、远程链路、批量大小以及幂等回放语义。
+
+**判断。** Raft 在只剩一票的 6 秒内不能提交是预期行为；多数派恢复后，个别旧提议仍等满客户端单次 1 分钟期限而阻塞 WAL 写入，不是 Raft 多数派协议必然要求。当前 `wrappedClient.Append` 的单次固定 1 分钟期限既不可在 TN `NewLogserviceHandle` 配置，也不会因为其他写入已经恢复而提前重试；总 `MaxTimeout=3m` 只在每次尝试结束后检查，并非严格总上限。需要一个能及时处理服务端失去 leader/提议悬挂的有限重试策略，同时把先前 Append 的结果视为**未知**，保留同 DSN 去重/回放正确性。这里的直接证据是 TN WAL driver 的长尾与服务端提议 timeout；没有启动真实 TN/CN，也未测 SQL 事务延迟。此路径不同于 #32133 的已连接失联节点，也不同于 #32148 的 Read 长尾。
+
+原始证据保留在 51 上 `/home/mo/jxm/logservice-tail-quorum-20261105/`：`quorum-tail-{a,b,c,d,fast-a,fast-b,fast-healthy}.{log,timeline,replay}`（不存在的组合仅以实际文件为准）、三个 `node-*/stdout.log`、`quorum-tail-fast-current.mapping`。快速版的唯一生产代码差异保留在临时 worktree `/tmp/mo-logservice-fast-retry-20261105/`，完成后将移除该临时目录，测试二进制和日志保留在 51。
