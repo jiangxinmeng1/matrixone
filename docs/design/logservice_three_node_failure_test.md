@@ -615,3 +615,11 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 | 2 | 再确认 **120/120** 条 Append，末条 LSN 535；`Truncate(450)` 后，同样在正式目录 index **537** 的重命名事件杀 node0，重启前确认同样的三文件布局 | 原盘重启后 index 537 目录再度出现，但两文件时间戳晚于 kill，且 node0 日志明确记录重启后的 `export snapshot success index=537`；这是同 index 的**重新导出**，旧标记文件已清除。三地址恢复完整成员；从 LSN 451 各读到 85 条，内容 SHA256 均为 `94d0b673359c6cfe8953af4d8765bc425014fc399e174642521c4f5caaab0194`。 |
 
 本轮没有观察到旧版 #32144 的“带标记文件的正式目录使同 index 导出持续拒绝”；node0 日志中 `request export snapshot failed` / `request rejected` 计数为 0。第二轮结束时 node0 正式导出目录数为 2，未超出配置配额。证据留在上述远端目录：`snapshot-watch{,-b}.log`、`seed.append`、`followup.append`、`survivor.read`、各节点 `after-truncate.read` / `after-second.read`、三个 `stdout.log` 和磁盘上的快照目录。本轮证明重启清理与重新导出、截断和读回，未模拟网络分区或 TN WAL 编码。
+
+## 最新 upstream/main 回归验证：迟到导出、崩溃恢复与三地址连接（2026-11-09 11:26–11:39）
+
+继续使用 `b19ef50f05` 版本，在全新三副本目录 `/home/mo/jxm/logservice-main-b19ef-late-export-20261109/` 测试。配置 `max-exported-snapshot=1`、`truncate-interval=1s`、HAKeeper 默认 5 分钟过期。数据 shard 的三个 RPC 地址为 `127.0.0.1:58201/58211/58221`；node0 为普通副本。直接客户端先确认 400 条写入，再通过 `SIGSTOP` 在 node0 的 `.generating` 目录出现时暂停进程 5 秒。两轮均观察到 `SyncRequestSnapshot` 返回 timeout，暂停结束后导出仍在磁盘形成完整的两文件正式目录；后续追加写入及截断分别使 index 407、657 的迟到快照被导入，旧目录被清理。第一轮截断后，三个地址各从 LSN 451 读到 78 条完全一致的记录；第二轮完成后正式导出目录数为 1，未超过配额。证据为 `pause-a.log`、`pause-b.log`、`seed.append`、`after.append`、`second.append`、`third.append` 和各节点 `after-late.read`。
+
+再做一次组合故障：在 index 818 的 `.generating` 目录出现时暂停 node0 5 秒，恢复后监视正式目录的重命名事件，并立即 `SIGKILL` node0；另外两票全程存活。杀进程时磁盘保留正式 `snapshot-0000000000000332` 目录。node0 从原盘重启后，三个地址都报告同一 leader 和完整三成员；随后 100/100 次 Append 成功，末条 LSN 919。执行 `Truncate(860)` 后，node0 日志确认导入 index 818；三个地址各从 LSN 861 读出 59 条记录，内容 SHA256 均为 `14e6bffb2a527ebc5ea46968a0470b9ff2b4e0e58d11ae5cf480ac40e3f7230b`。证据为 `pause-crash.log`、`pause-crash.truncate`、`crash-late.append`、各节点 `crash-late.read` 和 `stdout.log`。
+
+连接回退另测：仅对 node0 的 RPC 端口加入 `OUTPUT DROP`，保留两个可用副本，以同一份三地址配置独立发起 12 次 `GetLatestLsn`。12/12 次成功，进程总耗时约 0.1–1.0 秒；这组试验没有复现启动连接长尾。规则在试验结束时已删除，证据为 `connect-blackhole.log`。以上场景没有发现新的数据错误或可稳定复现的新缺陷；它们不能证明所有网络故障或导出时序都满足同样的耗时界限。
