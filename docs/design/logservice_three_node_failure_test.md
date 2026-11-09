@@ -623,3 +623,9 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 再做一次组合故障：在 index 818 的 `.generating` 目录出现时暂停 node0 5 秒，恢复后监视正式目录的重命名事件，并立即 `SIGKILL` node0；另外两票全程存活。杀进程时磁盘保留正式 `snapshot-0000000000000332` 目录。node0 从原盘重启后，三个地址都报告同一 leader 和完整三成员；随后 100/100 次 Append 成功，末条 LSN 919。执行 `Truncate(860)` 后，node0 日志确认导入 index 818；三个地址各从 LSN 861 读出 59 条记录，内容 SHA256 均为 `14e6bffb2a527ebc5ea46968a0470b9ff2b4e0e58d11ae5cf480ac40e3f7230b`。证据为 `pause-crash.log`、`pause-crash.truncate`、`crash-late.append`、各节点 `crash-late.read` 和 `stdout.log`。
 
 连接回退另测：仅对 node0 的 RPC 端口加入 `OUTPUT DROP`，保留两个可用副本，以同一份三地址配置独立发起 12 次 `GetLatestLsn`。12/12 次成功，进程总耗时约 0.1–1.0 秒；这组试验没有复现启动连接长尾。规则在试验结束时已删除，证据为 `connect-blackhole.log`。以上场景没有发现新的数据错误或可稳定复现的新缺陷；它们不能证明所有网络故障或导出时序都满足同样的耗时界限。
+
+## 最新 upstream/main 回归验证：恢复未稳定时重复下线与整组冷重启（2026-11-09 12:05–12:09）
+
+继续用上述独立集群和直接 LogService 三地址客户端，持续执行 Append→Read payload 核对；另一个控制器只在已确认 LSN 后方至少 100 条的位置推进 `Truncate`。先让普通副本 node0 四次下线、从原盘启动，其中前三次启动约 150 毫秒后再次杀进程，没有等待完整成员确认。任何时刻 node1、node2 两票均存活。持续客户端确认 172 条新记录，内部 Append 重试 1 次、Read 重试 0 次，最大单次写读周期 839.399 毫秒；四次截断成功，最终水位 970。三地址从 LSN 971 读取各 130 条记录，内容 SHA256 相同：`315acd2f3484573e85e2558f13f5f86db0c06aed3b937b3bb237df5d3ebebbbe`。
+
+随后对当时的 leader node2 做四次同类下线，另两票 node0、node1 一直存活；每次在停机期间发起安全水位截断，前三次原盘启动后约 150 毫秒再次杀进程。持续客户端再次确认 172 条新记录，内部 Append 重试 2 次、Read 重试 0 次，最大单次写读周期 6.250366 秒；四次截断成功，最终水位 1162。三地址从 LSN 1163 读取各 133 条记录，SHA256 均为 `0bd5a983c6098cda19c818a6301bd51c2af444d9ce2efd992f71787180d1332e`。最后同时 `SIGKILL` 三节点并全部从原盘启动，三个地址恢复相同三成员；再次读取同一范围仍为 133 条且 SHA256 不变。原始证据位于远端目录的 `rapid-restart.log`、`rapid.load`、`rapid-leader.log`、`rapid-leader.load` 和各节点的 `rapid-verify.read`、`rapid-leader-verify.read`、`rapid-cold-verify.read`。这组短时故障没有发现新缺陷；没有证明被反复重启的副本每次都曾进入追赶状态，也没有覆盖长时间 HAKeeper 成员替换。
