@@ -24,10 +24,12 @@ func main() {
 	sizeMiB := flag.Int("size-mib", 0, "payload size in MiB, up to 95")
 	tag := flag.String("tag", "large-wal", "record tag")
 	checkpointThrough := flag.Uint64("checkpoint-through", 0, "last checkpointed user LSN")
+	readyFile := flag.String("pause-before-write-ready", "", "signal after replay before the large WAL append")
+	releaseFile := flag.String("pause-before-write-release", "", "resume the large WAL append when this file exists")
 	flag.Parse()
 	if *addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" ||
 		(*mode != "write" && *mode != "replay" && *mode != "checkpoint") ||
-		*sizeMiB < 0 || *sizeMiB > 95 {
+		*sizeMiB < 0 || *sizeMiB > 95 || (*readyFile == "") != (*releaseFile == "") {
 		panic("invalid dedicated-cluster arguments")
 	}
 	const sid = "large-tn-wal-probe"
@@ -84,6 +86,23 @@ func main() {
 		fmt.Printf("checkpoint_ack through=%d checkpointed=%d\n",
 			*checkpointThrough, w.GetCheckpointed())
 		return
+	}
+	if *readyFile != "" {
+		if err := os.WriteFile(*readyFile, []byte("ready\n"), 0o644); err != nil {
+			panic(err)
+		}
+		deadline := time.Now().Add(60 * time.Second)
+		for {
+			if _, err := os.Stat(*releaseFile); err == nil {
+				break
+			} else if !os.IsNotExist(err) {
+				panic(err)
+			}
+			if time.Now().After(deadline) {
+				panic("timed out waiting to release large WAL append")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 	size := *sizeMiB << 20
 	payload := make([]byte, size)

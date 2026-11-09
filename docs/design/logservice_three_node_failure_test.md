@@ -669,3 +669,13 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 隔离期间，持续客户端确认 **2119** 次写入并回读、无重试和最终错误，最长单轮 **3.123 秒**；31 次 Truncate 全部成功，已核对 LSN 从 51 推进到 2191。恢复 node2 网络约 15 秒后，三个 RPC 地址对 shard 0 和 shard 1 均报告相同的原三成员和新 leader。截断水位为 2070，三地址从 LSN 2071 各读出 117 条用户记录，SHA256 均为 `7454bd10052802be5a2387e07e032d4fb973c4ba3c4e9acdcb11e111f83a2372`。
 
 为验证 node2 不只是出现在成员表里，网络恢复后再停止 node0 **35 秒**，只留 node1、node2 两票。新的连续客户端在这段时间将已核对 LSN 从 2215 推进到 2475，`Truncate(2375)` 成功。原盘恢复 node0 后，此段客户端累计确认 **293** 次写入并回读、无重试，最长单轮 **0.502 秒**；三个地址各从 LSN 2376 读出 114 条相同用户记录，SHA256 均为 `524b7c9970d4fb8860f7a42626b719ce283c6aa61ff5d1d7247a87d6d2e4dbe1`。节点日志无 panic、`L/shutdown` 或 `Expired logStore info`。这些结果未复现 30 秒加速阈值下的 #32134；仅覆盖这次默认 5 分钟配置、单 leader 长网络隔离和恢复后的两票服务。远端证据为 `hakeeper-leader-340s-20261109.{load,progress}`、`after-heal-vote.{load,progress}` 及三个节点的 `stdout.log`。测试进程已停止，测试 veth、bridge 和 network namespace 已删除。
+
+## 最新 upstream/main 回归验证：大 WAL 模糊成功重试、重复 PSN 与 checkpoint（2026-11-09 16:19–16:32）
+
+继续使用 `b19ef50f05` 的独立 TN WAL 编码三副本集群 `/home/mo/jxm/logservice-main-b19ef-wal-replay-20261109/`。探针 `test/logservice-chaos/tn_driver_probe/large_wal_probe/main.go` 通过真实 `wal.NewLogserviceHandle`、默认 100-client 池、`ReplayForWrite` 和 `AppendEntry(GroupUserTxn)` 写入，新增仅在完成回放后、写入前暂停的文件屏障。先独立回放并核对已有两条 95 MiB 记录，watermark 为 user LSN 213、checkpointed 为 211。暂停探针，确认数据 leader 在 node2，随后 `SIGSTOP` node2 并释放一条 95 MiB WAL 写入；node0、node1 两票继续运行。25 秒后 `SIGCONT` node2。
+
+这笔 WAL 写入最后以 user LSN **214** 成功，payload SHA256 为 `06670f0752e7d86bca233c8385492f6ac95590053b0a130c01ead1c707e5f6a8`，总耗时 **32.171 秒**，driver 底层 Append 重试 1 次。独立回放成功，日志确认同一 DSN **236** 的物理副本在 PSN **4746**、**4750**，后者被回放器识别为重复；逻辑回调只得到一次 LSN 214，哈希与 ACK 一致。这次未记录探针实际选中的 RPC 连接，不能把 32 秒全部归因于旧连接；物理重复与既有 Append 模糊成功后的重试机制一致，不能据此声称逻辑 WAL 重复提交。
+
+随后再确认一条 2 MiB WAL，user LSN **215**、SHA256 `7e360f0cde34f8e021d3d5d2334191c24c5026e2d17a0072eb36f8ff1baef8e6`。调用正常 `RangeCheckpoint(1,214,...)` 后，后台物理 Truncate 到第一份副本的 PSN **4746**；下一次独立 `ReplayForWrite` 报 `checkpointed=214`、`watermark=215`，回调仍能看见 LSN 214 和 215，其中 LSN 214 来自保留的 PSN 4750。重复回放及三副本整组正常停止、原盘冷重启后的回放仍是同样结果。检查 TAE `db.WalReplayer.checkLSN`：真实 TAE 回调用 checkpoint LSN 过滤 `lsn <= ckpLSN`，因此这次探针回调看见 214 **不能推断真实 TN 会重新应用已 checkpoint 的事务**；本轮没有启动 TN，也没有生成真实 TAE checkpoint 文件。
+
+再通过正常 `RangeCheckpoint(1,215,...)` 将物理截断推进到 PSN **5057**。最终独立回放得到 `checkpointed=215`、`watermark=215`，没有任何大记录回调，说明前次残留在下一次 checkpoint 后消失。本轮观察到一次 checkpoint 周期内保守保留重复副本，但没有最终 WAL 丢失、回放失败或可证明的 TN 重复应用；暂不单列新缺陷。51 上证据为 `large-leader-stop-a.log`、`large-after-duplicate.{write,checkpoint,replay,cold-replay,checkpoint215,final-replay}` 与各节点日志，三个测试节点已停止。
