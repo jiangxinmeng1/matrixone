@@ -16,15 +16,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("root", type=Path)
     parser.add_argument("node", type=int, choices=(0, 1, 2))
+    parser.add_argument("--hakeeper", action="store_true", help="watch the internal HAKeeper snapshot instead of shard 1 export")
     parser.add_argument("--timeout", type=float, default=90)
     args = parser.parse_args()
     root = args.root.resolve()
-    matches = glob.glob(
-        str(root / f"node-{args.node}" / "logservice-data" / "*" / "host-*" /
-            "*" / "exported-snapshot" / "shard-1" / "replica-*")
-    )
+    base = root / f"node-{args.node}" / "logservice-data" / "*" / "host-*" / "*"
+    if args.hakeeper:
+        pattern = base / "snapshot-part-0" / "snapshot-0-*"
+    else:
+        pattern = base / "exported-snapshot" / "shard-1" / "replica-*"
+    matches = glob.glob(str(pattern))
     if len(matches) != 1:
-        raise RuntimeError(f"expected one export parent, found {matches}")
+        raise RuntimeError(f"expected one snapshot parent, found {matches}")
     parent = matches[0]
     pid = int((root / f"node-{args.node}" / "pid").read_text())
     expected = os.path.realpath(root / "mo-service")
