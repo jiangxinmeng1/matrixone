@@ -635,3 +635,11 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 同一独立三副本集群的 `log-store-timeout` 仍为默认 **5 分钟**。先确认 HAKeeper shard 0 的 leader 是 node1、数据 shard 1 的 leader 是 node0，然后在持续三地址 Append→Read 客户端运行期间 `SIGKILL` node1，保持 node0、node2 两票存活 **375 秒**，越过默认过期阈值。控制器每约 10 秒把 `Truncate` 推进到已核对 LSN 后方至少 100 条，并监视两台存活进程。下线期间持续客户端最终完成 **2452/2452** 次写读核对，Append 内部重试 1 次、Read 重试 0 次，最长单轮 1.082134 秒；37/37 次截断成功，最终截断 LSN 3736。node0、node2 日志分别只有 1、2 次 LogService 心跳失败，没有 `Expired logStore info` 或 `L/shutdown`。
 
 原盘恢复 node1 后，三个地址对 shard 0 和 shard 1 均报告相同的原始三成员；node1 日志记录数据 shard snapshot 导入成功。三个地址从 LSN 3737 各读到 102 条记录，SHA256 均为 `28b06e2ae4476cd7864b50718a5723bbd80f9b7d9f496bf0634b6e9caa6a7afb`。证据为远端 `hakeeper-long.log`、`hakeeper-long.load`、`hakeeper-long.progress`、各节点 `hakeeper-long-verify.read` 及 `stdout.log`。本轮未复现 30 秒加速配置的 #32134 误关停；进程下线场景也不等同于双向网络隔离或先后两次隔离。
+
+## 最新 upstream/main 回归验证：64 MiB 读取上限附近的大 TN WAL 记录（2026-11-09 14:44–14:49）
+
+使用只含 TN WAL driver 编码的独立三副本目录 `/home/mo/jxm/logservice-main-b19ef-wal-replay-20261109/`，仍为 `b19ef50f05` 版本；探针源码为 `test/logservice-chaos/tn_driver_probe/large_wal_probe/main.go`，实际运行二进制在该版本源码环境构建。探针通过 TN 使用的 `wal.NewLogserviceHandle`、`ReplayForWrite`、`AppendEntry(GroupUserTxn)`、`RangeCheckpoint` 入口，不打印大 payload，而在写入确认和独立回放时分别输出长度及 SHA256。driver 默认单 WAL 记录上限 99 MiB，回放读取批次上限 64 MiB；本轮 payload 为 70、95 MiB，均低于单记录上限。
+
+70 MiB 记录在约 6.29 秒确认，独立回放得到 user LSN 211、73,400,320 字节，SHA256 `2cc2a358f5d47ee6dd0efff52464d052a048e6de246a9e08a5196578af126555`。95 MiB 记录在约 8.11 秒确认，独立回放得到 user LSN 212、99,614,720 字节，SHA256 `0e7c664bafdfb11db17667d709cd83432b1a7b172869eea0ff1989ec6b5bcd65`。第一次包含两条大记录的回放约 21.53 秒；同数据的三次重复回放约 3.20、1.35、0.79 秒，未形成稳定长尾。node1 为普通副本时将其 `SIGKILL`，其余两票存活；该状态下的独立回放约 0.78 秒完成，两条大记录哈希仍一致，随后恢复 node1。
+
+用 `RangeCheckpoint(1,211,files...)` 确认 checkpoint intent，后台物理 `Truncate` 推进到 PSN 1980，三个 LogService 节点均记录 snapshot 导入成功。独立回放只保留未 checkpoint 的 95 MiB、user LSN 212，哈希不变。接着同时强杀三个节点并从原盘启动，独立回放仍得到同一记录、同一哈希。最后在当前 leader node1 和普通副本 node0 存活时暂停另一普通副本 node2，写入另一条 95 MiB 记录；在 node2 保持暂停的 15 秒内，这笔写入以 5.43 秒确认，未发生重试。恢复 node2 后独立回放确认新记录 user LSN 213、SHA256 `0b68b8e1dc0de8694242437607e8147f7815b153147abb8139d50fb3c0b001be`，与 ACK 相同。证据为远端 `large70.*.log`、`large95.*.log` 与节点日志。本轮未发现大记录截断/回放错误；未模拟 TAE checkpoint 文件读取，也未验证更接近 99 MiB 的边界值。
