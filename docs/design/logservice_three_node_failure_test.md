@@ -653,3 +653,11 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 **存活与影响边界。** `Truncate(700)` 及后续正式 snapshot 导入成功后，前两个临时目录仍存在；第四次故障恢复后，三个地址都报告原三成员，从 LSN 926 各读到 91 条完全相同的记录，SHA256 均为 `c2657a1e8aa1be47e70f4628578e50511c608fd5881ea1f2927124f66f5cf4de`。没有观察到 WAL 丢失、客户端最终错误或导出阻塞。当前四个残留目录均为空，各占约 4 KiB；已证明的是反复崩溃可使不受 `max-exported-snapshot` 管理的目录项持续增长，没有实测大文件占用。代码上，`ReconcileInterruptedExport` 只识别正式 `snapshot-%016X` 目录的 marker，不处理 `snapshot-<index>-<replica>.generating`；`loadCompletedSnapshots` 同样忽略它。Dragonboat 对内部 snapshot 目录的 zombie 清理不覆盖 LogService 指定的外部导出目录。若在数据文件写入后、重命名前崩溃，可能遗留更大的临时文件，这是代码路径推断，本轮未命中。期望原盘启动或后续导出/导入清理不再使用的临时导出目录，并保护当前正在生成的目录。本问题不同于 #32161 的超时后完成的正式快照未登记。
 
 缺陷跟踪：[matrixorigin/matrixone#32412](https://github.com/matrixorigin/matrixone/issues/32412)，已指派 `jiangxinmeng1`。
+
+## 最新 upstream/main 回归验证：快照窗口轮换下线、持续负载与冷重启（2026-11-09 15:35–15:41）
+
+继续使用 `b19ef50f05` 二进制及上述三副本目录，HAKeeper 过期阈值 5 分钟。单个三地址客户端持续执行 Append→Read payload 核对，另一控制器只在已核对 LSN 后至少 100 条处推进 Truncate。按 node0、node1、node2 的顺序轮换三遍，共九轮；前六轮分别围绕导出快照、导入快照等待，后三轮在发起截断请求后立即杀节点。每轮只杀一台，另两台始终运行；恢复原盘、确认三地址均报告原三成员后才进入下一轮。node1 在第一组导出轮和第二组导入轮、node0/node1/node2 在最后三轮均作为当时 leader 被杀。两次导出等待及两次导入等待未在 18 秒内观察到目标日志，改在定时器上注入，因此这些轮次只证明持续负载下的节点下线，不能声称精确命中快照函数内部。其余轮次观察到目标节点的导出或导入成功日志，或与截断请求并发。
+
+第一段负载确认 **982** 次写入并回读，Append 重试 5 次、Read 重试 1 次，最长单轮 **7.397 秒**；21 次截断成功、1 次请求在 leader 切换时返回连接错误，下一次截断成功。第六轮脚本在发出 `SIGKILL` 后立即检查 `/proc`，因进程尚未退出而误报存活数异常；检查时 node2 已停止，持续客户端正常结束。调整脚本为等待进程退出最多 3 秒后，从第六轮继续：第二段确认 **412** 次写入并回读，Append 重试 5 次、Read 重试 0 次，最长单轮 **6.051 秒**；9 次截断全部成功。两段合计 **1394** 次 payload 核对、30 次成功截断、11 次客户端内部重试，没有最终写读错误。最终 Truncated LSN 为 2366、Latest LSN 为 2506；三个 RPC 地址从 LSN 2367 各读出 127 条相同用户记录，SHA256 均为 `e3945a53fd7fbeb9b61d6b3e4d0fafaa6a1c58b3551f3fcdd813400a952ad742`。
+
+三节点正常停止后从各自旧盘整组重启，三地址恢复相同三成员与 leader；再次从 LSN 2367 读取，三份记录数与 SHA256 均不变。同一测试目录的节点日志从建群起累计各有 13 次 `import snapshot success`、14 次 `export snapshot success`，无 panic、FATAL 或 `L/shutdown`。前述四个 `.generating` 残留仍未被正常导入和冷重启清理，支持 #32412 的持久性结论。证据保存在远端同一目录的 `generating-followup-20261109.{load,progress}`、`generating-followup-b-20261109.{load,progress}`、轮次截断输出及三个节点的 `stdout.log`。本轮未发现新的可稳定复现缺陷；测试进程已停止。
