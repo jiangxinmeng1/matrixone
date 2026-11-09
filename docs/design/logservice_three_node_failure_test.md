@@ -592,3 +592,15 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 **代码原因与影响。** `clientPool.GetOnFly()` 建连失败明确返回 `(nil, err)`；`truncateFromRemote` 仅在 `err == ErrClientPoolClosed` 时返回，对普通网络超时继续 `defer client.Putback()` 并访问 `client.wrapped.Truncate`。因此后台截断 goroutine 的 panic 会终止整个 TN 进程，尽管当时 WAL 写入和 checkpoint intent 已成功，三个 LogService 副本也可用。默认 5 分钟重试使错误潜伏。预期是在任何新客户端创建失败时将错误返回给 `doTruncate`，记录失败并允许以后重试物理截断，不能 panic。此测试证明了 TN WAL driver 进程的崩溃路径；没有声称已在真实 TN 服务进程中复现 SQL 层故障。
 
 独立缺陷跟踪：[matrixorigin/matrixone#32248](https://github.com/matrixorigin/matrixone/issues/32248)，已指派 `jiangxinmeng1`。
+
+## 最新 upstream/main 回归验证：已连接副本 Read 与 TN WAL 回放（2026-11-09 10:08–10:13）
+
+51 上的测试版 MO 更新为 upstream/main `b19ef50f05ab0e398b65b4cf3f745470f803df09`，安装在 `/home/mo/jxm/mo-upstream-main-b19ef50f05-20261109/`，`/home/mo/jxm/mo-current` 指向该目录。`mo-service -version`、本地与远端 SHA256、动态库解析均已核对。该提交包含 LogService `Read` 与 `GetTruncatedLsn` 的七秒子期限及重连重试。测试客户端和 TN WAL 探针也在这个提交的模块环境中重新编译；没有沿用旧版本的客户端代码。
+
+**已有连接的 Read 故障切换。** 新空盘三副本目录 `/home/mo/jxm/logservice-main-b19ef-read-failover-20261109/`，RPC `127.0.0.1:58201/58211/58221`。单个客户端先 Append 成功得到 LSN 6，然后在 Read 之前暂停；`ss` 确认其 TCP 连接指向普通副本 `58211`。仅对这个 RPC 端口加 `OUTPUT DROP` 并放行 Read，另两副本仍能服务。客户端内部在约 **8.002 秒**完成 Read 并核对刚确认的 payload；应用层 `read_attempts=1`、`read_retries=0`，没有 EOF 或最终错误。故障期间阻断规则命中 64 包；规则撤销后三地址均报告同一 leader 和三成员。证据：`read-a.log`、`read-a.ready`、`read-a.release`、节点日志。
+
+**TN WAL 启动回放的截断水位读取。** 另建只由 TN WAL driver 写入的空盘三副本目录 `/home/mo/jxm/logservice-main-b19ef-wal-replay-20261109/`；使用真实 `wal.NewLogserviceHandle`、默认 100-client 池、`ReplayForWrite`，先确认 10/10 条 user WAL，水位 10。新实例完成连接池初始化但尚未回放时暂停，然后对三个测试 RPC 端口同时加 `OUTPUT DROP` **8 秒**并放行回放；Raft 复制端口未隔离。规则共命中 1190 包。`Wal-Get-Truncate` 记录 **1 次内部重试、8.911 秒**，整次回放 **8.914 秒**成功；LSN 1–10 的 10 条 payload 全部读回，结束后三地址仍报告完整三成员。证据：`seed.log`、`replay-b.log`、`replay-b.ready`、`replay-b.release`、节点日志。仅隔离一个 RPC 地址的预选轮未命中回放实际使用的连接，1.370 毫秒完成，不计为故障回放验证。
+
+两次有效注入都没有出现旧版约 60 秒的读等待；这是本机这组时间线的观测值，不是所有网络故障的延迟上界。第一次尝试 WAL 回放时误把直接 LogService 客户端写入的原始 `UserRecord` 与 driver 专用 WAL 编码放在同一 shard，得到 `unsupported version`；该输入不符合 TN WAL 使用方式，已换全新空盘独立重测，不作为缺陷。所有测试规则均已删除。
+
+**持续 WAL + 轮流节点故障 + snapshot + 整组冷重启。** 在上述仅含 WAL driver 编码的集群，单个真实 TN WAL handle 继续顺序确认 **200/200** 条 user WAL，每 20 条用 `RangeCheckpoint(1,end,files...)` 确认一次合法 checkpoint intent，始终落后最新 ACK 10 条。确认到本轮 seq 52 时杀普通副本 node1，8 秒后原盘恢复；三地址确认它重新加入完整成员表后，seq 135 时杀当时的 leader node0，8 秒后原盘恢复，任何时刻至少两台 LogService 进程存活。leader 故障期间 ACK 短暂停顿，恢复后继续。最终 10 次 checkpoint intent 均成功，后台物理 Truncate 推进到 PSN 1059；三个节点日志都有 `export snapshot success`。独立 WAL 实例 `ReplayForWrite` 报告 user LSN 210、checkpointed 200，LSN **201–210** 的 10 条保留记录与 ACK payload 逐条一致。再把三台 LogService 同时 `SIGKILL` 并从各自旧盘启动：三地址重新看到相同三成员与 leader；独立回放仍成功，LSN 201–210 保持一致。证据：`lifecycle.log`、`lifecycle.progress`、`lifecycle-replay.log`、`after-cold-replay.log`、三个节点的 `stdout.log`。这验证了本轮 snapshot 导出后原盘冷启动和 driver 回放，没有模拟真实 TAE checkpoint 文件读取或 SQL 事务恢复。
