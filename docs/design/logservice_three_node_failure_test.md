@@ -661,3 +661,11 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 第一段负载确认 **982** 次写入并回读，Append 重试 5 次、Read 重试 1 次，最长单轮 **7.397 秒**；21 次截断成功、1 次请求在 leader 切换时返回连接错误，下一次截断成功。第六轮脚本在发出 `SIGKILL` 后立即检查 `/proc`，因进程尚未退出而误报存活数异常；检查时 node2 已停止，持续客户端正常结束。调整脚本为等待进程退出最多 3 秒后，从第六轮继续：第二段确认 **412** 次写入并回读，Append 重试 5 次、Read 重试 0 次，最长单轮 **6.051 秒**；9 次截断全部成功。两段合计 **1394** 次 payload 核对、30 次成功截断、11 次客户端内部重试，没有最终写读错误。最终 Truncated LSN 为 2366、Latest LSN 为 2506；三个 RPC 地址从 LSN 2367 各读出 127 条相同用户记录，SHA256 均为 `e3945a53fd7fbeb9b61d6b3e4d0fafaa6a1c58b3551f3fcdd813400a952ad742`。
 
 三节点正常停止后从各自旧盘整组重启，三地址恢复相同三成员与 leader；再次从 LSN 2367 读取，三份记录数与 SHA256 均不变。同一测试目录的节点日志从建群起累计各有 13 次 `import snapshot success`、14 次 `export snapshot success`，无 panic、FATAL 或 `L/shutdown`。前述四个 `.generating` 残留仍未被正常导入和冷重启清理，支持 #32412 的持久性结论。证据保存在远端同一目录的 `generating-followup-20261109.{load,progress}`、`generating-followup-b-20261109.{load,progress}`、轮次截断输出及三个节点的 `stdout.log`。本轮未发现新的可稳定复现缺陷；测试进程已停止。
+
+## 最新 upstream/main 回归验证：默认阈值下 HAKeeper leader 长时间网络隔离（2026-11-09 15:55–16:03）
+
+使用 `b19ef50f05` 服务二进制和新空盘三投票副本集群 `/home/mo/jxm/logservice-main-b19ef-long-partition-20261109/`。各节点在独立 Linux network namespace，RPC 地址为 `198.18.51.10:58401`、`.11:58411`、`.12:58421`；`log-store-timeout=5m`。开始时 node2 同时是 HAKeeper shard 0 和数据 shard 1 的 leader。运行 `test/logservice-chaos/run_long_partition.py`，单个三地址客户端连续 Append→Read payload 核对，另一线程把 Truncate 保持在已核对 LSN 后至少 100 条。热身确认到 LSN 51 后，关闭 node2 的宿主侧 veth **340 秒**，使它与 node0、node1 双向断开；后两台始终互通并保持运行。
+
+隔离期间，持续客户端确认 **2119** 次写入并回读、无重试和最终错误，最长单轮 **3.123 秒**；31 次 Truncate 全部成功，已核对 LSN 从 51 推进到 2191。恢复 node2 网络约 15 秒后，三个 RPC 地址对 shard 0 和 shard 1 均报告相同的原三成员和新 leader。截断水位为 2070，三地址从 LSN 2071 各读出 117 条用户记录，SHA256 均为 `7454bd10052802be5a2387e07e032d4fb973c4ba3c4e9acdcb11e111f83a2372`。
+
+为验证 node2 不只是出现在成员表里，网络恢复后再停止 node0 **35 秒**，只留 node1、node2 两票。新的连续客户端在这段时间将已核对 LSN 从 2215 推进到 2475，`Truncate(2375)` 成功。原盘恢复 node0 后，此段客户端累计确认 **293** 次写入并回读、无重试，最长单轮 **0.502 秒**；三个地址各从 LSN 2376 读出 114 条相同用户记录，SHA256 均为 `524b7c9970d4fb8860f7a42626b719ce283c6aa61ff5d1d7247a87d6d2e4dbe1`。节点日志无 panic、`L/shutdown` 或 `Expired logStore info`。这些结果未复现 30 秒加速阈值下的 #32134；仅覆盖这次默认 5 分钟配置、单 leader 长网络隔离和恢复后的两票服务。远端证据为 `hakeeper-leader-340s-20261109.{load,progress}`、`after-heal-vote.{load,progress}` 及三个节点的 `stdout.log`。测试进程已停止，测试 veth、bridge 和 network namespace 已删除。
