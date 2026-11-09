@@ -629,3 +629,9 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 继续用上述独立集群和直接 LogService 三地址客户端，持续执行 Append→Read payload 核对；另一个控制器只在已确认 LSN 后方至少 100 条的位置推进 `Truncate`。先让普通副本 node0 四次下线、从原盘启动，其中前三次启动约 150 毫秒后再次杀进程，没有等待完整成员确认。任何时刻 node1、node2 两票均存活。持续客户端确认 172 条新记录，内部 Append 重试 1 次、Read 重试 0 次，最大单次写读周期 839.399 毫秒；四次截断成功，最终水位 970。三地址从 LSN 971 读取各 130 条记录，内容 SHA256 相同：`315acd2f3484573e85e2558f13f5f86db0c06aed3b937b3bb237df5d3ebebbbe`。
 
 随后对当时的 leader node2 做四次同类下线，另两票 node0、node1 一直存活；每次在停机期间发起安全水位截断，前三次原盘启动后约 150 毫秒再次杀进程。持续客户端再次确认 172 条新记录，内部 Append 重试 2 次、Read 重试 0 次，最大单次写读周期 6.250366 秒；四次截断成功，最终水位 1162。三地址从 LSN 1163 读取各 133 条记录，SHA256 均为 `0bd5a983c6098cda19c818a6301bd51c2af444d9ce2efd992f71787180d1332e`。最后同时 `SIGKILL` 三节点并全部从原盘启动，三个地址恢复相同三成员；再次读取同一范围仍为 133 条且 SHA256 不变。原始证据位于远端目录的 `rapid-restart.log`、`rapid.load`、`rapid-leader.log`、`rapid-leader.load` 和各节点的 `rapid-verify.read`、`rapid-leader-verify.read`、`rapid-cold-verify.read`。这组短时故障没有发现新缺陷；没有证明被反复重启的副本每次都曾进入追赶状态，也没有覆盖长时间 HAKeeper 成员替换。
+
+## 最新 upstream/main 回归验证：默认过期阈值下 HAKeeper leader 长时间下线（2026-11-09 14:19–14:26）
+
+同一独立三副本集群的 `log-store-timeout` 仍为默认 **5 分钟**。先确认 HAKeeper shard 0 的 leader 是 node1、数据 shard 1 的 leader 是 node0，然后在持续三地址 Append→Read 客户端运行期间 `SIGKILL` node1，保持 node0、node2 两票存活 **375 秒**，越过默认过期阈值。控制器每约 10 秒把 `Truncate` 推进到已核对 LSN 后方至少 100 条，并监视两台存活进程。下线期间持续客户端最终完成 **2452/2452** 次写读核对，Append 内部重试 1 次、Read 重试 0 次，最长单轮 1.082134 秒；37/37 次截断成功，最终截断 LSN 3736。node0、node2 日志分别只有 1、2 次 LogService 心跳失败，没有 `Expired logStore info` 或 `L/shutdown`。
+
+原盘恢复 node1 后，三个地址对 shard 0 和 shard 1 均报告相同的原始三成员；node1 日志记录数据 shard snapshot 导入成功。三个地址从 LSN 3737 各读到 102 条记录，SHA256 均为 `28b06e2ae4476cd7864b50718a5723bbd80f9b7d9f496bf0634b6e9caa6a7afb`。证据为远端 `hakeeper-long.log`、`hakeeper-long.load`、`hakeeper-long.progress`、各节点 `hakeeper-long-verify.read` 及 `stdout.log`。本轮未复现 30 秒加速配置的 #32134 误关停；进程下线场景也不等同于双向网络隔离或先后两次隔离。
