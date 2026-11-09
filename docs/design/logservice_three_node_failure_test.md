@@ -604,3 +604,14 @@ node1/node2 的 `mo-logservice.metadata` 各自保留了旧 HAKeeper 副本：no
 两次有效注入都没有出现旧版约 60 秒的读等待；这是本机这组时间线的观测值，不是所有网络故障的延迟上界。第一次尝试 WAL 回放时误把直接 LogService 客户端写入的原始 `UserRecord` 与 driver 专用 WAL 编码放在同一 shard，得到 `unsupported version`；该输入不符合 TN WAL 使用方式，已换全新空盘独立重测，不作为缺陷。所有测试规则均已删除。
 
 **持续 WAL + 轮流节点故障 + snapshot + 整组冷重启。** 在上述仅含 WAL driver 编码的集群，单个真实 TN WAL handle 继续顺序确认 **200/200** 条 user WAL，每 20 条用 `RangeCheckpoint(1,end,files...)` 确认一次合法 checkpoint intent，始终落后最新 ACK 10 条。确认到本轮 seq 52 时杀普通副本 node1，8 秒后原盘恢复；三地址确认它重新加入完整成员表后，seq 135 时杀当时的 leader node0，8 秒后原盘恢复，任何时刻至少两台 LogService 进程存活。leader 故障期间 ACK 短暂停顿，恢复后继续。最终 10 次 checkpoint intent 均成功，后台物理 Truncate 推进到 PSN 1059；三个节点日志都有 `export snapshot success`。独立 WAL 实例 `ReplayForWrite` 报告 user LSN 210、checkpointed 200，LSN **201–210** 的 10 条保留记录与 ACK payload 逐条一致。再把三台 LogService 同时 `SIGKILL` 并从各自旧盘启动：三地址重新看到相同三成员与 leader；独立回放仍成功，LSN 201–210 保持一致。证据：`lifecycle.log`、`lifecycle.progress`、`lifecycle-replay.log`、`after-cold-replay.log`、三个节点的 `stdout.log`。这验证了本轮 snapshot 导出后原盘冷启动和 driver 回放，没有模拟真实 TAE checkpoint 文件读取或 SQL 事务恢复。
+
+## 最新 upstream/main 回归验证：正式 snapshot 目录崩溃后重启（2026-11-09 10:22–10:25）
+
+测试二进制仍为 `b19ef50f05`。另建空盘三投票副本集群 `/home/mo/jxm/logservice-main-b19ef-snapshot-crash-20261109/`，数据 shard 1，配置 `truncate-interval=1s`、`max-exported-snapshot=4`。直接 LogService 客户端先 **400/400** 条 Append 成功，末条 LSN 405。node0 是普通副本；在它的正式 snapshot 目录 `IN_MOVED_TO` 事件上用 `snapshot-crash-watch.py` 立即 `SIGKILL`，始终保留 leader node1 和普通副本 node2 两票。随后再用追加写入和更高截断位点重复一次同样的导出窗口。
+
+| 轮次 | 杀进程时磁盘证据 | 原盘启动后的结果 |
+|---|---|---|
+| 1 | `Truncate(200)` 后，node0 正式目录 index **407** 刚从 `.generating` 重命名；目录同时有 `.gbsnap`、`snapshot.metadata`、`dragonboat.snapshot.message` 三文件 | 原盘重启后 index 407 残留目录被清理，node0 重新加入三成员，之后正常导出 index 408 等快照。停机期间另两票从 LSN 201 读到 405，共 205 条。`Truncate(350)` 成功，三地址各读出 LSN 351–405 的 55 条相同记录。 |
+| 2 | 再确认 **120/120** 条 Append，末条 LSN 535；`Truncate(450)` 后，同样在正式目录 index **537** 的重命名事件杀 node0，重启前确认同样的三文件布局 | 原盘重启后 index 537 目录再度出现，但两文件时间戳晚于 kill，且 node0 日志明确记录重启后的 `export snapshot success index=537`；这是同 index 的**重新导出**，旧标记文件已清除。三地址恢复完整成员；从 LSN 451 各读到 85 条，内容 SHA256 均为 `94d0b673359c6cfe8953af4d8765bc425014fc399e174642521c4f5caaab0194`。 |
+
+本轮没有观察到旧版 #32144 的“带标记文件的正式目录使同 index 导出持续拒绝”；node0 日志中 `request export snapshot failed` / `request rejected` 计数为 0。第二轮结束时 node0 正式导出目录数为 2，未超出配置配额。证据留在上述远端目录：`snapshot-watch{,-b}.log`、`seed.append`、`followup.append`、`survivor.read`、各节点 `after-truncate.read` / `after-second.read`、三个 `stdout.log` 和磁盘上的快照目录。本轮证明重启清理与重新导出、截断和读回，未模拟网络分区或 TN WAL 编码。
