@@ -34,7 +34,7 @@ case "$operation" in
     pid=$(cat "$pid_file")
     [[ -e "/proc/$pid/exe" ]] || { echo "node $node_index already stopped"; exit 0; }
     actual=$(readlink -f "/proc/$pid/exe")
-    [[ "$actual" == "$binary" ]] || {
+    [[ "$actual" == "$(readlink -f "$binary")" ]] || {
       echo "refusing to signal pid $pid: executable is $actual" >&2
       exit 1
     }

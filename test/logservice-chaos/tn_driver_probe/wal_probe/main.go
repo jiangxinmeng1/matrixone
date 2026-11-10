@@ -97,7 +97,8 @@ func main() {
 	flag.BoolVar(&checkpointFiles, "checkpoint-files", false, "append a GroupFiles marker using the TAE checkpoint WAL form")
 	flag.Parse()
 	if addresses != "127.0.0.1:58001,127.0.0.1:58011,127.0.0.1:58021" &&
-		addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" {
+		addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" &&
+		addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" {
 		panic("use only the dedicated WAL StoreImpl test cluster")
 	}
 	if mode != "cycle" && mode != "replay" {
