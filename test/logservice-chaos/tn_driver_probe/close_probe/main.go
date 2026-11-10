@@ -45,12 +45,13 @@ func (c *appendBarrierClient) Append(ctx context.Context, rec logservice.LogReco
 func main() {
 	addresses := flag.String("addresses", "", "dedicated test RPC addresses")
 	prefix := flag.String("prefix", "close-probe", "unique payload")
+	count := flag.Int("count", 1, "accepted user WAL entries before close")
 	appendReady := flag.String("append-ready-file", "", "backend Append barrier ready")
 	appendRelease := flag.String("append-release-file", "", "backend Append barrier release")
 	closeReady := flag.String("close-ready-file", "", "close started signal")
 	flag.Parse()
 	if *addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" ||
-		*appendReady == "" || *appendRelease == "" || *closeReady == "" {
+		*count <= 0 || *count > 5000 || *appendReady == "" || *appendRelease == "" || *closeReady == "" {
 		panic("use only the isolated WAL test cluster")
 	}
 	const sid = "tn-wal-close-probe"
@@ -76,18 +77,28 @@ func main() {
 		panic(err)
 	}
 	fmt.Printf("replay_done user_lsn=%d checkpointed=%d\n", w.GetLSNWatermark(), w.GetCheckpointed())
-	e := entry.GetBase()
-	e.SetType(entry.IOET_WALEntry_Test)
-	if err := e.SetPayload([]byte(*prefix)); err != nil {
-		panic(err)
+	type waitResult struct {
+		lsn uint64
+		err error
 	}
-	lsn, err := w.AppendEntry(wal.GroupUserTxn, e)
-	if err != nil {
-		panic(err)
+	waitDone := make(chan waitResult, *count)
+	for seq := 0; seq < *count; seq++ {
+		payload := *prefix
+		if *count > 1 {
+			payload = fmt.Sprintf("%s/%06d", *prefix, seq)
+		}
+		e := entry.GetBase()
+		e.SetType(entry.IOET_WALEntry_Test)
+		if err := e.SetPayload([]byte(payload)); err != nil {
+			panic(err)
+		}
+		lsn, err := w.AppendEntry(wal.GroupUserTxn, e)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("accepted lsn=%d payload=%s\n", lsn, payload)
+		go func() { waitDone <- waitResult{lsn: lsn, err: e.WaitDone()} }()
 	}
-	fmt.Printf("accepted lsn=%d payload=%s\n", lsn, *prefix)
-	waitDone := make(chan error, 1)
-	go func() { waitDone <- e.WaitDone() }()
 	for {
 		if _, err := os.Stat(*appendReady); err == nil {
 			break
@@ -102,9 +113,13 @@ func main() {
 	}
 	cerr := <-closeDone
 	fmt.Printf("close_done elapsed_ms=%.3f err=%v\n", float64(time.Since(start).Microseconds())/1000, cerr)
-	werr := <-waitDone
-	fmt.Printf("wait_done lsn=%d err=%v\n", lsn, werr)
-	if cerr != nil || werr != nil {
+	failed := cerr != nil
+	for i := 0; i < *count; i++ {
+		result := <-waitDone
+		fmt.Printf("wait_done lsn=%d err=%v\n", result.lsn, result.err)
+		failed = failed || result.err != nil
+	}
+	if failed {
 		os.Exit(2)
 	}
 }
