@@ -44,7 +44,8 @@ func main() {
 	startRelease := flag.String("start-release-file", "", "wait for this file before worker Append calls")
 	traceBackend := flag.Bool("trace-backend-append", false, "log slow or failed individual LogService Append attempts")
 	flag.Parse()
-	if *addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" ||
+	if (*addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" &&
+		*addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221") ||
 		*workers <= 0 || *workers > 100 || *perWorker <= 0 || *delay < 0 || *checkpointEvery < 0 ||
 		(*startReady == "") != (*startRelease == "") {
 		panic("invalid isolated cluster or workload settings")
