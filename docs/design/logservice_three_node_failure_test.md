@@ -785,3 +785,11 @@ node1 原盘重启后，三地址重新报告原三成员；它于 10:23:18 导�
 将上一节的真实 TN WAL `close_probe` 扩展为可一次接收多条 user WAL；仍在底层 LogService `Append` 前设置屏障，等所有 `AppendEntry` 返回 LSN、所有 `WaitDone` 已启动、`Close` goroutine 已发起后再制造故障。本轮在同一 b19 三副本集群接收 **1000** 条记录（LSN **8363–9362**），起始数据 shard leader 是 node2。关闭窗口内杀 node2、释放底层屏障，node0/node1 两票持续运行。请求分成多个底层批次，日志记录到底层 Append 成功 **104** 次，以及连接重置 **56** 次、EOF **9** 次、`context deadline exceeded` **35** 次、`timeout` **56** 次；这些是重试尝试数，不是 156 条上层写入失败。
 
 `Close` 在 **61.137 秒**后返回 nil，**1000/1000** 个 `WaitDone` 均返回 nil；没有 goroutine 持续卡住或超过 driver 的 4 分钟关闭期限。node2 仍下线时，独立新实例 `ReplayForWrite` 返回 `user_lsn=9362, checkpointed=8060, truncated_dsn=8301`；LSN 8363–9362 的 **1000** 条 payload 与原探针接收记录逐条一致，文本 SHA256 `e5e686579dcb51b8acc78da8fa7224df6fabb21057ddda316a84f36c038e2d50`。恢复 node2 后整组三副本各自原盘冷重启，独立回放水位及这 1000 条记录不变。证据在远端同目录 `close-batch-leader-20261110.{load,exit,append-ready,append-release,close-ready,fault,replay,cold-replay}` 和节点日志。所有节点与测试网络已清理。本轮未发现新的提交丢失或关闭死锁；约 1 分钟关闭时长与故障下旧连接和批量重试有关，不能当作无故障关闭耗时。
+
+## 最新 upstream/main 回归验证：无用户写入时导出配额释放后的重新导出与消费（2026-11-10 17:47–17:50）
+
+复用已停止的 b19 三副本数据 shard 集群 `/home/mo/jxm/logservice-main-b19ef-long-partition-20261109/`，`truncate-interval=1s`、`max-exported-snapshot=4`、默认 5 分钟 HAKeeper store 过期阈值。从各自旧盘启动后，数据 leader 为 node0，普通副本 node1 已持有 4 个有效外部导出快照（index 5486、5487、5489、5490），数据 shard latest LSN 为 5492。本轮在故障和恢复观察阶段**没有启动用户写入负载**。17:47:21 只断开 node1 的测试 veth，node0/node2 两票继续运行；node1 于 17:47:24 因本地 `getTruncatedLsn` 超时触发配额释放，删除最新导出 index **5490**，计数 **4→3**，其余三个快照仍保留。17:47:51 恢复 node1 网络后，三个地址最终恢复原三成员视图；node1 于 17:48:16 重新导出 index **5494**，计数回到 4。
+
+随后显式提交安全的 `Truncate(5494)`，node1 于 17:49:10 **导入并删除刚重新导出的 index 5494**；三地址客户端查询的截断水位推进到 5494。再进行 20 轮 Append→Read payload 核对，**20/20** 成功、Append/Read 重试均为 0，最大整轮 **901.150 ms**。三副本各自原盘冷重启后，三个地址均从 LSN 5495 读到本轮 LSN 5501–5520 的 20 条记录，按 LSN/payload 与 ACK **20/20** 一致，文本 SHA256 均为 `77ca240966fcaafbc84944d4ceed86d1b62f1584e5d1a87249af0bcbe6675eb0`。证据在远端同目录 `quiescent-reexport-20261110.{before-latest,down,up,truncate-start,truncate,cycle,cold-node0.read,cold-node1.read,cold-node2.read}`、node1 导出/导入日志及快照目录；节点与测试网络均已清理。
+
+这轮验证了**无用户写入**时配额释放后能重新导出并消费快照，没有发现新的数据错误。但数据 shard 的物理 latest LSN 在隔离与恢复期间从 5492 前进到 5494，即使没有用户 Append 也有内部 Raft 记录变化；因此不能据此单独证明 `snapshotIndex` 下调是重新导出的必要条件，也不能把本轮称为“应用 index 完全不变”的测试。
