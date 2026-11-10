@@ -769,3 +769,13 @@ node1 原盘重启后，三地址重新报告原三成员；它于 10:23:18 导�
 探针最终 **6400/6400** 条确认，**29/29** 次 checkpoint intent 与 **29/29** 次后台物理 Truncate 成功，driver 未向上层返回写入或 checkpoint 错误。故障窗口有 **33** 次底层 Append 返回 EOF（11 次）、连接失败（17 次）或 timeout（5 次），均经 driver 重试得到最终确认；单笔确认最大 **6.954 秒**、p99 **1.267 秒**，没有超过 1 分钟的长尾。node2 仍下线时，新 WAL 实例 `ReplayForWrite` 成功，返回 `user_lsn=8360, checkpointed=8060, truncated_dsn=8301`。checkpoint 水位之后的 LSN 8061–8360 共 **300** 条与 ACK 的 LSN/payload **300/300** 一致，文本 SHA256 `009b42bfa3f5fb014db822e41a4cf48aeceb8f98d1eac2a2fe237fbb6ae88ffe`，没有 DSN 空洞回放错误。探针回调还看见 7 条 `lsn <= checkpointed` 的旧记录；真实 TAE 回放会按 checkpoint LSN 过滤，不能把它们算作重复应用。
 
 恢复 node2、整组三副本各自原盘冷重启后，再次独立回放得到相同水位，保留的 300 条与 ACK 仍全部一致。证据在远端同目录 `concurrent-rolling-20261110.{load,exit,node0-down,switch-start,switch-end,two-vote-replay,cold-replay}` 与节点日志。三个测试节点和网络命名空间均已清理。本轮未发现新的正确性缺陷；未生成或加载真实 TAE checkpoint 文件。
+
+## 最新 upstream/main 回归验证：已接收 WAL 的提交与 driver Close 遭遇 leader 故障（2026-11-10 17:25–17:28）
+
+新增隔离探针 `test/logservice-chaos/tn_driver_probe/close_probe/main.go`，调用真实 `wal.NewLogserviceHandle`、`ReplayForWrite`、`AppendEntry(GroupUserTxn)`，在底层 LogService `Append` 发出前设置文件屏障；`AppendEntry` 返回 LSN 后，另起 goroutine 执行 `WaitDone`，主线程同时发起 `Close`。屏障仅控制测试时机，底层请求放行后仍走真实客户端和服务。这样可检验已经被 WAL 接收、尚未得到持久化结果的记录在关闭时由谁交付终态；未启动 TN/CN。
+
+第一轮起始数据 shard leader 为 node2。探针确认已接收 user LSN **8361**、`Close` 已发起后，杀 node2 并释放底层 Append，node0/node1 两票继续运行。底层 Append 依次经历连接重置、约 **5.302 秒**的 `context deadline exceeded`，第三次成功；`Close` 约 **20.175 秒**返回 nil，`WaitDone` 返回 nil。node2 仍下线时新 WAL 实例回放得到 LSN 8361 和原 payload。
+
+第二轮恢复 node2 后，数据 shard leader 为 node1；探针已接收 LSN **8362** 并发起 `Close` 后，只在 node1 命名空间丢弃来自客户端 bridge `198.18.51.1` 到 RPC 端口 58211 的入站 TCP，服务进程、Raft 与另外两个 RPC 地址均未阻断，规则累计命中至少 **784** 包。旧连接上的底层 Append 等约 **49.837 秒**才以 `context deadline exceeded` 返回；随后重试约 **284 ms**成功，`Close` 总耗时 **60.477 秒**并返回 nil，`WaitDone` 返回 nil。规则仍生效时记录已确认，说明后续请求使用了可达路径；本轮没有记录重试具体选中的 RPC 地址。撤销规则后独立回放得到 LSN 8362 与原 payload，三个地址仍报告 node1 为数据 shard leader。整组原盘冷重启后，两条新 WAL 仍以 LSN 8361、8362 回放，水位 `user_lsn=8362, checkpointed=8060, truncated_dsn=8301`。
+
+证据在远端同目录 `close-accepted-leader-20261110.{load,exit,append-ready,append-release,close-ready,fault,replay}`、`close-accepted-rpc-blackhole-20261110.{load,exit,append-ready,append-release,close-ready,replay,cold-replay}` 和各节点日志。所有节点与网络规则均已清理。第一轮未见提交结果丢失；第二轮在三票仍运行时出现约 1 分钟的关闭长尾，根因仍是旧 RPC 连接等待超时，与现有旧连接长尾记录同类，不另建重复 issue。该场景未证明真实 TN 一定会在每次关闭时保留未完成的提交，结论限于真实 WAL driver API 的可达调用顺序。
