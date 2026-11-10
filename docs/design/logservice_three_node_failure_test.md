@@ -745,3 +745,11 @@ node1 原盘重启后，三地址重新报告原三成员；它于 10:23:18 导�
 第二次独立尝试加了写入前屏障：探针完成 `ReplayForWrite` 时 `ss -tnp` 记录到 **100** 个池连接；写入 20 条、进入后台截断屏障后记录到 **101** 个连接，唯一新增连接为 `198.18.51.1:34874 → 198.18.51.12:58221`（fd 106）。只在 node2 的测试网络命名空间丢弃来自 bridge `198.18.51.1` 到该 RPC 端口的入站 TCP，确认规则生效后释放截断屏障；Raft 与另外两个 RPC 地址均未阻断。规则命中 **469** 包。`Truncate` 对目标 PSN **5232** 首次连接失败后内部重试 1 次，最终物理截断成功；日志总时长 **34.842 秒**包括约 18 秒屏障等待，释放到完成约 **16 秒**。探针的 `Close` 随后正常返回，没有触及 4 分钟期限；在规则仍生效时，另两个地址可查询已推进的截断水位 5232。
 
 第二轮 **20/20** 条新 WAL 确认，恢复 RPC 规则后的新实例 `ReplayForWrite` 返回 `user_lsn=1480, checkpointed=1470, truncated_dsn=1616`；回放的 LSN 1471–1480 与 ACK 的 payload **10/10** 一致，文本 SHA256 `381b4fe554b50ea8956383bb8b2c5e5262ac96ba78fcdb88e686b82f119eafbc`。证据在远端同目录 `close-truncate-20261110.{load,ready,release}`（未命中对照）、`close-truncate-hit-20261110.{load,write-ready,write-release,truncate-ready,truncate-release,pool-sockets,onfly-sockets,replay,expected,observed}` 及节点日志。规则、进程、网络命名空间已清理。本轮没有发现新的关闭失败；不能据此证明多次连续 3 分钟超时也能满足 4 分钟关闭期限。
+
+## 最新 upstream/main 回归验证：后台物理 Truncate 时客户端三地址同时失联（2026-11-10 16:20–16:23）
+
+继续使用同一三副本 TN WAL 专用集群和默认 100-client 探针。真实 TN WAL driver 先确认 20 条新记录（user LSN 1481–1500），提交 checkpoint intent 到 1490；在后台物理 `Truncate(5655)` 发出前的屏障处，只阻断探针所在 bridge `198.18.51.1` 到三个 LogService RPC 端口 58201/58211/58221 的 TCP 入站包。三条规则分别命中 **472、528、444** 包；三个服务进程与 Raft 通道始终运行。该故障是客户端与整个服务的 RPC 失联，测试期间所有 RPC 地址均不可达。
+
+屏障释放后，后台 `Truncate` 重试 **11 次**，约 **49.003 秒**后报 `rpc timeout`；物理截断水位仍为 **5232**。`LogServiceDriver.Close()` 随后返回，探针进程退出码为 0，没有超过其 4 分钟关闭期限。checkpoint intent 的确认发生在网络阻断之前；`Close()` 未把这次异步物理截断失败上报给调用方，符合当前代码将错误记录在后台日志的行为，本轮不能据此判定数据丢失。
+
+撤销规则后，新 WAL 实例 `ReplayForWrite` 成功，返回 `user_lsn=1500, checkpointed=1490, truncated_dsn=1616`，仍能读到保留记录。再用新实例确认 20 条 WAL、提交 checkpoint intent 到 1510，后台物理截断在 **432.845 ms** 内成功推进到 PSN **5978**。最终独立回放返回 `user_lsn=1520, checkpointed=1510, truncated_dsn=1660`；保留的 LSN 1511–1520 与 ACK **10/10** 逐条一致，文本 SHA256 `53548d7c34c02dab7e4a7e9c31678d893e94f282f4ae1a6a7cee862ebdfce2c0`。三节点整组原盘冷重启后回放水位与记录不变。证据在远端同目录 `close-truncate-allrpc-20261110.{load,ready,release,replay,recover,final-replay,cold-replay}` 和节点日志。规则、节点、网络命名空间均已清理。本轮未发现新的正确性缺陷；短期未完成的物理截断保守保留了旧日志，下一次 checkpoint 后恢复推进。
