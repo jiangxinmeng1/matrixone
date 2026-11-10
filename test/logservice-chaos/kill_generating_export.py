@@ -16,13 +16,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("root", type=Path)
     parser.add_argument("node", type=int, choices=(0, 1, 2))
-    parser.add_argument("--hakeeper", action="store_true", help="watch the internal HAKeeper snapshot instead of shard 1 export")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--hakeeper", action="store_true", help="watch the internal HAKeeper snapshot instead of shard 1 export")
+    target.add_argument("--internal-data", action="store_true", help="watch the internal shard 1 import snapshot instead of shard 1 export")
     parser.add_argument("--timeout", type=float, default=90)
     args = parser.parse_args()
     root = args.root.resolve()
     base = root / f"node-{args.node}" / "logservice-data" / "*" / "host-*" / "*"
     if args.hakeeper:
         pattern = base / "snapshot-part-0" / "snapshot-0-*"
+    elif args.internal_data:
+        pattern = base / "snapshot-part-1" / "snapshot-1-*"
     else:
         pattern = base / "exported-snapshot" / "shard-1" / "replica-*"
     matches = glob.glob(str(pattern))
