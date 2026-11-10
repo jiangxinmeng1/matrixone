@@ -753,3 +753,11 @@ node1 原盘重启后，三地址重新报告原三成员；它于 10:23:18 导�
 屏障释放后，后台 `Truncate` 重试 **11 次**，约 **49.003 秒**后报 `rpc timeout`；物理截断水位仍为 **5232**。`LogServiceDriver.Close()` 随后返回，探针进程退出码为 0，没有超过其 4 分钟关闭期限。checkpoint intent 的确认发生在网络阻断之前；`Close()` 未把这次异步物理截断失败上报给调用方，符合当前代码将错误记录在后台日志的行为，本轮不能据此判定数据丢失。
 
 撤销规则后，新 WAL 实例 `ReplayForWrite` 成功，返回 `user_lsn=1500, checkpointed=1490, truncated_dsn=1616`，仍能读到保留记录。再用新实例确认 20 条 WAL、提交 checkpoint intent 到 1510，后台物理截断在 **432.845 ms** 内成功推进到 PSN **5978**。最终独立回放返回 `user_lsn=1520, checkpointed=1510, truncated_dsn=1660`；保留的 LSN 1511–1520 与 ACK **10/10** 逐条一致，文本 SHA256 `53548d7c34c02dab7e4a7e9c31678d893e94f282f4ae1a6a7cee862ebdfce2c0`。三节点整组原盘冷重启后回放水位与记录不变。证据在远端同目录 `close-truncate-allrpc-20261110.{load,ready,release,replay,recover,final-replay,cold-replay}` 和节点日志。规则、节点、网络命名空间均已清理。本轮未发现新的正确性缺陷；短期未完成的物理截断保守保留了旧日志，下一次 checkpoint 后恢复推进。
+
+## 最新 upstream/main 回归验证：落后副本导入 Raft snapshot 与新 TN WAL 实例回放重叠（2026-11-10 16:46–16:50）
+
+复用上述 b19 三副本 TN WAL 专用集群。初始数据 shard leader 为 node1，普通副本 node0 在 16:46 左右被杀；node1、node2 两票期间，真实 TN WAL 探针确认 **400/400** 条新记录、**20/20** 次 checkpoint intent 与 **20/20** 次后台物理 Truncate。单笔写入最大 **1.680 秒**、p99 **890 ms**。停机的 node0 与存活副本之间形成了被压缩的 Raft 日志缺口。
+
+16:48:50.472 从旧盘启动 node0，约 **0.28 秒后**杀当时 leader node1，立即启动新的 `wal.NewLogserviceHandle` 实例执行 `ReplayForWrite`，仅 node0、node2 两进程存活。node2 于 16:48:53.533 向 node0 发送数据 shard Raft snapshot **index 7141**（日志明确写明 `entry compacted`），node0 于 16:48:53.809 开始导入；HAKeeper shard 同期也收到 snapshot index 12234。新实例从启动到退出约 **6.236 秒**，成功返回 `user_lsn=1920, checkpointed=1910, truncated_dsn=2100`；其中 `ReplayForWrite` 自身报告约 **4 ms**，其余时间包括创建默认 100-client 池、故障后的发现与关闭。没有把这 6.236 秒全算作回放耗时。
+
+保持 node1 下线，在 node0、node2 两票上再确认 **40/40** 条 WAL、**2/2** 次 checkpoint intent 和 **2/2** 次物理 Truncate；单笔写入最大 **785 ms**。恢复 node1 后独立回放为 `user_lsn=1960, checkpointed=1950, truncated_dsn=2144`，保留的 LSN 1951–1960 与 ACK **10/10** 一致，文本 SHA256 `6889cff6698370d7ecb328282a4b88674f557704c0c4647b6d6ca08a336db6da`。整组三副本各自从旧盘冷重启后，三个 RPC 地址均报告原三成员，独立回放水位和记录不变。证据在远端同目录 `replay-catchup-switch-20261110.{load,progress,exit,switch-start,switch-end,replay,replay-start,replay-end,replay-exit,two-votes,final-replay,cold-three-replay}` 和节点日志。节点与测试网络已清理。本轮未发现新的回放错误或一分钟长尾；未启动真实 TN/TAE checkpoint 文件加载。
