@@ -793,3 +793,21 @@ node1 原盘重启后，三地址重新报告原三成员；它于 10:23:18 导�
 随后显式提交安全的 `Truncate(5494)`，node1 于 17:49:10 **导入并删除刚重新导出的 index 5494**；三地址客户端查询的截断水位推进到 5494。再进行 20 轮 Append→Read payload 核对，**20/20** 成功、Append/Read 重试均为 0，最大整轮 **901.150 ms**。三副本各自原盘冷重启后，三个地址均从 LSN 5495 读到本轮 LSN 5501–5520 的 20 条记录，按 LSN/payload 与 ACK **20/20** 一致，文本 SHA256 均为 `77ca240966fcaafbc84944d4ceed86d1b62f1584e5d1a87249af0bcbe6675eb0`。证据在远端同目录 `quiescent-reexport-20261110.{before-latest,down,up,truncate-start,truncate,cycle,cold-node0.read,cold-node1.read,cold-node2.read}`、node1 导出/导入日志及快照目录；节点与测试网络均已清理。
 
 这轮验证了**无用户写入**时配额释放后能重新导出并消费快照，没有发现新的数据错误。但数据 shard 的物理 latest LSN 在隔离与恢复期间从 5492 前进到 5494，即使没有用户 Append 也有内部 Raft 记录变化；因此不能据此单独证明 `snapshotIndex` 下调是重新导出的必要条件，也不能把本轮称为“应用 index 完全不变”的测试。
+
+## 过期 TN 回放水位对数据 shard 快照导入的影响（2026-11-10 17:57–18:02）
+
+在 51 上以 b19 版新建三副本空盘集群 `/home/mo/jxm/logservice-main-b19ef-tn-expiry-20261110/`，数据 shard 1，`truncate-interval=1s`、导出配额 4、Log store 过期阈值 5 分钟。使用 `test/logservice-chaos/tn_heartbeat_probe/` 向 HAKeeper **人工注入一次 TN heartbeat**，设置 `ReplayedLsn=1`；该探针不启动真实 TN/TAE，也不生成 checkpoint 文件。先完成 120/120 轮 Append→Read，`Truncate(10)` 后再完成 120/120 轮，三个副本均产生导出快照。随后 `Truncate(136)` 成功，三节点均记录回放水位低于目标 index，拒绝导入。
+
+TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报 `TimeoutState`；在 tick 803 和 1064 查询时，这个 TN 仍在集群状态里，回放水位保持 1。期间新增 80/80 轮 Append→Read 成功、没有重试、最大周期 190.408 ms，但三个副本在一分钟内分别记录约 48/49/49 次快照导入否决，导出目录持续各保留 4 个。将**同一个人工 TN** 的回放水位更新为 200 后，三副本立即导入 index 133/136 的可用快照，截断水位推进至 136。第二轮使该 heartbeat 再次过期，提交 `Truncate(337)` 后三节点仍因水位 200 拒绝导入；人工将水位提高到 400 后三节点导入 index 337。随后 30/30 轮 Append→Read 成功，最大周期 741.129 ms，集群已停止并清理网络。
+
+该行为在两次过期、恢复循环中稳定出现，说明**过期状态本身不解除快照导入的 TN 回放水位保护**。这也可能是保护仍需从旧 checkpoint 恢复的 TN：不能仅凭过期就安全丢弃其 WAL。第二轮人工设置的 400 还高于当时 data shard latest LSN 341，只用于验证门槛，不代表真实 TN 可达状态。因此本轮只记录潜在长期保留快照/日志的活性风险，尚不认定为生产缺陷或建立 issue。证据保存在远端该目录的 `baseline.cycle`、`expired.cycle`、`final.cycle`、`tn-heartbeat.*` 和节点日志。
+
+## 最新 upstream/main `45917e803f`：三副本故障、TN WAL 截断与恢复（2026-11-11 09:49–09:56）
+
+将 upstream/main 更新至 `45917e803f2915f6f0838b2b2fe9f591fc5b6018`，包含 `39e470bad8` 的 LogService required LSN、WAL 截断及故障切换恢复修复。按这一提交重建 Go 服务、直接客户端、真实 `logservicedriver` 探针和更新过头文件接口的 `libmo.so`；四个二进制/库的本地与 51 远端 SHA256 一致。服务 SHA256 为 `c5965df87d5236efbf35778c605febf7dfcfb4501eb9fcfe1473e83aa5f64445`。51 上 `/home/mo/jxm/mo-current` 已指向 `/home/mo/jxm/mo-upstream-main-45917e803f-20261111/`。构建未注入 Git 版本变量，因此 `mo-service -version` 的 commit 字段为空，版本以源码检出和哈希绑定。两个隔离三副本集群使用独立空目录、网络命名空间、数据 shard 1 与配置为 5 分钟的 Log store 过期阈值；未启动 TN/CN。
+
+**直接客户端集群** `/home/mo/jxm/logservice-main-45917e803f-20261111/`：三地址 `198.18.51.10:59001`、`.11:59011`、`.12:59021` 一致发现 leader node2。无故障 Append→Read **40/40**，零重试。持续 180 轮写读时杀 node2 5 秒、恢复后杀普通副本 node0 约 7 秒，两票始终在线；在 node0 下线时 `Truncate(99)` 成功。负载 **180/180** 完成，Append 共 3 次重试、Read 无重试，最大完整写读周期 **4.328 秒**。整组三副本原盘冷重启后，从三个单独 RPC 地址各读取截断位点后的 135 条用户记录；其中本轮已确认的 134 条按 LSN/payload 在三个地址均 **134/134** 匹配。
+
+**仅写 TN WAL 的集群** `/home/mo/jxm/logservice-main-45917e803f-driver-20261111/`：三地址端口 59201/59211/59221，使用同提交编译的真实 `logservicedriver`，从 `ReplayForWrite` 开始写入并每 20 条调用一次 `Truncate(DSN-10)`；该调用提交后台截断意图。基线 80/80 条确认，重新打开 driver 回放剩余 30 条，DSN 连续至 80。接着持续写入 180 条，杀 leader node0 5 秒、恢复后杀普通副本 node2 5 秒；**180/180** 条确认，最大单条确认 **7.603 秒**，没有超过 10 秒的写入。新 driver 回放剩余 30 条、DSN 连续至 260；三节点整组原盘冷重启后再次得到相同结果，三个进程都保持运行。最后在另外两票互通时隔离 leader node0 的网络 8 秒，持续写入 100 条并继续提交截断意图；**100/100** 确认，最大单条 **7.854 秒**，恢复后回放剩余 30 条、DSN 连续至 360。
+
+故障窗口可见预期的连接失败、超时及 driver 慢写日志；进程关闭时最后一次异步截断意图出现 `context canceled`，重开 driver 的回放与水位检查均通过。冷重启节点日志中也有 `shard already exist` 启动错误，但此次三个服务进程继续运行并形成多数派，与前文记录的旧 HAKeeper ID 启动问题同类，未单列新缺陷。**本轮没有发现新的数据错误或一分钟长尾。** 证据在两个远端目录的 `baseline.cycle`、`fault.cycle`、`fault.truncate`、`cold-read-*.log`、`baseline.log`、`fault.log`、`net.log`、各次 `*replay.log` 与节点日志。两个测试集群和网络命名空间均已停止/清理；上述 `mo-current` 仅保留新版本文件指向。
