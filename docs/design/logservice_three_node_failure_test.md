@@ -1007,3 +1007,30 @@ node1/node2 两票继续完成 **400/400** 条 user WAL、**40** 次 checkpoint�
 随后杀数据 leader node2，仅保留 node0/node1 两票。新 driver 再次回放到同一水位，接着独立单 driver 写入 **20/20** 条，LSN 从 **61026** 连续到 **61045**，checkpoint ACK 到 **61035**。旧实例退出后，另一新 driver 在两票状态回放 `user_lsn=61045, checkpointed=61035`；水位后的 **61036–61045** 十条与写入 ACK 的 LSN/payload **10/10** 一致。node0/node1 原盘冷重启、node2 仍下线后的回放结果不变；node2 原盘恢复后三票回放仍为同一水位，没有缺失、重复或水位回退。
 
 证据保存在远端 `empty-retained-wal-20261111/` 的 `writer.log`、`two-vote-replay.log`、`after.log`、`two-vote-after-replay.log`、`cold-two-vote-replay.log`、`three-vote-replay.log` 和节点日志。结论只覆盖单个可写 driver 的顺序交接及 LogService 持久恢复；测试 checkpoint 文件名为 marker，不验证真实文件服务内容。本轮没有发现新缺陷。
+
+## 单 TN WAL driver 大小混写、两次 leader 切换与回放（2026-11-11 15:55–16:01）
+
+### 未覆盖路径再梳理
+
+从 `logservicedriver/commit.go` 的单条物理 WAL 大小上限、`group_committer.go` 的装包，以及 `replayer.go` 的 `MaxReadBatchSize=64 MiB` 分批读取出发，前轮独立覆盖了 64 MiB 单条 WAL 和小记录并发乱序，但**没有覆盖同一个 driver 内大/小记录混写、跨多个读取批次、同时发生 leader 切换和 checkpoint**。本轮以此为优先。此前已覆盖的短时/长时副本下线、物理截断、Raft snapshot、客户端池饱和及小记录的 Close 故障交错不再原样重复。datasync 和同时存活的两个 TN driver 均排除。
+
+本轮后仍有这些单 driver 路径待测：
+
+| 优先级 | 路径 | 与已有测试的差别 |
+| --- | --- | --- |
+| 高 | 大 WAL 已接收但仍在提交时，driver `Close` 与 leader 断线重叠 | 已测批量小 WAL 的 Close 故障；尚未覆盖接近装包上限的内存与等待者生命周期 |
+| 高 | 真实 TAE checkpoint 文件写入中仍有并发事务 WAL，随后节点故障和原盘重开 | 已测同进程 TAE 的单次 checkpoint 文件加载及 50 行恢复；尚未把并发事务与真实文件生成放在同一窗口 |
+| 中 | 接近 99 MiB 默认物理 WAL 上限的有效记录与小记录混写 | 已测 64 MiB 单条和本轮 8 MiB 混写；靠近大小边界的装包分支未做集成验证 |
+| 中 | 历史版本持久 WAL 的 skip 命令兼容与升级后回放 | 当前代码有 legacy v2 单测；尚未用旧版二进制产生真实数据再用新版回放 |
+
+### 新增实测
+
+在 51 上使用三副本隔离集群 `/home/mo/jxm/logservice-main-45917e803f-two-down-20261111/`，服务端为 `9381db5dde`。探针只使用生产 `wal.NewLogserviceHandle` 的回放、并发 `AppendEntry`、`RangeCheckpoint` 和 `Close` 路径。其大记录是 **8 MiB**，小记录约 19 字节；ACK 和回放仅输出 LSN、长度、SHA256。每一阶段旧 driver 完全退出后才启动新的 driver。服务端 LogService shard 1 有三个地址，故障时始终保持两票。
+
+第一阶段从 `user_lsn=61045` 开始，8 个并发写入者各写 12 条，每人每 3 条有一条 8 MiB，共 **96/96 ACK、32 条大 WAL、约 256 MiB 大记录数据**。约第 20 条 ACK 后杀当时的数据 leader node2，node0/node1 两票完成剩余写入；最终 LSN **61141**。底层 `AppendWAL` 出现 **1 次 EOF、5 次 timeout**，由生产 driver 重试，最终上层写入错误为 0。ACK 最大耗时 **5.716 秒**，无超过 60 秒的写入。旧 driver 退出后，新 driver 在两票状态回放，**96/96** 条按 LSN、字节数和 SHA256 匹配，checkpoint 水位仍为 61035。
+
+第二阶段保持 node2 下线，另一个单 driver 并发写 **64/64** 条，其中 **32 条为 8 MiB**，每约 16 条 ACK 提交一次带测试 `GroupFiles` marker 的 checkpoint；最终 `user_lsn=61205, checkpointed=61173`。新 driver 在两票状态回放，水位后 **32/32** 条与 ACK 的 LSN、长度、SHA256 一致，其中 13 条为 8 MiB；单条 ACK 最大耗时 **2.745 秒**。node0/node1 原盘冷重启后，回放水位及全部 35 条物理可见记录的集合完全相同；其中 3 条虽物理可见但已在 checkpoint 水位之前，不计入必须保留的用户 WAL。
+
+node2 原盘恢复后，确认三个地址均报告同一副本组，再杀当前 leader node0，只留 node1/node2 两票。独立新 driver 继续写 **8/8** 条，LSN **61206–61213**；再启动一个新 driver 回放，原先水位后的 32 条仍全部匹配，新增 8 条按 LSN、长度、SHA256 **8/8** 匹配。这说明先前落后的 node2 追上本轮大 WAL 后可与 node1 组成多数派继续服务。
+
+证据位于远端 `mixed-wal-20261111/` 的 `write.log`、`two-vote-replay.log`、`checkpoint-write.log`、`checkpoint-replay.log`、`cold-two-vote-replay.log`、`three-status.log`、`recovered-two-vote-write.log.gz` 和 `recovered-two-vote-replay.log`。其中 `three-status.log` 记录了 node2 刚启动时短暂连接失败；随后再次查询确认三个地址均可访问。探针源码是测试工作树 `test/logservice-chaos/tn_driver_probe/concurrent_probe/main.go` 的混写参数扩展；已完成 `go list`、`go build`、`go vet` 和定向包编译测试，并在 51 上运行该二进制。测试结束已停止三个节点并清理网络命名空间。本轮没有发现已确认 WAL 丢失、重复、回放摘要不符或一分钟写入长尾。

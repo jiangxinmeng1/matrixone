@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"os"
@@ -65,7 +66,10 @@ func (c *tracedClient) AppendWAL(ctx context.Context, rec logservice.LogRecord) 
 
 func main() {
 	addresses := flag.String("addresses", "", "three dedicated test LogService RPC addresses")
+	mode := flag.String("mode", "write", "write or replay")
 	prefix := flag.String("prefix", "concurrent", "unique payload prefix")
+	largeEvery := flag.Int("large-every", 0, "make every Nth entry per worker large; zero disables")
+	largeMiB := flag.Int("large-mib", 0, "size of large payload in MiB")
 	workers := flag.Int("workers", 32, "concurrent appenders")
 	perWorker := flag.Int("per-worker", 30, "entries per appender")
 	delay := flag.Duration("delay", 20*time.Millisecond, "delay between entries per appender")
@@ -83,7 +87,9 @@ func main() {
 		*addresses != "198.18.51.10:59601,198.18.51.11:59611,198.18.51.12:59621" &&
 		*addresses != "198.18.51.10:59801,198.18.51.11:59811,198.18.51.12:59821" &&
 		*addresses != "198.18.51.10:60201,198.18.51.11:60211,198.18.51.12:60221") ||
+		(*mode != "write" && *mode != "replay") ||
 		*workers <= 0 || *workers > 100 || *perWorker <= 0 || *delay < 0 || *checkpointEvery < 0 ||
+		*largeEvery < 0 || *largeMiB < 0 || *largeMiB > 32 || (*largeEvery == 0) != (*largeMiB == 0) ||
 		(*startReady == "") != (*startRelease == "") ||
 		(*firstReady == "") != (*firstRelease == "") {
 		panic("invalid isolated cluster or workload settings")
@@ -116,13 +122,20 @@ func main() {
 	defer cancel()
 	if err := w.Replay(ctx, func(group uint32, lsn uint64, payload []byte, _ uint16, _ any) driver.ReplayEntryState {
 		if group == wal.GroupUserTxn {
-			fmt.Printf("replay lsn=%d payload=%s\n", lsn, payload)
+			if *largeEvery > 0 || *mode == "replay" {
+				fmt.Printf("replay lsn=%d bytes=%d sha256=%x\n", lsn, len(payload), sha256.Sum256(payload))
+			} else {
+				fmt.Printf("replay lsn=%d payload=%s\n", lsn, payload)
+			}
 		}
 		return driver.RE_Nomal
 	}, func() driver.ReplayMode { return driver.ReplayMode_ReplayForWrite }, nil); err != nil {
 		panic(err)
 	}
 	fmt.Printf("ready lsn=%d checkpointed=%d\n", w.GetLSNWatermark(), w.GetCheckpointed())
+	if *mode == "replay" {
+		return
+	}
 
 	var acked atomic.Int64
 	var ackMu sync.Mutex
@@ -187,10 +200,18 @@ func main() {
 			defer wg.Done()
 			<-start
 			for seq := 0; seq < *perWorker; seq++ {
-				payload := fmt.Sprintf("%s/%02d/%04d", *prefix, worker, seq)
+				payload := []byte(fmt.Sprintf("%s/%02d/%04d", *prefix, worker, seq))
+				if *largeEvery > 0 && seq%*largeEvery == 0 {
+					large := make([]byte, *largeMiB<<20)
+					copy(large, payload)
+					for i := len(payload); i < len(large); i++ {
+						large[i] = byte((i*31 + worker*17 + seq) % 251)
+					}
+					payload = large
+				}
 				e := entry.GetBase()
 				e.SetType(entry.IOET_WALEntry_Test)
-				if err := e.SetPayload([]byte(payload)); err != nil {
+				if err := e.SetPayload(payload); err != nil {
 					errors <- err
 					return
 				}
@@ -214,8 +235,13 @@ func main() {
 				}
 				ackMu.Unlock()
 				count := acked.Add(1)
-				fmt.Printf("ack count=%d lsn=%d payload=%s elapsed_ms=%.3f\n",
-					count, lsn, payload, float64(time.Since(began).Microseconds())/1000)
+				if *largeEvery > 0 {
+					fmt.Printf("ack count=%d lsn=%d bytes=%d sha256=%x elapsed_ms=%.3f\n",
+						count, lsn, len(payload), sha256.Sum256(payload), float64(time.Since(began).Microseconds())/1000)
+				} else {
+					fmt.Printf("ack count=%d lsn=%d payload=%s elapsed_ms=%.3f\n",
+						count, lsn, payload, float64(time.Since(began).Microseconds())/1000)
+				}
 				if *delay > 0 {
 					time.Sleep(*delay)
 				}
