@@ -973,3 +973,13 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 **恢复节点参与多数派。** 随后杀原 leader node1，只留刚恢复的 node0 与 node2；两票选出新 leader，继续完成 **20/20** 条 TN WAL 写入和 2 次 checkpoint。两票回放以及三节点整组原盘冷重启后的回放均到 `user_lsn=60485, checkpointed=60475`，水位后 10 条与 ACK **10/10** 匹配。node0 此后又生成 4 个正常导出快照，达到配置配额，说明残留清理没有阻断后续导出。
 
 远端证据在 `snapshot-generating-9381-20261111/` 的 `watch-events.log`、`old-replay.log`、`new-status.log`、`new-replay.log`、`live-load.log`、`two-vote-replay.log`、`three-vote-replay.log`、`recovered-node-load.log`、`recovered-node-replay.log`、`cold-replay.log`，以及节点日志。测试造的外来目录已清掉，节点和网络命名空间均已停止、清理。本轮没有发现新缺陷；真实中断目录为空，带文件的残留目录由旧/新版对照验证清理，尚未在真实导出中途捕获到带部分文件的目录。
+
+## 最新 LogService 版 `9381db5dde`：真实 snapshot 文件写入中断（2026-11-11 15:37–15:40）
+
+继续使用 51 上已升级至 `9381db5dde` 的隔离集群和同一份副本原盘。测试开始时 upstream/main 已前进到 `d9190ff6d0`，但相对 `9381db5dde`，`pkg/logservice`、TAE logstore 与 TN service 均无代码差异，本轮继续使用已验证哈希的 `9381db5dde` 服务二进制。没有运行 datasync 或真实 TN 服务；负载使用真实 TN WAL driver。
+
+这次在 node0 的导出路径上同时监听新建 `.generating` 目录及目录内部文件创建事件。TN WAL driver 连续写入并每 10 条提交一次带测试 `GroupFiles` marker 的 checkpoint。真实 `snapshot-000000000000D888-262146.generating` 创建后约 132 ms，监听器捕获到其中的 `snapshot-000000000000D888.gbsnap` 文件创建，立即停掉 node0；磁盘上留下 **1116 字节**的 `.gbsnap` 文件，最终 `snapshot-000000000000D888` 目录不存在。这次确实命中了含部分文件的导出中断，并非手工放入的残留。
+
+node1/node2 两票继续完成 **400/400** 条 user WAL、**40** 次 checkpoint。独立新 driver 回放到 `user_lsn=60885, checkpointed=60875`，水位后最后 10 条与 ACK **10/10** 匹配。node0 原盘重启时清除了上述非空 `.generating` 目录，三地址重新发现完整副本组，回放水位与 10 条内容不变。随后杀数据 leader node2，只留刚恢复的 node0 与 node1，两票继续完成 **20/20** 条写入与 2 次 checkpoint；两票回放及整组三节点原盘冷重启后均为 `user_lsn=60905, checkpointed=60895`，水位后最后 10 条与 ACK **10/10** 匹配。node0 此后又保留了 4 个正常导出快照，未积累新的 `.generating` 目录。
+
+证据位于远端 `snapshot-generating-files-20261111/` 的 `watch-events.log`、`live-load.log`、`two-vote-replay.log`、`three-vote-replay.log`、`recovered-load.log`、`recovered-two-vote-replay.log`、`cold-replay.log`，以及节点日志；监听脚本为集群根目录的 `kill_generating_after_file.py`。本轮未发现部分文件残留导致的启动失败、快照导出阻塞或已确认 WAL 丢失。测试节点和网络命名空间已停止、清理。
