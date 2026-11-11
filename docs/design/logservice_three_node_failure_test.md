@@ -1058,3 +1058,27 @@ node2 原盘恢复后，确认三个地址均报告同一副本组，再杀当�
 首次跨进程检查曾误报 `ExpectedEOB`：`catalog.MockSchemaAll` 在新进程生成了新的随机表名，探针按这个新名字查旧表；第二次尝试使用尚未实现的 `database.Relations()`，得到空列表。改为通过 `MakeRelationIt()` 从持久目录枚举原表 schema 后，两次跨进程校验均通过。前两次失败是**测试夹具错误，不列为产品缺陷**；服务端当时已回放到 checkpoint LSN 72、WAL LSN 90。
 
 远端证据在该集群根目录 `test.log`、`cold-reopen-fixed2.log`、`cold-reopen-repeat.log` 和节点日志；本地 mock 定向测试、vet、测试二进制编译均通过，race 模式定向测试按 30 秒预算重复 **32 次**及包级单次检查通过。测试结束已停止三个节点并清理网络命名空间。本轮没有发现行数丢失、checkpoint/WAL 水位回退或两票下无法重开。**剩余边界：**本轮证明事务提交与 `ForceCheckpoint` 调用区间重叠，未在 checkpoint 文件写入事件上精确触发 leader 停机；旧版持久 skip 命令升级回放仍待测。
+
+## 预分配 TN WAL 序列、并发物理追加、截断与尾部裁剪（2026-11-11 17:01–17:13）
+
+使用 51 上新空盘隔离三副本 `/home/mo/jxm/logservice-preassigned-20261111/`，服务端 `9381db5dde`，shard 1，三个地址为 `198.18.51.10:60201`、`198.18.51.11:60211`、`198.18.51.12:60221`。探针 `test/logservice-chaos/tn_driver_probe/preassigned_probe/main.go` 调用生产 `wal.NewLogserviceHandle`、`ReplayForWrite`、`AppendEntry`、`RangeCheckpoint`；只在底层 `AppendWAL` 包装器设置屏障。先在一个 driver 中依次取得全部 user LSN，确认底层成功回包数为 0，才并发释放物理 Append。每次独立回放之前均退出旧 driver，不运行真实 TN 服务或 datasync。以预分配时的 `(LSN, 长度, SHA256)` 为独立预期值，按回调**顺序**核对。
+
+### 大并发乱序与物理截断
+
+第一轮先分配 **LSN 1–64**，每条 3 MiB；首个底层 Append 另行阻塞。放行其他请求后，已成功提交 22 条时杀 leader node0，只保留 node1/node2；再放行首个请求，最终 **64/64** 条上层 ACK 成功。64 个成功物理 `(PSN, LSN)` 存在 **1017 对**顺序逆转。新 driver 在两票状态回放 **64/64** 条，严格按 LSN 1–64 递增，长度和摘要全匹配。checkpoint 到 48 时，最早的物理记录仍是必须保留的 LSN 49，所以物理截断不能前进；推进 checkpoint 到 63 后，物理 PSN 截断到 **232**。两票原盘冷重启后水位为 `user_lsn=64, checkpointed=63`，水位后必须保留的 LSN 64 内容正确。回调仍可能交付已 checkpoint 的物理可见记录，判断保留集须使用 checkpoint 水位。
+
+恢复三票后，第二轮先分配 **LSN 65–160 共 96 条**，每条 3 MiB；放行前仍无底层成功回包。首个请求继续阻塞，其他请求中已有 40 条物理成功时杀 leader node1，留 node0/node2 两票，再放行首个请求。最终 **96/96** 条上层 ACK 成功，96 个成功物理 `(PSN, LSN)` 有 **2053 对**逆序；负载期间底层累计 **574 次失败尝试并重试**（417 次 `context deadline exceeded`、130 次 timeout，其余为连接写错误），但没有上层最终错误。两票独立回放严格按 LSN 65–160 递增，**96/96** 长度与摘要匹配。checkpoint 到 **144** 后物理 PSN 截断到 **1178**；两票原盘冷重启后 `user_lsn=160, checkpointed=144`，必须保留的 LSN **145–160 共 16/16** 条按序且内容全匹配。大并发的底层重试次数说明该负载下有明显重试压力；本轮没有记录逐条 ACK 耗时，不据此判断一分钟长尾。
+
+### 真实 DSN 缺口、复用上层 LSN 与截断后回放失败
+
+第三轮用同一集群恢复三票，旧 driver 先顺序分配 **LSN 161–184 共 24 条**，每条 1 MiB；首个底层 Append 阻塞，其余 **23 条物理 Append 返回成功**，但按 driver 的有序确认路径，**上层 ACK 为 0**。直接 `SIGKILL` 旧 driver，确认它已退出后启动新 driver。新回放写入覆盖 **DSN 168–190** 的 skip 命令，裁掉未确认尾部，报告 `user_lsn=160, checkpointed=144`，没有交付旧轮的任何记录。新的唯一 driver 重新分配并确认 **LSN 161–176 共 16/16 条**；这些上层 LSN 与旧轮相同，payload 摘要全部不同。独立 driver 在截断前能回放这 16 条，水位为 176。
+
+随后 checkpoint 到 **LSN 172**，后台 `Wal-Truncate-Execute` 把物理水位从 PSN 1178 推到 **1841**，checkpointed DSN 为 178。下一次独立回放在 `replayer.go:1024` 报错并由探针 panic：
+
+```text
+Wal-Replay-DSN-Overlap: wal record dsn range [183, 184] at psn 2762 overlaps pending dsn range [184, 184] at psn 2209
+```
+
+同一持久状态上连续再回放两次，均得到相同错误；整组三副本各自原盘强制冷重启后再次回放，仍得到相同错误，故这不是临时 leader/连接故障。失败前的日志显示 skip 命令为版本 1，读取后多条 `Wal-Replay-Stale-Skip-Entry`，例如 DSN 184 的 skip 目标 PSN 2210、当前 pending PSN 2209；随后对一些旧物理记录报告 duplicate，最后在新旧 DSN 范围部分重叠时终止。**缺陷影响：**16 条已 ACK 的新 WAL 在截断后不能完成 `ReplayForWrite`，TN 重启可能无法恢复可写。证据足以确认回放失败和时间线；PSN 对不上的根因还需进一步定位，不能仅凭日志断言是 skip 命令生成、物理截断或读取索引中的哪一处实现错误。
+
+远端 `preassigned/r1/`、`r2/`、`r3/` 保存每轮 `write.log`、独立回放、checkpoint 和冷重启日志；第三轮关键文件是 `r3/write.log`、`post-kill-replay.log`、`post-skip-write.log`、`checkpoint172.log`、`checkpoint175.log`、`repro-1.log`、`repro-2.log`、`cold-repro.log`。本轮结束后已停止三个节点并清理隔离网络命名空间，保留原盘和日志以便进一步定位。此处的 checkpoint 使用测试 marker；它验证 WAL 截断和回放，不代替真实 TAE checkpoint 文件加载。
