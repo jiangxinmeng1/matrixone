@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
@@ -101,6 +102,9 @@ func (tableScan *TableScan) Prepare(proc *process.Process) (err error) {
 	if tableScan.OutputAllocation != nil {
 		err = tableScan.ctr.buf.SetAllocationAccount(tableScan.OutputAllocation)
 	}
+	if err == nil {
+		err = tableScan.prepareLocalDomains(proc)
+	}
 	return
 }
 
@@ -116,6 +120,14 @@ func (tableScan *TableScan) Call(proc *process.Process) (vm.CallResult, error) {
 
 	if err, isCancel := vm.CancelCheck(proc); isCancel {
 		return vm.CancelResult, err
+	}
+	if len(tableScan.ctr.domainProbes) > 0 {
+		if err := tableScan.waitLocalDomains(proc); err != nil {
+			return vm.CancelResult, err
+		}
+		if tableScan.ctr.domainEmpty {
+			return vm.CancelResult, nil
+		}
 	}
 
 	for {
@@ -141,6 +153,7 @@ func (tableScan *TableScan) Call(proc *process.Process) (vm.CallResult, error) {
 		newCtx := perfcounter.AttachS3RequestKey(proc.Ctx, crs)
 		if tableScan.ReadPolicy != 0 {
 			newCtx = fileservice.WithFileServicePolicy(newCtx, fileservice.GetFileServicePolicy(newCtx)|tableScan.ReadPolicy)
+			newCtx = fileservice.WithPreloadGroup(newCtx, tableScan.TableID)
 		}
 		isEnd, err := tableScan.readBatch(newCtx, proc)
 		if err != nil {
@@ -151,6 +164,9 @@ func (tableScan *TableScan) Call(proc *process.Process) (vm.CallResult, error) {
 		// Record ReadSize metrics when scan completes all blocks (isEnd == true)
 		// This matches explain analyze output which shows total read size for the entire scan
 		if isEnd {
+			for _, source := range tableScan.ctr.domainSources {
+				source.producer.Complete(false)
+			}
 			if analyzer != nil {
 				opStats := analyzer.GetOpStats()
 				// GetOpStats() will panic if opStats is nil, so we can safely access it here
@@ -198,6 +214,14 @@ func (tableScan *TableScan) Call(proc *process.Process) (vm.CallResult, error) {
 			}
 		}
 
+		if len(tableScan.ctr.domainSources) > 0 || len(tableScan.ctr.domainProbes) > 0 {
+			if err = tableScan.applyLocalDomains(proc); err != nil {
+				return vm.CancelResult, err
+			}
+			if tableScan.ctr.buf.IsEmpty() {
+				continue
+			}
+		}
 		break
 	}
 
@@ -267,18 +291,21 @@ func padCharColumnsToFullLength(bat *batch.Batch, proc *process.Process) error {
 // and shrinking it is precisely the crash. It cannot mask a real misalignment either --
 // any vector the reader DID fill is shrunk, so every populated column stays consistent
 // with the row count set below.
-func shrinkPopulatedVecs(bat *batch.Batch, sels []int64) {
+func shrinkPopulatedVecs(bat *batch.Batch, sels []int64, mp *mpool.MPool) error {
 	if len(sels) == bat.RowCount() {
-		return
+		return nil
 	}
 	rowCount := bat.RowCount()
 	for _, vec := range bat.Vecs {
 		if vec == nil || (vec.Length() == 0 && rowCount != 0) {
 			continue
 		}
-		vec.Shrink(sels, false)
+		if err := vec.Shrink(sels, false, mp); err != nil {
+			return err
+		}
 	}
 	bat.SetRowCount(len(sels))
+	return nil
 }
 
 // evalFilter evaluates inline filter expressions in-place. loadedColumns is
@@ -393,10 +420,14 @@ func (tableScan *TableScan) evalFilter(
 				}
 
 				if loadedColumns == nil {
-					shrinkPopulatedVecs(bat, sels)
+					if err := shrinkPopulatedVecs(bat, sels, proc.Mp()); err != nil {
+						return engine.ReaderFilterResult{}, err
+					}
 				} else {
 					for _, pos := range loadedColumns {
-						bat.Vecs[pos].Shrink(sels, false)
+						if err := bat.Vecs[pos].Shrink(sels, false, proc.Mp()); err != nil {
+							return engine.ReaderFilterResult{}, err
+						}
 					}
 					bat.SetRowCount(len(sels))
 				}
