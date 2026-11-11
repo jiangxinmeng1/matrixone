@@ -983,3 +983,27 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 node1/node2 两票继续完成 **400/400** 条 user WAL、**40** 次 checkpoint。独立新 driver 回放到 `user_lsn=60885, checkpointed=60875`，水位后最后 10 条与 ACK **10/10** 匹配。node0 原盘重启时清除了上述非空 `.generating` 目录，三地址重新发现完整副本组，回放水位与 10 条内容不变。随后杀数据 leader node2，只留刚恢复的 node0 与 node1，两票继续完成 **20/20** 条写入与 2 次 checkpoint；两票回放及整组三节点原盘冷重启后均为 `user_lsn=60905, checkpointed=60895`，水位后最后 10 条与 ACK **10/10** 匹配。node0 此后又保留了 4 个正常导出快照，未积累新的 `.generating` 目录。
 
 证据位于远端 `snapshot-generating-files-20261111/` 的 `watch-events.log`、`live-load.log`、`two-vote-replay.log`、`three-vote-replay.log`、`recovered-load.log`、`recovered-two-vote-replay.log`、`cold-replay.log`，以及节点日志；监听脚本为集群根目录的 `kill_generating_after_file.py`。本轮未发现部分文件残留导致的启动失败、快照导出阻塞或已确认 WAL 丢失。测试节点和网络命名空间已停止、清理。
+
+## 单 TN WAL driver 覆盖复查与全量 checkpoint 后空 WAL 恢复（2026-11-11 15:43–15:50）
+
+本轮限定**任一时刻只有一个 TN WAL driver 实例存活**；每次新实例启动前都结束旧实例。没有运行 datasync 或真实 TN 服务。LogService 服务端仍为 `9381db5dde`；检查当时最新 upstream/main `d9190ff6d0`，其 `pkg/logservice`、TAE logstore、TN service 相对该服务端版本没有代码差异。
+
+### 已覆盖路径及仍需补测的路径
+
+| 路径 | 既有证据 | 当前边界 |
+| --- | --- | --- |
+| 三副本 leader/普通副本短时或长时下线、网络隔离、两票写读、恢复与原盘冷重启 | 多轮故障矩阵、超过 3 分钟的旧 leader 隔离、双节点短暂停机 | 已覆盖服务端和 TN WAL driver；不推断真实 TN 服务整体可用性 |
+| 单 driver 并发 Append 的 DSN/PSN 乱序与空洞 | 16 轮追加矩阵产生 351 个补空洞映射，424 条旧实例 ACK 均在回放中匹配 | 尚未覆盖大小差异显著的 WAL 混写批次边界 |
+| checkpoint、后台 TruncateWAL、模糊成功、Close 和 leader 切换 | checkpoint/物理截断发送前后、回包丢失等窗口已有逐条回放核对 | 本轮补测所有 user WAL 均已被物理截断后的下一次写入 |
+| Raft snapshot 导出、导入、追赶和中途崩溃 | 落后副本追赶、真实 `.generating` 文件写入中断及原盘恢复 | 与 TN checkpoint 文件不同；后者另有同进程 TAE 测试 |
+| 持续回放转写入、真实 TAE checkpoint 文件加载 | 已测切换期间 leader 停机及同进程 TAE DB 重开后扫描 50 行 | 本轮不扩展同时存活的多个 TN driver 实例 |
+
+剩余优先路径是**一个 driver 内大小差异显著的 WAL 并发混写**：跨 LogService 读取批次边界做 checkpoint 和 leader 切换，再结束旧实例，以单独的新实例回放，核对每条已确认记录的长度、摘要和 LSN。这可检查 `group_committer` 的装包和 `replayer` 的跨批次解析。另一个边界是真实 TN 服务的启动、关闭和文件服务配合；当前测试夹具只复用生产 WAL driver。datasync 路径不纳入本轮范围。
+
+### 新增实测：物理 user WAL 为空时从截断水位续写
+
+复用 51 上隔离三副本集群 `/home/mo/jxm/logservice-main-45917e803f-two-down-20261111/`。旧 driver 用真实 `wal.NewLogserviceHandle`、`ReplayForWrite`、`AppendEntry`、带 `GroupFiles` 测试 marker 的 checkpoint 写入 100 条，最后一条 ACK 为 `empty-retained-r1/000099`、**user LSN 61025**；checkpoint ACK 覆盖到 **61025**。探针在计划的第 101 条发送前暂停，等待后台物理截断完成；日志确认 `psn-intent=57777, psn-truncated=57777`。随后结束旧 driver，未发送第 101 条。新 driver 独立回放时**没有交付任何 user WAL 条目**，但从服务端持久水位恢复 `user_lsn=61025, checkpointed=61025, truncated_dsn=61577`，没有把下一条逻辑 LSN 重置为 1。
+
+随后杀数据 leader node2，仅保留 node0/node1 两票。新 driver 再次回放到同一水位，接着独立单 driver 写入 **20/20** 条，LSN 从 **61026** 连续到 **61045**，checkpoint ACK 到 **61035**。旧实例退出后，另一新 driver 在两票状态回放 `user_lsn=61045, checkpointed=61035`；水位后的 **61036–61045** 十条与写入 ACK 的 LSN/payload **10/10** 一致。node0/node1 原盘冷重启、node2 仍下线后的回放结果不变；node2 原盘恢复后三票回放仍为同一水位，没有缺失、重复或水位回退。
+
+证据保存在远端 `empty-retained-wal-20261111/` 的 `writer.log`、`two-vote-replay.log`、`after.log`、`two-vote-after-replay.log`、`cold-two-vote-replay.log`、`three-vote-replay.log` 和节点日志。结论只覆盖单个可写 driver 的顺序交接及 LogService 持久恢复；测试 checkpoint 文件名为 marker，不验证真实文件服务内容。本轮没有发现新缺陷。
