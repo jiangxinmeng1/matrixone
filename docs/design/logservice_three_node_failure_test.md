@@ -811,3 +811,15 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 **仅写 TN WAL 的集群** `/home/mo/jxm/logservice-main-45917e803f-driver-20261111/`：三地址端口 59201/59211/59221，使用同提交编译的真实 `logservicedriver`，从 `ReplayForWrite` 开始写入并每 20 条调用一次 `Truncate(DSN-10)`；该调用提交后台截断意图。基线 80/80 条确认，重新打开 driver 回放剩余 30 条，DSN 连续至 80。接着持续写入 180 条，杀 leader node0 5 秒、恢复后杀普通副本 node2 5 秒；**180/180** 条确认，最大单条确认 **7.603 秒**，没有超过 10 秒的写入。新 driver 回放剩余 30 条、DSN 连续至 260；三节点整组原盘冷重启后再次得到相同结果，三个进程都保持运行。最后在另外两票互通时隔离 leader node0 的网络 8 秒，持续写入 100 条并继续提交截断意图；**100/100** 确认，最大单条 **7.854 秒**，恢复后回放剩余 30 条、DSN 连续至 360。
 
 故障窗口可见预期的连接失败、超时及 driver 慢写日志；进程关闭时最后一次异步截断意图出现 `context canceled`，重开 driver 的回放与水位检查均通过。冷重启节点日志中也有 `shard already exist` 启动错误，但此次三个服务进程继续运行并形成多数派，与前文记录的旧 HAKeeper ID 启动问题同类，未单列新缺陷。**本轮没有发现新的数据错误或一分钟长尾。** 证据在两个远端目录的 `baseline.cycle`、`fault.cycle`、`fault.truncate`、`cold-read-*.log`、`baseline.log`、`fault.log`、`net.log`、各次 `*replay.log` 与节点日志。两个测试集群和网络命名空间均已停止/清理；上述 `mo-current` 仅保留新版本文件指向。
+
+## 最新 upstream/main `45917e803f`：TN WAL 原子截断遇到 leader 切换及模糊成功（2026-11-11 10:03–10:11）
+
+在 51 上新建空盘三副本集群 `/home/mo/jxm/logservice-main-45917e803f-wal-truncate-20261111/`，数据 shard 1，RPC 端口 59401/59411/59421，`mo-service` 和客户端均基于 `45917e803f`。扩展 `test/logservice-chaos/tn_driver_probe/wal_probe/main.go` 的客户端包装层，使它能在新接口 `TruncateWAL(PSN, checkpointedDSN)` **调用前**和**服务端成功返回后**设屏障；后者还能仅在第一次成功回包处注入 `context.DeadlineExceeded`，模拟已提交但回包丢失。业务路径仍使用真实 `wal.NewLogserviceHandle`、`ReplayForWrite`、`AppendEntry(GroupUserTxn)`、`RangeCheckpoint` 和后台 `logservicedriver` 截断；没有启动 TN/CN 或加载真实 TAE checkpoint 文件。测试期间另外两票始终互通。
+
+**请求调用前切换 leader。** 探针在第一次 `TruncateWAL(psn=211, checkpointedDSN=10)` 调用前暂停；已确认 user LSN 21 后，杀数据 leader node2，立即放行请求，约 5 秒后从原盘恢复 node2。120/120 条 user WAL 和 6 次 checkpoint 均成功；第一次后台物理截断重试 1 次，约 **17.206 秒**后完成，前台写入最大 **3.696 秒**，没有超过 10 秒。独立新 WAL 实例报告 `user_lsn=120, checkpointed=110, truncated_dsn=98`；保留回放的 LSN 91–120 共 30 条与 ACK 逐条匹配。整组三副本冷重启后水位和这 30 条记录不变。第一次优雅停止全组三节点时，最后存活的 log 节点等待配置的 1 分钟 shutdown 阶段超时才退出；重启脚本最初只等 20 秒，此后等节点实际退出再启动，不将该脚本失败算作数据缺陷。
+
+**提交成功后丢回包并切换 leader，短运行。** 同一集群继续写入。探针确认服务端已提交 `TruncateWAL(psn=908, checkpointedDSN=142)`，暂停返回；此时杀 leader node2，释放包装层并把本次成功转换为一次测试注入的 deadline 错误，5 秒后恢复 node2。80/80 条 user WAL 均确认；旧 driver 在结束关闭时取消了尚未完成的后台重试。新 driver 从服务端恢复到 `user_lsn=200, checkpointed=190, truncated_dsn=142`，回放的 LSN 131–200 共 70 条与此前 ACK 全部匹配。三节点强制冷重启后水位和记录完全相同。此轮证明新实例可以从持久状态恢复，不能据此称旧实例已完成重试。
+
+**相同模糊成功窗口，保持旧 driver 长运行。** 再写入 200 条，启用 100 ms 轮间间隔，定期 checkpoint。服务端成功提交 `TruncateWAL(psn=1666, checkpointedDSN=230)` 后丢首次回包并杀 leader node2；约 5 秒后恢复。旧 driver 在约 **4.091 秒**、3 次重试后通过 `GetWALTruncate` 读回持久 `(PSN 1666, checkpointed DSN 230)`，把该次模糊结果判为成功，后续后台物理截断继续推进。200/200 条 user WAL 确认，前台单条最大 **3.427 秒**、无超过 10 秒的写入。新实例回放到 `user_lsn=400, checkpointed=390`，保留的 LSN 371–400 共 30 条与 ACK 一致；整组强制冷重启后水位和记录不变。
+
+三轮均未出现数据缺失、DSN 回放缺口或一分钟前台长尾。回放探针会打印 checkpoint 水位之前尚未物理截断的旧记录；真实 TAE 会按 checkpoint LSN 过滤，不能把打印出的全部记录算作需要重新应用。提交成功后丢回包是**测试包装层注入**，明确验证了 driver 的模糊成功处理，但不等同于证明实际网络必然产生同一错误形态。本轮证据在远端该目录的 `wal.log`、`replay.log`、`cold-replay.log`、`ackloss*.log`、`ackloss*replay.log`、节点日志及运行脚本；节点和测试网络已清理。

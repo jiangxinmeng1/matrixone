@@ -20,12 +20,16 @@ import (
 
 type faultHookClient struct {
 	logservice.Client
-	once            *sync.Once
-	ready           string
-	release         string
-	truncateOnce    *sync.Once
-	truncateReady   string
-	truncateRelease string
+	once                 *sync.Once
+	ready                string
+	release              string
+	truncateOnce         *sync.Once
+	truncateReady        string
+	truncateRelease      string
+	truncateAfterOnce    *sync.Once
+	truncateAfterReady   string
+	truncateAfterRelease string
+	dropTruncateAck      bool
 }
 
 func (c *faultHookClient) GetTruncatedLsn(ctx context.Context) (logservice.Lsn, error) {
@@ -63,16 +67,58 @@ func (c *faultHookClient) Truncate(ctx context.Context, lsn logservice.Lsn) erro
 	return c.Client.Truncate(ctx, lsn)
 }
 
+func (c *faultHookClient) TruncateWAL(ctx context.Context, psn, checkpointedDSN logservice.Lsn) error {
+	if c.truncateReady != "" {
+		c.truncateOnce.Do(func() {
+			if err := os.WriteFile(c.truncateReady,
+				[]byte(fmt.Sprintf("psn=%d checkpointed_dsn=%d\n", psn, checkpointedDSN)), 0o644); err != nil {
+				panic(err)
+			}
+			for {
+				if _, err := os.Stat(c.truncateRelease); err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+	err := c.Client.TruncateWAL(ctx, psn, checkpointedDSN)
+	if err != nil || c.truncateAfterReady == "" {
+		return err
+	}
+	dropped := false
+	c.truncateAfterOnce.Do(func() {
+		dropped = c.dropTruncateAck
+		if err := os.WriteFile(c.truncateAfterReady,
+			[]byte(fmt.Sprintf("psn=%d checkpointed_dsn=%d committed=true\n", psn, checkpointedDSN)), 0o644); err != nil {
+			panic(err)
+		}
+		for {
+			if _, err := os.Stat(c.truncateAfterRelease); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+	if dropped {
+		fmt.Printf("injected_truncate_ack_loss psn=%d checkpointed_dsn=%d\n", psn, checkpointedDSN)
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
 func main() {
 	var addresses, mode, prefix, readyFile, releaseFile, progressFile string
 	var checkpointReadyFile, checkpointReleaseFile string
 	var replayReadyFile, replayReleaseFile string
 	var readReadyFile, readReleaseFile string
 	var truncateReadyFile, truncateReleaseFile string
+	var truncateAfterReadyFile, truncateAfterReleaseFile string
 	var count, pauseBeforeSeq, checkpointEvery, pauseAtCheckpoint int
 	var checkpointLag uint64
 	var writeDelay, replayTimeout time.Duration
 	var checkpointFiles bool
+	var dropTruncateAck bool
 	flag.StringVar(&addresses, "addresses", "", "three test LogService addresses")
 	flag.StringVar(&mode, "mode", "cycle", "cycle or replay")
 	flag.StringVar(&prefix, "prefix", "wal-probe", "unique payload prefix")
@@ -92,13 +138,17 @@ func main() {
 	flag.StringVar(&readReleaseFile, "read-release-file", "", "wait for this file before replay Read")
 	flag.StringVar(&truncateReadyFile, "truncate-ready-file", "", "write this file before the first physical Truncate RPC")
 	flag.StringVar(&truncateReleaseFile, "truncate-release-file", "", "wait for this file before the first physical Truncate RPC")
+	flag.StringVar(&truncateAfterReadyFile, "truncate-after-ready-file", "", "write after the first successful WAL Truncate RPC")
+	flag.StringVar(&truncateAfterReleaseFile, "truncate-after-release-file", "", "release the first committed WAL Truncate RPC")
+	flag.BoolVar(&dropTruncateAck, "drop-first-truncate-ack", false, "inject a lost acknowledgement after the first committed WAL truncate")
 	flag.DurationVar(&replayTimeout, "replay-timeout", 3*time.Minute, "overall replay context deadline")
 	flag.DurationVar(&writeDelay, "write-delay", 0, "delay after each acknowledged user entry")
 	flag.BoolVar(&checkpointFiles, "checkpoint-files", false, "append a GroupFiles marker using the TAE checkpoint WAL form")
 	flag.Parse()
 	if addresses != "127.0.0.1:58001,127.0.0.1:58011,127.0.0.1:58021" &&
 		addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" &&
-		addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" {
+		addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" &&
+		addresses != "198.18.51.10:59401,198.18.51.11:59411,198.18.51.12:59421" {
 		panic("use only the dedicated WAL StoreImpl test cluster")
 	}
 	if mode != "cycle" && mode != "replay" {
@@ -109,7 +159,9 @@ func main() {
 		(pauseAtCheckpoint >= 0 && (checkpointReadyFile == "" || checkpointReleaseFile == "")) ||
 		((replayReadyFile == "") != (replayReleaseFile == "")) ||
 		((readReadyFile == "") != (readReleaseFile == "")) ||
-		((truncateReadyFile == "") != (truncateReleaseFile == "")) {
+		((truncateReadyFile == "") != (truncateReleaseFile == "")) ||
+		((truncateAfterReadyFile == "") != (truncateAfterReleaseFile == "")) ||
+		(dropTruncateAck && truncateAfterReadyFile == "") {
 		panic("invalid count or pause settings")
 	}
 
@@ -123,16 +175,19 @@ func main() {
 	}
 	var readHookOnce sync.Once
 	var truncateHookOnce sync.Once
+	var truncateAfterHookOnce sync.Once
 	factory := func() (logservice.Client, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()
 		client, err := logservice.NewClient(ctx, sid, clientCfg)
-		if err != nil || (readReadyFile == "" && truncateReadyFile == "") {
+		if err != nil || (readReadyFile == "" && truncateReadyFile == "" && truncateAfterReadyFile == "") {
 			return client, err
 		}
 		return &faultHookClient{
 			Client: client, once: &readHookOnce, ready: readReadyFile, release: readReleaseFile,
 			truncateOnce: &truncateHookOnce, truncateReady: truncateReadyFile, truncateRelease: truncateReleaseFile,
+			truncateAfterOnce: &truncateAfterHookOnce, truncateAfterReady: truncateAfterReadyFile,
+			truncateAfterRelease: truncateAfterReleaseFile, dropTruncateAck: dropTruncateAck,
 		}, nil
 	}
 	w := wal.NewLogserviceHandle(logservicedriver.LogServiceClientFactory(factory), 0)
