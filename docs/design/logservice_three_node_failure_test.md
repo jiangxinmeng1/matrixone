@@ -895,3 +895,13 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 新 driver 随后再确认 **200/200** 条 user WAL，按每 20 条提交一次带 `GroupFiles` 测试 marker 的 checkpoint，将 checkpoint 水位推进到 **15270**。物理截断后回放到 `user_lsn=15320, checkpointed=15270, truncated_dsn=15330`；本轮可回放的 70 条与 ACK **70/70** 匹配，水位后必须保留的 LSN 15271–15320 **50/50** 匹配，旧的重复物理记录已不在可回放范围。整组再次原盘冷重启后水位和这 50 条不变，回放未再记录那些旧副本。
 
 证据在远端该目录的 `ooo-load.log`、`ooo2-load.log`、`ooo2-two-vote-replay.log`、`ooo2-cold-replay.log`、`ooo-postcp.log`、`ooo-postcp-replay.log`、`ooo-postcp-cold-replay.log`、`run-ooo-append.sh`、`run-ooo-physical.sh` 与节点日志。三个节点与测试网络命名空间已停止、清理。本轮未发现新数据错误；重复物理记录与故障时已提交、回包丢失后重试的形态一致，用户 WAL 回放保持一次交付。
+
+## 近轮阴性结果的覆盖复查与高并发旧 leader 黑洞（2026-11-11 14:02–14:04）
+
+拉取 upstream/main 后，远端最新为 `553e16f52b`；从 51 上测试二进制的 `45917e803f` 到该提交只有 parser 相关提交，`pkg/logservice`、`pkg/vm/engine/tae/logstore`、`pkg/tnservice` 没有代码差异。因此本轮继续使用 `45917e803f` 的已验证二进制。此前版本已经合入 `d2dab994dd` 的 RPC 停顿超时与连接切换、`ee5e93bcef` 的读写/快照/截断恢复、`39e470bad8` 的 WAL 恢复修复；近几轮主要验证这些修复后的故障恢复路径，不能把阴性结果解释为这些模块从无缺陷。
+
+**新的压力组合。** 在 51 的三副本集群 `/home/mo/jxm/logservice-main-45917e803f-two-down-20261111/` 使用默认 100-client 的真实 TN WAL driver，100 个并发写入者共计划 12000 条 user WAL，每约 300 条确认发起带 `GroupFiles` 测试 marker 的 checkpoint，保留最近 300 条连续确认记录。热身至 500 条后，确认数据 leader 是 node0；当时 `ss` 记录约 **44** 条到 node0 RPC 端口的连接。随后只在 node0 的网络命名空间丢弃来自客户端 bridge 的 RPC 入站包，并双向阻断 node0 与 node1/node2 的 Raft 通道；node1/node2 互通、各进程均运行。规则持续约 **60 秒**，RPC DROP 命中 **779** 包，四条 Raft DROP 分别命中 **33、39、274、268** 包，证明故障生效。故障 20 秒时 ACK 为 1299，60 秒时为 7788；撤销规则后继续至 **12000/12000** 条确认、**39** 次 checkpoint intent，底层记录 **49** 次失败 `AppendWAL` 尝试，无最终用户写入或 checkpoint 错误。单条确认 p99 **5.238 秒**、最大 **11.305 秒**，**98** 条超过 10 秒、**0** 条超过 60 秒。
+
+保持 node0 下线、只留 node1/node2 两票时，独立新 driver 回放为 `user_lsn=27320, checkpointed=27020, truncated_dsn=15962`；本轮可回放的 384 条与 ACK **384/384** 匹配，其中 checkpoint 水位后的 LSN 27021–27320 **300/300** 匹配。三节点各自原盘强制冷重启后水位不变，这 300 条再次 **300/300** 匹配。故障规则、节点和测试网络命名空间已清理。证据在远端同目录 `blackhole100-load.log`、`blackhole100-preconn-count`、`blackhole100-two-vote-replay.log`、`blackhole100-cold-replay.log`、`run-leader-blackhole-100.sh` 及节点日志。
+
+**为何最近没有新缺陷及剩余盲区。** 本轮显示旧连接黑洞会带来秒级尾部，但当前 8 秒底层 RPC 读超时、重新发现与 driver 重试在这一组合下没有退化成旧版约 60 秒单次等待。此前多数进程停机实验仅持续 5–9 秒，验证的是恢复与多数派语义，不能覆盖持续超过 driver 默认 3 分钟重试检查窗口的长期故障。现有探针以 ACK、可回放 LSN/payload 和测试 checkpoint marker 为主要 oracle；它能识别 WAL 丢失、重复或水位错误，但不能验证真实 TAE checkpoint 文件的生成/加载、事务可见性、SQL 结果，也不能仅凭成功 ACK 排除所有未确认但已提交的请求。历史报告已记录旧版实际缺陷和修复后的回归结果；本轮没有发现新的数据正确性缺陷或一分钟长尾。
