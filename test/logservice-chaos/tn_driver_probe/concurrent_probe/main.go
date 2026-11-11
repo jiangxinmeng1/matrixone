@@ -31,6 +31,22 @@ func (c *tracedClient) Append(ctx context.Context, rec logservice.LogRecord) (lo
 	return lsn, err
 }
 
+func (c *tracedClient) AppendWAL(ctx context.Context, rec logservice.LogRecord) (logservice.Lsn, error) {
+	start := time.Now()
+	walClient, ok := c.Client.(interface {
+		AppendWAL(context.Context, logservice.LogRecord) (uint64, error)
+	})
+	if !ok {
+		return 0, fmt.Errorf("underlying LogService client does not implement AppendWAL")
+	}
+	lsn, err := walClient.AppendWAL(ctx, rec)
+	if err != nil || time.Since(start) > 3*time.Second {
+		fmt.Printf("backend_append_wal lsn=%d elapsed_ms=%.3f err=%v\n",
+			lsn, float64(time.Since(start).Microseconds())/1000, err)
+	}
+	return lsn, err
+}
+
 func main() {
 	addresses := flag.String("addresses", "", "three dedicated test LogService RPC addresses")
 	prefix := flag.String("prefix", "concurrent", "unique payload prefix")
@@ -45,7 +61,8 @@ func main() {
 	traceBackend := flag.Bool("trace-backend-append", false, "log slow or failed individual LogService Append attempts")
 	flag.Parse()
 	if (*addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" &&
-		*addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221") ||
+		*addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" &&
+		*addresses != "198.18.51.10:59601,198.18.51.11:59611,198.18.51.12:59621") ||
 		*workers <= 0 || *workers > 100 || *perWorker <= 0 || *delay < 0 || *checkpointEvery < 0 ||
 		(*startReady == "") != (*startRelease == "") {
 		panic("invalid isolated cluster or workload settings")

@@ -32,6 +32,17 @@ type faultHookClient struct {
 	dropTruncateAck      bool
 }
 
+// Preserve the WAL-specific proposal deadline when a test hook wraps NewClient.
+func (c *faultHookClient) AppendWAL(ctx context.Context, rec logservice.LogRecord) (logservice.Lsn, error) {
+	walClient, ok := c.Client.(interface {
+		AppendWAL(context.Context, logservice.LogRecord) (uint64, error)
+	})
+	if !ok {
+		return 0, fmt.Errorf("underlying LogService client does not implement AppendWAL")
+	}
+	return walClient.AppendWAL(ctx, rec)
+}
+
 func (c *faultHookClient) GetTruncatedLsn(ctx context.Context) (logservice.Lsn, error) {
 	lsn, err := c.Client.GetTruncatedLsn(ctx)
 	if err == nil && c.ready != "" {
@@ -148,7 +159,8 @@ func main() {
 	if addresses != "127.0.0.1:58001,127.0.0.1:58011,127.0.0.1:58021" &&
 		addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" &&
 		addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" &&
-		addresses != "198.18.51.10:59401,198.18.51.11:59411,198.18.51.12:59421" {
+		addresses != "198.18.51.10:59401,198.18.51.11:59411,198.18.51.12:59421" &&
+		addresses != "198.18.51.10:59601,198.18.51.11:59611,198.18.51.12:59621" {
 		panic("use only the dedicated WAL StoreImpl test cluster")
 	}
 	if mode != "cycle" && mode != "replay" {

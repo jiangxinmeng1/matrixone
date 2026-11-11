@@ -823,3 +823,13 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 **相同模糊成功窗口，保持旧 driver 长运行。** 再写入 200 条，启用 100 ms 轮间间隔，定期 checkpoint。服务端成功提交 `TruncateWAL(psn=1666, checkpointedDSN=230)` 后丢首次回包并杀 leader node2；约 5 秒后恢复。旧 driver 在约 **4.091 秒**、3 次重试后通过 `GetWALTruncate` 读回持久 `(PSN 1666, checkpointed DSN 230)`，把该次模糊结果判为成功，后续后台物理截断继续推进。200/200 条 user WAL 确认，前台单条最大 **3.427 秒**、无超过 10 秒的写入。新实例回放到 `user_lsn=400, checkpointed=390`，保留的 LSN 371–400 共 30 条与 ACK 一致；整组强制冷重启后水位和记录不变。
 
 三轮均未出现数据缺失、DSN 回放缺口或一分钟前台长尾。回放探针会打印 checkpoint 水位之前尚未物理截断的旧记录；真实 TAE 会按 checkpoint LSN 过滤，不能把打印出的全部记录算作需要重新应用。提交成功后丢回包是**测试包装层注入**，明确验证了 driver 的模糊成功处理，但不等同于证明实际网络必然产生同一错误形态。本轮证据在远端该目录的 `wal.log`、`replay.log`、`cold-replay.log`、`ackloss*.log`、`ackloss*replay.log`、节点日志及运行脚本；节点和测试网络已清理。
+
+**探针路径更正（2026-11-11 10:21）。** 上述三轮启用故障钩子时，测试包装层只暴露 `logservice.Client` 接口，而 `AppendWAL` 是该接口之外的可选方法；`logservicedriver` 的类型断言因此失败并回退到普通 `Append`。WAL driver、checkpoint、`TruncateWAL` 与回放逻辑仍是生产代码，记录内容和截断结果的核对有效；但上述写入耗时**不能代表**新 `AppendWAL` 的 7 秒提议期限及其重试表现。已在探针包装层显式转发可选 `AppendWAL`；下轮用修正后的路径重新测相关故障。
+
+## 最新 upstream/main `45917e803f`：落后副本 Raft snapshot 追赶时切走 leader（2026-11-11 10:23–10:26）
+
+在 51 上以空目录新建三副本集群 `/home/mo/jxm/logservice-main-45917e803f-snapshot-catchup-20261111/`，数据 shard 1，RPC 端口 59601/59611/59621，服务与探针均基于 `45917e803f`。修正 `concurrent_probe` 包装层以显式转发可选 `AppendWAL`，确保 driver 使用新版本的 WAL 专用提议期限；测试层还记录失败或超过 3 秒的底层尝试。使用真实 `wal.NewLogserviceHandle` 和 `ReplayForWrite`，32 个并发写入者共计划 6400 条 user WAL，每约 200 条确认发起一次带 `GroupFiles` marker 的 checkpoint，并保留至少 300 条连续确认的 user LSN。未启动 TN/CN 或加载真实 TAE checkpoint 文件。
+
+起始数据 leader 为 node2。约 500 条确认时杀普通副本 node0，保持 node1/node2 两票写入与 checkpoint；到约 5000 条确认时从旧盘恢复 node0。node2 于 **10:25:07.141** 开始向 node0 发送数据 shard Raft snapshot index **2563**，日志明确写明 `entry compacted`；约 **46 ms** 后杀 node2。node1 在新 term 中于 10:25:11.039 向 node0 发送数据 shard snapshot index **2579**，node0 于 10:25:11.492 记录开始恢复该 snapshot。node0/node1 两票继续运行至负载结束，node0 随后还导入外部导出快照 index 3124、3209。
+
+最终 **6400/6400** 条 user WAL、**29/29** 次 checkpoint 成功；底层 `AppendWAL` 记录到 **31** 次失败尝试，均未向上层形成最终写入错误。单条确认 p99 **1.200 秒**、最大 **5.934 秒**，没有超过 10 秒的写入。保持 node2 下线时，独立新 WAL 实例回放到 `user_lsn=6400, checkpointed=6100, truncated_dsn=6056`；checkpoint 之后必须保留的 LSN **6101–6400** 与 ACK 的 LSN/payload **300/300** 一致，没有缺口。恢复 node2 后整组三副本强制冷重启，再次得到相同水位，回放输出的 **396** 条记录与两票时逐条一致。证据在远端该目录的 `load.log`、`two-votes-replay.log`、`cold-replay.log`、`run-catchup.sh` 及三节点日志。节点和测试网络已清理。本轮未发现新的数据错误或一分钟写入长尾；Raft snapshot 与后续外部快照消费均在目标副本的真实日志中得到确认。
