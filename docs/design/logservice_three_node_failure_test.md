@@ -961,3 +961,15 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 **物理截断已提交，成功回包未交给旧 driver。** 暂停第 100 次 `AppendWAL`；第一次真实 `TruncateWAL(PSN 50893, checkpointed DSN 60292)` 已由服务端成功返回，包装层在交给旧 driver 前停住。当时旧 driver 已确认 checkpoint 到 user LSN **59902**、写入 **213** 条。杀 leader 和旧 driver 后，两票新实例从服务端读回同一个 `(PSN 50893, checkpointed DSN 60292)`，补 **79** 个空洞，按序回放 **213/213** 条；两票原盘冷重启后截断水位及记录集不变。恢复第三票后继续写 **100/100** 条，推进 checkpoint 到 **60115**、物理截断到 **PSN 60489**；整组冷重启后水位后 **60116–60165** 共 50 条与 ACK **50/50** 匹配。
 
 证据位于远端 `ooo-checkpoint-overlap-20261111/` 的 `load*.log`、`replay*.log`、`two-vote-*.log`、`after*.log`，及屏障文件所记录的物理截断参数。成功回包被拦住是测试注入的模糊成功时序；结果说明新实例可用服务端持久水位恢复，但不声称实际网络必然产生同一回包形态。本轮未发现已确认 WAL 丢失、重复、乱序，或 checkpoint/物理截断水位回退。测试节点和网络命名空间已停止、清理。
+
+## 最新 upstream/main `9381db5dde`：中断中的真实 snapshot 导出与副本原盘重启（2026-11-11 15:26–15:32）
+
+拉取 upstream/main 至 `9381db5dde`，相对前一测试版 `45917e803f`，LogService 的新改动为 `pkg/logservice/snapshot.go` 在 store 启动时清理本副本遗留的 `snapshot-<index>-<replica>.generating` 目录。按该提交重新编译 `mo-service`，本地与 51 上 SHA256 均为 `295d29e6f72c8c5ee1d7671722b27da5837956003ea31bc24ffb3d39963d74b1`；定向单测 `TestReconcileInterruptedExport` 与 `TestReconcileInterruptedExportPreservesFailedRemoval` 通过。51 上 `/home/mo/jxm/mo-current` 已指向 `/home/mo/jxm/mo-upstream-main-9381db5dde-20261111/`。继续使用隔离集群 `/home/mo/jxm/logservice-main-45917e803f-two-down-20261111/` 的原盘，数据 shard 1、三地址 60201/60211/60221；测试过程没有启动 TN/CN，也没有运行 datasync。
+
+**旧版对照与新版启动范围。** 在 node0 真实导出快照目录旁创建同副本 `snapshot-000000000000FFFF-262146.generating`、其他副本 ID `snapshot-000000000000FFFE-262147.generating`、格式不匹配的 `.generating.old`，以及带 `dragonboat.snapshot.message` 的未完成最终目录。旧版服务原盘启动后，同副本 `.generating` 仍在、未完成最终目录被清理，TN driver 回放到 `user_lsn=60165, checkpointed=60115`。停机后换成 `9381db5dde`，再放入一个带完成标记的最终目录并启动：同副本 `.generating` 与该最终目录均被清理，外来 ID 和格式不匹配目录保留，原有 4 个正常快照保留；三地址状态一致，TN driver 回放水位不变。这里人工目录只用于验证旧/新版启动处理的差异。
+
+**真实导出中断。** 在 node0 的导出目录上用 Linux inotify 监听创建事件，同时用真实 TN WAL driver 持续写入并每 10 条提交一次带测试 `GroupFiles` marker 的 checkpoint。观察到真实 `snapshot-000000000000D1E9-262146.generating` 目录创建事件后，测试脚本立刻杀 node0；该临时目录留在磁盘上，对应最终目录尚不存在。node1/node2 两票继续完成 **300/300** 条写入和 **30** 次 checkpoint，独立回放得到 `user_lsn=60465, checkpointed=60455`，水位后 10 条与 ACK **10/10** 匹配。node0 从原盘重启时清除了真实中断目录，三地址重新发现完整三副本，回放水位和这 10 条记录不变。
+
+**恢复节点参与多数派。** 随后杀原 leader node1，只留刚恢复的 node0 与 node2；两票选出新 leader，继续完成 **20/20** 条 TN WAL 写入和 2 次 checkpoint。两票回放以及三节点整组原盘冷重启后的回放均到 `user_lsn=60485, checkpointed=60475`，水位后 10 条与 ACK **10/10** 匹配。node0 此后又生成 4 个正常导出快照，达到配置配额，说明残留清理没有阻断后续导出。
+
+远端证据在 `snapshot-generating-9381-20261111/` 的 `watch-events.log`、`old-replay.log`、`new-status.log`、`new-replay.log`、`live-load.log`、`two-vote-replay.log`、`three-vote-replay.log`、`recovered-node-load.log`、`recovered-node-replay.log`、`cold-replay.log`，以及节点日志。测试造的外来目录已清掉，节点和网络命名空间均已停止、清理。本轮没有发现新缺陷；真实中断目录为空，带文件的残留目录由旧/新版对照验证清理，尚未在真实导出中途捕获到带部分文件的目录。
