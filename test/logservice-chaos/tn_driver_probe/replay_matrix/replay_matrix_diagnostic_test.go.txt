@@ -1,0 +1,125 @@
+package logservicedriver
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"testing"
+
+	"github.com/matrixorigin/matrixone/pkg/logservice"
+	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/entry"
+	walEntry "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
+)
+
+type fixedReplayMatrixDriver struct {
+	*mockDriver
+	records []logservice.LogRecord
+}
+
+func (d *fixedReplayMatrixDriver) readFromBackend(_ context.Context, firstPSN uint64, maxSize int) (uint64, []logservice.LogRecord, error) {
+	var out []logservice.LogRecord
+	for _, rec := range d.records {
+		if rec.Lsn < firstPSN {
+			continue
+		}
+		out = append(out, rec)
+		if len(out) == maxSize {
+			return rec.Lsn + 1, out, nil
+		}
+	}
+	return firstPSN, out, nil
+}
+
+func TestDiagnosticFixedReplayMatrix(t *testing.T) {
+	var total, failed int
+	for _, shape := range []string{"partial", "identical"} {
+		for _, gap := range []uint64{0, 2, 3, 4} {
+			for _, cutoff := range []uint64{0, 1} {
+				for _, batch := range []int{1, 2, 3, 4, 5, 64} {
+					name := fmt.Sprintf("%s/gap-%d/truncate-%d/batch-%d", shape, gap, cutoff, batch)
+					t.Run(name, func(t *testing.T) {
+						total++
+						psns := []uint64{1, 2, 3, 4}
+						if gap != 0 {
+							for i := range psns {
+								if psns[i] >= gap {
+									psns[i]++
+								}
+							}
+						}
+						// Physical order: checkpointed prefix, obsolete LSN 3,
+						// skip the obsolete copy, replacement LSNs.
+						base := newMockDriver(cutoff, nil, 10)
+						base.checkpointedDSN = 1
+						fromLSN := uint64(2)
+						wantLSNs := []uint64{2, 3}
+						if shape == "identical" {
+							base.checkpointedDSN = 2
+							fromLSN = 3
+							wantLSNs = []uint64{3}
+						}
+						d := &fixedReplayMatrixDriver{mockDriver: base}
+						for _, psn := range psns {
+							d.records = append(d.records, logservice.LogRecord{Lsn: psn, Type: pb.UserRecord})
+						}
+						decode := func(record logservice.LogRecord) LogEntry {
+							if record.Lsn == psns[2] {
+								return SkipMapToLogEntry(map[uint64]uint64{3: psns[1]})
+							}
+							writer := NewLogEntryWriter()
+							var lsns []uint64
+							if record.Lsn == psns[0] {
+								lsns = []uint64{1}
+								if shape == "identical" {
+									lsns = []uint64{1, 2}
+								}
+							} else if record.Lsn == psns[1] {
+								lsns = []uint64{3}
+							} else {
+								lsns = []uint64{2, 3}
+								if shape == "identical" {
+									lsns = []uint64{3}
+								}
+								writer.SetSafeDSN(base.checkpointedDSN)
+							}
+							for _, lsn := range lsns {
+								e := entry.MockEntryWithPayload([]byte{byte(record.Lsn)})
+								e.DSN = lsn
+								e.Entry.GetInfo().(*walEntry.Info).GroupLSN = lsn
+								if err := writer.AppendEntry(e); err != nil {
+									panic(err)
+								}
+							}
+							out, err := writer.Finish()
+							if err != nil {
+								panic(err)
+							}
+							return out
+						}
+						var applied []uint64
+						var payloads []byte
+						r := newReplayer(mockHandleFactory(fromLSN, func(e *entry.Entry) {
+							applied = append(applied, e.Info.GroupLSN)
+							payloads = append(payloads, e.Entry.GetPayload()[0])
+						}), d, batch,
+							WithReplayerAppendSkipCmd(noopAppendSkipCmd),
+							WithReplayerUnmarshalLogRecord(decode))
+						ctx, cancel := context.WithCancel(context.Background())
+						defer cancel()
+						err := r.Replay(ctx)
+						wantPayloads := make([]byte, len(wantLSNs))
+						for i := range wantPayloads {
+							wantPayloads[i] = byte(psns[3])
+						}
+						if err != nil || !slices.Equal(applied, wantLSNs) || !slices.Equal(payloads, wantPayloads) {
+							failed++
+							t.Errorf("shape=%s fixed PSN order=%v truncate=%d batch=%d: applied=%v payloads=%v err=%v", shape, psns, cutoff, batch, applied, payloads, err)
+						}
+					})
+				}
+			}
+		}
+	}
+	fmt.Printf("MATRIX_SUMMARY total=%d failed=%d\n", total, failed)
+}
