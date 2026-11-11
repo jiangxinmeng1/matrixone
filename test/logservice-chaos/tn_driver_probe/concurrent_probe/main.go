@@ -62,7 +62,8 @@ func main() {
 	flag.Parse()
 	if (*addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" &&
 		*addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" &&
-		*addresses != "198.18.51.10:59601,198.18.51.11:59611,198.18.51.12:59621") ||
+		*addresses != "198.18.51.10:59601,198.18.51.11:59611,198.18.51.12:59621" &&
+		*addresses != "198.18.51.10:59801,198.18.51.11:59811,198.18.51.12:59821") ||
 		*workers <= 0 || *workers > 100 || *perWorker <= 0 || *delay < 0 || *checkpointEvery < 0 ||
 		(*startReady == "") != (*startRelease == "") {
 		panic("invalid isolated cluster or workload settings")

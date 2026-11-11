@@ -833,3 +833,11 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 起始数据 leader 为 node2。约 500 条确认时杀普通副本 node0，保持 node1/node2 两票写入与 checkpoint；到约 5000 条确认时从旧盘恢复 node0。node2 于 **10:25:07.141** 开始向 node0 发送数据 shard Raft snapshot index **2563**，日志明确写明 `entry compacted`；约 **46 ms** 后杀 node2。node1 在新 term 中于 10:25:11.039 向 node0 发送数据 shard snapshot index **2579**，node0 于 10:25:11.492 记录开始恢复该 snapshot。node0/node1 两票继续运行至负载结束，node0 随后还导入外部导出快照 index 3124、3209。
 
 最终 **6400/6400** 条 user WAL、**29/29** 次 checkpoint 成功；底层 `AppendWAL` 记录到 **31** 次失败尝试，均未向上层形成最终写入错误。单条确认 p99 **1.200 秒**、最大 **5.934 秒**，没有超过 10 秒的写入。保持 node2 下线时，独立新 WAL 实例回放到 `user_lsn=6400, checkpointed=6100, truncated_dsn=6056`；checkpoint 之后必须保留的 LSN **6101–6400** 与 ACK 的 LSN/payload **300/300** 一致，没有缺口。恢复 node2 后整组三副本强制冷重启，再次得到相同水位，回放输出的 **396** 条记录与两票时逐条一致。证据在远端该目录的 `load.log`、`two-votes-replay.log`、`cold-replay.log`、`run-catchup.sh` 及三节点日志。节点和测试网络已清理。本轮未发现新的数据错误或一分钟写入长尾；Raft snapshot 与后续外部快照消费均在目标副本的真实日志中得到确认。
+
+## 最新 upstream/main `45917e803f`：旧 leader 的 RPC 可达而 Raft 无法提交（2026-11-11 10:39–10:41）
+
+51 上另建空盘三投票副本集群 `/home/mo/jxm/logservice-main-45917e803f-raft-only-20261111/`，数据 shard 1，RPC 端口 59801/59811/59821，Log store 过期阈值设为 5 分钟。使用已修正可选 `AppendWAL` 转发的真实 TN WAL driver 探针，32 个并发写入者共计划 5120 条 user WAL，每约 200 条确认发起一次带 `GroupFiles` 测试 marker 的 checkpoint，并保留至少 200 条连续确认的 user LSN。初始数据 leader 为 node1。约 311 条确认后，仅在 node1 的测试网络命名空间加入四条 TCP DROP 规则：丢弃 node0/node2 到 node1 Raft 端口 59810 的入站包，以及 node1 到两个普通副本 Raft 端口 59800/59820 的出站包；**RPC 59811 和 gossip 保持可达，另外两票互通**。
+
+规则持续约 **50 秒**。隔离 20 秒时 ACK 已到 1004，隔离 50 秒时到 2932；旧 leader 的 RPC 地址仍响应 shard 查询并报告新 leader 为 node2。撤销前四条规则分别命中入站 **19/42** 包、出站 **150/195** 包，确认 Raft 故障确实生效。随后撤销规则，持续负载 **5120/5120** 条确认、**24/24** 次 checkpoint 成功；记录 **20** 次底层 `AppendWAL` 超时尝试，但无上层写入或 checkpoint 最终错误。超时尝试约 **6.96–6.99 秒**，随后由 driver 重试；单条上层确认 p99 **2.939 秒**、最大 **8.339 秒**，没有超过 10 秒或一分钟的写入长尾。
+
+独立新 WAL 实例回放得到 `user_lsn=5120, checkpointed=4920, truncated_dsn=4774`；checkpoint 后必须保留的 LSN **4921–5120** 共 200 条与 ACK 的 LSN/payload **200/200** 一致。整组三副本强制冷重启后水位不变，回放输出的 **390** 条记录与重启前逐条一致。证据在远端该目录的 `load.log`、`old-leader-rpc-status.log`、`replay.log`、`cold-replay.log`、`run-raft-only.sh` 和节点日志；规则、进程及网络命名空间均已清理。本轮是旧 leader 仍可接 RPC、另外两票仍能提交时的真实 `AppendWAL` 重试验证；未发现新的长尾或数据缺陷。
