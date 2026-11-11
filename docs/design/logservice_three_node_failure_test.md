@@ -1046,3 +1046,15 @@ node2 原盘恢复后，确认三个地址均报告同一副本组，再杀当�
 **追加尝试：放行后、底层调用未返回时下线 leader。** 第一次尝试等待 socket 发送队列的观测条件，底层调用却先 timeout，之后才杀 leader；该次不能算目标窗口。它最终重试成功，Close 约 **25.695 秒**返回 nil，独立两票回放验证 95 MiB 的 LSN **61227** 与接收时长度、SHA256 一致。第二次重新建立三票，探针接收另一条 95 MiB WAL，LSN **61228**；启动 Close、放行首次底层 `AppendWAL` 后约 **105 ms**，确认当时底层调用**尚无返回日志**，立即杀 leader node2。该调用随后 timeout，driver 重试成功，Close 约 **24.026 秒**返回 nil，`WaitDone` 返回 nil。两票回放及两票原盘冷重启后，LSN 61228 的 **99,614,720 字节**和 SHA256 `d84f0fc7b6817971de9b180d81dbb33beb637f008b09dacdc5e001807fc51f0e` 均不变，水位为 `user_lsn=61228, checkpointed=61173`。
 
 远端证据在 `large-close-20261111/`、`near-limit/`、`inflight/` 与 `inflight-fast/` 子目录：各自的 `run.log`、`two-vote-replay.log`；冷重启验证对应 `cold-two-vote-replay.log`，最后一轮的放行时序记录为 `inflight-fast/timing.txt`。后一轮另有 `after-write.log`、`after-replay.log`。可复现探针源码为 `test/logservice-chaos/tn_driver_probe/close_probe/main.go`。本轮没有发现 Close 挂起、已接收 WAL 丢失、重复或水位回退。**时机边界：**首两轮屏障在底层 RPC 发送前；追加快速轮证明放行后约 105 ms 底层调用尚未返回，**没有抓包证明请求字节已到达服务端**，因此不能把该轮解释为已提交后回包丢失。真实 TAE checkpoint 文件写入中并发事务、以及旧版持久 skip 命令升级回放，也仍待测。测试节点和网络命名空间已停止、清理。
+
+## 单 TN WAL driver：真实 TAE checkpoint 与并发事务、两票冷重启（2026-11-11 16:30–16:38）
+
+在 51 上新建**空盘**三副本集群 `/home/mo/jxm/logservice-tae-concurrent-20261111/`，数据 shard 1、RPC 地址 60601/60611/60621、Log store 过期阈值 5 分钟，服务端为 `9381db5dde`。同一个测试进程内只打开一个 TAE DB，经 `options.WithWalClientFactory` 使用真实 LogService 三地址和生产 TN WAL driver；没有启动 TN/CN 服务或 datasync。探针源码新增于 `test/logservice-chaos/tn_driver_probe/tae_checkpoint_probe/tae_checkpoint_concurrent_test.go`。
+
+创建含 `mo_catalog` 系统目录写入的测试表，先确认 **50 行**。随后一个写入 goroutine 按不同主键偏移连续提交每批 10 行，前台调用真实 `DB.ForceCheckpoint`；写入者在 checkpoint 完成后停止。脚本在开始 ForceCheckpoint 前杀数据 leader node2，node0/node1 两票继续服务。checkpoint 耗时 **5.418 秒**，期间按提交时间戳确认 **13 笔事务**落在调用区间内；总共提交 **84 笔**，生成 **1 个真实 checkpoint meta 文件**，checkpoint LSN 为 **72**。停写后另提交 10 行，预期总数 **900 行**、WAL LSN **90**；同进程关闭重开 TAE 后扫描到 **900/900 行**，并明确从 `meta_0-0_1794385933434353408-0.ckp` 读取 checkpoint。
+
+随后 node2 保持下线，node0/node1 **原盘冷重启**，原测试进程已退出。独立新进程用同一 TAE 本地目录和同一 LogService shard 打开，扫描仍为 **900/900 行**，checkpoint LSN **72**、WAL LSN **90**；再写 10 行并关闭重开，扫描 **910/910 行**、WAL LSN **91**。再次独立跨进程打开，读 **910/910**、续写并重开后读 **920/920**，WAL LSN **92**。整个过程中任一时刻只有一个 TAE 实例及其 TN WAL driver 存活。
+
+首次跨进程检查曾误报 `ExpectedEOB`：`catalog.MockSchemaAll` 在新进程生成了新的随机表名，探针按这个新名字查旧表；第二次尝试使用尚未实现的 `database.Relations()`，得到空列表。改为通过 `MakeRelationIt()` 从持久目录枚举原表 schema 后，两次跨进程校验均通过。前两次失败是**测试夹具错误，不列为产品缺陷**；服务端当时已回放到 checkpoint LSN 72、WAL LSN 90。
+
+远端证据在该集群根目录 `test.log`、`cold-reopen-fixed2.log`、`cold-reopen-repeat.log` 和节点日志；本地 mock 定向测试、vet、测试二进制编译均通过，race 模式定向测试按 30 秒预算重复 **32 次**及包级单次检查通过。测试结束已停止三个节点并清理网络命名空间。本轮没有发现行数丢失、checkpoint/WAL 水位回退或两票下无法重开。**剩余边界：**本轮证明事务提交与 `ForceCheckpoint` 调用区间重叠，未在 checkpoint 文件写入事件上精确触发 leader 停机；旧版持久 skip 命令升级回放仍待测。
