@@ -841,3 +841,15 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 规则持续约 **50 秒**。隔离 20 秒时 ACK 已到 1004，隔离 50 秒时到 2932；旧 leader 的 RPC 地址仍响应 shard 查询并报告新 leader 为 node2。撤销前四条规则分别命中入站 **19/42** 包、出站 **150/195** 包，确认 Raft 故障确实生效。随后撤销规则，持续负载 **5120/5120** 条确认、**24/24** 次 checkpoint 成功；记录 **20** 次底层 `AppendWAL` 超时尝试，但无上层写入或 checkpoint 最终错误。超时尝试约 **6.96–6.99 秒**，随后由 driver 重试；单条上层确认 p99 **2.939 秒**、最大 **8.339 秒**，没有超过 10 秒或一分钟的写入长尾。
 
 独立新 WAL 实例回放得到 `user_lsn=5120, checkpointed=4920, truncated_dsn=4774`；checkpoint 后必须保留的 LSN **4921–5120** 共 200 条与 ACK 的 LSN/payload **200/200** 一致。整组三副本强制冷重启后水位不变，回放输出的 **390** 条记录与重启前逐条一致。证据在远端该目录的 `load.log`、`old-leader-rpc-status.log`、`replay.log`、`cold-replay.log`、`run-raft-only.sh` 和节点日志；规则、进程及网络命名空间均已清理。本轮是旧 leader 仍可接 RPC、另外两票仍能提交时的真实 `AppendWAL` 重试验证；未发现新的长尾或数据缺陷。
+
+## 最新 upstream/main `45917e803f`：TN WAL 双节点短暂停机、批量 Close 与故障中回放（2026-11-11 10:46–10:54）
+
+在 51 上以空目录新建三副本集群 `/home/mo/jxm/logservice-main-45917e803f-two-down-20261111/`，数据 shard 1，RPC 端口 60201/60211/60221，Log store 过期阈值 5 分钟。探针调用真实 `wal.NewLogserviceHandle`、`ReplayForWrite`、`AppendEntry(GroupUserTxn)`、`RangeCheckpoint`、`Close` 与新版本可选 `AppendWAL`；没有运行 datasync、真实 TN/CN，也没有加载真实 TAE checkpoint 文件。
+
+**持续负载期间短暂失去多数派。** 16 个并发写入者计划写 1920 条，约每 100 条确认后提交带 `GroupFiles` 测试 marker 的 checkpoint，保留至少 100 条连续确认的 user WAL。起始数据 leader 为 node1；确认数到 212 时同时杀 node1 和 node0，约 8 秒内只剩 node2 一票，确认数停在 212，没有错误地报告新成功。恢复 node0、保持 node1 下线后，node0/node2 两票完成 **1920/1920** 条确认和 **18** 次 checkpoint。底层 `AppendWAL` 有 **27** 次失败尝试，driver 最终重试成功；上层无写入、checkpoint 错误。单笔确认 p99 **3.082 秒**、最大 **9.937 秒**，无超过 10 秒或 1 分钟的写入。两票独立回放报告 `user_lsn=1920, checkpointed=1820, truncated_dsn=1755`；回放的 195 条记录与已确认 LSN/payload **195/195** 一致。
+
+**已接收 WAL 的批量 Close 同时短暂失去多数派。** 在同一集群恢复三票后，新实例先完成 `ReplayForWrite`，接收 100 条 user WAL（LSN 1921–2020），在底层 `AppendWAL` 前设屏障，启动每条记录的 `WaitDone` 和 driver `Close`。然后杀 node1/node2，仅保留 node0 约 9 秒；释放写入屏障后恢复 node1。底层 `AppendWAL` 共记录 **52** 次连接失败、连接重置或 timeout 尝试；`Close` 约 **13.385 秒**返回 nil，**100/100** 个 `WaitDone` 均返回 nil。整组三节点原盘强制冷重启后，新 driver 回放报告 `user_lsn=2020, checkpointed=1820, truncated_dsn=1755`；这 100 条记录按 LSN/payload **100/100** 匹配，无重复。屏障包装层显式转发可选 `AppendWAL`，确保测到生产 driver 的 WAL 专用请求路径。
+
+**故障中回放。** 冷重启后，三个 RPC 地址一致报告数据 leader 为 node1。新 driver 在成功读取 WAL 截断水位、即将读取日志时被测试屏障暂停；杀 node1，保持 node0/node2 两票，放行回放。`ReplayForWrite` 约 **3.616 秒**完成，水位仍为 `user_lsn=2020, checkpointed=1820, truncated_dsn=1755`。首次尝试因测试包装层仍拦截旧 `GetTruncatedLsn`，没有触发该屏障，故不计入故障验证；随后改为拦截当前回放使用的 `GetWALTruncate` 并重新编译执行，实际命中屏障。
+
+证据在远端上述目录的 `load.log`、`two-votes-replay.log`、`close-load.log`、`cold-replay.log`、`replay-leader-fail.log`、三份 `run-*.sh` 和节点日志。三个节点与测试网络命名空间均已停止、清理。本轮未发现新的 WAL 丢失、重复、挂起或一分钟长尾。测试仅覆盖 TN WAL driver API 与 LogService，`GroupFiles` 使用测试 marker，不验证真实文件服务内容。

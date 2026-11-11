@@ -45,6 +45,17 @@ func (c *faultHookClient) AppendWAL(ctx context.Context, rec logservice.LogRecor
 
 func (c *faultHookClient) GetTruncatedLsn(ctx context.Context) (logservice.Lsn, error) {
 	lsn, err := c.Client.GetTruncatedLsn(ctx)
+	c.pauseBeforeRead(err, lsn)
+	return lsn, err
+}
+
+func (c *faultHookClient) GetWALTruncate(ctx context.Context) (logservice.Lsn, logservice.Lsn, error) {
+	psn, checkpointedDSN, err := c.Client.GetWALTruncate(ctx)
+	c.pauseBeforeRead(err, psn)
+	return psn, checkpointedDSN, err
+}
+
+func (c *faultHookClient) pauseBeforeRead(err error, lsn logservice.Lsn) {
 	if err == nil && c.ready != "" {
 		c.once.Do(func() {
 			if err := os.WriteFile(c.ready, []byte(fmt.Sprintf("%d\n", lsn)), 0o644); err != nil {
@@ -58,7 +69,6 @@ func (c *faultHookClient) GetTruncatedLsn(ctx context.Context) (logservice.Lsn, 
 			}
 		})
 	}
-	return lsn, err
 }
 
 func (c *faultHookClient) Truncate(ctx context.Context, lsn logservice.Lsn) error {
@@ -145,7 +155,7 @@ func main() {
 	flag.StringVar(&checkpointReleaseFile, "checkpoint-release-file", "", "wait for this file before checkpoint WaitDone")
 	flag.StringVar(&replayReadyFile, "replay-ready-file", "", "write this file after client pool creation, before replay")
 	flag.StringVar(&replayReleaseFile, "replay-release-file", "", "wait for this file before replay")
-	flag.StringVar(&readReadyFile, "read-ready-file", "", "write this file after first successful GetTruncatedLsn, before replay Read")
+	flag.StringVar(&readReadyFile, "read-ready-file", "", "write this file after first successful WAL truncate query, before replay Read")
 	flag.StringVar(&readReleaseFile, "read-release-file", "", "wait for this file before replay Read")
 	flag.StringVar(&truncateReadyFile, "truncate-ready-file", "", "write this file before the first physical Truncate RPC")
 	flag.StringVar(&truncateReleaseFile, "truncate-release-file", "", "wait for this file before the first physical Truncate RPC")
@@ -161,7 +171,8 @@ func main() {
 		addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" &&
 		addresses != "198.18.51.10:59401,198.18.51.11:59411,198.18.51.12:59421" &&
 		addresses != "198.18.51.10:59601,198.18.51.11:59611,198.18.51.12:59621" &&
-		addresses != "198.18.51.10:59801,198.18.51.11:59811,198.18.51.12:59821" {
+		addresses != "198.18.51.10:59801,198.18.51.11:59811,198.18.51.12:59821" &&
+		addresses != "198.18.51.10:60201,198.18.51.11:60211,198.18.51.12:60221" {
 		panic("use only the dedicated WAL StoreImpl test cluster")
 	}
 	if mode != "cycle" && mode != "replay" {

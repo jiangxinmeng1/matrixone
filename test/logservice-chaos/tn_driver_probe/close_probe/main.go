@@ -42,6 +42,30 @@ func (c *appendBarrierClient) Append(ctx context.Context, rec logservice.LogReco
 	return lsn, err
 }
 
+func (c *appendBarrierClient) AppendWAL(ctx context.Context, rec logservice.LogRecord) (logservice.Lsn, error) {
+	c.once.Do(func() {
+		if err := os.WriteFile(c.ready, []byte("ready\n"), 0o644); err != nil {
+			panic(err)
+		}
+		for {
+			if _, err := os.Stat(c.release); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+	walClient, ok := c.Client.(interface {
+		AppendWAL(context.Context, logservice.LogRecord) (uint64, error)
+	})
+	if !ok {
+		return 0, fmt.Errorf("underlying LogService client does not implement AppendWAL")
+	}
+	start := time.Now()
+	lsn, err := walClient.AppendWAL(ctx, rec)
+	fmt.Printf("backend_append_wal lsn=%d elapsed_ms=%.3f err=%v\n", lsn, float64(time.Since(start).Microseconds())/1000, err)
+	return lsn, err
+}
+
 func main() {
 	addresses := flag.String("addresses", "", "dedicated test RPC addresses")
 	prefix := flag.String("prefix", "close-probe", "unique payload")
@@ -50,7 +74,8 @@ func main() {
 	appendRelease := flag.String("append-release-file", "", "backend Append barrier release")
 	closeReady := flag.String("close-ready-file", "", "close started signal")
 	flag.Parse()
-	if *addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" ||
+	if (*addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" &&
+		*addresses != "198.18.51.10:60201,198.18.51.11:60211,198.18.51.12:60221") ||
 		*count <= 0 || *count > 5000 || *appendReady == "" || *appendRelease == "" || *closeReady == "" {
 		panic("use only the isolated WAL test cluster")
 	}
