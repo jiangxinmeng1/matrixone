@@ -905,3 +905,15 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 保持 node0 下线、只留 node1/node2 两票时，独立新 driver 回放为 `user_lsn=27320, checkpointed=27020, truncated_dsn=15962`；本轮可回放的 384 条与 ACK **384/384** 匹配，其中 checkpoint 水位后的 LSN 27021–27320 **300/300** 匹配。三节点各自原盘强制冷重启后水位不变，这 300 条再次 **300/300** 匹配。故障规则、节点和测试网络命名空间已清理。证据在远端同目录 `blackhole100-load.log`、`blackhole100-preconn-count`、`blackhole100-two-vote-replay.log`、`blackhole100-cold-replay.log`、`run-leader-blackhole-100.sh` 及节点日志。
 
 **为何最近没有新缺陷及剩余盲区。** 本轮显示旧连接黑洞会带来秒级尾部，但当前 8 秒底层 RPC 读超时、重新发现与 driver 重试在这一组合下没有退化成旧版约 60 秒单次等待。此前多数进程停机实验仅持续 5–9 秒，验证的是恢复与多数派语义，不能覆盖持续超过 driver 默认 3 分钟重试检查窗口的长期故障。现有探针以 ACK、可回放 LSN/payload 和测试 checkpoint marker 为主要 oracle；它能识别 WAL 丢失、重复或水位错误，但不能验证真实 TAE checkpoint 文件的生成/加载、事务可见性、SQL 结果，也不能仅凭成功 ACK 排除所有未确认但已提交的请求。历史报告已记录旧版实际缺陷和修复后的回归结果；本轮没有发现新的数据正确性缺陷或一分钟长尾。
+
+## 最新 upstream/main `45917e803f`：TN driver 并发乱序 Append、进程崩溃与补空洞（2026-11-11 14:21–14:27）
+
+继续使用 51 上隔离的三副本数据 shard 1 集群 `/home/mo/jxm/logservice-main-45917e803f-two-down-20261111/`，地址为 `198.18.51.10:60201`、`.11:60211`、`.12:60221`。`upstream/main` 当前是 `553e16f52b`，两版之间 LogService、TAE logstore 和 TN service 源码无差异。仍使用真实 `wal.NewLogserviceHandle`、`ReplayForWrite`、并发 `AppendEntry`、底层 `AppendWAL`、`RangeCheckpoint` 和 WAL 回放；只在**第一个**底层 `AppendWAL` 发出前设测试屏障。没有启动真实 TN/CN，也没有运行 datasync。
+
+**构造与复现。** 每轮启动 100 个并发写入者，每人计划写 8 条；首个 `AppendWAL` 停在屏障，其他请求继续。直接查询 LogService `GetLatestLsn`，待物理 PSN 比屏障前至少增加 20，再用 `SIGKILL` 结束旧 driver 进程，始终不释放该屏障。随后创建新 driver 执行 `ReplayForWrite`，核对旧进程已打印 ACK 的 `(user LSN, payload)`；除第二轮外，新 driver 再写 20 条、原盘冷重启服务并复查。前六轮三票运行；后两轮先杀普通副本 node2，只留 node0/node1 两票，在每轮中只冷重启这两票。每轮的进程终止都发生在首个请求尚未发送、后续物理 PSN 已增长的窗口，形成实际的物理乱序和未发送/未完成批次。
+
+八轮的物理 PSN 在屏障期间分别增加 **223、353、224、273、270、283、177、152**；`Wal-Replay-Append-Skip-Entries` 分别记录 **15、3、59、9、3、12、2、2** 个 DSN→PSN 补空洞映射，合计 **105** 个。按进程结束后落盘的输出统计，旧进程已确认的 user WAL 在第 1/3/6 轮分别为 **50/91/14** 条，其他轮为 0；这 **155/155** 条在新 driver 回放中按 LSN 和内容匹配，回放结果按 user LSN 严格递增且无重复。某些未收到 ACK 的写入也可能在故障前完成物理提交；本轮只对有 ACK 的记录作持久性承诺。第 1、3–8 轮的回放记录集在对应的原盘冷重启后完全一致；第 2 轮没有单独做紧随其后的冷重启，但后续多次冷重启和最终三票回放结果与该轮回放一致。
+
+恢复 node2 后，三票最终回放到 `user_lsn=27615, checkpointed=27020`。水位后 LSN **27021–27615** 共 **595** 条连续、无缺失或重复，其中上述八轮新写入的 **155** 条已确认记录与每轮新实例写入的 **140** 条记录均可核对。再用新 driver 写入 **100/100** 条，并每 20 条提交一次带测试 `GroupFiles` marker 的 checkpoint，保留最近 20 条；新实例和三节点整组原盘冷重启后均报告 `user_lsn=27715, checkpointed=27695, truncated_dsn=27867`，保留的 LSN **27696–27715** 与最后 20 条 ACK **20/20** 精确匹配。
+
+证据位于远端 `ooo-gap-20261111/` 的各轮 `*.load.log`、`*.replay.log`、`*.cold-replay.log`、`*.write.log`，以及 `final-three-vote-replay.log`、`post-checkpoint*.log`；复现脚本是集群根目录的 `tn_ooo_rounds.py`。这是 driver WAL 层的真实调用顺序与故障恢复验证；测试 `GroupFiles` marker 仍不等同于真实 TAE checkpoint 文件。另尝试在进程内创建 TAE 表、生成 checkpoint 文件后重开 DB，但最小测试在本地 mock 后端回放找不到表；不做 checkpoint 的重启基线和仓库现有的 `TestCheckpointObjectList` 均通过，尚未排除探针配置差异，因此没有把这次探索算作 LogService 缺陷或 51 上验证。八轮 WAL 故障测试未发现已确认写入丢失、回放乱序、重复交付或空洞处理错误，也没有据此建立新缺陷。所有测试节点和网络命名空间已停止、清理。
