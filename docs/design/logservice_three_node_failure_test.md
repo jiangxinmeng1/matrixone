@@ -949,3 +949,15 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 最后再写 **100/100** 条，并每 20 条提交一次带测试 `GroupFiles` marker 的 checkpoint，保留最近 50 条。新实例及三节点整组原盘冷重启后均得到 `user_lsn=59394, checkpointed=59344, truncated_dsn=59694`；水位后 LSN **59345–59394** 与最后 50 条 ACK **50/50** 精确匹配。物理尚未截断的旧 checkpointed 记录也可能被探针打印，核对时按 checkpoint 水位过滤。
 
 证据在远端 `ooo-repeat-20261111/` 与 `ooo-nth-20261111/` 的 `summary.json`、各轮 `*.load.log`、`*.replay.log`、`*.cold-replay.log`、`*.after.log`，以及 `final-all16.log`、`post-checkpoint*.log`；运行脚本为集群根目录的 `tn_ooo_repeat_matrix.py`、`tn_ooo_repeat_nth.py`。测试屏障只改变底层请求出发时机，真实 TN WAL driver 负责写入、重试、补空洞、回放和 checkpoint；没有运行 datasync 或真实 TN 服务。本轮未发现乱序、空洞、节点切换或重启导致的已确认 WAL 丢失/重复。测试节点和网络命名空间已停止、清理。
+
+## 最新 upstream/main `45917e803f`：并发乱序空洞与 checkpoint/物理截断重叠（2026-11-11 15:03–15:11）
+
+复用 51 上隔离三副本集群 `/home/mo/jxm/logservice-main-45917e803f-two-down-20261111/`，继续用真实 TN WAL driver；100 个写入者并发 Append，同时每约 10 或 20 条 ACK 提交一次带测试 `GroupFiles` marker 的 checkpoint。测试包装层可在第 20/100 次真实 `AppendWAL` 发出前、第一次 `TruncateWAL` 发出前或服务端成功返回后设屏障，不修改 WAL 内容与 driver 实现。每次旧进程被杀后，独立新 driver 回放并按 `(user LSN, payload)` 核对 ACK，再进行两票原盘冷重启。没有启动 TN 服务或运行 datasync。
+
+**尚未确认的 checkpoint 与乱序写入。** 暂停第 20 次底层 `AppendWAL` 时，其他物理日志继续提交，旧 driver 已有 **117** 条 ACK，但 checkpoint ACK 为 0、`TruncateWAL` 还未发出。在此窗口杀旧 driver；新 driver 补 **40** 个空洞并回放 **117/117** 条，按 LSN 递增。随后杀数据 leader，仅保留两票回放，再冷重启这两票；三次回放记录集完全一致，checkpoint 水位保持 59344。这个结果不证明被暂停的调用一定是 checkpoint marker，只说明 checkpoint 尚未确认时旧实例崩溃没有丢失已确认 WAL。
+
+**checkpoint 已确认，物理截断尚未发送。** 暂停第 100 次 `AppendWAL`，同时让第一次 `TruncateWAL(PSN 49949, checkpointed DSN 59910)` 停在发出前；旧 driver 已确认 checkpoint 到 user LSN **59532**、写入 **241** 条。此时杀 leader 和旧 driver，两票新实例读到仍为旧值的物理截断水位，补 **89** 个空洞，按序回放 **241/241** 条；两票原盘冷重启后结果一致。恢复第三票后，新实例继续写 **100/100** 条、推进 checkpoint 到 **59802**、物理截断到 **PSN 60164**；整组冷重启后水位后 **59803–59852** 共 50 条与 ACK **50/50** 匹配。
+
+**物理截断已提交，成功回包未交给旧 driver。** 暂停第 100 次 `AppendWAL`；第一次真实 `TruncateWAL(PSN 50893, checkpointed DSN 60292)` 已由服务端成功返回，包装层在交给旧 driver 前停住。当时旧 driver 已确认 checkpoint 到 user LSN **59902**、写入 **213** 条。杀 leader 和旧 driver 后，两票新实例从服务端读回同一个 `(PSN 50893, checkpointed DSN 60292)`，补 **79** 个空洞，按序回放 **213/213** 条；两票原盘冷重启后截断水位及记录集不变。恢复第三票后继续写 **100/100** 条，推进 checkpoint 到 **60115**、物理截断到 **PSN 60489**；整组冷重启后水位后 **60116–60165** 共 50 条与 ACK **50/50** 匹配。
+
+证据位于远端 `ooo-checkpoint-overlap-20261111/` 的 `load*.log`、`replay*.log`、`two-vote-*.log`、`after*.log`，及屏障文件所记录的物理截断参数。成功回包被拦住是测试注入的模糊成功时序；结果说明新实例可用服务端持久水位恢复，但不声称实际网络必然产生同一回包形态。本轮未发现已确认 WAL 丢失、重复、乱序，或 checkpoint/物理截断水位回退。测试节点和网络命名空间已停止、清理。
