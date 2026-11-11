@@ -76,7 +76,7 @@ func main() {
 	flag.Parse()
 	if (*addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" &&
 		*addresses != "198.18.51.10:60201,198.18.51.11:60211,198.18.51.12:60221") ||
-		*count <= 0 || *count > 5000 || *appendReady == "" || *appendRelease == "" || *closeReady == "" {
+		*count <= 0 || *count > 10000 || *appendReady == "" || *appendRelease == "" || *closeReady == "" {
 		panic("use only the isolated WAL test cluster")
 	}
 	const sid = "tn-wal-close-probe"

@@ -867,3 +867,19 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 保持 node2 下线时，独立 `ReplayForWrite` 返回 `user_lsn=2860, checkpointed=2840, truncated_dsn=1755`；第二轮的 50 条、旧 writer 的 640 条和接管后的 50 条分别按 LSN/payload **50/50、640/640、50/50** 匹配。随后三节点各自原盘强制冷重启，再次回放到相同水位；本轮四段写入合计 **840/840** 条与 ACK 逐条一致，其中 checkpoint 水位 2840 之后必须保留的 LSN 2841–2860 **20/20** 一致。四段负载的单条确认最大耗时分别为 **0.672、0.416、7.685、0.228 秒**；本轮未见 DSN 缺口、重复回放、写入错误或一分钟长尾。
 
 证据保存在远端该目录的 `promotion.log`、`promotion-one.log`、`live-writer.log`、`live-promotion.log`、`promotion-two-votes-replay.log`、`live-two-vote-replay.log`、`live-cold-replay.log`、三份 `run-*promotion*.sh` 和节点日志。三个节点与测试网络命名空间已停止、清理。checkpoint 使用测试 `GroupFiles` marker；记录匹配证明 WAL 路径正确，不代替真实 TAE checkpoint 文件加载验证。
+
+## 最新 upstream/main `45917e803f`：TN WAL 客户端池饱和时 Close 遭遇双节点停机（2026-11-11 11:49–11:51）
+
+复用 51 上独立三副本集群 `/home/mo/jxm/logservice-main-45917e803f-two-down-20261111/`，从前轮 `user_lsn=2860` 开始。将测试探针 `close_probe` 的允许条数上限从 5000 提到 10000，本轮使用 **8000** 条；仍调用真实 `wal.NewLogserviceHandle`、`ReplayForWrite`、`AppendEntry`、`WaitDone`、`Close` 和底层 `AppendWAL`，只在请求出发前用测试屏障控制时机。没有运行 datasync 或真实 TN/CN。
+
+探针已接收 LSN **2861–10860** 共 8000 条、启动每条记录的 `WaitDone` 和 driver `Close` 后，杀 node0/node1，释放底层写入屏障，仅保留 node2 一票约 8 秒。单票期间完成的 `WaitDone` 为 **0**；恢复 node0 后 `Close` 约 **14.270 秒**返回 nil，**8000/8000** 个 `WaitDone` 返回 nil。底层共记录 **249** 次成功 `AppendWAL` 与 **279** 次失败尝试；这些是物理批次/重试，不是用户记录数。日志有一次获取写入客户端等待 **11.878 秒**，说明该轮确实触及客户端池压力，并非仅把 8000 条全部合成少量提交。
+
+保持 node1 下线的两票回放得到 `user_lsn=10860, checkpointed=2840, truncated_dsn=1755`，8000 条按 LSN/payload **8000/8000** 匹配。整组三节点各自原盘强制冷重启后得到相同水位，再次 **8000/8000** 匹配。证据在远端该目录的 `close-sat.log`、`close-sat-two-vote-replay.log`、`close-sat-cold-replay.log`、`run-close-saturation.sh` 和节点日志。本轮没有发现已接收 WAL 的最终结果丢失、关闭挂起或一分钟写入长尾。
+
+## 最新 upstream/main `45917e803f`：后台物理 TruncateWAL 窗口整组冷停机（2026-11-11 11:51–11:54）
+
+在同一集群使用真实 TN WAL `wal-probe` 连续确认 **200/200** 条新记录（LSN 10861–11060），每 20 条提交一次带 `GroupFiles` 测试 marker 的 checkpoint，并保留最近 10 条。第一次后台 `TruncateWAL(psn=5794, checkpointedDSN=10912)` 发出前命中测试屏障，已确认 20 条；此时杀全组三个 LogService 进程，释放屏障，5 秒后从各自原盘重启。全停期间 ACK 仍为 20，没有错误地确认写入。第一次截断执行因连接拒绝失败（共 11 次尝试，约 303 ms）；服务恢复后后台在约 3.495 秒内成功推进同一 PSN，后续截断继续推进。旧 driver 最终确认 **200/200** 条、**10** 次 checkpoint intent；进程关闭时最后一次尚未完成的异步截断收到 `context canceled`，没有当作已完成的物理截断。
+
+新 driver 回放得到 `user_lsn=11060, checkpointed=11050, truncated_dsn=11088`；物理截断后仍可回放的本轮 30 条与 ACK **30/30** 匹配，其中 checkpoint 水位之后必须保留的 LSN 11051–11060 **10/10** 匹配。整组再次原盘冷重启后水位与这 10 条保持一致。随后新 driver 再确认 **60/60** 条 WAL、**3** 次 checkpoint intent；最终回放到 `user_lsn=11120, checkpointed=11110, truncated_dsn=11154`，新水位后必须保留的 LSN 11111–11120 **10/10** 匹配，证明恢复实例仍可继续推进写入和截断。
+
+证据在远端该目录的 `truncate-cold.log`、`truncate-cold-replay.log`、`truncate-cold-cold-replay.log`、`truncate-cold-recover.log`、`truncate-cold-recover-replay.log`、`run-truncate-cold-window.sh` 和节点日志。三个节点与测试网络命名空间均已停止、清理。本轮未发现新的 WAL 丢失或回放错误；测试 marker 不代替真实 TAE checkpoint 文件加载验证。
