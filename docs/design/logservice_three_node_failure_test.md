@@ -853,3 +853,17 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 **故障中回放。** 冷重启后，三个 RPC 地址一致报告数据 leader 为 node1。新 driver 在成功读取 WAL 截断水位、即将读取日志时被测试屏障暂停；杀 node1，保持 node0/node2 两票，放行回放。`ReplayForWrite` 约 **3.616 秒**完成，水位仍为 `user_lsn=2020, checkpointed=1820, truncated_dsn=1755`。首次尝试因测试包装层仍拦截旧 `GetTruncatedLsn`，没有触发该屏障，故不计入故障验证；随后改为拦截当前回放使用的 `GetWALTruncate` 并重新编译执行，实际命中屏障。
 
 证据在远端上述目录的 `load.log`、`two-votes-replay.log`、`close-load.log`、`cold-replay.log`、`replay-leader-fail.log`、三份 `run-*.sh` 和节点日志。三个节点与测试网络命名空间均已停止、清理。本轮未发现新的 WAL 丢失、重复、挂起或一分钟长尾。测试仅覆盖 TN WAL driver API 与 LogService，`GroupFiles` 使用测试 marker，不验证真实文件服务内容。
+
+## 最新 upstream/main `45917e803f`：TN WAL 持续回放切换为写入并接管旧 writer（2026-11-11 11:28–11:33）
+
+继续使用 51 上独立三副本集群 `/home/mo/jxm/logservice-main-45917e803f-two-down-20261111/`，从上一轮的 `user_lsn=2020` 开始。新增 `test/logservice-chaos/tn_driver_probe/promotion_probe/main.go`，使用真实 `wal.NewLogserviceHandle`、`Replay` 的动态 mode getter、`AppendEntry`、`RangeCheckpoint` 与 `Close`，先以 `ReplayMode_ReplayForever` 持续回放，外部文件触发切换至 `ReplayMode_ReplayForWrite`。这是 TAE 从持续回放切换到可写的同一 driver 状态转换；探针只控制切换时机。没有运行 datasync、真实 TN/CN 或加载真实 TAE checkpoint 文件。
+
+**切换时杀 leader。** 三票启动后，数据 leader 为 node0。回放者应用到首条保留 WAL 后杀 node0，并请求切换可写；node1/node2 两票互通。约 **7.436 秒**后 `Replay` 返回，driver 报告原水位 `user_lsn=2020, checkpointed=1820`；随后确认 **100/100** 条新 WAL（LSN 2021–2120），提交一次 checkpoint 到 LSN 2100。node0 仍下线时，独立新 driver 回放确认这 100 条的 LSN/payload **100/100** 匹配。
+
+**切换时短暂失去多数派。** 先保持 node0 下线，在 node1/node2 两票下启动另一持续回放者；回放开始后再杀 node1，只留 node2 一票并请求切换。单票约 **8 秒**期间新写入 ACK 为 **0**。恢复 node1 后，切换约 **9.492 秒**完成，随后确认 **50/50** 条新 WAL（LSN 2121–2170），checkpoint 到 LSN 2150。
+
+**活跃 writer 与持续回放者交接。** 三票恢复后，旧 writer 使用真实 TN WAL driver 并发写入 **640/640** 条（LSN 2171–2810）；第二个 driver 同时以持续回放模式追尾，在旧 writer 约确认 145 条时，回放者已应用到 LSN **2300**。此时杀数据 leader node2，node0/node1 两票继续服务；旧 writer 完成余下写入并关闭。只在旧 writer 退出后才请求回放者切换可写；它报告已回放到旧 writer 最终 LSN **2810**，随后确认 **50/50** 条新 WAL（LSN 2811–2860），checkpoint 到 LSN 2840。这样避免了两个可写 driver 同时分配 DSN，符合单个 TN writer 交接的使用顺序。
+
+保持 node2 下线时，独立 `ReplayForWrite` 返回 `user_lsn=2860, checkpointed=2840, truncated_dsn=1755`；第二轮的 50 条、旧 writer 的 640 条和接管后的 50 条分别按 LSN/payload **50/50、640/640、50/50** 匹配。随后三节点各自原盘强制冷重启，再次回放到相同水位；本轮四段写入合计 **840/840** 条与 ACK 逐条一致，其中 checkpoint 水位 2840 之后必须保留的 LSN 2841–2860 **20/20** 一致。四段负载的单条确认最大耗时分别为 **0.672、0.416、7.685、0.228 秒**；本轮未见 DSN 缺口、重复回放、写入错误或一分钟长尾。
+
+证据保存在远端该目录的 `promotion.log`、`promotion-one.log`、`live-writer.log`、`live-promotion.log`、`promotion-two-votes-replay.log`、`live-two-vote-replay.log`、`live-cold-replay.log`、三份 `run-*promotion*.sh` 和节点日志。三个节点与测试网络命名空间已停止、清理。checkpoint 使用测试 `GroupFiles` marker；记录匹配证明 WAL 路径正确，不代替真实 TAE checkpoint 文件加载验证。
