@@ -19,7 +19,12 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/wal"
 )
 
-type tracedClient struct{ logservice.Client }
+type tracedClient struct {
+	logservice.Client
+	firstAppend  *atomic.Bool
+	firstReady   string
+	firstRelease string
+}
 
 func (c *tracedClient) Append(ctx context.Context, rec logservice.LogRecord) (logservice.Lsn, error) {
 	start := time.Now()
@@ -32,6 +37,17 @@ func (c *tracedClient) Append(ctx context.Context, rec logservice.LogRecord) (lo
 }
 
 func (c *tracedClient) AppendWAL(ctx context.Context, rec logservice.LogRecord) (logservice.Lsn, error) {
+	if c.firstReady != "" && !c.firstAppend.Swap(true) {
+		if err := os.WriteFile(c.firstReady, []byte("ready\n"), 0o644); err != nil {
+			panic(err)
+		}
+		for {
+			if _, err := os.Stat(c.firstRelease); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 	start := time.Now()
 	walClient, ok := c.Client.(interface {
 		AppendWAL(context.Context, logservice.LogRecord) (uint64, error)
@@ -59,6 +75,8 @@ func main() {
 	startReady := flag.String("start-ready-file", "", "write this file after replay and before worker Append calls")
 	startRelease := flag.String("start-release-file", "", "wait for this file before worker Append calls")
 	traceBackend := flag.Bool("trace-backend-append", false, "log slow or failed individual LogService Append attempts")
+	firstReady := flag.String("first-append-ready-file", "", "signal before the first backend AppendWAL")
+	firstRelease := flag.String("first-append-release-file", "", "release the first backend AppendWAL")
 	flag.Parse()
 	if (*addresses != "127.0.0.1:58201,127.0.0.1:58211,127.0.0.1:58221" &&
 		*addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" &&
@@ -66,7 +84,8 @@ func main() {
 		*addresses != "198.18.51.10:59801,198.18.51.11:59811,198.18.51.12:59821" &&
 		*addresses != "198.18.51.10:60201,198.18.51.11:60211,198.18.51.12:60221") ||
 		*workers <= 0 || *workers > 100 || *perWorker <= 0 || *delay < 0 || *checkpointEvery < 0 ||
-		(*startReady == "") != (*startRelease == "") {
+		(*startReady == "") != (*startRelease == "") ||
+		(*firstReady == "") != (*firstRelease == "") {
 		panic("invalid isolated cluster or workload settings")
 	}
 
@@ -76,14 +95,15 @@ func main() {
 	clientCfg := logservice.ClientConfig{
 		LogShardID: 1, TNReplicaID: 100, ServiceAddresses: strings.Split(*addresses, ","),
 	}
+	var firstAppend atomic.Bool
 	factory := func() (logservice.Client, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		client, err := logservice.NewClient(ctx, sid, clientCfg)
-		if err != nil || !*traceBackend {
+		if err != nil || (!*traceBackend && *firstReady == "") {
 			return client, err
 		}
-		return &tracedClient{Client: client}, nil
+		return &tracedClient{Client: client, firstAppend: &firstAppend, firstReady: *firstReady, firstRelease: *firstRelease}, nil
 	}
 	w := wal.NewLogserviceHandle(logservicedriver.LogServiceClientFactory(factory), 0)
 	defer func() {

@@ -883,3 +883,15 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 新 driver 回放得到 `user_lsn=11060, checkpointed=11050, truncated_dsn=11088`；物理截断后仍可回放的本轮 30 条与 ACK **30/30** 匹配，其中 checkpoint 水位之后必须保留的 LSN 11051–11060 **10/10** 匹配。整组再次原盘冷重启后水位与这 10 条保持一致。随后新 driver 再确认 **60/60** 条 WAL、**3** 次 checkpoint intent；最终回放到 `user_lsn=11120, checkpointed=11110, truncated_dsn=11154`，新水位后必须保留的 LSN 11111–11120 **10/10** 匹配，证明恢复实例仍可继续推进写入和截断。
 
 证据在远端该目录的 `truncate-cold.log`、`truncate-cold-replay.log`、`truncate-cold-cold-replay.log`、`truncate-cold-recover.log`、`truncate-cold-recover-replay.log`、`run-truncate-cold-window.sh` 和节点日志。三个节点与测试网络命名空间均已停止、清理。本轮未发现新的 WAL 丢失或回放错误；测试 marker 不代替真实 TAE checkpoint 文件加载验证。
+
+## 最新 upstream/main `45917e803f`：单 TN driver 乱序物理批次、leader 切换与重复记录回放（2026-11-11 11:58–12:03）
+
+复用 51 上隔离三副本集群 `/home/mo/jxm/logservice-main-45917e803f-two-down-20261111/`。给 `concurrent_probe` 增加只暂停**首个**底层 `AppendWAL` 的测试屏障；其余客户端仍调用真实 LogService `AppendWAL`。探针使用真实 `wal.NewLogserviceHandle`、`ReplayForWrite` 和 100 个并发写入者，各写 20 条。暂停仅改变请求到达顺序，不修改 WAL 内容或 driver 的提交代码；未运行 datasync、真实 TN/CN 或加载真实 TAE checkpoint 文件。
+
+第一次尝试用“首批暂停时上层已出现 ACK”判断后续物理批次是否提交，但 30 秒内 ACK 为 0；脚本释放屏障，2000/2000 条正常完成，没有注入节点故障，**不计为故障验证**。这说明仅凭 ACK 观察不能确定后续物理请求的状态。第二次改用直接 LogService `GetLatestLsn` 查询物理 PSN：首个 `AppendWAL` 仍在屏障上时，物理最新 PSN 从 **8889** 升到 **9164**，且已有 **59** 条上层 ACK，确认后续批次已进入日志。此时杀数据 leader node0，再放行首批；node1/node2 两票持续服务。第二轮 **2000/2000** 条确认，底层有 **47** 次失败尝试，driver 最终重试成功。
+
+保持 node0 下线时，新 TN driver 回放到 `user_lsn=15120, checkpointed=11110, truncated_dsn=11154`；两轮已确认的 LSN 11121–15120 共 **4000/4000** 条按 LSN/payload 匹配。回放日志明确识别到 **10 条重复的物理 WAL 记录**（相同 DSN 范围、不同 PSN），没有 DSN 重叠错误，也没有将其重复交付为用户记录。三节点各自原盘强制冷重启后，水位、**4000/4000** 条匹配和这 10 条物理副本的识别结果不变。
+
+新 driver 随后再确认 **200/200** 条 user WAL，按每 20 条提交一次带 `GroupFiles` 测试 marker 的 checkpoint，将 checkpoint 水位推进到 **15270**。物理截断后回放到 `user_lsn=15320, checkpointed=15270, truncated_dsn=15330`；本轮可回放的 70 条与 ACK **70/70** 匹配，水位后必须保留的 LSN 15271–15320 **50/50** 匹配，旧的重复物理记录已不在可回放范围。整组再次原盘冷重启后水位和这 50 条不变，回放未再记录那些旧副本。
+
+证据在远端该目录的 `ooo-load.log`、`ooo2-load.log`、`ooo2-two-vote-replay.log`、`ooo2-cold-replay.log`、`ooo-postcp.log`、`ooo-postcp-replay.log`、`ooo-postcp-cold-replay.log`、`run-ooo-append.sh`、`run-ooo-physical.sh` 与节点日志。三个节点与测试网络命名空间已停止、清理。本轮未发现新数据错误；重复物理记录与故障时已提交、回包丢失后重试的形态一致，用户 WAL 回放保持一次交付。
