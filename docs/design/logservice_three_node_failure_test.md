@@ -925,3 +925,17 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 重开日志明确读取 `meta_0-0_1794378830125939584-0.ckp` 并执行 `Replay-Catalog`；查询仍扫描到 **50/50** 行，checkpoint LSN 为 1。之后通过同一 TAE DB 创建 `after_restart` 数据库，第二次关闭重开，原表仍是 **50/50** 行且新数据库可见；测试进程整体 **21.54 秒** PASS。这个结果覆盖真实 checkpoint 文件生成、加载、目录恢复、两票期间 WAL 重新连接与事务读写，不代表已覆盖真实 TN 服务的生命周期或 SQL 层。
 
 最初的本地最小探针使用 `CreateRelAndAppend`，只建了内存目录项、没有写 `mo_catalog` 行；它在 checkpoint 后回放找不到表。改用生产更接近的 `CreateRelAndAppend2` 后本地 mock 测试通过，并才执行上述 51 远端实验。因此初版失败是测试夹具缺失系统目录写入，**不列为产品缺陷**。远端证据是 `tae-first.log`、三个节点日志和测试二进制；对应探针源码在测试工作树的 `test/logservice-chaos/tn_driver_probe/tae_checkpoint_probe/`。本轮没有发现新的数据错误；测试节点和网络命名空间已停止、清理。
+
+## 最新 upstream/main `45917e803f`：旧 leader 网络隔离超过 3 分钟，两票持续写入（2026-11-11 14:36–14:41）
+
+复用 51 上隔离集群 `/home/mo/jxm/logservice-main-45917e803f-two-down-20261111/`。先确认 node2 为数据 leader，再启动真实 TN WAL driver 的 100 个并发写入者（每人计划 1000 条，每条后间隔 20 ms），每约 300 条 ACK 提交一次带测试 `GroupFiles` marker 的 checkpoint，保留最近 300 条。热身到 510 条 ACK 后，使用 node2 网络命名空间中的五条 `iptables DROP` 规则阻断 node2 与 node0/node1 的双向 Raft 通道，以及客户端到 node2 RPC 的入站包；node0/node1 保持互通并选举出新 leader。持续隔离 **220 秒**，超过 driver 默认的 3 分钟重试检查窗口；结束时规则计数分别命中 **862** 个客户端入站包和 **194/25/453/318** 个 Raft 方向包，证明故障仍在生效。
+
+隔离开始 20/180/220 秒时，已确认写入分别为 **1607/24800/30774** 条；清理网络规则并结束旧 driver 时共有 **30874** 条 ACK、**95** 次 checkpoint ACK、**36** 次底层 `AppendWAL` 失败尝试，**0** 个最终 Append 错误。单条确认 p99 **2.292 秒**、最大 **10.409 秒**，仅 1 条超过 10 秒、**0** 条超过 60 秒。独立新 driver 回放到 `user_lsn=58689, checkpointed=58289, truncated_dsn=58041`；checkpoint 水位之后 **58290–58689** 共 **400** 个 LSN 连续、无重复，其中旧进程已确认且应保留的 **300/300** 条按 LSN/payload 匹配。结束时主动 `SIGKILL` 旧进程，因此水位之后另有尚未打印 ACK 但已提交的记录，不把它们算作客户端已确认写入。两票始终在线，所以这轮验证的是持续故障下**各次请求能不断切到可用多数派**；不证明单个请求在无多数派时可无限重试。
+
+证据在远端 `long3m-20261111/load.log`、`replay.log`、根目录 `long3m_logservice.sh` 和节点日志。本轮没有出现一分钟长尾或可回放数据缺失。
+
+## 最新 upstream/main `45917e803f`：Append 已提交但旧 driver 未获回包后崩溃（2026-11-11 14:41）
+
+在同一集群的全部三个副本恢复后，扩展测试客户端包装层：让**第一次真实 `AppendWAL` 成功返回**后、把结果交回真实 TN driver 前停在屏障，记录服务端返回的物理 **PSN 33692**。旧 driver 仅计划写 `ambig-postcommit-r1/00/0000` 一条；屏障就绪后不放行，直接 `SIGKILL` 旧进程，因此旧进程 **0** 条 ACK。这是一次确定的“服务端已提交、调用方未得到结果”，不需要推测 TCP 回包是否丢失。
+
+新 driver 的 `ReplayForWrite` 找到该 payload，逻辑 **LSN 58690**。整组三节点原盘冷重启后的回放仍恰好找到一次同一 `(LSN, payload)`；新实例随后 **20/20** 条写入从 LSN **58691** 连续推进到 **58710**，没有将模糊成功的旧记录重复交付。证据在远端 `ambig-postcommit-20261111/load.log`、`replay.log`、`cold-replay.log`、`after.log`，以及测试包装层源码 `test/logservice-chaos/tn_driver_probe/concurrent_probe/main.go`。这是包装层控制的故障时序，不表示网络本身必然以同一方式丢回包；恢复结果符合预期，未建立新缺陷。所有测试节点、隔离规则和测试网络命名空间已停止、清理。
