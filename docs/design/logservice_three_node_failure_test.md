@@ -939,3 +939,13 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 在同一集群的全部三个副本恢复后，扩展测试客户端包装层：让**第一次真实 `AppendWAL` 成功返回**后、把结果交回真实 TN driver 前停在屏障，记录服务端返回的物理 **PSN 33692**。旧 driver 仅计划写 `ambig-postcommit-r1/00/0000` 一条；屏障就绪后不放行，直接 `SIGKILL` 旧进程，因此旧进程 **0** 条 ACK。这是一次确定的“服务端已提交、调用方未得到结果”，不需要推测 TCP 回包是否丢失。
 
 新 driver 的 `ReplayForWrite` 找到该 payload，逻辑 **LSN 58690**。整组三节点原盘冷重启后的回放仍恰好找到一次同一 `(LSN, payload)`；新实例随后 **20/20** 条写入从 LSN **58691** 连续推进到 **58710**，没有将模糊成功的旧记录重复交付。证据在远端 `ambig-postcommit-20261111/load.log`、`replay.log`、`cold-replay.log`、`after.log`，以及测试包装层源码 `test/logservice-chaos/tn_driver_probe/concurrent_probe/main.go`。这是包装层控制的故障时序，不表示网络本身必然以同一方式丢回包；恢复结果符合预期，未建立新缺陷。所有测试节点、隔离规则和测试网络命名空间已停止、清理。
+
+## 最新 upstream/main `45917e803f`：TN driver 并发乱序 Append 追加 16 轮矩阵（2026-11-11 14:52–14:55）
+
+按用户要求在 51 上复用同一隔离集群，再运行**16 轮新的**同一 TN WAL driver 内并发 Append。每轮使用 64–100 个写入者、每人计划 10–30 条；暂停一个真实底层 `AppendWAL` **发送之前**，确认其他请求使 LogService 物理 PSN 至少增加 25/75/125/200 后，以 `SIGKILL` 结束旧 driver。前 12 轮暂停**首个**底层调用，分别覆盖三票运行 4 轮、普通副本先下线 4 轮、物理乱序已形成后再杀 leader 4 轮。追加 4 轮将暂停点改到第 **3/5/10/20** 次底层调用，分别覆盖三票、普通副本下线、leader 下线、三票；该变化使前面的物理批次有机会先确认。整个故障窗口始终至少有两票存活。每轮均由新 driver 执行 `ReplayForWrite`，核对旧进程 ACK 的 `(user LSN, payload)`，再写 10 条并对存活副本做原盘冷重启，比较前后回放记录集；下线副本随后恢复。
+
+16 轮均观察到屏障仍未放行时物理 PSN 前进，并在重启回放中写出非空的 `Wal-Replay-Append-Skip-Entries`，合计 **351** 个 DSN→PSN 补空洞映射。旧进程累计打印 **424** 条已确认 user WAL，逐轮回放及最后的全局回放 **424/424** 按 LSN/payload 匹配；各轮冷重启前后记录集相等、按 user LSN 递增且无重复。第 3/5/10/20 次暂停的四轮分别有 **25/50/88/129** 条 ACK 和 **25/47/72/62** 个补空洞映射，其中暂停第 10 次时叠加了 leader 停机。每轮新实例的后续 **10/10** 条写入成功，合计 **160/160** 条；最终全局回放到 `user_lsn=59294, checkpointed=58289`，水位后 **58290–59294** 共 **1005** 个逻辑 LSN 连续、无缺失或重复。
+
+最后再写 **100/100** 条，并每 20 条提交一次带测试 `GroupFiles` marker 的 checkpoint，保留最近 50 条。新实例及三节点整组原盘冷重启后均得到 `user_lsn=59394, checkpointed=59344, truncated_dsn=59694`；水位后 LSN **59345–59394** 与最后 50 条 ACK **50/50** 精确匹配。物理尚未截断的旧 checkpointed 记录也可能被探针打印，核对时按 checkpoint 水位过滤。
+
+证据在远端 `ooo-repeat-20261111/` 与 `ooo-nth-20261111/` 的 `summary.json`、各轮 `*.load.log`、`*.replay.log`、`*.cold-replay.log`、`*.after.log`，以及 `final-all16.log`、`post-checkpoint*.log`；运行脚本为集群根目录的 `tn_ooo_repeat_matrix.py`、`tn_ooo_repeat_nth.py`。测试屏障只改变底层请求出发时机，真实 TN WAL driver 负责写入、重试、补空洞、回放和 checkpoint；没有运行 datasync 或真实 TN 服务。本轮未发现乱序、空洞、节点切换或重启导致的已确认 WAL 丢失/重复。测试节点和网络命名空间已停止、清理。
