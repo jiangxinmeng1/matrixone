@@ -1034,3 +1034,13 @@ node1/node2 两票继续完成 **400/400** 条 user WAL、**40** 次 checkpoint�
 node2 原盘恢复后，确认三个地址均报告同一副本组，再杀当前 leader node0，只留 node1/node2 两票。独立新 driver 继续写 **8/8** 条，LSN **61206–61213**；再启动一个新 driver 回放，原先水位后的 32 条仍全部匹配，新增 8 条按 LSN、长度、SHA256 **8/8** 匹配。这说明先前落后的 node2 追上本轮大 WAL 后可与 node1 组成多数派继续服务。
 
 证据位于远端 `mixed-wal-20261111/` 的 `write.log`、`two-vote-replay.log`、`checkpoint-write.log`、`checkpoint-replay.log`、`cold-two-vote-replay.log`、`three-status.log`、`recovered-two-vote-write.log.gz` 和 `recovered-two-vote-replay.log`。其中 `three-status.log` 记录了 node2 刚启动时短暂连接失败；随后再次查询确认三个地址均可访问。探针源码是测试工作树 `test/logservice-chaos/tn_driver_probe/concurrent_probe/main.go` 的混写参数扩展；已完成 `go list`、`go build`、`go vet` 和定向包编译测试，并在 51 上运行该二进制。测试结束已停止三个节点并清理网络命名空间。本轮没有发现已确认 WAL 丢失、重复、回放摘要不符或一分钟写入长尾。
+
+## 单 TN WAL driver 大 WAL 排空与 Close、leader 下线重叠（2026-11-11 16:07–16:15）
+
+从上节未覆盖清单选择两条有效负载：**4 条各 24 MiB** 的已接收 WAL，以及接近 `DefaultMaxWALRecordSize=99 MiB` 的**单条 95 MiB** WAL。扩展现有 `close_probe` 的大小参数：探针完成 `ReplayForWrite` 后由真实 TN WAL handle 接收记录，让第一次底层 `AppendWAL` 停在**发出 RPC 前**，随后启动 `w.Close()` 并发等待；脚本确认屏障和 Close 信号后杀数据 leader，保持另外两票，再放行底层提交。新实例只在旧 driver 完全退出后启动。记录以 LSN、字节数和 SHA256 作为独立回放核对依据；没有运行真实 TN 服务或 datasync。
+
+**4 × 24 MiB。** 初始水位 `user_lsn=61213, checkpointed=61173`，四条记录被 driver 接收为 LSN **61214–61217**，当时 leader 为 node2。杀 node2 后放行，底层观察到一次连接拒绝、一次 `context deadline exceeded` 和一次 timeout，后续重试成功。Close 约 **22.352 秒**返回 nil，**4/4** 个 `WaitDone` 返回 nil。旧 driver 退出后的两票回放 **4/4** 按 LSN、长度、SHA256 匹配；node0/node1 原盘冷重启后的水位仍为 `user_lsn=61217, checkpointed=61173`，全部物理可见回放记录集与冷重启前一致。
+
+**单条 95 MiB。** 恢复第三票后，leader 为 node1。新 driver 接收 LSN **61218**，字节数 **99,614,720**；Close 发起后杀 node1，仅留 node0/node2，放行底层提交。一次底层 timeout 后重试成功，Close 约 **13.296 秒**返回 nil，`WaitDone` 返回 nil。两票回放和两票原盘冷重启后，LSN 61218 的长度及 SHA256 均与接收时一致，水位为 `user_lsn=61218, checkpointed=61173`。再由独立新 driver 写 **8/8** 条小 WAL，LSN **61219–61226** 连续，后续独立回放 **8/8** 按 LSN、长度、SHA256 匹配。
+
+远端证据在 `large-close-20261111/` 和其 `near-limit/` 子目录：`run.log`、`two-vote-replay.log`、`cold-two-vote-replay.log`，以及后一轮的 `after-write.log`、`after-replay.log`。可复现探针源码为 `test/logservice-chaos/tn_driver_probe/close_probe/main.go`。本轮没有发现 Close 挂起、已接收 WAL 丢失、重复或水位回退。**时机边界：**屏障在底层 RPC 发送前；尚未验证一个 95 MiB `AppendWAL` 已进入网络且请求或回包悬停时，Close 与 leader 停机同时发生。真实 TAE checkpoint 文件写入中并发事务、以及旧版持久 skip 命令升级回放，也仍待测。测试节点和网络命名空间已停止、清理。

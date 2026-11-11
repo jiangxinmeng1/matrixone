@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"os"
@@ -70,13 +71,16 @@ func main() {
 	addresses := flag.String("addresses", "", "dedicated test RPC addresses")
 	prefix := flag.String("prefix", "close-probe", "unique payload")
 	count := flag.Int("count", 1, "accepted user WAL entries before close")
+	sizeMiB := flag.Int("size-mib", 0, "payload size in MiB; zero keeps the small payload")
 	appendReady := flag.String("append-ready-file", "", "backend Append barrier ready")
 	appendRelease := flag.String("append-release-file", "", "backend Append barrier release")
 	closeReady := flag.String("close-ready-file", "", "close started signal")
 	flag.Parse()
 	if (*addresses != "198.18.51.10:58201,198.18.51.11:58211,198.18.51.12:58221" &&
 		*addresses != "198.18.51.10:60201,198.18.51.11:60211,198.18.51.12:60221") ||
-		*count <= 0 || *count > 10000 || *appendReady == "" || *appendRelease == "" || *closeReady == "" {
+		*count <= 0 || *count > 10000 || *sizeMiB < 0 || *sizeMiB > 95 ||
+		(*sizeMiB > 0 && *count > 512 / *sizeMiB) ||
+		*appendReady == "" || *appendRelease == "" || *closeReady == "" {
 		panic("use only the isolated WAL test cluster")
 	}
 	const sid = "tn-wal-close-probe"
@@ -112,16 +116,29 @@ func main() {
 		if *count > 1 {
 			payload = fmt.Sprintf("%s/%06d", *prefix, seq)
 		}
+		data := []byte(payload)
+		if *sizeMiB > 0 {
+			large := make([]byte, *sizeMiB<<20)
+			copy(large, data)
+			for i := len(data); i < len(large); i++ {
+				large[i] = byte((i*31 + seq*17) % 251)
+			}
+			data = large
+		}
 		e := entry.GetBase()
 		e.SetType(entry.IOET_WALEntry_Test)
-		if err := e.SetPayload([]byte(payload)); err != nil {
+		if err := e.SetPayload(data); err != nil {
 			panic(err)
 		}
 		lsn, err := w.AppendEntry(wal.GroupUserTxn, e)
 		if err != nil {
 			panic(err)
 		}
-		fmt.Printf("accepted lsn=%d payload=%s\n", lsn, payload)
+		if *sizeMiB > 0 {
+			fmt.Printf("accepted lsn=%d bytes=%d sha256=%x\n", lsn, len(data), sha256.Sum256(data))
+		} else {
+			fmt.Printf("accepted lsn=%d payload=%s\n", lsn, payload)
+		}
 		go func() { waitDone <- waitResult{lsn: lsn, err: e.WaitDone()} }()
 	}
 	for {
