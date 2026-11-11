@@ -1082,3 +1082,19 @@ Wal-Replay-DSN-Overlap: wal record dsn range [183, 184] at psn 2762 overlaps pen
 同一持久状态上连续再回放两次，均得到相同错误；整组三副本各自原盘强制冷重启后再次回放，仍得到相同错误，故这不是临时 leader/连接故障。失败前的日志显示 skip 命令为版本 1，读取后多条 `Wal-Replay-Stale-Skip-Entry`，例如 DSN 184 的 skip 目标 PSN 2210、当前 pending PSN 2209；随后对一些旧物理记录报告 duplicate，最后在新旧 DSN 范围部分重叠时终止。**缺陷影响：**16 条已 ACK 的新 WAL 在截断后不能完成 `ReplayForWrite`，TN 重启可能无法恢复可写。证据足以确认回放失败和时间线；PSN 对不上的根因还需进一步定位，不能仅凭日志断言是 skip 命令生成、物理截断或读取索引中的哪一处实现错误。
 
 远端 `preassigned/r1/`、`r2/`、`r3/` 保存每轮 `write.log`、独立回放、checkpoint 和冷重启日志；第三轮关键文件是 `r3/write.log`、`post-kill-replay.log`、`post-skip-write.log`、`checkpoint172.log`、`checkpoint175.log`、`repro-1.log`、`repro-2.log`、`cold-repro.log`。本轮结束后已停止三个节点并清理隔离网络命名空间，保留原盘和日志以便进一步定位。此处的 checkpoint 使用测试 marker；它验证 WAL 截断和回放，不代替真实 TAE checkpoint 文件加载。
+
+## 独立空盘复测裁尾、复用 LSN 与 PSN 跳号（2026-11-11 17:20–17:31）
+
+对上节故障做两套**独立空盘**对照，沿用三副本配置、真实 TN WAL driver 和生产 LogService `9381db5dde`；任一时刻只有一个 driver。地址仍为 `198.18.51.10:60201`、`:60211`、`:60221`，但两套分别使用独立根目录、UUID、数据盘和启动周期，不与原故障盘混用。探针的 `scan` 模式只读调用 `GetTruncatedLsn`/`Read`，比较每条返回记录自带的真实 `record.Lsn` 与当前回放器采用的 `batchFirst + index` 推算值；指定 `-scan-min/-scan-max` 时输出实际 PSN、推算 PSN、记录类型和 WAL DSN。
+
+**空盘 A：缺口在首条 LSN。** 旧 driver 顺序分配 LSN 1–24，挡住第一条底层请求，其余 23 条物理 Append 返回成功，0 条上层 ACK，随后直接杀旧进程。新 driver **跳过未发送的 LSN 1，交付 LSN 2–24 共 23 条**，水位到 24；后续独立 driver 从 LSN 25 写入 16/16 条。checkpoint 到 36，物理截断 PSN 437，三副本原盘冷重启后 `user_lsn=40, checkpointed=36`，必须保留的 LSN 37–40 四条顺序和摘要匹配。此观察说明当前实现在**没有已应用前缀**的缺口处可跳过首个 DSN 并应用后续物理成功记录；这些记录旧轮没有上层 ACK，不能仅由 ACK=0 推断它们必然没有提交。是否满足完整 TAE 事务语义需单独验证。
+
+**空盘 A：已有 checkpoint 前缀。** 同一独立集群接着从水位 40 分配旧轮 LSN 41–64，首条不发送、余下 23 条物理成功、0 条上层 ACK。新 driver 写入 skip 命令后裁回 `user_lsn=40`，新轮复用 LSN 41–56 并 16/16 ACK；截断前独立回放 16/16。checkpoint 到 52，物理截断 PSN 1502，之后独立回放成功，水位为 `user_lsn=56, checkpointed=52`。这次旧物理记录的 PSN 1117–1139 已落在截断水位之前；不能用它证明保留旧物理记录时的 skip 匹配行为。
+
+**空盘 B：完全未发送的尾部。** 旧 driver 顺序分配 LSN 1–24，在释放任何底层请求前杀进程，确认底层成功数为 0。新 driver 回放水位仍为 0，重新使用 LSN 1–16 并 16/16 ACK。checkpoint 到 12、物理截断 PSN 774、三票原盘冷重启后，必须保留的 LSN 13–16 四条顺序及摘要匹配。
+
+**空盘 B：两票状态保留旧物理记录。** 以已 checkpoint 到 12 的水位 16 为前缀，旧 driver 分配 LSN 17–40，首条阻塞、其余 23 条物理成功、0 条上层 ACK；杀 node1 后杀旧 driver，仅留 node0/node2。新 driver 写 skip 命令、裁回 `user_lsn=16`，复用 LSN 17–32 并 16/16 ACK。checkpoint 到 28、物理截断 PSN 962 后，旧物理记录仍在约 PSN 1265–1287，独立回放**没有** stale skip 或 DSN overlap；两票原盘冷重启后 `user_lsn=32, checkpointed=28`，必须保留的 LSN 29–32 四条顺序和摘要匹配。可见**旧物理记录保留与重复上层 LSN 本身不会必然失败**。
+
+**故障盘的直接 PSN 核对。** 原故障盘在物理截断到 PSN 1841 后，用只读客户端扫描 LogService `Read`：某批起点为 1842，返回列表的第 0 条真实 PSN 1842，第 1 条真实 PSN **1844**，中间 PSN 1843 未出现在结果中；该批后续记录的 `record.Lsn` 继续比 `batchFirst + index` 大 1。例如旧记录 `DSN 184` 的真实 PSN 是 **2210**，而故障回放把它按 **2209** 放入 pending；已持久化的 skip 命令正确指向 PSN **2210**，因此被判为 stale，旧记录未被移除。随后新物理记录 PSN 2762 占 DSN 183–184，与旧待处理记录发生部分重叠，回放在交付用户 WAL **之前**失败。`replayer.go:readNextBatch` 用 `psnToRead + i` 推算 PSN，尽管每条 `LogRecord` 已带真实 `Lsn`；`store.go:markEntries` 对部分 Raft 条目不返回记录，使批内 PSN 可以不连续。这是 skip 目标与 pending PSN 不一致的直接证据。尚未单独确定缺席的 PSN 1843 对应哪种 Raft 命令，也尚未测量这种跳号触发最终回放失败的频率。空盘 B 的只读扫描也观察到批内推算 PSN 与真实 PSN 不同，但其 skip 生成和消费阶段的推算方式相同，因此该次未失败；这支持**跨阶段 PSN 推算不稳定**是关键条件。
+
+远端证据：空盘 A 为 `/home/mo/jxm/logservice-preassigned-repeat-a-20261111/` 的 `initial-replay.log`、`old/`、`tail/`、`checkpoint36.log`、`post-truncate-replay.log`、`cold-replay.log`、`scan.log`；空盘 B 为 `/home/mo/jxm/logservice-preassigned-repeat-b-20261111/` 的 `unsent/`、`two-vote/`，特别是 `two-vote/scan-window.log`。故障盘真实 PSN 扫描保存在原根目录 `preassigned/r3/scan-start.log`、`scan-raw-window.log`。两套对照的节点与测试网络均已停止，磁盘和日志保留。对应缺陷见 [#32534](https://github.com/matrixorigin/matrixone/issues/32534)。

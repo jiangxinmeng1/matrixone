@@ -87,7 +87,7 @@ func (c *gatedClient) AppendWAL(ctx context.Context, rec logservice.LogRecord) (
 
 func main() {
 	addresses := flag.String("addresses", "", "isolated three-node LogService addresses")
-	mode := flag.String("mode", "replay", "write, replay, or checkpoint")
+	mode := flag.String("mode", "replay", "write, replay, checkpoint, or scan")
 	prefix := flag.String("prefix", "preassigned", "payload prefix to verify")
 	count := flag.Int("count", 64, "number of sequentially preassigned user WAL entries")
 	sizeMiB := flag.Int("size-mib", 3, "size per user WAL entry in MiB")
@@ -96,13 +96,17 @@ func main() {
 	firstReady := flag.String("first-ready-file", "", "signal when the first backend call is held")
 	firstRelease := flag.String("first-release-file", "", "release the first backend call")
 	checkpointThrough := flag.Uint64("checkpoint-through", 0, "checkpoint through this user LSN")
+	scanMin := flag.Uint64("scan-min", 0, "first physical LSN to print in scan mode")
+	scanMax := flag.Uint64("scan-max", 0, "last physical LSN to print in scan mode")
 	flag.Parse()
 	if *addresses != "198.18.51.10:60201,198.18.51.11:60211,198.18.51.12:60221" ||
-		(*mode != "write" && *mode != "replay" && *mode != "checkpoint") ||
+		(*mode != "write" && *mode != "replay" && *mode != "checkpoint" && *mode != "scan") ||
 		*count <= 0 || *count > 96 || *sizeMiB <= 0 || *sizeMiB > 4 ||
 		(*assignedReady == "") != (*assignedRelease == "") ||
 		(*firstReady == "") != (*firstRelease == "") ||
-		(*mode == "checkpoint" && *checkpointThrough == 0) {
+		(*mode == "checkpoint" && *checkpointThrough == 0) ||
+		(*scanMin == 0) != (*scanMax == 0) ||
+		(*scanMax != 0 && *scanMax < *scanMin) {
 		panic("invalid isolated WAL probe parameters")
 	}
 	const sid = "tn-preassigned-wal-probe"
@@ -110,6 +114,56 @@ func main() {
 	defer runtime.CompareAndDeleteServiceBasedRuntime(sid, runtime.DefaultRuntime())
 	config := logservice.ClientConfig{
 		LogShardID: 1, TNReplicaID: 100, ServiceAddresses: strings.Split(*addresses, ","),
+	}
+	if *mode == "scan" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		client, err := logservice.NewClient(ctx, sid, config)
+		cancel()
+		if err != nil {
+			panic(err)
+		}
+		defer client.Close()
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		first, err := client.GetTruncatedLsn(ctx)
+		cancel()
+		if err != nil {
+			panic(err)
+		}
+		first++
+		var total, mismatch uint64
+		for {
+			ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+			records, next, err := client.Read(ctx, first, 4<<20)
+			cancel()
+			if err != nil {
+				panic(err)
+			}
+			for i, record := range records {
+				total++
+				computed := first + uint64(i)
+				if *scanMin != 0 && record.Lsn >= *scanMin && record.Lsn <= *scanMax {
+					fmt.Printf("psn_record batch_first=%d index=%d computed=%d actual=%d type=%d",
+						first, i, computed, record.Lsn, record.Type)
+					if len(record.Data) >= 12+logservicedriver.EmptyLogEntrySize {
+						batch := logservicedriver.LogEntry(record.Data[12:])
+						fmt.Printf(" cmd=%d start_dsn=%d entries=%d", batch.GetCmdType(), batch.GetStartDSN(), batch.GetEntryCount())
+					}
+					fmt.Println()
+				}
+				if record.Lsn != computed {
+					mismatch++
+					if mismatch <= 20 {
+						fmt.Printf("psn_mismatch batch_first=%d index=%d computed=%d actual=%d type=%d\n",
+							first, i, computed, record.Lsn, record.Type)
+					}
+				}
+			}
+			if next == first {
+				fmt.Printf("scan_done records=%d psn_mismatch=%d\n", total, mismatch)
+				return
+			}
+			first = next
+		}
 	}
 	gate := make(chan struct{})
 	var enabled atomic.Bool
