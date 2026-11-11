@@ -916,4 +916,12 @@ TN heartbeat 超过默认 10 秒有效期后，控制面 `GetClusterDetails` 报
 
 恢复 node2 后，三票最终回放到 `user_lsn=27615, checkpointed=27020`。水位后 LSN **27021–27615** 共 **595** 条连续、无缺失或重复，其中上述八轮新写入的 **155** 条已确认记录与每轮新实例写入的 **140** 条记录均可核对。再用新 driver 写入 **100/100** 条，并每 20 条提交一次带测试 `GroupFiles` marker 的 checkpoint，保留最近 20 条；新实例和三节点整组原盘冷重启后均报告 `user_lsn=27715, checkpointed=27695, truncated_dsn=27867`，保留的 LSN **27696–27715** 与最后 20 条 ACK **20/20** 精确匹配。
 
-证据位于远端 `ooo-gap-20261111/` 的各轮 `*.load.log`、`*.replay.log`、`*.cold-replay.log`、`*.write.log`，以及 `final-three-vote-replay.log`、`post-checkpoint*.log`；复现脚本是集群根目录的 `tn_ooo_rounds.py`。这是 driver WAL 层的真实调用顺序与故障恢复验证；测试 `GroupFiles` marker 仍不等同于真实 TAE checkpoint 文件。另尝试在进程内创建 TAE 表、生成 checkpoint 文件后重开 DB，但最小测试在本地 mock 后端回放找不到表；不做 checkpoint 的重启基线和仓库现有的 `TestCheckpointObjectList` 均通过，尚未排除探针配置差异，因此没有把这次探索算作 LogService 缺陷或 51 上验证。八轮 WAL 故障测试未发现已确认写入丢失、回放乱序、重复交付或空洞处理错误，也没有据此建立新缺陷。所有测试节点和网络命名空间已停止、清理。
+证据位于远端 `ooo-gap-20261111/` 的各轮 `*.load.log`、`*.replay.log`、`*.cold-replay.log`、`*.write.log`，以及 `final-three-vote-replay.log`、`post-checkpoint*.log`；复现脚本是集群根目录的 `tn_ooo_rounds.py`。这是 driver WAL 层的真实调用顺序与故障恢复验证；测试 `GroupFiles` marker 仍不等同于真实 TAE checkpoint 文件。八轮 WAL 故障测试未发现已确认写入丢失、回放乱序、重复交付或空洞处理错误，也没有据此建立新缺陷。所有测试节点和网络命名空间已停止、清理。
+
+## 最新 upstream/main `45917e803f`：真实 TAE checkpoint 文件加载遇到 LogService leader 停机（2026-11-11 14:33–14:34）
+
+在 51 上以**新空盘**建立三副本集群 `/home/mo/jxm/logservice-main-45917e803f-tae-checkpoint-20261111/`，数据 shard 1，RPC 端口 60401/60411/60421、Log store 过期阈值 5 分钟。没有启动 TN 服务，而是在同机测试进程内打开真实 TAE DB，并通过 `options.WithWalClientFactory` 将其 WAL 接到真实 LogService 三地址客户端。测试调用仓库的 `testutil.CreateRelAndAppend2`，它同时写入 `mo_catalog` 系统目录行，创建一张 50 行表，确认事务可扫描，然后强制生成增量 checkpoint 文件。`tae_checkpoint lsn=1 meta_files=1` 后在测试屏障停住；此时杀数据 leader node0，保留 node1/node2 两票，再放行 TAE 关闭与重开。
+
+重开日志明确读取 `meta_0-0_1794378830125939584-0.ckp` 并执行 `Replay-Catalog`；查询仍扫描到 **50/50** 行，checkpoint LSN 为 1。之后通过同一 TAE DB 创建 `after_restart` 数据库，第二次关闭重开，原表仍是 **50/50** 行且新数据库可见；测试进程整体 **21.54 秒** PASS。这个结果覆盖真实 checkpoint 文件生成、加载、目录恢复、两票期间 WAL 重新连接与事务读写，不代表已覆盖真实 TN 服务的生命周期或 SQL 层。
+
+最初的本地最小探针使用 `CreateRelAndAppend`，只建了内存目录项、没有写 `mo_catalog` 行；它在 checkpoint 后回放找不到表。改用生产更接近的 `CreateRelAndAppend2` 后本地 mock 测试通过，并才执行上述 51 远端实验。因此初版失败是测试夹具缺失系统目录写入，**不列为产品缺陷**。远端证据是 `tae-first.log`、三个节点日志和测试二进制；对应探针源码在测试工作树的 `test/logservice-chaos/tn_driver_probe/tae_checkpoint_probe/`。本轮没有发现新的数据错误；测试节点和网络命名空间已停止、清理。
