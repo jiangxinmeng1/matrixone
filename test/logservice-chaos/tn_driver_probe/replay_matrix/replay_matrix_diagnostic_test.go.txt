@@ -34,17 +34,19 @@ func (d *fixedReplayMatrixDriver) readFromBackend(_ context.Context, firstPSN ui
 func TestDiagnosticFixedReplayMatrix(t *testing.T) {
 	var total, failed int
 	for _, shape := range []string{"partial", "identical"} {
-		for _, gap := range []uint64{0, 2, 3, 4} {
+		for _, gap := range []struct{ at, width uint64 }{
+			{0, 0}, {2, 1}, {2, 2}, {3, 1}, {3, 2}, {4, 1}, {4, 2},
+		} {
 			for _, cutoff := range []uint64{0, 1} {
 				for _, batch := range []int{1, 2, 3, 4, 5, 64} {
-					name := fmt.Sprintf("%s/gap-%d/truncate-%d/batch-%d", shape, gap, cutoff, batch)
+					name := fmt.Sprintf("%s/gap-%d-width-%d/truncate-%d/batch-%d", shape, gap.at, gap.width, cutoff, batch)
 					t.Run(name, func(t *testing.T) {
 						total++
 						psns := []uint64{1, 2, 3, 4}
-						if gap != 0 {
+						if gap.at != 0 {
 							for i := range psns {
-								if psns[i] >= gap {
-									psns[i]++
+								if psns[i] >= gap.at {
+									psns[i] += gap.width
 								}
 							}
 						}

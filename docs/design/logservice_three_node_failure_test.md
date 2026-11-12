@@ -1105,4 +1105,20 @@ Wal-Replay-DSN-Overlap: wal record dsn range [183, 184] at psn 2762 overlaps pen
 
 当前服务端对应的生产回放代码运行结果为 **72/96 通过、24/96 失败**。所有失败均为物理跳号位于旧记录之前：部分重叠形状 **12 组**返回 `Wal-Replay-DSN-Overlap`，且在错误前没有用户 WAL 回调；完全相同形状 **12 组**返回成功，却把旧 payload 交付为 LSN 3，新 payload 被当成重复物理记录忽略。后者是确定性包内复现，**尚未在真实三副本上单独复现静默交付旧内容**。其余 72 组全部按正确 LSN 和新 payload 交付，覆盖没有跳号、跳号晚于旧记录、不同截断 PSN 和不同批边界的对照。
 
-仅在本地临时把 `replayer.go:readNextBatch` 的 `psnToRead + i` 换成返回记录自带的 `record.Lsn`，同一矩阵变为 **96/96 通过**；测试后撤回该临时代码改动，没有推送生产修复。这一对照支持 PSN 推算是直接原因，不代替对完整 `Read` 合约和已有回放测试的修复审查。可重复运行的诊断夹具和自动清理脚本保存在 `test/logservice-chaos/tn_driver_probe/replay_matrix/`；当前版本运行时预期退出码为 1，输出 `MATRIX_SUMMARY total=96 failed=24`，脚本退出后不会在生产包留下失败测试文件。上述结论已追加到 [#32534](https://github.com/matrixorigin/matrixone/issues/32534#issuecomment-6792540727)。
+仅在本地临时把 `replayer.go:readNextBatch` 的 `psnToRead + i` 换成返回记录自带的 `record.Lsn`，同一矩阵变为 **96/96 通过**；测试后撤回该临时代码改动，没有推送生产修复。这一对照支持 PSN 推算是直接原因，不代替对完整 `Read` 合约和已有回放测试的修复审查。可重复运行的诊断夹具和自动清理脚本保存在 `test/logservice-chaos/tn_driver_probe/replay_matrix/`。上述初始 96 组结论已追加到 [#32534](https://github.com/matrixorigin/matrixone/issues/32534#issuecomment-6792540727)。
+
+### 扩展跳号宽度与重跑（2026-11-12）
+
+固定矩阵增加物理 PSN 连续缺失 **2 个**的情况，在旧记录前、skip 前、替代记录前各设置一组；形状、截断水位和读取批大小不变。总计 **2 × 7 × 2 × 6 = 168 组**。当前代码实跑 `MATRIX_SUMMARY total=168 failed=48`：**120/168** 组通过；旧记录之前有 1 或 2 个 PSN 缺失时，部分重叠形状共 **24** 组报 `Wal-Replay-DSN-Overlap`，完全重叠形状共 **24** 组错误交付旧 payload。其余位置与无缺口对照通过。临时改用返回记录的真实 `record.Lsn` 后 **168/168** 通过，随后撤回临时代码改动。此处仍是包内注入 `Read` 结果的确定性诊断，不能据此宣称静默旧 payload 已在真实三副本集群重现。
+
+## 单 TN driver 重复追加、checkpoint 与两票/三票原盘冷重启（2026-11-11 17:48–17:49）
+
+在 51 的隔离三副本 `/home/mo/jxm/logservice-preassigned-repeat-b-20261111/` 上，用生产 `wal.NewLogserviceHandle` 连续执行 **5 轮**：每轮由唯一 driver 写入并确认新 WAL、提交 checkpoint intent、停止当轮所有存活 LogService 进程、从各自原盘冷重启，再由独立新 driver 回放。轮次写入量为 **8、16、24、8、16**，累计 **72/72** 条 ACK；每次重启后独立核对分配 LSN、ACK 的长度和 SHA256，以及 checkpoint 以上必须保留的四条 WAL 顺序与摘要。五轮结束水位依次为 **40、56、80、88、104**，checkpoint 到 **36、52、76、84、100**，五轮保留集均 **4/4** 匹配。第 1、3、5 轮只有两票存活，分别为 node0+node2、node0+node1、node1+node2；第 2、4 轮为三票。检查脚本 `restart-append/run-cycles.sh` 及每轮 `write.log`、`checkpoint.log`、`cold-replay.log` 保存在该远端根目录。测试后节点和隔离网络均已停止。checkpoint 使用测试 `GroupFiles` marker，未加载真实 TAE checkpoint 文件。
+
+## TAE checkpoint 水位与 LogService truncate 的持久化边界（代码检查，2026-11-12）
+
+真实 TAE 启动先从 `ckp/` 元数据及其引用的数据文件恢复，取得 `ckpLSN`，再把它交给事务 WAL 回放；`db/replay.go:checkLSN` 跳过 `lsn <= ckpLSN`，对其后的 WAL 要求逐一递增。因此，**旧 WAL 恰好与 checkpoint 前缀重叠时会被跳过**；对于高于 `ckpLSN` 的旧记录，单靠这个水位无法判别它与同 LSN 的新记录属于不同代，driver 在回调前报 DSN overlap 时 TAE 也无从补救。
+
+增量 checkpoint 的顺序是：写入数据及 checkpoint metadata，`saveCheckpoint` 的 `WriteEnd` 成功后将 meta 文件登记；然后 `RangeCheckpoint` 分别追加 `GroupCKP` 和 `GroupFiles`，等待 checkpoint intent 完成；后台再根据 LSN→DSN 映射请求 driver `Truncate`。这些动作与对象存储上的 checkpoint 文件**没有跨存储原子事务**。崩溃在文件发布后、WAL checkpoint intent 之前时，重启会列出该 meta 文件，而未推进的物理截断仍保留旧 WAL；从代码顺序看，这是可以回放的方向，但尚未在该精确切点做真实 TAE 进程崩溃实验。`RangeCheckpoint` 将 `GroupCKP` 与 `GroupFiles` 分成两次 Append，也留下需要单独故障注入的中间状态。
+
+LogService 侧的物理截断 PSN 与 `checkpointedDSN` 则由同一条 Raft `WALTruncate` 命令提交并应用，重启查询返回这对水位；这只保证 **LogService 内部**两者一致。定向执行 `TestWALTruncatePreservesCheckpointedDSN` 与 `TestReplayCheckpointedInteriorHoleAfterPhysicalTruncate` 通过，分别覆盖服务端 snapshot/恢复和 driver 对已截断内部缺口的处理。由于本轮没有验证 checkpoint 元数据文件可见性、`GroupCKP`/`GroupFiles` 中途故障和 GC 的所有交错，目前不能把跨存储崩溃窗口判定为完全安全。
