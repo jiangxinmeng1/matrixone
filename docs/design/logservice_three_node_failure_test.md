@@ -1143,3 +1143,13 @@ LogService 侧的物理截断 PSN 与 `checkpointedDSN` 则由同一条 Raft `WA
 这证明本轮外部 snapshot 的导出/导入、落后副本原盘恢复、两票切主和全组冷重启后可继续服务。按 MO 客户端方式从三个入口建连的 `Read` 可能转发到 leader，因此三份一致读取不单独证明每个副本本地日志逐条相同；各节点本地 snapshot 导入日志是独立的恢复证据。远端脚本和证据位于 `run-snapshot-catchup.sh`、`verify-post-failover.py` 与 `snapshot-follower-catchup/`，包括负载、三次 truncate、节点状态和冷重启读取日志。
 
 **导入成功后清理失败的定向测试。** 在 `pkg/logservice` 使用真实单节点 Dragonboat shard 导出 index 14 的 snapshot，再推进截断使其可导入；仅对导出目录的第一次 `RemoveAll` 注入写错误。第一次截断循环日志确认 `import snapshot success` 后 `remove exported snapshots failed`；恢复文件系统后再次执行截断循环，重新导入并完成目录清理，快照管理器计数回到 0。新增 `TestImportSnapshotRetryAfterCleanupFailure` 连续运行 **10 次通过**。它验证单进程重试路径；不代替杀进程恰在导入成功与清理之间的实机测试。
+
+## LogService snapshot 其他恢复窗口：导入成功后崩溃与多快照边界（2026-11-12）
+
+在 51 上创建另一套**全新空盘**三副本 `/home/mo/jxm/logservice-snapshot-import-window-20261112/`，shard 1，地址 `198.18.51.10:61401`、`:61411`、`:61421`，1 秒截断循环、5 分钟 HAKeeper store 过期阈值。服务端基于 `9ab445e0d8` 对应的 LogService 源码，只在测试二进制中于 `importSnapshot` 的 `SyncRequestImportSnapshot` **成功返回之后、`snapshotMgr.Remove` 之前**加屏障，并将其限定到该隔离目录的 node2。二进制及配套 native 库在 51 上单独保存；本地生产源码已恢复，屏障没有提交。全程使用直接 LogService 客户端，不涉及 TN driver 或 TAE。
+
+**精确导入后崩溃。** 先写 100 条并 `Truncate(50)`，node2 导出 index 107、109、112、114 四份快照；打开屏障后再写 100 条、`Truncate(130)`。node2 日志确认 **index 114 导入成功**，屏障写出 `import-completed-before-cleanup` 标记，随后立即杀 node2，因而它尚未执行本地 `snapshotMgr.Remove` 和 `forwardTruncate`。node0/node1 两票继续完成 **100/100** 轮 Append 后立即 Read，Append/Read 重试均为 **0**，最大整轮 **847.171 ms**，再 `Truncate(180)`。撤销屏障并从 node2 原盘启动后，node2 日志第二次确认**同一 index 114 导入成功**，原 `snapshot-0000000000000072` 导出目录最终消失。三地址均恢复原三成员；从 LSN 181 读取，保留的 **128** 条与每次成功写入的 LSN/payload 完全匹配。三节点整组从各自原盘冷重启后 `GetTruncatedLsn=180`，同一 **128/128** 条再次经三个地址读取匹配。证据在远端 `exact-import-crash/`、`import-ready`、`mo-exact-snapshot-import-crash-20261112.sh`、`verify-exact-import-crash.py` 及 node2 `stdout.log`。这证明该精确**导入成功后**窗口可重复导入并完成清理；尚未命中 Dragonboat 导入请求**执行中**的进程崩溃。
+
+**多份导出快照与截断水位边界。** 上述全组冷重启后，node2 同时持有 index **314、318、320、322** 四份有效导出快照，物理 latest LSN 为 323。再追加 `boundary-tail` **100/100** 条，成功返回的 LSN 为 **325–424**；依次执行 `Truncate(319)`、`Truncate(320)`、`Truncate(322)`。node2 本地日志依次确认导入 **318、320、322**：水位 319 选不超过它的最大候选 318，水位恰等于 320 和 322 时分别选对应快照。旧的 314/318/320/322 导出目录全部清理。三个地址从 LSN 325 读取的 **100/100** 条按 LSN/payload 匹配；再次整组三副本原盘冷重启后 `GetTruncatedLsn=322`，三地址同一 **100/100** 条仍匹配。证据在远端 `snapshot-boundary-sequence/`、`verify-snapshot-boundaries.py` 和 node2 日志。按 MO 客户端方式从各入口建连可能转向 leader，三地址读取结果不单独证明每个副本本地数据逐字节一致；node2 的三次本地导入日志是独立证据。
+
+**多快照部分清理失败后重建管理器。** 新增 `TestSnapshotPartialCleanupReloadsRemainingCandidates`：固定三份导出快照 index 100、200、300，删除 100 成功、删除 200 注入文件系统写错误；重建 snapshot manager 模拟进程重载磁盘目录，确认只恢复 200/300，再继续清理 200、保留 300。定向测试重复 **20 次通过**。该测试覆盖本地管理器的部分进度与重载，不代替三副本文件系统故障。
