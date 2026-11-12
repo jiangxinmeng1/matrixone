@@ -33,14 +33,15 @@ func main() {
 	defer runtime.CompareAndDeleteServiceBasedRuntime("logservice-chaos", runtime.DefaultRuntime())
 	var addresses, operation, prefix, progressFile, stopFile, readReadyFile, readReleaseFile string
 	var count, pauseReadSeq int
-	var first, lsn, shard uint64
+	var first, lsn, shard, checkpointedDSN uint64
 	var tryTimeout, maxRetryWindow time.Duration
 	flag.StringVar(&addresses, "addresses", "127.0.0.1:32001", "comma-separated Logservice RPC addresses")
-	flag.StringVar(&operation, "op", "status", "status, append, load, cycle, read, truncate, truncated, or latest")
+	flag.StringVar(&operation, "op", "status", "status, append, append-wal, load, cycle, read, truncate, wal-truncate, wal-state, truncated, or latest")
 	flag.StringVar(&prefix, "prefix", "probe", "unique append payload prefix")
 	flag.IntVar(&count, "count", 1, "append count")
 	flag.Uint64Var(&first, "first", 1, "first LSN for read")
 	flag.Uint64Var(&lsn, "lsn", 0, "LSN for truncate")
+	flag.Uint64Var(&checkpointedDSN, "checkpointed-dsn", 0, "durable TN DSN for WAL truncate")
 	flag.Uint64Var(&shard, "shard", 1, "shard ID for status")
 	flag.DurationVar(&tryTimeout, "try-timeout", time.Minute, "per-attempt timeout for load, matching MO WAL default")
 	flag.DurationVar(&maxRetryWindow, "retry-window", 3*time.Minute, "retry continuation window for load, matching MO WAL default")
@@ -69,13 +70,25 @@ func main() {
 	}
 	defer client.Close()
 	switch operation {
-	case "append":
+	case "append", "append-wal":
 		for i := 0; i < count; i++ {
 			payload := []byte(fmt.Sprintf("%s/%06d", prefix, i))
 			record := pb.NewUserLogRecord(100, len(payload))
 			record.SetPayload(payload)
 			requestCtx, requestCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			index, appendErr := client.Append(requestCtx, record)
+			var index uint64
+			var appendErr error
+			if operation == "append-wal" {
+				walClient, ok := client.(interface {
+					AppendWAL(context.Context, logservice.LogRecord) (uint64, error)
+				})
+				if !ok {
+					panic("LogService client does not implement AppendWAL")
+				}
+				index, appendErr = walClient.AppendWAL(requestCtx, record)
+			} else {
+				index, appendErr = client.Append(requestCtx, record)
+			}
 			requestCancel()
 			fmt.Printf("append payload=%s lsn=%d err=%v\n", payload, index, appendErr)
 			if appendErr != nil {
@@ -145,6 +158,17 @@ func main() {
 		err = client.Truncate(requestCtx, lsn)
 		requestCancel()
 		fmt.Printf("truncate lsn=%d err=%v\n", lsn, err)
+	case "wal-truncate":
+		requestCtx, requestCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err = client.TruncateWAL(requestCtx, lsn, checkpointedDSN)
+		requestCancel()
+		fmt.Printf("wal-truncate psn=%d checkpointed_dsn=%d err=%v\n", lsn, checkpointedDSN, err)
+	case "wal-state":
+		requestCtx, requestCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		psn, dsn, getErr := client.GetWALTruncate(requestCtx)
+		requestCancel()
+		fmt.Printf("wal-state psn=%d checkpointed_dsn=%d err=%v\n", psn, dsn, getErr)
+		err = getErr
 	case "truncated":
 		requestCtx, requestCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		index, getErr := client.GetTruncatedLsn(requestCtx)

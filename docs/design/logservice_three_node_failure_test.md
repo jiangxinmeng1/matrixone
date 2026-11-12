@@ -1153,3 +1153,15 @@ LogService 侧的物理截断 PSN 与 `checkpointedDSN` 则由同一条 Raft `WA
 **多份导出快照与截断水位边界。** 上述全组冷重启后，node2 同时持有 index **314、318、320、322** 四份有效导出快照，物理 latest LSN 为 323。再追加 `boundary-tail` **100/100** 条，成功返回的 LSN 为 **325–424**；依次执行 `Truncate(319)`、`Truncate(320)`、`Truncate(322)`。node2 本地日志依次确认导入 **318、320、322**：水位 319 选不超过它的最大候选 318，水位恰等于 320 和 322 时分别选对应快照。旧的 314/318/320/322 导出目录全部清理。三个地址从 LSN 325 读取的 **100/100** 条按 LSN/payload 匹配；再次整组三副本原盘冷重启后 `GetTruncatedLsn=322`，三地址同一 **100/100** 条仍匹配。证据在远端 `snapshot-boundary-sequence/`、`verify-snapshot-boundaries.py` 和 node2 日志。按 MO 客户端方式从各入口建连可能转向 leader，三地址读取结果不单独证明每个副本本地数据逐字节一致；node2 的三次本地导入日志是独立证据。
 
 **多快照部分清理失败后重建管理器。** 新增 `TestSnapshotPartialCleanupReloadsRemainingCandidates`：固定三份导出快照 index 100、200、300，删除 100 成功、删除 200 注入文件系统写错误；重建 snapshot manager 模拟进程重载磁盘目录，确认只恢复 200/300，再继续清理 200、保留 300。定向测试重复 **20 次通过**。该测试覆盖本地管理器的部分进度与重载，不代替三副本文件系统故障。
+
+## TN WAL 所用 LogService 接口：原子截断水位与 snapshot 故障恢复（2026-11-12）
+
+代码调用复查：单个 TN `logservicedriver` 对数据 shard 的服务端操作是 `AppendWAL`（客户端不支持时回退 `Append`）、`Read`、`GetWALTruncate`、`TruncateWAL`，兼容路径也会调用 `GetTruncatedLsn`；`UpdateLeaseholderID`、`SetRequiredLsn`、`ReadLsn` 不在该 driver 的实际调用链里。本轮补测此前三副本 snapshot 实验只用普通 `Truncate` 而没有覆盖的 **`TruncateWAL(PSN, checkpointedDSN)` 二元持久水位**。复用 51 上隔离三副本的原盘 `/home/mo/jxm/logservice-snapshot-import-window-20261112/`，服务端仍为上一节的测试二进制，未启用其导入屏障。扩展直接客户端探针的 `wal-truncate`、`wal-state`、`append-wal` 操作；本轮 `checkpointedDSN` 是测试传入的固定值，**没有运行真实 TN driver 或验证 DSN 与业务 checkpoint 的关系**。
+
+1. **普通副本 node1 下线。** node0/node2 两票完成普通 `Append` **200/200**，提交 `TruncateWAL(PSN 564, checkpointedDSN 77)`。node1 原盘恢复，本地日志确认导入 index **434**；三个入口的 `GetWALTruncate` 均返回 `(564,77)`，从 PSN 565 起的 **79/79** 条用户日志与 ACK 的物理 LSN 和 payload 匹配。
+2. **当时 leader node2 下线。** node0/node1 两票完成普通 `Append` **100/100**，推进 `TruncateWAL(716,88)`。node2 原盘恢复，本地日志确认导入 index **653**；三个入口的 `GetWALTruncate` 均为 `(716,88)`，保留 **39/39** 条匹配。整组三节点原盘冷重启后，同一水位和保留集再次经三个入口匹配。
+3. **冷重启后新 leader node0 下线，使用真实 `AppendWAL` 提议接口。** node1/node2 两票完成 **100/100**，推进 `TruncateWAL(834,99)`。node0 原盘恢复，本地日志确认导入 index **766**；三个入口水位均为 `(834,99)`，保留 **39/39** 条匹配。再次整组原盘冷重启后水位及 39 条记录不变。
+
+每个阶段的成功写入集合均从独立 ACK 日志生成，按返回的物理 LSN 和 payload 与 `Read` 比较；三个入口可能重定向到 leader，故它们的结果不单独证明每个副本本地字节一致，本地导入日志提供额外恢复证据。远端证据在 `wal-snapshot-state-20261112/` 的 `append-{a,b,c}.log`、`truncate-{a,b,c}.log`、各阶段 `state`/`read`/`cold` 日志和节点 `stdout.log`。本轮未见水位回退或已确认用户日志丢失。测试进程和网络命名空间已停止，磁盘与证据保留。
+
+仍需针对**真实单 TN driver**补测的交错：后台 `TruncateWAL` 已提交且随后发生落后副本的 snapshot 导入时，旧 driver 继续并发追加、checkpoint、关闭，再由新 driver 读取持久二元水位并回放；此前已分别测过 driver 截断和 LogService snapshot，但尚未把两者放进同一故障窗口。另一个服务端窗口是 Dragonboat `SyncRequestImportSnapshot` **执行中**崩溃，上一节仅精确覆盖成功返回后的崩溃。旧版本持久 WAL 的升级兼容和 datasync 按本轮限定不纳入此清单。
