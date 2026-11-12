@@ -1185,3 +1185,11 @@ LogService 侧的物理截断 PSN 与 `checkpointedDSN` 则由同一条 Raft `WA
 旧实例完全退出后，独立新 driver 恢复 `user_lsn=1370, checkpointed=1350, truncated_dsn=1412`，回放 LSN **1331–1370** 共 40 条，全部与 ACK 的 LSN/payload 匹配，其中 checkpoint 后必须保留的 **20/20** 条齐全。再杀当时 leader node0，让 node1 与刚恢复的 node2 两票继续写 **30/30** 条；新 driver 回放 LSN **1331–1400** 共 70 条，全部匹配。两票从各自原盘冷重启后仍为 `user_lsn=1400, checkpointed=1350, truncated_dsn=1412`、服务端 `(3352,1412)` 和同一 **70/70** 条。与上一节累计 **1400** 个上层 LSN 的独立 ACK 集核对，未见缺失、重复或内容错配。本轮没有发现新缺陷。
 
 证据保存在 51 的 `driver-ackloss-snapshot-20261112/`：`truncate.committed`、`restart.time`、`release.time`、`write.log`、`replay-three.log`、`two-vote-write.log`、`two-vote-replay.log`、`cold-two-vote-replay.log` 与各节点本地日志。测试结束已停所有节点并清理隔离网络；仅保留磁盘与日志。该轮只模拟**服务端已返回成功、客户端处理前丢回包**，不能证明真实 TCP 丢包恰在相同位置的概率；它验证该可达错误结果下的 driver 与 LogService 状态恢复。
+
+## Dragonboat 外部 snapshot 导入复制中断与重试（2026-11-12）
+
+代码检查发现 `SyncRequestImportSnapshot` 会先在目标副本的临时 `.generating` 目录复制导出 snapshot，再请求 Dragonboat 导入；此前实机测试精确杀在**导入成功返回后**，没有覆盖复制中断留下的目标临时文件。本轮新增 `TestImportSnapshotRetryAfterPartialCopy`，使用真实单副本 LogService/Dragonboat shard、内存文件系统的定向故障包装，以及 TN WAL 会使用的 `TruncateWAL(PSN, checkpointedDSN)` 状态更新。先写入、截断并导出有效 snapshot，再继续写入、推进二元水位，使其成为可导入候选；故障只命中 Dragonboat 目标临时目录，不命中源导出目录。
+
+四个子场景为：目标 snapshot 文件**写入 1 字节后报错**、文件**写完但 `Sync` 报错**，各自分别在**同进程重试**和**关闭服务、保留原文件系统重新启动后重试**。首次导入均返回注入的 I/O 错误，snapshot manager 仍保留源候选，目标临时文件确实存在；关闭服务后文件仍保留。故障解除后下一轮导入成功，候选被清理、目标临时文件消失，`GetWALTruncate` 始终保持 `(PSN 15, checkpointedDSN 2)`。定向测试连续 **20 次通过**，race 模式 **1 次通过**；`go list`、`go build`、`go vet` 也通过。未发现新缺陷。
+
+这是**复制阶段 I/O 错误加原文件系统重载**的包级实验，不等同于在 51 上把进程杀在 Dragonboat 导入请求执行中；后者仍是实机故障注入空白。本轮没有运行 datasync，也没有启动真实 TN driver；水位由服务端生产 `truncateWAL` 路径提交。
