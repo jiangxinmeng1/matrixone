@@ -1203,3 +1203,17 @@ LogService 侧的物理截断 PSN 与 `checkpointedDSN` 则由同一条 Raft `WA
 旧 driver 最终确认 **1000/1000** 条 WAL 和 **50/50** 次 checkpoint，最高用户 LSN **2400**；单条 ACK 最大 **2323.434 ms**，没有超过 60 秒的写入。它完全退出后，独立新 driver 读回 `user_lsn=2400, checkpointed=2380, truncated_dsn=2542`，服务端 `GetWALTruncate=(5351,2542)`；回放 LSN **2361–2400** 共 40 条全部与独立 ACK 的 LSN/payload 匹配，checkpoint 后必须保留的 **20/20** 条齐全。再杀当时 leader node1，仅让 node0 与经历复制中崩溃的 node2 两票继续写 **30/30** 条；新 driver 回放 LSN **2361–2430** 共 70 条匹配。两票原盘冷重启后同一 70 条及水位不变；恢复 node1 后三个入口均报告原三成员，独立回放也与两票冷重启的 70 条逐条相同。与此前同一隔离盘上的 ACK 累计核对 **2430** 个连续上层 LSN，未发现缺失、重复或内容错配。
 
 远端证据在 `driver-midcopy-crash-20261112/` 的 `crash.marker`、`partial-file.stat`、`write.log`、`replay-three.log`、`two-vote-write.log`、`two-vote-replay.log`、`cold-two-vote-replay.log`、`three-restored-replay.log`、状态日志和 node2 的 `stdout-crash.log`/`stdout.log`。本轮没有发现新缺陷。该实验精确覆盖**复制首字节后的进程崩溃**；不代表复制完成后但 Dragonboat 完成导入前的所有内部阶段，也不验证真实 TAE checkpoint 文件。三个测试节点和隔离网络均已停止，磁盘证据保留。
+
+## Dragonboat 外部 snapshot 复制完成、导入请求前崩溃：单 TN driver 与三副本恢复（2026-11-12）
+
+继续复用 51 上 `/home/mo/jxm/logservice-wal-snapshot-driver-20261112/` 的隔离三副本原盘和真实单 TN WAL driver，不运行 datasync。为了命中此前未测的切点，仅给 node2 构建临时 Dragonboat 故障二进制：`tools.CopySnapshot` **成功返回后、调用 `n.requestImportSnapshot(ss)` 之前**，记录目标 `.generating` 目录并 `os.Exit(137)`。node0/node1 始终运行正常服务端；node2 故障后从同一原盘换回正常二进制。临时模块替换和钩子未写入仓库生产源码或 `go.mod`，故障二进制 SHA256 为 `fee75a1aec0207e57bd86541d332da276f0b27b83df5b57affcfbbe878d793f3`。
+
+起始服务端 `GetWALTruncate=(PSN 5351, checkpointedDSN 2542)`。停 node2，让 node0/node1 两票承担写入；顺序启动三个**不重叠**的单 driver 实例。前两次分别确认 **800/800**、**500/500** 条 WAL，并完成 **40、25** 次测试 checkpoint；第三个持续写入实例运行期间，node2 用故障二进制从原盘启动。钩子命中 snapshot index **8306**（文件名 `2072` 为十六进制）、副本 ID **385026**；目标 `.generating` 中的 `.gbsnap` 为 **1094 字节**，与源导出文件的 SHA256 完全相同。故障进程退出，日志没有 `import snapshot success`；正常二进制从该原盘重启后，node2 日志确认成功导入同一 index **8306**，残留目标临时目录消失。三客户端入口随后报告同一三成员视图。
+
+本轮 node2 停止时间超过测试环境的 **5 分钟** store 过期阈值，HAKeeper 已把原 ID **262145** 替换为 **385026**；因此上述导入发生在**新成员 ID** 上，不能解读成旧 ID 原样回归。后续原盘整组冷重启、切主和恢复后，三入口的成员表均为 `{262146, 262147, 385026}`，旧 ID 未重新加入。
+
+第三个 driver 共确认 **501/501** 条 WAL，最高用户 LSN **4231**；终止它时另有一条未收到 ACK 的 `driver-postcopy-live/000501` 已提交为 LSN **4232**。独立新 driver 回放到 4232，确认前述 **4231** 个连续 ACK LSN 的内容全部匹配，并把 4232 单独列为“已提交、回包未确认”的记录。接续 driver 再确认 **30/30** 条，LSN **4233–4262**。三个节点随后从各自原盘整组冷重启：`GetWALTruncate=(PSN 8773, checkpointedDSN 4574)`，独立回放 `user_lsn=4262, checkpointed=4210`；checkpoint 后 LSN **4211–4262** 共 **52** 条逐一匹配，其中 **51** 条有 ACK，4232 为上述未确认提交。
+
+冷重启后 leader 为 node2 的 **385026**。杀 node2，仅保留 node0/node1 两票，继续确认 **30/30** 条 WAL，LSN **4263–4292**；独立回放到 4292。node2 原盘恢复后三入口成员一致，独立回放 checkpoint 后 **82/82** 条（4211–4292）内容和顺序均正确。五段本轮写入合计 **1861** 条 ACK；与该隔离盘此前 **2430** 条 ACK 合并，已确认用户 LSN **1–4231、4233–4292** 连续且无内容错配，唯一间隔 4232 是确实提交但无 ACK 的在途请求。本轮未发现新缺陷。五段 ACK 最大耗时依次约 **1.49、1.80、1.17、0.21、0.95 秒**；没有发生一分钟级写入长尾。
+
+证据保存在 51 的 `driver-postcopy-crash-20261112/`：`postcopy.marker`、`postcopy-files.txt`、`postcopy-sha256.txt`、`write.log`、`round2.log`、`live.log`、`continued-write.log`、`cold-replay.log`、`cold-status.log`、`two-vote-write.log`、`two-vote-replay.log`、`three-restored-replay.log`、`three-restored-status.log` 和 node2 的 `stdout-postcopy-crash.log`/`stdout.log`。实验结束已停三个节点并拆除隔离网络，原盘及日志保留。该切点位于**复制完成与导入请求之间**；Dragonboat 请求已入队但尚未完成、以及真实 TAE checkpoint 文件的故障交错仍需另测。
