@@ -1273,3 +1273,15 @@ LogService 侧的物理截断 PSN 与 `checkpointedDSN` 则由同一条 Raft `WA
 三节点随后从各自原盘整组冷重启，水位、三入口成员表和同一 **40/40** 条回放不变。再确认 **60/60** 条续写、**3** 次 checkpoint，LSN **9873–9932**；服务端水位推进到 `(PSN 23022, DSN 10834)`，独立回放 `user_lsn=9932, checkpointed=9912`。物理截断后实际保留的尾部为 LSN **9913–9932** 共 **20/20** 条，与 ACK 逐条匹配；导出目录数回到配置上限 **4**，没有观察到越界。本轮 **260** 条 ACK 连续，无重复或内容错配，也没有一分钟级写入长尾。
 
 证据在 51 的 `driver-quota-timeout-20261112/`：`partition.time`、`reconnect.time`、`partition-write.log`、`recovered-replay.log`、`recovered-wal-state.log`、`recovered-status.log`、`cold-replay.log`、`cold-wal-state.log`、`cold-continue-write.log`、`cold-continue-replay.log`、`cold-continue-wal-state.log`，以及 node2 的 `stdout.log` 中带时间戳的 timeout、DropNewest 和导入日志。实验后节点与隔离网络均已停止。本轮验证了真实网络隔离造成的一次超时及候选保留和恢复；没有覆盖持续可获得 leader 视图、连续多次 `SyncRead` 超时时的循环行为，也没有覆盖 `max-exported-snapshot=1` 的保留单候选分支。
+
+## 连续截断水位读取超时、配额降至 1：保留单候选与同进程恢复（2026-11-12）
+
+承接上一节，在 51 的同一隔离三副本原盘上测试持续可见 leader 时的超时分支。起始用户 LSN **9932**、node2（副本 **405505**）有 **4** 份导出 snapshot，index 为 **23041、23043、23046、23049**。仅给 node2 使用 Go overlay 临时二进制，在 `store.getTruncatedLsn` 读取 shard 1 的水位前检查测试标记文件；标记存在时返回 `dragonboat.ErrTimeout`，删除标记后同一进程恢复生产读取。临时二进制 SHA256 为 `04c9f4c2ce4f2e50b79f1765c49b9fa6a2dad15c23ea2571a471931649fcbc13`。同时将**该测试节点**的 `max-exported-snapshot` 从 **4** 暂改为 **1**，原配置另存并在测试后原样恢复；node0/node1 配置与正常服务端未变。未改仓库源码或 `go.mod`，未运行 datasync。
+
+node2 重启后，三票持续互通，leader 视图可用。开启受控超时的前几轮截断 tick 依次记录 `droppedIndex=23049, before=4, after=3`、`23046, 3→2`、`23043, 2→1`。磁盘最终只保留最老的 index **23041**；在标记文件仍存在期间，node2 累计记录 **105** 次 `get truncated lsn timed out`，DropNewest 始终只有 **3** 次，没有把最后一份候选删掉。测试时由唯一真实 TN WAL driver 完成 **200/200** 条写入，LSN **9933–10132**、**10** 次测试 checkpoint，最大单条 ACK **1956.609 ms**，没有一分钟级长尾。这里的 timeout 是**受控返回值注入**，并非真实网络超时；上一节才是真实网络故障对照。
+
+删除超时标记后**不重启 node2**，其 PID 始终为 **1565366**。最后一次 timeout 日志早于删除时刻；约 2 秒后，node2 记录成功导入保留的 snapshot index **23041**，随后又出现一份新导出候选，目录数仍为 **1**。独立 driver 回放 `user_lsn=10132, checkpointed=10112, truncated_dsn=11032`，服务端 `GetWALTruncate=(PSN 23697, checkpointedDSN 11032)`，尾部 LSN **10093–10132** 共 **40/40** 条与 ACK 匹配。继续在**同一个 node2 进程**确认 **60/60** 条写入、**3** 次 checkpoint，LSN **10133–10192**；水位推进到 `(PSN 24227, DSN 11098)`，独立回放尾部 **40/40** 条匹配。
+
+然后停止三个节点，还原 node2 的原配置 `max-exported-snapshot=4`，全部换正常二进制从各自原盘冷重启。三入口仍报告成员 `{262146,262147,405505}`，水位保持 `(PSN 24227, DSN 11098)`，同一尾部 **40/40** 条回放不变。再确认 **60/60** 条写入和 **3** 次 checkpoint，LSN **10193–10252**；水位推进到 `(PSN 25085, DSN 11164)`，独立回放 LSN **10213–10252** 共 **40/40** 条匹配。全轮 **320** 条 ACK 的 LSN **9933–10252** 连续，无重复或内容错配；最终导出目录数为 **3**，低于还原后的配额 **4**。未发现新缺陷。
+
+证据在 51 的 `driver-quota-single-20261112/`：`node2-hook.log`、`log-2.toml.original`、`release.time`、`node2.pid.before-release`、`timeout-write.log`、`released-replay.log`、`released-write.log`、`released-continue-replay.log`、`cold-replay.log`、`cold-write.log`、`cold-continue-replay.log`、水位及三入口状态日志。实验后节点和隔离网络均已停止，node2 配置已恢复。这验证了**已存在 4 份候选时把配额降到 1**的清理与单候选保留路径；不等同于从空盘起步一直使用配额 1 的部署，也不证明真实网络会连续 105 次保持 leader 视图并恰好只让 `SyncRead` 超时。
