@@ -1175,3 +1175,13 @@ LogService 侧的物理截断 PSN 与 `checkpointedDSN` 则由同一条 Raft `WA
 **第二轮：snapshot 导入时 checkpoint 与物理截断持续推进。** 先恢复 node1，再停 node2；另一个单 driver 每 20 条提交一次 checkpoint，完成 **300/300** 条和 **15** 次 checkpoint。node2 于第 **155** 条 ACK 后原盘启动，在 11:18:41 与 11:18:53 分别导入 index **1483、2151** 的 snapshot；旧 driver 同时持续写入，11:18:43、11:18:51、11:18:56 等时间点的 `TruncateWAL` 均成功，故这次确实命中了导入、写入和物理截断交错。新 driver 回放为 `user_lsn=970, checkpointed=950, truncated_dsn=972`；交付 LSN **931–970** 共 40 条全部匹配 ACK，其中 checkpoint 后必须保留的 **20/20** 条齐全。服务端返回 `(truncatedPSN=2246, checkpointedDSN=972)`。整组三节点原盘冷重启后，上述回放集合及二元水位不变。
 
 两轮累计确认 **970** 个连续上层用户 LSN；核对以每次 ACK 的 LSN/payload 为独立基准，拒绝重复回放，并要求所有 checkpoint 后的 ACK 都出现。节点本地 snapshot 导入日志和 driver 的 `Wal-Truncate-Execute` 日志提供交错时序证据；各轮日志与进度文件保存在远端 `driver-snapshot-overlap/`。未发现已确认 WAL 丢失、重复、payload 错配或截断水位回退。测试节点和隔离网络均已停止，证据磁盘保留。仍未覆盖 `SyncRequestImportSnapshot` **执行中**崩溃、真实 TAE checkpoint 文件与对象存储的跨系统交错；本节只证明 LogService 与单个 TN WAL driver 的恢复路径。
+
+## 单 TN WAL driver：截断已提交但回包丢失，期间副本导入 snapshot（2026-11-12）
+
+复用上一节的全空盘起步三副本与相同服务端二进制，先从原盘冷启动，确认起始服务端 `GetWALTruncate=(PSN 2246, checkpointedDSN 972)`。停 node2，让 node0/node1 两票运行真实单 TN WAL driver；探针只包装 `TruncateWAL` 的第一次**成功返回**，写出 `psn=2293 checkpointed_dsn=1016 committed=true` 标记并扣住回包，随后把这次成功转换为一次测试注入的 `context.DeadlineExceeded`。其他 `AppendWAL`、checkpoint、driver 内部重试和新实例回放均执行生产代码；没有启动真实 TN 或 datasync。
+
+旧 driver 在回包屏障期间继续写入和确认 checkpoint，node2 于主负载第 **182** 条 ACK 后从原盘恢复。node2 本地于 **11:23:12** 导入 index **2291** 的 snapshot，而屏障直到 **11:23:34** 才放行；因此确实覆盖了“截断已提交、旧 driver 尚未获回包、落后副本导入 snapshot”的时间窗。放行模拟错误后，driver 的 `GetWALTruncate` 于 11:23:35 读回已提交的 `(2293,1016)`，该次后台截断记录 **1 次重试后成功**；后续物理截断继续到 `(PSN 3352, checkpointedDSN 1412)`，node2 又导入 index **3224、3352**。主负载 **400/400** 条 ACK、**20/20** 次 checkpoint ACK，无上层写入失败；单条 ACK 最大 **1001.532 ms**。首次截断日志记录的约 54 秒包含人为屏障等待，不是未注入条件下的服务端延迟。
+
+旧实例完全退出后，独立新 driver 恢复 `user_lsn=1370, checkpointed=1350, truncated_dsn=1412`，回放 LSN **1331–1370** 共 40 条，全部与 ACK 的 LSN/payload 匹配，其中 checkpoint 后必须保留的 **20/20** 条齐全。再杀当时 leader node0，让 node1 与刚恢复的 node2 两票继续写 **30/30** 条；新 driver 回放 LSN **1331–1400** 共 70 条，全部匹配。两票从各自原盘冷重启后仍为 `user_lsn=1400, checkpointed=1350, truncated_dsn=1412`、服务端 `(3352,1412)` 和同一 **70/70** 条。与上一节累计 **1400** 个上层 LSN 的独立 ACK 集核对，未见缺失、重复或内容错配。本轮没有发现新缺陷。
+
+证据保存在 51 的 `driver-ackloss-snapshot-20261112/`：`truncate.committed`、`restart.time`、`release.time`、`write.log`、`replay-three.log`、`two-vote-write.log`、`two-vote-replay.log`、`cold-two-vote-replay.log` 与各节点本地日志。测试结束已停所有节点并清理隔离网络；仅保留磁盘与日志。该轮只模拟**服务端已返回成功、客户端处理前丢回包**，不能证明真实 TCP 丢包恰在相同位置的概率；它验证该可达错误结果下的 driver 与 LogService 状态恢复。
