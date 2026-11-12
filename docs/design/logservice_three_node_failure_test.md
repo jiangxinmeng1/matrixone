@@ -1241,3 +1241,23 @@ LogService 侧的物理截断 PSN 与 `checkpointedDSN` 则由同一条 Raft `WA
 三个节点从各自原盘**整组冷重启**后，三客户端入口均报告成员 `{262146,262147,405505}`，水位仍为 `(PSN 17628, checkpointedDSN 9484)`，独立回放尾部 **40/40** 条不变。再确认 **30/30** 条续写，LSN **8723–8752**；新 driver 回放 LSN **8683–8752** 共 **70/70** 条顺序和内容匹配。本轮累计 **1630** 条 ACK 的 LSN **7123–8752** 连续、无重复或内容错配；两段主负载最大单条 ACK 分别约 **1.46、1.13 秒**，未见一分钟级写入长尾或新数据一致性缺陷。
 
 远端证据在 `/home/mo/jxm/logservice-wal-snapshot-driver-20261112/driver-commit-stages-20261112/`：`finalize.marker`、`save.marker`、`finalize-files-before-restart.txt`、`save-files-before-restart.txt`、两轮 `*-write.log`、`finalize-replay.log`、`pre-cold-replay.log`、`cold-replay.log`、`cold-continue-replay.log`、水位及三入口状态日志。实验结束已停三个节点并拆除隔离网络，磁盘证据保留。尚未覆盖单个文件写入或 LogDB `SaveSnapshots` **调用中途**的 I/O 失败，以及真实 TAE checkpoint 文件。
+
+## 导出 snapshot 正式目录完成但标记未清理：单 TN driver 与原盘恢复（2026-11-12）
+
+复用 51 上同一隔离三副本原盘，从用户 LSN **8752**、服务端 `GetWALTruncate=(PSN 17628, checkpointedDSN 9484)` 起步。正常服务端维持 node0/node1；node2 使用临时 Dragonboat 二进制，仅当 `snapshotter.Commit` 处理 **Exported** 请求且 `FinalizeSnapshot` 成功返回后，在 `RemoveFlagFile` 前记录标记并 `os.Exit(137)`。临时构建 SHA256 为 `f81ecdb198ebed524c19d0e20c4ff74098593386b3c29b8beb3b194354033cde`。仓库生产源码和 `go.mod` 未改，不运行 datasync。
+
+单个真实 TN WAL driver 持续写入、每 20 条提交一次测试 checkpoint。标记命中 `replica=405505 index=18724 after-export-finalize`，node2 退出；其导出正式目录当时包含 `.gbsnap`、`snapshot.metadata` 和 `dragonboat.snapshot.message`。导出还没有成功返回到 LogService 的 `exportSnapshot`，因此也没有执行 `snapshotManager.Add`。node0/node1 两票继续写入。换正常二进制从 node2 原盘重启后，带标记的 index **18724** 目录消失，随后 node2 记录更高 index 的新导出与导入；继续观察的导出目录数为 **3–4**，没有超过配置上限 **4**。这与启动时 `ReconcileInterruptedExport` 清理带标记残留的代码路径一致；实机直接核对了目录消失和后续进度，没有对清理函数内部单独插桩。
+
+主负载确认 **400/400** 条 WAL，LSN **8753–9152**、**20** 次 checkpoint；独立 driver 回放 `user_lsn=9152, checkpointed=9132, truncated_dsn=9954`，服务端水位 `(PSN 19104, DSN 9954)`，尾部 **40/40** 条与 ACK 匹配。三节点整组原盘冷重启后，水位和三入口成员表 `{262146,262147,405505}` 不变，同一 **40/40** 条再次匹配。再确认 **60/60** 条续写和 **3** 次 checkpoint，LSN **9153–9212**；水位推进到 `(PSN 19787, DSN 10020)`，回放 `user_lsn=9212, checkpointed=9192`，尾部 **40/40** 条匹配。本轮 **460** 条 ACK 连续，主负载最大单条 ACK 约 **1.59 秒**，未发现新数据一致性缺陷或一分钟级写入长尾。
+
+证据保存在 51 的 `driver-export-finalize-20261112/`：`export-finalize.marker`、`export-files-before-restart.txt`、`export-dir-count-before-restart.txt`、`export-node2.log`、`write.log`、`pre-cold-replay.log`、`cold-replay.log`、`cold-continue-write.log`、`cold-continue-replay.log`、水位及三入口状态日志。实验后节点和隔离网络已停止。
+
+## 导出成功返回至 snapshotManager.Add 之间崩溃：未登记快照的重启恢复（2026-11-12）
+
+继续复用同一隔离三副本原盘，从用户 LSN **9212**、服务端 `GetWALTruncate=(PSN 19787, checkpointedDSN 10020)` 起步。只在 node2 的临时 LogService 构建中，于 `SyncRequestSnapshot(Exported=true)` **成功返回后、`snapshotManager.Add` 前**记录返回的 index 并 `os.Exit(137)`；构建使用 Go overlay，未改仓库源码或 `go.mod`，SHA256 为 `785af46f4801a87c9f25da1d87a55a18f3e8823b60cae8800d273a4584a6a863`。node0/node1 两票仍运行正常服务端，负载仍是单个真实 TN WAL driver，不运行 datasync。
+
+标记命中 `replica=405505 index=20370 after-export-success`，node2 退出；当时导出正式目录只有 `.gbsnap` 和 `snapshot.metadata` 两个文件，没有完成标记，LogService 尚未调用 `snapshotManager.Add`。正常二进制从 node2 同一原盘重启后，该目录先保持存在，随后服务端记录**同一 index 20370** 的导入成功，目录消失。由代码与目录、日志顺序可判定启动时的 `snapshotManager.Init` 找回了完整导出候选；未对 `Init` 本身插桩。后续导出目录数为 **4**，没有超过配置上限。
+
+主负载确认 **400/400** 条 WAL，LSN **9213–9612**、**20** 次 checkpoint；独立 driver 回放 `user_lsn=9612, checkpointed=9592, truncated_dsn=10460`，服务端水位 `(PSN 20745, DSN 10460)`，尾部 **40/40** 条与 ACK 匹配。三节点整组原盘冷重启后，水位、三入口成员和同一 **40/40** 条均不变。再确认 **60/60** 条续写和 **3** 次 checkpoint，LSN **9613–9672**；水位推进到 `(PSN 21525, DSN 10526)`，回放 `user_lsn=9672, checkpointed=9652`，尾部 **40/40** 条匹配。本轮 **460** 条 ACK 连续，主负载最大单条 ACK 约 **1.50 秒**；未发现新数据一致性缺陷或一分钟级写入长尾。
+
+证据保存在 51 的 `driver-export-preadd-20261112/`：`export-preadd.marker`、`export-files-before-restart.txt`、`export-dir-count-before-restart.txt`、`export-node2.log`、`write.log`、`pre-cold-replay.log`、`cold-replay.log`、`cold-continue-write.log`、`cold-continue-replay.log`、水位及三入口状态日志。实验后节点和隔离网络已停止。这两轮均在 node2 执行，没有锁定它在导出瞬间的 leader 角色；刻意让当前 leader 命中同一窗口、或底层文件写入中途失败的组合仍需单测。
