@@ -1121,4 +1121,25 @@ Wal-Replay-DSN-Overlap: wal record dsn range [183, 184] at psn 2762 overlaps pen
 
 增量 checkpoint 的顺序是：写入数据及 checkpoint metadata，`saveCheckpoint` 的 `WriteEnd` 成功后将 meta 文件登记；然后 `RangeCheckpoint` 分别追加 `GroupCKP` 和 `GroupFiles`，等待 checkpoint intent 完成；后台再根据 LSN→DSN 映射请求 driver `Truncate`。这些动作与对象存储上的 checkpoint 文件**没有跨存储原子事务**。崩溃在文件发布后、WAL checkpoint intent 之前时，重启会列出该 meta 文件，而未推进的物理截断仍保留旧 WAL；从代码顺序看，这是可以回放的方向，但尚未在该精确切点做真实 TAE 进程崩溃实验。`RangeCheckpoint` 将 `GroupCKP` 与 `GroupFiles` 分成两次 Append，也留下需要单独故障注入的中间状态。
 
-LogService 侧的物理截断 PSN 与 `checkpointedDSN` 则由同一条 Raft `WALTruncate` 命令提交并应用，重启查询返回这对水位；这只保证 **LogService 内部**两者一致。定向执行 `TestWALTruncatePreservesCheckpointedDSN` 与 `TestReplayCheckpointedInteriorHoleAfterPhysicalTruncate` 通过，分别覆盖服务端 snapshot/恢复和 driver 对已截断内部缺口的处理。由于本轮没有验证 checkpoint 元数据文件可见性、`GroupCKP`/`GroupFiles` 中途故障和 GC 的所有交错，目前不能把跨存储崩溃窗口判定为完全安全。
+LogService 侧的物理截断 PSN 与 `checkpointedDSN` 则由同一条 Raft `WALTruncate` 命令提交并应用，重启查询返回这对水位；这只保证 **LogService 内部**两者一致。定向执行 `TestWALTruncatePreservesCheckpointedDSN` 与 `TestReplayCheckpointedInteriorHoleAfterPhysicalTruncate` 通过，分别覆盖服务端 snapshot/恢复和 driver 对已截断内部缺口的处理。下节验证两处崩溃切点；对象存储跨节点可见性和 GC 的所有交错仍未覆盖，不能把跨存储窗口判定为完全安全。
+
+### 精确崩溃切点的真实 TAE 恢复（2026-11-12）
+
+复用 51 上三副本原盘 `/home/mo/jxm/logservice-tae-concurrent-20261111/` 和先前真实 TAE 测试的本地目录；每次只有一个 TAE 进程存活。仅为测试二进制临时设置屏障，实验后已从本地生产源码移除，未提交到分支。两次均在测试进程确认追加 10 行后，由屏障确认指定阶段成功，再 `SIGKILL` 进程；LogService 节点保留原盘，之后由独立进程加载同一 TAE 本地目录，扫描每列并核对行数，继续提交 10 行再重开核对。该测试没有逐行比对所有列值。LogService 三副本保持存活，不把 TN driver 已知尾部复用故障混入此实验。
+
+1. **checkpoint metadata 已 `WriteEnd`、`GroupCKP` 尚未发送。** 原有 920 行，追加到 **930 行**、WAL LSN **93**；临时屏障在 `saveCheckpoint` 返回后命中，进程日志无新 `TRACE-WAL-TRUNCATE-Send-Intent`。杀进程后，`ckp/` 中出现新 meta 文件。独立重开读取 **2 份** checkpoint 元数据，得到 `ckpLSN=93`，LogService 仍返回旧的 `(truncatedPSN=275, checkpointedDSN=72)`；扫描 **930/930** 行，继续写入并再次重开为 **940/940** 行、WAL LSN **95**。
+2. **`GroupCKP` 已提交、`GroupFiles` 尚未发送。** 从 940 行追加到 **950 行**、WAL LSN **96**。临时屏障等待 `GroupCKP` 条目的 `WaitDone` 成功才写出 `checkpoint-intent-committed` 标记，随后阻止 `GroupFiles` 发送；确认标记后杀进程。独立重开读取 **3 份** checkpoint 元数据，得到 `ckpLSN=96`，LogService 仍返回 `(275,72)`；扫描 **950/950** 行，继续写入并再次重开为 **960/960** 行、WAL LSN **98**。
+
+两处切点都显示“对象存储 checkpoint 水位领先于 LogService 物理截断水位”时仍能读取并继续写入。它们没有覆盖文件尚未全局可见、GC 同时运行或物理 truncate 已提交但回包丢失等其他交错。第二轮后仍观察到旧的 LogService 截断水位；是否会在没有后续 checkpoint 的情况下长期保留可删除日志，需要另测。远端证据为 `meta-crash.log`、`meta-crash.marker`、`meta-crash-reopen.log`、`intent-crash.log`、`intent-crash.marker`、`intent-crash-reopen.log` 和对应的 `ckp/` 文件。
+
+**后续 checkpoint 推进对照。** 同一份 TAE 数据重开后有 960 行，LogService 起始 `(truncatedPSN, checkpointedDSN)=(275,72)`；新增 10 行并正常提交下一份真实 TAE checkpoint，水位到 `ckpLSN=99`、WAL LSN 100。后台物理截断在 30 秒观察窗口内推进到 **`(2526,102)`**；同进程重开后按列扫描仍为 **970/970** 行。说明此前两处崩溃窗口留下的旧物理水位可由下一次 checkpoint 推进；没有下一次 checkpoint 时是否长期滞留，仍未验证。远端证据为 `truncate-after-crash.log`；环境门控的复现夹具为 `test/logservice-chaos/tn_driver_probe/tae_checkpoint_probe/tae_checkpoint_truncate_recovery_test.go`。
+
+## LogService 自身 snapshot：落后副本、截断、切主和原盘冷重启（2026-11-12）
+
+在 51 上创建**全新空盘**三副本 `/home/mo/jxm/logservice-snapshot-recovery-20261112/`，使用 `9381db5dde` 服务端、shard 1、地址 `198.18.51.10:61201`、`:61211`、`:61221`、1 秒截断循环和 5 分钟 HAKeeper store 过期阈值。全程使用直接 LogService 客户端的 `Append`、`Read`、`Truncate`，没有 TN driver 或 TAE。先确认 100 条种子日志，然后停 node2；node0/node1 两票持续做 Append 后立即 Read，先后 `Truncate(169)`、`Truncate(323)`。第一次截断后两个存活副本日志均记录成功导出 snapshot；写读负载期间从原盘启动 node2。连续负载完成 **352/352** 轮，Append 和 Read 重试均为 **0**，最大整轮 **852.894 ms**；node2 本地日志记录 `import snapshot success`，index **242**。截断水位 323 后的 **138** 条按 LSN/payload 与负载记录核对，分别经三个服务地址建连读取，均完全一致。
+
+随后再次停 node2 并从原盘启动，确认三成员；再杀原 leader node0，仅 node1+node2 两票继续完成 **100/100** 轮写读，两个操作的重试均为 **0**，最大整轮 **591.869 ms**。两票期间 `Truncate(500)` 成功；node0 从原盘恢复后，三地址均发现新 leader node1 与原三成员，node0 本地日志记录成功导入 index **381** 的 snapshot，node2 记录成功导入 index **471**。从 LSN 501 读取的 **70** 条与负载预期逐条一致。再将**三个 LogService 进程全部停止并从各自原盘冷重启**，`GetTruncatedLsn=500`，三地址成员和 leader 一致；同一保留集 **70/70** 条再次逐条匹配。
+
+这证明本轮外部 snapshot 的导出/导入、落后副本原盘恢复、两票切主和全组冷重启后可继续服务。按 MO 客户端方式从三个入口建连的 `Read` 可能转发到 leader，因此三份一致读取不单独证明每个副本本地日志逐条相同；各节点本地 snapshot 导入日志是独立的恢复证据。远端脚本和证据位于 `run-snapshot-catchup.sh`、`verify-post-failover.py` 与 `snapshot-follower-catchup/`，包括负载、三次 truncate、节点状态和冷重启读取日志。
+
+**导入成功后清理失败的定向测试。** 在 `pkg/logservice` 使用真实单节点 Dragonboat shard 导出 index 14 的 snapshot，再推进截断使其可导入；仅对导出目录的第一次 `RemoveAll` 注入写错误。第一次截断循环日志确认 `import snapshot success` 后 `remove exported snapshots failed`；恢复文件系统后再次执行截断循环，重新导入并完成目录清理，快照管理器计数回到 0。新增 `TestImportSnapshotRetryAfterCleanupFailure` 连续运行 **10 次通过**。它验证单进程重试路径；不代替杀进程恰在导入成功与清理之间的实机测试。
