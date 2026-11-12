@@ -1261,3 +1261,15 @@ LogService 侧的物理截断 PSN 与 `checkpointedDSN` 则由同一条 Raft `WA
 主负载确认 **400/400** 条 WAL，LSN **9213–9612**、**20** 次 checkpoint；独立 driver 回放 `user_lsn=9612, checkpointed=9592, truncated_dsn=10460`，服务端水位 `(PSN 20745, DSN 10460)`，尾部 **40/40** 条与 ACK 匹配。三节点整组原盘冷重启后，水位、三入口成员和同一 **40/40** 条均不变。再确认 **60/60** 条续写和 **3** 次 checkpoint，LSN **9613–9672**；水位推进到 `(PSN 21525, DSN 10526)`，回放 `user_lsn=9672, checkpointed=9652`，尾部 **40/40** 条匹配。本轮 **460** 条 ACK 连续，主负载最大单条 ACK 约 **1.50 秒**；未发现新数据一致性缺陷或一分钟级写入长尾。
 
 证据保存在 51 的 `driver-export-preadd-20261112/`：`export-preadd.marker`、`export-files-before-restart.txt`、`export-dir-count-before-restart.txt`、`export-node2.log`、`write.log`、`pre-cold-replay.log`、`cold-replay.log`、`cold-continue-write.log`、`cold-continue-replay.log`、水位及三入口状态日志。实验后节点和隔离网络已停止。这两轮均在 node2 执行，没有锁定它在导出瞬间的 leader 角色；刻意让当前 leader 命中同一窗口、或底层文件写入中途失败的组合仍需单测。
+
+## 导出快照配额已满时隔离 node2：真实 SyncRead 超时与 DropNewest（2026-11-12）
+
+复用 51 上同一隔离三副本原盘、原服务端和真实**单 TN WAL driver**；不运行 datasync，也未用故障二进制。起始用户 LSN **9672**、服务端 `GetWALTruncate=(PSN 21525, checkpointedDSN 10526)`，node2（副本 **405505**）的导出 snapshot 目录有 **4** 份，恰好达到 `max-exported-snapshot=4`。三节点正常启动并确认三成员后，用隔离网络的 `netns.sh down 2` 切断 node2 对另两节点的通信，仍保持 node0/node1 两票连通。
+
+隔离开始于 **16:37:00**。node2 日志在 **16:37:03** 记录一次 `get truncated lsn timed out, tick skipped`，紧接着记录 `dropped newest exported snapshot to unblock truncation`，字段为 `droppedIndex=21561, before=4, after=3`；磁盘目录数也从 **4** 降到 **3**。随后 node2 丢失 leader 视图，截断循环反复记录 `no leader yet, skip truncate`，所以本轮只观察到**一次**真实超时触发的 DropNewest；不能把后续跳过 tick 计作重复超时。此时较老的 index **21559** 导出候选没有被丢弃。
+
+隔离期间 node0/node1 两票完成 **200/200** 条 WAL，LSN **9673–9872**，以及 **10** 次测试 checkpoint；最大单条 ACK **904.867 ms**。约 **105 秒**后恢复 node2 网络，此时旧 driver 已结束，没有新写入推动恢复。node2 于 **16:38:48** 导入保留下来的 snapshot index **21559**；三个客户端入口仍报告成员 `{262146,262147,405505}`。独立新 driver 回放 `user_lsn=9872, checkpointed=9852, truncated_dsn=10746`，服务端水位 `(PSN 22137, DSN 10746)`，checkpoint 后 LSN **9833–9872** 共 **40/40** 条与 ACK 匹配；node2 的导出目录数观察为 **2**。
+
+三节点随后从各自原盘整组冷重启，水位、三入口成员表和同一 **40/40** 条回放不变。再确认 **60/60** 条续写、**3** 次 checkpoint，LSN **9873–9932**；服务端水位推进到 `(PSN 23022, DSN 10834)`，独立回放 `user_lsn=9932, checkpointed=9912`。物理截断后实际保留的尾部为 LSN **9913–9932** 共 **20/20** 条，与 ACK 逐条匹配；导出目录数回到配置上限 **4**，没有观察到越界。本轮 **260** 条 ACK 连续，无重复或内容错配，也没有一分钟级写入长尾。
+
+证据在 51 的 `driver-quota-timeout-20261112/`：`partition.time`、`reconnect.time`、`partition-write.log`、`recovered-replay.log`、`recovered-wal-state.log`、`recovered-status.log`、`cold-replay.log`、`cold-wal-state.log`、`cold-continue-write.log`、`cold-continue-replay.log`、`cold-continue-wal-state.log`，以及 node2 的 `stdout.log` 中带时间戳的 timeout、DropNewest 和导入日志。实验后节点与隔离网络均已停止。本轮验证了真实网络隔离造成的一次超时及候选保留和恢复；没有覆盖持续可获得 leader 视图、连续多次 `SyncRead` 超时时的循环行为，也没有覆盖 `max-exported-snapshot=1` 的保留单候选分支。
