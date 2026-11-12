@@ -1285,3 +1285,13 @@ node2 重启后，三票持续互通，leader 视图可用。开启受控超时�
 然后停止三个节点，还原 node2 的原配置 `max-exported-snapshot=4`，全部换正常二进制从各自原盘冷重启。三入口仍报告成员 `{262146,262147,405505}`，水位保持 `(PSN 24227, DSN 11098)`，同一尾部 **40/40** 条回放不变。再确认 **60/60** 条写入和 **3** 次 checkpoint，LSN **10193–10252**；水位推进到 `(PSN 25085, DSN 11164)`，独立回放 LSN **10213–10252** 共 **40/40** 条匹配。全轮 **320** 条 ACK 的 LSN **9933–10252** 连续，无重复或内容错配；最终导出目录数为 **3**，低于还原后的配额 **4**。未发现新缺陷。
 
 证据在 51 的 `driver-quota-single-20261112/`：`node2-hook.log`、`log-2.toml.original`、`release.time`、`node2.pid.before-release`、`timeout-write.log`、`released-replay.log`、`released-write.log`、`released-continue-replay.log`、`cold-replay.log`、`cold-write.log`、`cold-continue-replay.log`、水位及三入口状态日志。实验后节点和隔离网络均已停止，node2 配置已恢复。这验证了**已存在 4 份候选时把配额降到 1**的清理与单候选保留路径；不等同于从空盘起步一直使用配额 1 的部署，也不证明真实网络会连续 105 次保持 leader 视图并恰好只让 `SyncRead` 超时。
+
+## 导出请求超时但 Dragonboat 迟到完成：三次连续回归验证（2026-11-12）
+
+针对前文记录的 #32161 时间线，在 51 同一隔离三副本原盘上用正常服务端和真实**单 TN WAL driver**重测。服务端二进制 `go version -m` 标识为 `48d13d7a01bf+dirty`；本轮未用故障二进制、未改配置、未运行 datasync。起始用户 LSN **10252**，node2 当前副本 **405505**，导出快照配额 `max-exported-snapshot=4`。用从旧复现脚本改成当前测试目录及副本 ID 的 `inotify` 监听 node2 的导出 `.generating` 目录创建，命中后只对该正常 `mo-service` 进程 `SIGSTOP` **5 秒**再 `SIGCONT`；node0/node1 保持连通和运行。每轮监听器退出后立即启动下一轮，node2 全程保持**同一 PID 1605423**。
+
+三次分别命中导出 index **25560、25678、25754**。每次暂停后，node2 都记录真实 `request export snapshot failed: timeout`；恢复后 Dragonboat 在磁盘留下只有 `.gbsnap` 与 `snapshot.metadata` 的有效正式目录。第一、二份在 node2 未重启时被后续流程清理；第三份也在主负载结束前消失。每次检查时正式导出目录数均为 **4**，没有重现旧实验中 **7>4** 的配额越界。代码的 `MarkExportUncertain` 与 `ReconcileUncertainExports` 可解释该结果；实机证据直接确认的是三次 timeout、迟到形成的两文件目录、同 PID 期间目录消失和配额抽样，未对 manager 内部登记动作单独插桩。该抽样不能证明任意瞬间都不可能短暂超过配额。
+
+单 driver 主负载确认 **400/400** 条 WAL，LSN **10253–10652**、**20** 次测试 checkpoint；最大单条 ACK **5848.035 ms**，未达到一分钟。独立新 driver 回放 `user_lsn=10652, checkpointed=10632, truncated_dsn=11604`，服务端 `GetWALTruncate=(PSN 25940, checkpointedDSN 11604)`；checkpoint 后 LSN **10613–10652** 共 **40/40** 条与 ACK 匹配，三客户端入口仍报告成员 `{262146,262147,405505}`。三节点整组原盘冷重启后水位、成员和同一 **40/40** 条回放不变。再确认 **60/60** 条续写和 **3** 次 checkpoint，LSN **10653–10712**；水位推进到 `(PSN 26404, DSN 11670)`，独立回放 LSN **10673–10712** 共 **40/40** 条匹配。三份迟到目录均仍不存在，导出目录数为 **4**。本轮 **460** 条 ACK 连续，无重复或内容错配；未发现新的数据一致性缺陷。
+
+远端证据在 `/home/mo/jxm/logservice-wal-snapshot-driver-20261112/driver-late-export-20261112/`：`pause_snapshot_export.py`、`watcher{1,2,3}.log`、`round1-write.log`、`pre-cold-replay.log`、`pre-cold-wal-state.log`、`cold-replay.log`、`cold-continue-write.log`、`cold-continue-replay.log`、水位和三入口状态日志，以及 node2 `stdout.log` 的三次 timeout。实验后节点和隔离网络均已停止。本轮验证连续三次**真实请求超时、迟到完成**在当前服务端上的运行中清理；没有覆盖更大的 snapshot 文件、长时间停机或超过三次事件持续发生时的磁盘峰值。
