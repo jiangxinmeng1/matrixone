@@ -1193,3 +1193,13 @@ LogService 侧的物理截断 PSN 与 `checkpointedDSN` 则由同一条 Raft `WA
 四个子场景为：目标 snapshot 文件**写入 1 字节后报错**、文件**写完但 `Sync` 报错**，各自分别在**同进程重试**和**关闭服务、保留原文件系统重新启动后重试**。首次导入均返回注入的 I/O 错误，snapshot manager 仍保留源候选，目标临时文件确实存在；关闭服务后文件仍保留。故障解除后下一轮导入成功，候选被清理、目标临时文件消失，`GetWALTruncate` 始终保持 `(PSN 15, checkpointedDSN 2)`。定向测试连续 **20 次通过**，race 模式 **1 次通过**；`go list`、`go build`、`go vet` 也通过。未发现新缺陷。
 
 这是**复制阶段 I/O 错误加原文件系统重载**的包级实验，不等同于在 51 上把进程杀在 Dragonboat 导入请求执行中；后者仍是实机故障注入空白。本轮没有运行 datasync，也没有启动真实 TN driver；水位由服务端生产 `truncateWAL` 路径提交。
+
+## Dragonboat 外部 snapshot 复制首字节后进程崩溃：单 TN driver 与三副本恢复（2026-11-12）
+
+先拉取 upstream main 到 `4760bcaa88`；对比已测的 `9381db5dde`，`pkg/logservice` 只有 gossip fixture 测试变化，生产 LogService 代码没有新增差异。本轮复用 51 上**全空盘起步、当前已保存 WAL 证据**的三副本 `/home/mo/jxm/logservice-wal-snapshot-driver-20261112/`，正常节点使用上一节的 `48d13d7a01` 分支服务端。为精确命中剩余窗口，仅给 node2 单独构建临时 Dragonboat 故障二进制：在 `tools.copyFile` 已打开目标 `.generating` snapshot 文件、从源文件复制并同步**首字节**后记录目标路径并 `os.Exit(137)`。该构建使用临时 module replacement，SHA256 `f509d5ebbd2469a32fb9884e7f68c0f1f5604c7012654832554914f20c3ede1e`；仓库的 `go.mod` 和生产源码均未改，正常重启又换回原二进制。没有运行 datasync。
+
+起始服务端水位为 `(truncatedPSN=3352, checkpointedDSN=1412)`。停 node2，node0/node1 两票运行真实单 TN WAL driver 的 `ReplayForWrite`、`AppendEntry(GroupUserTxn)`、每 20 条一次 `RangeCheckpoint` 与后台 `TruncateWAL`；checkpoint 文件仍是测试 marker。主负载第 **458** 条 ACK 后以故障二进制从 node2 原盘启动。钩子记录 Dragonboat 目标 `snapshot-0000000000000D48-262145.generating/snapshot-0000000000000D48.gbsnap`，文件实测只留下 **1 字节**，node2 进程已退出，故障进程日志**没有** `import snapshot success`；这证明崩溃发生在 `SyncRequestImportSnapshot` 的文件复制阶段、成功返回之前。node0/node1 的 driver 继续写入；在第 **592** 条 ACK 后用正常二进制从 node2 原盘重启。node2 本地随后成功导入同一 index **3400** 的 snapshot，又导入更新的 index **4953**，残留的 1 字节目标文件消失；三个客户端入口恢复同一三成员视图。
+
+旧 driver 最终确认 **1000/1000** 条 WAL 和 **50/50** 次 checkpoint，最高用户 LSN **2400**；单条 ACK 最大 **2323.434 ms**，没有超过 60 秒的写入。它完全退出后，独立新 driver 读回 `user_lsn=2400, checkpointed=2380, truncated_dsn=2542`，服务端 `GetWALTruncate=(5351,2542)`；回放 LSN **2361–2400** 共 40 条全部与独立 ACK 的 LSN/payload 匹配，checkpoint 后必须保留的 **20/20** 条齐全。再杀当时 leader node1，仅让 node0 与经历复制中崩溃的 node2 两票继续写 **30/30** 条；新 driver 回放 LSN **2361–2430** 共 70 条匹配。两票原盘冷重启后同一 70 条及水位不变；恢复 node1 后三个入口均报告原三成员，独立回放也与两票冷重启的 70 条逐条相同。与此前同一隔离盘上的 ACK 累计核对 **2430** 个连续上层 LSN，未发现缺失、重复或内容错配。
+
+远端证据在 `driver-midcopy-crash-20261112/` 的 `crash.marker`、`partial-file.stat`、`write.log`、`replay-three.log`、`two-vote-write.log`、`two-vote-replay.log`、`cold-two-vote-replay.log`、`three-restored-replay.log`、状态日志和 node2 的 `stdout-crash.log`/`stdout.log`。本轮没有发现新缺陷。该实验精确覆盖**复制首字节后的进程崩溃**；不代表复制完成后但 Dragonboat 完成导入前的所有内部阶段，也不验证真实 TAE checkpoint 文件。三个测试节点和隔离网络均已停止，磁盘证据保留。
