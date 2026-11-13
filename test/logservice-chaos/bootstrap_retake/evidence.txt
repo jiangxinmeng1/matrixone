@@ -1,0 +1,24 @@
+MatrixOne branch codex/logservice-chaos at d524d683db before this report update
+2026-11-13 Asia/Shanghai, local three-voter HAKeeper test fixture
+No voter stopped; one TN heartbeat; bootstrap commands committed but not executed.
+
+Short interval (30 ms, 3 second budget):
+GOWORK=off go test -mod=readonly ./pkg/logservice -run '^TestDiagnosticBootstrapLeaderRetakeRealElapsed/short$' -count=3 -timeout=2m
+ok github.com/matrixorigin/matrixone/pkg/logservice 30.218s
+Verbose follow-up:
+A deadline=2026-11-13T12:07:55.073448654+08:00
+B deadline=2026-11-13T12:07:56.096382552+08:00
+A retake failed at 2026-11-13T12:07:55.14720928+08:00
+PASS
+
+Default interval (3 seconds, 5 minute budget):
+GOWORK=off go test -mod=readonly ./pkg/logservice -run '^TestDiagnosticBootstrapLeaderRetakeRealElapsed$/^default$' -count=1 -v -timeout=8m
+A deadline=2026-11-13T12:05:48.846073465+08:00
+B deadline=2026-11-13T12:06:50.028798814+08:00
+2026/11/13 12:05:53.922782 +0800 HAKeeper is in HAKeeperBootstrapFailed state
+2026/11/13 12:05:53.922964 +0800 HAKeeper is in HAKeeperBootstrapFailed state
+2026/11/13 12:05:53.923025 +0800 HAKeeper is in HAKeeperBootstrapFailed state
+A retake failed at 2026-11-13T12:05:53.923868016+08:00
+--- PASS: TestDiagnosticBootstrapLeaderRetakeRealElapsed (302.01s)
+    --- PASS: TestDiagnosticBootstrapLeaderRetakeRealElapsed/default (302.01s)
+PASS
