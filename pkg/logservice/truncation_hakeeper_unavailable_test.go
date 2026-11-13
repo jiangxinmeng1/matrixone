@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lni/dragonboat/v4"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/stretchr/testify/require"
@@ -30,9 +31,17 @@ func TestTruncationWaitsForHAKeeperWithFullSnapshotQuota(t *testing.T) {
 		require.Equal(t, 1, s.store.snapshotMgr.Count(1, 1))
 		firstIndex := s.store.snapshotMgr.NewestIndex(1, 1)
 		require.Zero(t, s.store.shardSnapshotInfo.getTruncatedLsn(1))
+		for i := 0; i < 10; i++ {
+			resp = s.handleAppend(ctx, pb.Request{Method: pb.APPEND,
+				LogRequest: pb.LogRequest{ShardID: 1}}, getTestAppendCmd(100, make([]byte, 8)))
+			require.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+		}
 		resp = s.handleTruncate(ctx, pb.Request{Method: pb.TRUNCATE,
-			LogRequest: pb.LogRequest{ShardID: 1, Lsn: 6}})
+			LogRequest: pb.LogRequest{ShardID: 1, Lsn: firstIndex + 1}})
 		require.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+		dir, eligibleIndex := s.store.snapshotMgr.EvalImportSnapshot(1, 1, firstIndex+1)
+		require.NotEmpty(t, dir)
+		require.Equal(t, firstIndex, eligibleIndex)
 		for i := 0; i < 3; i++ {
 			require.NoError(t, s.store.processShardTruncateLog(ctx, 1))
 			require.Equal(t, 1, s.store.snapshotMgr.Count(1, 1))
@@ -42,5 +51,14 @@ func TestTruncationWaitsForHAKeeperWithFullSnapshotQuota(t *testing.T) {
 		resp = s.handleAppend(ctx, pb.Request{Method: pb.APPEND,
 			LogRequest: pb.LogRequest{ShardID: 1}}, getTestAppendCmd(100, make([]byte, 8)))
 		require.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+		peers := map[uint64]dragonboat.Target{1: s.ID()}
+		require.NoError(t, s.store.startHAKeeperReplica(1, peers, false))
+		require.Eventually(t, func() bool {
+			if err := s.store.processShardTruncateLog(ctx, 1); err != nil {
+				return false
+			}
+			return s.store.shardSnapshotInfo.getTruncatedLsn(1) >= firstIndex
+		}, 5*time.Second, 50*time.Millisecond)
+		require.Zero(t, s.store.snapshotMgr.Count(1, 1))
 	})
 }
