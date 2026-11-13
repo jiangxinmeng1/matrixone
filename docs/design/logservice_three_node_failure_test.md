@@ -1358,11 +1358,10 @@ node2 重启后，三票持续互通，leader 视图可用。开启受控超时�
 
 远端证据在 `leader-export-netcut-20261113/`：`netcut_export.py`、`netcut_export_second.py`、`watcher.log`、`watcher2.log`、`during-second.link`、`status-during-second.log`、`load.log`、`replay.log`、`cold-replay.log`、`cold-write.log`、`cold-continue-replay.log`、水位及三入口状态文件和各节点日志。实验后已停三个节点并拆除隔离网络，原盘与证据保留。第一次两票状态查询发生在网络恢复后，故第一次的隔离证据以链路操作记录、角色变化和节点本地超时日志为主；第二次则在链路仍 DOWN 时记录了状态。两笔约 18 秒的长尾与断网窗口相邻，可能包含旧连接等待及重新发现时间，本轮未对每次底层 RPC 逐步插桩，不能精确拆分耗时。
 
-## HAKeeper 启动切主、删除 CN、一组多步骤调度与快照配额（2026-11-13）
+## HAKeeper 启动切主、删除 CN 与快照配额（2026-11-13）
 
-本轮在本机对工作树 `f62fbcbc72` 测试；已拉取 `upstream/main` 至 `6c7457903d`，这四处相关生产文件在两版之间无差异。未在 51 上启动新集群。无 datasync 路径。
+本轮在本机对工作树 `f62fbcbc72` 测试；已拉取 `upstream/main` 至 `6c7457903d`，相关生产文件在两版之间无差异。未在 51 上启动新集群。只考虑单个 TN，不运行 datasync；原静态审查中的多 TN 副本移除 Operator 路径不纳入本轮结论。
 
 1. **启动命令已复制、尚未执行时切主：未复现“立即 BootstrapFailed”。** 新增 `TestBootstrapLeaderTakeoverAfterCommandsCommitted`：三副本 HAKeeper 收到三个 Log store 心跳和一个 TN 心跳，leader 提交启动命令，状态确认为 `HAKeeperBootstrapCommandsReceived`；随即停掉该 leader 的 HAKeeper 副本，等待另外两票选出新 leader。新 leader 调用 `checkBootstrap` 后，状态仍为 `HAKeeperBootstrapCommandsReceived`，本地 `bootstrapCheckDeadline` 已初始化。连跑 2 次通过；已有 `TestCheckBootstrapLeaderTakeoverInitializesDeadlineOnce` 也通过。当前代码使用新 leader 初始化绝对检查期限的逻辑，原静态审查所说的本地 `bootstrapCheckCycles=0` 立即失败路径已不存在。本测试只断言切主后的首轮检查，不代表实际启动命令全部执行完毕。
 2. **删除 CN：确认状态机不确定性。** 临时诊断测试构造两个 HAKeeper 状态机，放入相同 CN 记录，依次应用字节相同的 `GetDeleteCNStoreCmd`，两次应用间隔 10 ms。连跑 3 次，两个副本的 `DeletedStores[0].DownTime` 分别相差 10.397、10.625、10.660 ms；UUID 和其余输入相同。`handleDeleteCNCmd` 在状态机应用时读取 `time.Now()`，故复制命令无法保证相同状态；七天清理边界也由各副本本地时间决定。此处是状态机级稳定复现，尚未做真实多副本切主前后 API 查询，也未观察到用户 WAL 丢失。临时的“验证现有错误”测试没有作为永久回归测试提交。已记录为 [matrixorigin/matrixone#32661](https://github.com/matrixorigin/matrixone/issues/32661)，指派给 `jiangxinmeng1`。
-3. **多步骤 Operator：确认中间一步不会自行派发，尚未证实永久卡住。** 临时测试用一个包含两个 `RemoveTnReplica` 步骤的 Operator：第一次 `Dispatch` 只发第一个；第一个完成后，`RemoveFinishedOperator` 把游标移到第二个，但 `Dispatch(nil)` 不发命令。再传入检查器可生成的、针对剩余副本的新 Operator 后，第二个命令发出；测试连跑 3 次通过。TN 检查器每轮按当前上报状态重新生成多移除步骤，因此此测试只证明依赖下一轮检查及上报更新，不能认定永久遗漏。临时诊断测试未保留。
-4. **HAKeeper 不可用且快照配额满：确认导入停滞而普通 Append 可继续。** 新增 `TestTruncationWaitsForHAKeeperWithFullSnapshotQuota`：单普通 shard、无 HAKeeper、`MaxExportedSnapshot=1`，先导出一份，再推进截断水位并跑三轮处理。三轮均保持一份快照，索引不变，已导入截断水位保持 0；前后 Append 均成功。连跑 3 次通过。当前 `shouldDoImport` 读取 HAKeeper 失败会跳过，配额满又阻止导出；只有 `getTruncatedLsn` 超时的分支尝试释放配额，单份快照时也会保留该份。这验证了阻塞条件，尚未测长期磁盘增长或 HAKeeper 恢复后的追赶。
+3. **HAKeeper 不可用且快照配额满：确认导入停滞而普通 Append 可继续。** 新增 `TestTruncationWaitsForHAKeeperWithFullSnapshotQuota`：单普通 shard、单个 TN ID、无 HAKeeper、`MaxExportedSnapshot=1`，先导出一份，再推进截断水位并跑三轮处理。三轮均保持一份快照，索引不变，已导入截断水位保持 0；前后 Append 均成功。连跑 3 次通过。当前 `shouldDoImport` 读取 HAKeeper 失败会跳过，配额满又阻止导出；只有 `getTruncatedLsn` 超时的分支尝试释放配额，单份快照时也会保留该份。这验证了阻塞条件，尚未测长期磁盘增长或 HAKeeper 恢复后的追赶。
