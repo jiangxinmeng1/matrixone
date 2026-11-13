@@ -1327,3 +1327,13 @@ node2 重启后，三票持续互通，leader 视图可用。开启受控超时�
 **整组冷重启与续写。** 脚本对三节点发 `SIGKILL` 后几乎立即启动，首次三个进程都因 `failed to lock data directory` 退出；当时只等待 `/proc/<pid>/exe` 消失，未记录旧进程状态或锁持有者。稍等后再次启动同一原盘，三个地址恢复一致成员，独立回放 **761–800** 的 **40/40** 条以及 `(PSN 1547, DSN 832)` 水位均不变。随后确认 **60/60** 条、**3** 次 checkpoint ACK，用户 LSN **801–860**；独立回放 **821–860** 共 **40/40** 条匹配，水位推进到 `(PSN 2328, DSN 898)`，三个节点仍各保留 **1** 份导出目录。另在两票存活时对 node0 连续做 **3** 次快速 `SIGKILL`→原盘启动，再整组三节点连续做 **2** 次；这 5 次在观察到旧进程为 zombie 后均首次启动成功，最终独立回放仍到 LSN 860、水位 `(2328,898)`。因此锁错误目前只观察到一次，尚未稳定复现，不能据此认定新的服务端缺陷；本轮也不称整组第一次启动即成功。
 
 本轮合计 **860** 条 ACK 的用户 LSN **1–860** 连续；五次独立回放各自保留的尾部均与 ACK 内容一致，未发现配额 1 导致的截断停滞、候选堆积或数据错配。51 上保留 `follower-write.log`、`leader-write.log`、`cold-write.log`、五次 replay 日志、`rapid-restart.log`、`rapid-all-restart.log`、各阶段 WAL 水位和三入口状态、节点日志以及下线/恢复时间文件。实验结束已停止三个测试节点并拆除隔离网络；原盘和证据保留。配额目录数是阶段性抽样，不代表对任意瞬间峰值的证明；checkpoint 文件仍为测试 marker。
+
+## 导出配额 1 时连续三次超时后迟到完成：同进程消费与冷重启（2026-11-13）
+
+继续使用上一节从空盘起步、三个节点均配置 `max-exported-snapshot=1` 的 51 隔离三副本；起始已确认用户 LSN **860**、`GetWALTruncate=(PSN 2328, checkpointedDSN 898)`。服务端仍为 `upstream/main` **99605b3914** 对应的正常二进制；当时新到的 **437c648450** 在 `pkg/logservice` 和 `logservicedriver` 没有代码差异。只运行一个真实 TN WAL driver，不运行 datasync。node2 为普通数据副本，使用 Linux inotify 监听其 exported snapshot 目录；每次出现新的 `.generating` 目录，立即对该**正常服务端进程** `SIGSTOP` 5 秒再 `SIGCONT`。node0/node1 两票保持运行，node2 不重启。
+
+三次监听依次命中导出 index **3091、3300、3421**（目录名十六进制 `0C13`、`0CE4`、`0D5D`）。同一 node2 PID **3544551** 在三次暂停后各记录一次真实 `request export snapshot failed: timeout`；恢复后 Dragonboat 仍把对应导出完成，LogService 随后分别记录**同一 index 3091、3300、3421 的 `import snapshot success`**。前后还发生其他正常导出与导入。阶段性目录检查：第一次暂停后和主负载结束时，node2 均只有 **1** 份正式导出目录；主负载结束时 node0/node1 也各只有 **1** 份。代码中的 `MarkExportUncertain`、`ReconcileUncertainExports` 可以解释迟到目录如何重新进入管理器；本轮没有对其内部列表单独插桩，也未测任意瞬间的目录峰值。
+
+负载确认 **500/500** 条用户 WAL、**25** 次测试 checkpoint，LSN **861–1360** 连续，最大单条 ACK **1034.844 ms**，无上层最终错误。独立新 driver 回放保留尾部 **1321–1360** 共 **40/40** 条与 ACK 的 LSN/payload 匹配，水位 `(PSN 3587, DSN 1448)`。等待三个旧进程进入退出状态后，用三份原盘整组冷重启：三个地址报告同一成员 `{262145,262146,262147}`，同一 **40/40** 条和水位不变。再确认 **60/60** 条续写、**3** 次 checkpoint，LSN **1361–1420**，最大单条 ACK **841.353 ms**；独立回放 **1381–1420** 共 **40/40** 条匹配，水位推进到 `(PSN 4293, DSN 1514)`，三个节点最终仍各保留 **1** 份目录。本轮 **560** 条 ACK 连续，未发现新缺陷或一分钟级写入长尾。
+
+远端证据位于 `/home/mo/jxm/logservice-quota-one-fresh-20261113/`：`pause_export_quota1.py`、`pause-export{,-2,-3}.log`、`late-write.log`、`late-replay.log`、`late-cold-replay.log`、`late-cold-write.log`、`late-cold-continue-replay.log`、各阶段 WAL 水位与三入口状态、node2 `stdout.log` 及 `late-cold-start.log`。实验后已停三个节点并拆除隔离网络；原盘与证据保留。该窗口是通过暂停整个 node2 进程造成的超时，不等同于只阻塞 Dragonboat 导出线程；上一轮已单独覆盖后一种窗口，但配额为 5。
