@@ -228,6 +228,52 @@ func TestCheckBootstrapLeaderTakeoverInitializesDeadlineOnce(t *testing.T) {
 	require.Equal(t, []bool{false}, calls)
 }
 
+func TestCheckBootstrapLeaderTakeoverWithoutLocalState(t *testing.T) {
+	start := time.Unix(100, 0)
+	window := checkBootstrapCycles * 3 * time.Second
+	for _, tc := range []struct {
+		name            string
+		complete        bool
+		recoveryPending bool
+		transitionFirst bool
+	}{
+		{name: "replicas not ready"},
+		{name: "replicas ready", complete: true, transitionFirst: true},
+		{name: "recovery pending", complete: true, recoveryPending: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := bootstrapCheckTestState(tc.complete, tc.recoveryPending)
+			s := &store{cfg: Config{HAKeeperCheckInterval: toml.Duration{Duration: 3 * time.Second}}}
+			var transitions []bool
+			injected := moerr.NewInternalErrorNoCtx("stop before raft proposal")
+			setter := func(success bool) error {
+				transitions = append(transitions, success)
+				return injected
+			}
+			err := s.checkBootstrapWithSetterAt(start, state, setter)
+			require.Equal(t, start.Add(window), s.bootstrapCheckDeadline)
+			require.NotNil(t, s.bootstrapMgr)
+			if tc.transitionFirst {
+				require.ErrorIs(t, err, injected)
+				require.Equal(t, []bool{true}, transitions)
+				return
+			}
+			require.NoError(t, err)
+			require.Empty(t, transitions)
+			// A subsequent check keeps the first deadline. Incomplete replicas
+			// fail only when that deadline arrives; completed recovery can
+			// still transition to Running at that same boundary.
+			if tc.recoveryPending {
+				state.LogServiceRecoveryPending = false
+			}
+			err = s.checkBootstrapWithSetterAt(start.Add(window), state, setter)
+			require.ErrorIs(t, err, injected)
+			require.Equal(t, start.Add(window), s.bootstrapCheckDeadline)
+			require.Equal(t, []bool{tc.recoveryPending}, transitions)
+		})
+	}
+}
+
 func TestIDAllocatorCapacity(t *testing.T) {
 	tests := []struct {
 		next     uint64
