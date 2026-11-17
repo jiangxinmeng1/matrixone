@@ -86,8 +86,20 @@ func TestSnapshotImportAfterThreeReplicaLeaderFailure(t *testing.T) {
 		written[lsn] = payload
 	}
 	dead := int(leader - 1)
+	// Pin the existing RPC connection to the node about to stop. Reconnects
+	// still use the normal three-address managed client discovery path.
+	managed := client.(*managedClient)
+	managed.resetClient()
+	bound, err := connectToLogServiceAddress(ctx, "", configs[dead].LogServiceServiceAddr(), managed.cfg)
+	require.NoError(t, err)
+	managed.client = bound
 	require.NoError(t, services[dead].Close())
 	closed[dead] = true
+	readStart := time.Now()
+	preFailoverRecords, _, err := client.Read(ctx, snapshotIndex+1, math.MaxUint64)
+	require.NoError(t, err)
+	t.Logf("read on pre-failover client after leader close took %s", time.Since(readStart))
+	require.GreaterOrEqual(t, len(preFailoverRecords), len(written))
 	require.Eventually(t, func() bool {
 		id, _, ok, err := services[survivor].store.nh.GetLeaderID(1)
 		return err == nil && ok && id != 0 && id != leader

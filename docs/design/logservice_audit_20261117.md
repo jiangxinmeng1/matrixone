@@ -67,3 +67,9 @@
 重建 LogService 后，内存中的 `snapshotIndex` 从 0 开始，已有导出快照仍由管理器加载。诊断性地让 TN 在重启前不再写入，下一次截断 tick 仍能导出新快照：Raft 重启后 index 从 14 进到 15。三轮均无错误；这条水位线索未形成缺陷。临时测试改动已撤销。
 
 另在三副本 Log shard 加 HAKeeper 的测试集群中导出两份快照，然后保留较旧快照、将较新快照的 `.gbsnap` 文件替换为空文件，并把 `TRUNCATE_WAL` 水位推进至较新 index。正常截断 tick 连续两次都选中坏候选并返回 `invalid file size`；较旧候选可以直接导入，但导入后下一轮正常 tick 仍被坏候选挡住。普通模式 5 轮、`-race` 3 轮稳定复现。候选损坏由测试显式注入，未证明实际存储出现损坏的概率；若持续写入且导出配额耗尽，物理日志压缩会持续停滞。复现见 [snapshot_corrupt_candidate](../../test/logservice-chaos/snapshot_corrupt_candidate/README.md)，缺陷记录：[matrixone#32842](https://github.com/matrixorigin/matrixone/issues/32842)，已分配给 `jiangxinmeng1`。
+
+## 三副本 leader 停止后的旧连接读取（2026-11-17）
+
+扩展 `TestSnapshotImportAfterThreeReplicaLeaderFailure`：写入并导出快照后，将 managed client 当前 RPC 连接明确绑定到即将停止的 Raft leader；关闭该服务，立即用旧 client 读取已确认 WAL，然后继续原有切主、截断、快照导入和旧目录恢复检查。普通模式五轮读取均成功，耗时分别约 4.4、4.3、5.8、2.3、3.0 毫秒；完整测试以 `-race` 三轮通过。首次未固定连接的测试有时连在 follower 上，已修正。此处故障是正常关闭服务导致连接报错，不等同于网络黑洞；未复现新问题。
+
+本次扩展后完整 `pkg/logservice` 包以 `-race -count=1` 再跑一轮，通过（180.019 秒）。
