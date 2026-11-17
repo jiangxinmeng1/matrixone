@@ -73,3 +73,7 @@
 扩展 `TestSnapshotImportAfterThreeReplicaLeaderFailure`：写入并导出快照后，将 managed client 当前 RPC 连接明确绑定到即将停止的 Raft leader；关闭该服务，立即用旧 client 读取已确认 WAL，然后继续原有切主、截断、快照导入和旧目录恢复检查。普通模式五轮读取均成功，耗时分别约 4.4、4.3、5.8、2.3、3.0 毫秒；完整测试以 `-race` 三轮通过。首次未固定连接的测试有时连在 follower 上，已修正。此处故障是正常关闭服务导致连接报错，不等同于网络黑洞；未复现新问题。
 
 本次扩展后完整 `pkg/logservice` 包以 `-race -count=1` 再跑一轮，通过（180.019 秒）。
+
+## 保留旧目录的副本启动遇到快照目录 I/O 错误（2026-11-17）
+
+新增独立诊断：启动 Log shard 副本并关闭服务，保留本地数据和文件系统；重建服务时，让 `ReconcileInterruptedExport` 的第一次目录扫描成功，在随后 `startReplica` 调用 `snapshotMgr.Init` 的第二次扫描注入一次 `syscall.EIO`。三个独立进程均在 `pkg/logservice/store.go:674` 直接 panic，无法将错误返回上层启动流程。复现源文件以 `.go.txt` 保存在 [snapshot_init_list_eio](../../test/logservice-chaos/snapshot_init_list_eio/README.md)，避免正常测试进程退出。该测试只证明瞬时目录读取错误下的行为，不代表真实磁盘错误频率。此路径与导出快照提交 EIO 引起进程退出的 [matrixone#32836](https://github.com/matrixorigin/matrixone/issues/32836) 同属快照 I/O 错误处理问题，作为补充复现记录，不单列重复缺陷。

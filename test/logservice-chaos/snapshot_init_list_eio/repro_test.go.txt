@@ -1,0 +1,50 @@
+package logservice
+
+import (
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+
+	"github.com/lni/dragonboat/v4"
+	"github.com/lni/vfs"
+	"github.com/matrixorigin/matrixone/pkg/common/morpc"
+	"github.com/stretchr/testify/require"
+)
+
+type failSecondExportListFS struct {
+	vfs.FS
+	enabled atomic.Bool
+	calls   atomic.Int32
+}
+
+func (fs *failSecondExportListFS) List(name string) ([]string, error) {
+	if fs.enabled.Load() && strings.Contains(name, "shard-1/replica-1") &&
+		fs.calls.Add(1) == 2 {
+		return nil, syscall.EIO
+	}
+	return fs.FS.List(name)
+}
+
+func TestDiagnosticRestartSnapshotDirectoryListEIO(t *testing.T) {
+	cfg := getServiceTestConfig()
+	fs := &failSecondExportListFS{FS: cfg.FS}
+	cfg.FS = fs
+	files := newFS()
+	start := func() *Service {
+		s, err := NewServiceWithRetry(func() Config { return cfg }, files, nil,
+			WithBackendFilter(func(morpc.Message, string) bool { return true }))
+		require.NoError(t, err)
+		return s
+	}
+	s := start()
+	require.NoError(t, s.store.startReplica(1, 1,
+		map[uint64]dragonboat.Target{1: s.ID()}, false))
+	require.NoError(t, s.Close())
+	fs.calls.Store(0)
+	fs.enabled.Store(true)
+	// The first scan reconciles interrupted exports; the second loads the
+	// snapshot manager during startReplica. Current code panics on its EIO.
+	restarted := start()
+	defer restarted.Close()
+}
