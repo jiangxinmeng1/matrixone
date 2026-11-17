@@ -28,3 +28,7 @@
 
 1. **超出 TN 读取批量预算的单条 WAL。** TN driver 每批以 64 MiB 读取，单条 WAL 默认上限为 99 MiB。使用生产默认 100 MiB RPC 上限，真实客户端写入 65 MiB、99 MiB 记录后，以 64 MiB 预算读取，均得到完整单条记录且游标正确指向后续小记录。进一步在导出快照后写入 99 MiB 记录，推进 `TRUNCATE_WAL` 水位并导入旧快照；导入前后记录内容和游标均正确，两轮通过。诊断代码见 [large_wal_read](../../test/logservice-chaos/large_wal_read/README.md)。该测试是单副本，直接调用导入函数；未覆盖 HAKeeper 导入许可或真实 TN WAL 编码。
 2. **已有连接被黑洞后的 `GetWALTruncate`。** 实际 RPC 客户端经代理建立连接，然后让代理停止转发响应。首次查询约 8.002 秒后报错；客户端重置连接并改用健康直连地址，下一次查询约 1.3 毫秒成功，返回相同 PSN/DSN。此行为与当前 8 秒后端读取超时一致；外层 TN driver 会在错误后重试。本测试只覆盖单服务连接切换，尚未在三副本网络隔离下测量完整 TN driver 尾延迟。复现见 [get_wal_truncate_blackhole](../../test/logservice-chaos/get_wal_truncate_blackhole/README.md)。未据此建立新缺陷。
+
+## 快照导入与后续截断并发（2026-11-17）
+
+审查 `importSnapshot` 与 `handleWALTruncate` 的交错：旧快照导入期间，单个 TN 可以继续推进 checkpointed DSN 与物理截断 PSN。扩展 `TestImportedSnapshotRetainsLaterWALAcrossServiceRecreation`，在导出快照后写入 10 条 WAL，先截断到快照位置，再并发导入旧快照和推进至一条较新 WAL 的 PSN/DSN。等待两操作成功后关闭并重建 LogService，核对较新的截断状态、全部 10 条已确认 WAL 字节，并继续写入。普通模式连跑 20 次、`-race` 连跑 5 次通过。此测试在单投票副本上运行，服务重建发生于同一测试进程；没有覆盖三副本切主、HAKeeper 导入许可或实际 TN checkpoint 生成。未发现新缺陷。

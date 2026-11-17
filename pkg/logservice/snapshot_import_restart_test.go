@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,8 +64,12 @@ func TestImportedSnapshotRetainsLaterWALAcrossServiceRecreation(t *testing.T) {
 	index := service.store.snapshotMgr.NewestIndex(1, 1)
 	require.NotZero(t, index)
 	written := make(map[uint64][]byte)
+	var laterPSN uint64
 	for i := 10; i < 20; i++ {
 		lsn, cmd := appendOne(service, i)
+		if laterPSN == 0 {
+			laterPSN = lsn
+		}
 		written[lsn] = cmd
 	}
 	resp = service.handleTruncateWAL(ctx, pb.Request{Method: pb.TRUNCATE_WAL,
@@ -72,7 +77,25 @@ func TestImportedSnapshotRetainsLaterWALAcrossServiceRecreation(t *testing.T) {
 	require.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
 	dir, importedIndex := service.store.snapshotMgr.EvalImportSnapshot(1, 1, index)
 	require.Equal(t, index, importedIndex)
-	require.NoError(t, service.store.importSnapshot(ctx, 1, 1, index, dir))
+	var wg sync.WaitGroup
+	var importErr error
+	var laterTruncate pb.Response
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		importErr = service.store.importSnapshot(ctx, 1, 1, index, dir)
+	}()
+	go func() {
+		defer wg.Done()
+		laterTruncate = service.handleTruncateWAL(ctx, pb.Request{Method: pb.TRUNCATE_WAL,
+			LogRequest: pb.LogRequest{ShardID: 1, Lsn: laterPSN, CheckpointedDSN: 11}})
+	}()
+	wg.Wait()
+	require.NoError(t, importErr)
+	require.Equal(t, uint32(moerr.Ok), laterTruncate.ErrorCode, laterTruncate.ErrorMessage)
+	before, err := service.store.getWALTruncate(ctx, 1)
+	require.NoError(t, err)
+	require.Equal(t, walTruncateState{psn: laterPSN, dsn: 11}, before)
 	require.NoError(t, service.Close())
 	service = nil
 
@@ -81,6 +104,9 @@ func TestImportedSnapshotRetainsLaterWALAcrossServiceRecreation(t *testing.T) {
 		_, _, ok, err := service.store.nh.GetLeaderID(1)
 		return err == nil && ok
 	}, 5*time.Second, 10*time.Millisecond)
+	after, err := service.store.getWALTruncate(ctx, 1)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "WAL truncate checkpoint changed after snapshot import and restart")
 	records, _, err := service.store.queryLog(ctx, 1, index+1, math.MaxUint64)
 	require.NoError(t, err)
 	for _, record := range records {
