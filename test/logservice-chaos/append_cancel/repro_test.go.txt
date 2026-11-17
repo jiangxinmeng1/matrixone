@@ -1,0 +1,42 @@
+package logservicedriver
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/matrixorigin/matrixone/pkg/logservice"
+	"github.com/stretchr/testify/require"
+)
+
+type cancelOnFirstAppendClient struct {
+	BackendClient
+	cancel context.CancelFunc
+	calls  int
+}
+
+func (c *cancelOnFirstAppendClient) AppendWAL(_ context.Context, _ logservice.LogRecord) (uint64, error) {
+	c.calls++
+	if c.calls == 1 {
+		c.cancel()
+	}
+	return 0, context.Canceled
+}
+
+func TestDiagnosticAppendRetriesAfterCallerCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backend := newMockBackendClient(NewMockBackend())
+	client := &cancelOnFirstAppendClient{BackendClient: backend, cancel: cancel}
+	wrapped := &wrappedClient{
+		wrapped: client,
+		pool:    &clientPool{cfg: &Config{MaxTimeout: 250 * time.Millisecond}},
+	}
+	start := time.Now()
+	_, err := wrapped.Append(ctx, LogEntry("one WAL record"), nil)
+	elapsed := time.Since(start)
+	require.ErrorIs(t, err, context.Canceled)
+	require.GreaterOrEqual(t, client.calls, 2)
+	require.GreaterOrEqual(t, elapsed, 450*time.Millisecond)
+	t.Logf("caller canceled during first AppendWAL; attempts=%d elapsed=%s", client.calls, elapsed)
+}
