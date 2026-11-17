@@ -1,0 +1,39 @@
+package logservice
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestDiagnosticGetWALTruncateBlackholedConnection(t *testing.T) {
+	RunClientTest(t, false, nil, func(t *testing.T, s *Service, cfg ClientConfig, _ Client) {
+		address, drop, cleanup := startDroppingResponseProxy(t, s.cfg.LogServiceServiceAddr())
+		defer cleanup()
+		cfg.ServiceAddresses = []string{address}
+		cfg.DiscoveryAddress = ""
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		throughProxy, err := NewClient(ctx, s.ID(), cfg)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, throughProxy.Close()) }()
+		beforePSN, beforeDSN, err := throughProxy.GetWALTruncate(ctx)
+		require.NoError(t, err)
+		throughProxy.(*managedClient).cfg.ServiceAddresses = []string{s.cfg.LogServiceServiceAddr()}
+		drop.Store(true)
+		started := time.Now()
+		_, _, err = throughProxy.GetWALTruncate(ctx)
+		firstElapsed := time.Since(started)
+		require.Error(t, err)
+		require.NoError(t, ctx.Err())
+		started = time.Now()
+		afterPSN, afterDSN, err := throughProxy.GetWALTruncate(ctx)
+		secondElapsed := time.Since(started)
+		require.NoError(t, err)
+		require.Equal(t, beforePSN, afterPSN)
+		require.Equal(t, beforeDSN, afterDSN)
+		t.Logf("blackholed established GetWALTruncate failed after %s; reconnect succeeded after %s", firstElapsed, secondElapsed)
+	})
+}

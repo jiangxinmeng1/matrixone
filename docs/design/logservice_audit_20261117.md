@@ -23,3 +23,8 @@
 - 新增快照并发写入测试连跑 10 次，服务重建测试连跑 3 次：通过。
 - 两个新增测试以 `-race -count=3` 运行：通过；`pkg/logservice` 完整包普通测试及 `-race` 测试各跑 1 次：通过。
 - 新工作树没有预编译的 `thirdparties/install`；本轮测试使用现存 `matrixone-upstream-main-20261111` 工作树的原生头文件和库。首次尝试使用主工作树旧版 USearch 头文件时编译失败，换成匹配的新版依赖后通过。没有把依赖不匹配当作产品缺陷。
+
+## 读取游标与 RPC 故障补测（2026-11-17）
+
+1. **超出 TN 读取批量预算的单条 WAL。** TN driver 每批以 64 MiB 读取，单条 WAL 默认上限为 99 MiB。使用生产默认 100 MiB RPC 上限，真实客户端写入 65 MiB、99 MiB 记录后，以 64 MiB 预算读取，均得到完整单条记录且游标正确指向后续小记录。进一步在导出快照后写入 99 MiB 记录，推进 `TRUNCATE_WAL` 水位并导入旧快照；导入前后记录内容和游标均正确，两轮通过。诊断代码见 [large_wal_read](../../test/logservice-chaos/large_wal_read/README.md)。该测试是单副本，直接调用导入函数；未覆盖 HAKeeper 导入许可或真实 TN WAL 编码。
+2. **已有连接被黑洞后的 `GetWALTruncate`。** 实际 RPC 客户端经代理建立连接，然后让代理停止转发响应。首次查询约 8.002 秒后报错；客户端重置连接并改用健康直连地址，下一次查询约 1.3 毫秒成功，返回相同 PSN/DSN。此行为与当前 8 秒后端读取超时一致；外层 TN driver 会在错误后重试。本测试只覆盖单服务连接切换，尚未在三副本网络隔离下测量完整 TN driver 尾延迟。复现见 [get_wal_truncate_blackhole](../../test/logservice-chaos/get_wal_truncate_blackhole/README.md)。未据此建立新缺陷。
