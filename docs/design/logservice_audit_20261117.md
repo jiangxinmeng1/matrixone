@@ -40,3 +40,7 @@
 ## 导入快照时发生一次 I/O 错误（2026-11-17）
 
 检查 `importSnapshot` 失败后是否保留可重试的候选。新增 `TestImportSnapshotRetriesAfterCopyFailure`：导出快照、继续写入 10 条 WAL 并推进 `TRUNCATE_WAL` 后，在 Dragonboat 复制快照到内部临时目录时注入一次 `Create` 错误。首次导入按预期报错，快照管理器仍保留原候选；使用同一份快照立即重试成功，候选被删除，后续 WAL 字节和继续写入均正确。普通模式连跑 3 次、`-race` 连跑 5 次通过。该测试覆盖单副本和一次临时文件错误，不覆盖持续磁盘故障或三副本导入。审查 Dragonboat 实现还发现，导入请求的 context 只在入口检查，后续复制与提交不会因为调用方的 deadline 自动中断；因此本轮没有把“导入已完成但返回超时”作为已证实的路径。2026-11-17 再次获取 `upstream/main` 为 `47957ef450`，相对本分支基线 `e765c5fd44` 没有 LogService 或 TN logservicedriver 代码变化。未发现新缺陷。
+
+## `TRUNCATE_WAL` 已提交但回包丢失（2026-11-17）
+
+新增 `TestTruncateWALBlackholedResponseCanBeReconciled`：真实 RPC 客户端先经代理连到单副本 LogService，再丢弃服务端回包。服务端已经提交 PSN/DSN 水位，客户端约 16 秒后报错；客户端重连健康地址后，重复截断返回 `ErrInvalidTruncateLsn`，`GetWALTruncate` 查到原先提交的 PSN/DSN。普通模式共跑 3 次、`-race` 跑 1 次通过；单次 `-race` 测得等待 15.994 秒。另在 TN logservicedriver 新增 `TestTruncateReconcilesCommittedRequestWithLostReply`，模拟首次截断已提交但回包丢失：driver 重试并核对水位后正确返回成功；若 checkpointed DSN 小于请求值则拒绝确认。该测试普通模式连跑 10 次，新增不足水位断言后以 `-race` 连跑 10 次通过。约 16 秒是本测试连接被黑洞时的观测值，不能推断三副本中两票可用时的尾延迟；未发现新缺陷。

@@ -103,6 +103,43 @@ func TestTruncateOnFlyClientFactoryErrorCanRetry(t *testing.T) {
 	require.Equal(t, uint64(1), checkpointedDSN)
 }
 
+type lostTruncateReplyClient struct {
+	*mockBackendClient
+	calls *atomic.Int32
+}
+
+func (c *lostTruncateReplyClient) TruncateWAL(ctx context.Context, psn, checkpointedDSN uint64) error {
+	err := c.mockBackendClient.TruncateWAL(ctx, psn, checkpointedDSN)
+	if err == nil && c.calls.Add(1) == 1 {
+		return errors.New("injected lost TRUNCATE_WAL reply")
+	}
+	return err
+}
+
+func TestTruncateReconcilesCommittedRequestWithLostReply(t *testing.T) {
+	backend := NewMockBackend()
+	var calls atomic.Int32
+	cfg := NewConfig("", WithConfigOptMaxClient(1),
+		WithConfigOptClientFactory(func() (logservice.Client, error) {
+			return &lostTruncateReplyClient{
+				mockBackendClient: newMockBackendClient(backend), calls: &calls,
+			}, nil
+		}))
+	pool := newClientPool(&cfg)
+	defer pool.Close()
+	d := &LogServiceDriver{clientPool: pool, config: cfg}
+	psn, err := d.truncateFromRemote(context.Background(), 5, 3, 2)
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), psn)
+	require.Equal(t, int32(1), calls.Load(), "first request must have committed before the reply was lost")
+	gotPSN, gotDSN, err := backend.GetWALTruncate(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(5), gotPSN)
+	require.Equal(t, uint64(3), gotDSN)
+	_, err = d.truncateFromRemote(context.Background(), 5, 4, 0)
+	require.ErrorContains(t, err, "checkpointed DSN 3, expected at least 4")
+}
+
 type cancelTruncateClient struct {
 	*mockBackendClient
 	started chan struct{}

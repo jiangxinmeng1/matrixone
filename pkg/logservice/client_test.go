@@ -731,6 +731,55 @@ func TestAppendBlackholedResponseReturnsUnknownBeforeCallerDeadline(t *testing.T
 	})
 }
 
+func TestTruncateWALBlackholedResponseCanBeReconciled(t *testing.T) {
+	RunClientTest(t, false, nil, func(t *testing.T, s *Service, cfg ClientConfig, healthy Client) {
+		address, drop, cleanup := startDroppingResponseProxy(t, s.cfg.LogServiceServiceAddr())
+		defer cleanup()
+		cfg.ServiceAddresses = []string{address}
+		cfg.DiscoveryAddress = ""
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		throughProxy, err := NewClient(ctx, s.ID(), cfg)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, throughProxy.Close()) }()
+		var first uint64
+		for i := 0; i < 5; i++ {
+			record := healthy.GetLogRecord(8)
+			copy(record.Payload(), []byte("wal-test"))
+			lsn, err := healthy.Append(ctx, record)
+			require.NoError(t, err)
+			if i == 0 {
+				first = lsn
+			}
+		}
+		throughProxy.(*managedClient).cfg.ServiceAddresses = []string{s.cfg.LogServiceServiceAddr()}
+		drop.Store(true)
+		started := time.Now()
+		firstErr := make(chan error, 1)
+		go func() { firstErr <- throughProxy.TruncateWAL(ctx, first, 1) }()
+		committed := assert.Eventually(t, func() bool {
+			psn, dsn, err := healthy.GetWALTruncate(ctx)
+			return err == nil && psn == first && dsn == 1
+		}, 5*time.Second, 10*time.Millisecond,
+			"the server must commit the truncation before its response is lost")
+		select {
+		case err := <-firstErr:
+			require.Error(t, err)
+		case <-ctx.Done():
+			<-firstErr
+			t.Fatal(ctx.Err())
+		}
+		require.True(t, committed)
+		t.Logf("committed TRUNCATE_WAL response lost; client returned after %s", time.Since(started))
+		err = throughProxy.TruncateWAL(ctx, first, 1)
+		require.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidTruncateLsn), "got %v", err)
+		psn, dsn, err := throughProxy.GetWALTruncate(ctx)
+		require.NoError(t, err)
+		require.Equal(t, first, psn)
+		require.Equal(t, uint64(1), dsn)
+	})
+}
+
 func startHangingTCPServer(t *testing.T) (string, func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
