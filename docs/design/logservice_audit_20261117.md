@@ -36,3 +36,7 @@
 ## 导出快照后、TN 截断前重启（2026-11-17）
 
 检查 `startReplica` 重新加载导出快照的窗口：快照已落在磁盘，TN 仍未推进 checkpointed DSN。新增 `TestExportedSnapshotSurvivesRestartBeforeWALTruncate`，先导出快照并写入后续 10 条 WAL，然后关闭并重建 LogService；确认快照管理器重新发现原快照且 checkpointed DSN 尚未前进。之后提交 `TRUNCATE_WAL`、导入原快照、再次重建服务，逐条核对后续 WAL、PSN/DSN 水位并继续写入。普通模式连跑 10 次、`-race` 连跑 3 次通过。测试为单副本、同进程服务重建，并直接调用快照导入；未覆盖三副本切主及 HAKeeper 导入许可。未发现新缺陷。
+
+## 导入快照时发生一次 I/O 错误（2026-11-17）
+
+检查 `importSnapshot` 失败后是否保留可重试的候选。新增 `TestImportSnapshotRetriesAfterCopyFailure`：导出快照、继续写入 10 条 WAL 并推进 `TRUNCATE_WAL` 后，在 Dragonboat 复制快照到内部临时目录时注入一次 `Create` 错误。首次导入按预期报错，快照管理器仍保留原候选；使用同一份快照立即重试成功，候选被删除，后续 WAL 字节和继续写入均正确。普通模式连跑 3 次、`-race` 连跑 5 次通过。该测试覆盖单副本和一次临时文件错误，不覆盖持续磁盘故障或三副本导入。审查 Dragonboat 实现还发现，导入请求的 context 只在入口检查，后续复制与提交不会因为调用方的 deadline 自动中断；因此本轮没有把“导入已完成但返回超时”作为已证实的路径。2026-11-17 再次获取 `upstream/main` 为 `47957ef450`，相对本分支基线 `e765c5fd44` 没有 LogService 或 TN logservicedriver 代码变化。未发现新缺陷。
