@@ -1,0 +1,69 @@
+package logservice
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/lni/dragonboat/v4"
+	"github.com/lni/goutils/leaktest"
+	"github.com/lni/vfs"
+	"github.com/stretchr/testify/require"
+)
+
+func TestDiagnosticCorruptNewestSnapshotBlocksOlderCandidate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	logger, _ := captureLogger()
+	s1, s2, s3, cfg1, cfg2, cfg3 := buildZombieCluster(t, logger)
+	services := []*Service{s1, s2, s3}
+	configs := []Config{cfg1, cfg2, cfg3}
+	defer func() {
+		for i, s := range services {
+			require.NoError(t, s.Close())
+			vfs.ReportLeakedFD(configs[i].FS, t)
+		}
+	}()
+	peers := map[uint64]dragonboat.Target{1: s1.ID(), 2: s2.ID(), 3: s3.ID()}
+	for i, s := range services {
+		require.NoError(t, s.store.startReplica(1, uint64(i+1), peers, false))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	require.NoError(t, s1.store.getOrExtendTNLease(ctx, 1, 100))
+	appendN := func(start, end int) {
+		for i := start; i < end; i++ {
+			_, err := s1.store.append(ctx, 1, getTestAppendCmd(100, []byte(fmt.Sprintf("wal-%04d", i))), true)
+			require.NoError(t, err)
+		}
+	}
+	appendN(0, 10)
+	require.NoError(t, s1.store.truncateLog(ctx, 1, 4))
+	require.NoError(t, s1.store.processShardTruncateLog(ctx, 1))
+	older := s1.store.snapshotMgr.NewestIndex(1, 1)
+	require.NotZero(t, older)
+	appendN(10, 20)
+	require.NoError(t, s1.store.processShardTruncateLog(ctx, 1))
+	newer := s1.store.snapshotMgr.NewestIndex(1, 1)
+	require.Greater(t, newer, older)
+	require.NoError(t, s1.store.truncateWAL(ctx, 1, newer, 20))
+	path := s1.store.snapshotMgr.snapshotPath(nodeID{shardID: 1, replicaID: 1}, snapshotIndex(newer))
+	file := s1.store.cfg.FS.PathJoin(path, fmt.Sprintf(snapshotPathPattern+".gbsnap", newer))
+	require.NoError(t, s1.store.cfg.FS.Remove(file))
+	f, err := s1.store.cfg.FS.Create(file)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	for i := 0; i < 2; i++ {
+		err := s1.store.processShardTruncateLog(ctx, 1)
+		t.Logf("tick %d: err=%v, candidate=%d, count=%d", i, err,
+			s1.store.snapshotMgr.NewestIndex(1, 1), s1.store.snapshotMgr.Count(1, 1))
+		require.Error(t, err)
+	}
+	olderDir, selected := s1.store.snapshotMgr.EvalImportSnapshot(1, 1, older)
+	require.Equal(t, older, selected)
+	require.NoError(t, s1.store.importSnapshot(ctx, 1, 1, older, olderDir))
+	// Even after the older candidate is imported, the next regular tick still
+	// selects the corrupt newer one and does not clear it.
+	require.Error(t, s1.store.processShardTruncateLog(ctx, 1))
+	require.Equal(t, newer, s1.store.snapshotMgr.NewestIndex(1, 1))
+}

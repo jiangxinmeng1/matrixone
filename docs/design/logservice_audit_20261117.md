@@ -61,3 +61,9 @@
 复现源文件及单独运行方法见 [snapshot_export_commit_eio](../../test/logservice-chaos/snapshot_export_commit_eio/README.md)。该源文件以 `.go.txt` 存放，避免正常测试套件意外退出。缺陷记录：[matrixone#32836](https://github.com/matrixorigin/matrixone/issues/32836)，已分配给 `jiangxinmeng1`。
 
 新增四个正常测试以 `-race -count=3` 联合运行通过；完整 `pkg/logservice` 包以 `-race -count=1` 运行通过（155.612 秒）。故障注入诊断在独立进程中运行，不包含在正常包测试内。
+
+## 重启后导出水位与坏快照候选（2026-11-17）
+
+重建 LogService 后，内存中的 `snapshotIndex` 从 0 开始，已有导出快照仍由管理器加载。诊断性地让 TN 在重启前不再写入，下一次截断 tick 仍能导出新快照：Raft 重启后 index 从 14 进到 15。三轮均无错误；这条水位线索未形成缺陷。临时测试改动已撤销。
+
+另在三副本 Log shard 加 HAKeeper 的测试集群中导出两份快照，然后保留较旧快照、将较新快照的 `.gbsnap` 文件替换为空文件，并把 `TRUNCATE_WAL` 水位推进至较新 index。正常截断 tick 连续两次都选中坏候选并返回 `invalid file size`；较旧候选可以直接导入，但导入后下一轮正常 tick 仍被坏候选挡住。普通模式 5 轮、`-race` 3 轮稳定复现。候选损坏由测试显式注入，未证明实际存储出现损坏的概率；若持续写入且导出配额耗尽，物理日志压缩会持续停滞。复现见 [snapshot_corrupt_candidate](../../test/logservice-chaos/snapshot_corrupt_candidate/README.md)，缺陷记录：[matrixone#32842](https://github.com/matrixorigin/matrixone/issues/32842)，已分配给 `jiangxinmeng1`。
