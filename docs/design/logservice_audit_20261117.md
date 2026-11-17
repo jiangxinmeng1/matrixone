@@ -1,6 +1,6 @@
 # LogService 单 TN 路径检查与测试（2026-11-17）
 
-基线：`upstream/main` `e765c5fd44`。只检查单个逻辑 TN 使用的 LogService 写入、截断、快照路径；未运行 datasync，也未启动真实 TN 或三节点故障集群。
+基线：`upstream/main` `e765c5fd44`；已核对后续 `47957ef450` 未修改本轮涉及的 LogService 和 TN driver 代码。只检查单个逻辑 TN 使用的 LogService 写入、截断、快照路径；未运行 datasync，也未启动真实 TN。后续测试在本机启动了三副本 LogService/HAKeeper 测试集群。
 
 ## 本轮检查
 
@@ -44,3 +44,20 @@
 ## `TRUNCATE_WAL` 已提交但回包丢失（2026-11-17）
 
 新增 `TestTruncateWALBlackholedResponseCanBeReconciled`：真实 RPC 客户端先经代理连到单副本 LogService，再丢弃服务端回包。服务端已经提交 PSN/DSN 水位，客户端约 16 秒后报错；客户端重连健康地址后，重复截断返回 `ErrInvalidTruncateLsn`，`GetWALTruncate` 查到原先提交的 PSN/DSN。普通模式共跑 3 次、`-race` 跑 1 次通过；单次 `-race` 测得等待 15.994 秒。另在 TN logservicedriver 新增 `TestTruncateReconcilesCommittedRequestWithLostReply`，模拟首次截断已提交但回包丢失：driver 重试并核对水位后正确返回成功；若 checkpointed DSN 小于请求值则拒绝确认。该测试普通模式连跑 10 次，新增不足水位断言后以 `-race` 连跑 10 次通过。约 16 秒是本测试连接被黑洞时的观测值，不能推断三副本中两票可用时的尾延迟；未发现新缺陷。
+
+## 三副本快照、切主与成员变更（2026-11-17）
+
+- `TestSnapshotImportAfterThreeReplicaLeaderFailure`：三副本 Log shard 和 HAKeeper 中先写入、由 follower 导出快照，再关闭 leader；客户端重试同一 WAL，提交 `TRUNCATE_WAL`，运行带 HAKeeper 检查的正常截断循环，核对两存活副本的已确认 WAL。最后用旧目录重建被关闭的服务并核对追赶。普通模式 10 轮、`-race` 3 轮通过。最初的 `Eventually` 回调可能独自阻塞到超时，曾产生误导性失败；改成每次读取独立 2 秒期限后未复现数据问题。
+- `TestImportSnapshotExportedBeforeReplicaRemoval`：三成员快照导出后，停止并正式移除原 leader，再在剩余副本写入、导入旧快照；成员关系没有回退，快照后的 WAL 保留。普通模式 10 轮、`-race` 5 轮通过。
+- `TestImportSnapshotExportedBeforeReplicaAddition`：两成员时导出快照，随后增加第三个投票副本并追赶，再导入旧快照；关闭原成员后，新成员与另一原成员仍可写入并读到所有已确认 WAL。普通模式 10 轮、`-race` 3 轮通过。
+- `TestImportSnapshotRetriesAfterExportCleanupFailure`：快照已经成功导入 Dragonboat 后，清理外部快照目录时注入一次错误；候选仍可重试，重试后 WAL 完整。普通模式 1 轮、`-race` 5 轮通过。
+
+以上测试使用本机测试服务和一个逻辑 TN 租约，没有启动真实 TN 进程，也没有覆盖 datasync。正常路径未发现新缺陷。
+
+## 新缺陷：导出快照提交 I/O 错误导致整个 LogService 进程退出
+
+独立诊断测试在外部快照目录从 `snapshot-*.generating` 重命名为最终目录时注入一次 `syscall.EIO`。3 个独立 Go 测试进程均直接 panic：`commit snapshot failed: input/output error`。LogService 通过 `SnapshotOption{Exported: true}` 请求该快照，本次导出不会压缩活动 Raft 日志；Dragonboat 快照 worker 却把提交错误统一传给 `panicNow`，调用方无法取得普通错误并在下一轮重试。此为单节点 I/O 故障注入，未实测三副本集群在此故障下的业务延迟。
+
+复现源文件及单独运行方法见 [snapshot_export_commit_eio](../../test/logservice-chaos/snapshot_export_commit_eio/README.md)。该源文件以 `.go.txt` 存放，避免正常测试套件意外退出。缺陷记录：[matrixone#32836](https://github.com/matrixorigin/matrixone/issues/32836)，已分配给 `jiangxinmeng1`。
+
+新增四个正常测试以 `-race -count=3` 联合运行通过；完整 `pkg/logservice` 包以 `-race -count=1` 运行通过（155.612 秒）。故障注入诊断在独立进程中运行，不包含在正常包测试内。

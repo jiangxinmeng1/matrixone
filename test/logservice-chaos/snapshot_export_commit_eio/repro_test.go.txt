@@ -1,0 +1,61 @@
+package logservice
+
+import (
+	"context"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/lni/dragonboat/v4"
+	"github.com/lni/goutils/leaktest"
+	"github.com/lni/vfs"
+	"github.com/matrixorigin/matrixone/pkg/common/morpc"
+	"github.com/stretchr/testify/require"
+)
+
+var errSnapshotExportRename = syscall.EIO
+
+type failExportRenameFS struct {
+	vfs.FS
+	fail atomic.Bool
+}
+
+func (fs *failExportRenameFS) Rename(oldname, newname string) error {
+	if strings.Contains(oldname, ".generating") &&
+		strings.Contains(newname, "shard-1/replica-1/snapshot-") &&
+		fs.fail.CompareAndSwap(true, false) {
+		return errSnapshotExportRename
+	}
+	return fs.FS.Rename(oldname, newname)
+}
+
+func TestDiagnosticExportSnapshotCommitEIOPanics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	cfg := getServiceTestConfig()
+	fs := &failExportRenameFS{FS: cfg.FS}
+	cfg.FS = fs
+	defer vfs.ReportLeakedFD(fs, t)
+	s, err := NewServiceWithRetry(func() Config { return cfg }, newFS(), nil,
+		WithBackendFilter(func(morpc.Message, string) bool { return true }))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close()) }()
+	require.NoError(t, s.store.startReplica(1, 1,
+		map[uint64]dragonboat.Target{1: s.ID()}, false))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	require.NoError(t, s.store.getOrExtendTNLease(ctx, 1, 100))
+	for i := 0; i < 10; i++ {
+		_, err := s.store.append(ctx, 1, getTestAppendCmd(100, []byte("initial")), true)
+		require.NoError(t, err)
+	}
+	require.NoError(t, s.store.truncateLog(ctx, 1, 4))
+	_, err = s.store.append(ctx, 1, getTestAppendCmd(100, []byte("advance")), true)
+	require.NoError(t, err)
+	fs.fail.Store(true)
+	err = s.store.processShardTruncateLog(ctx, 1)
+	// This assertion would pass if the export error were returned normally.
+	// Current Dragonboat behavior panics in its snapshot worker first.
+	require.ErrorIs(t, err, errSnapshotExportRename)
+}
