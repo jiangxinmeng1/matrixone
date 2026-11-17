@@ -32,3 +32,7 @@
 ## 快照导入与后续截断并发（2026-11-17）
 
 审查 `importSnapshot` 与 `handleWALTruncate` 的交错：旧快照导入期间，单个 TN 可以继续推进 checkpointed DSN 与物理截断 PSN。扩展 `TestImportedSnapshotRetainsLaterWALAcrossServiceRecreation`，在导出快照后写入 10 条 WAL，先截断到快照位置，再并发导入旧快照和推进至一条较新 WAL 的 PSN/DSN。等待两操作成功后关闭并重建 LogService，核对较新的截断状态、全部 10 条已确认 WAL 字节，并继续写入。普通模式连跑 20 次、`-race` 连跑 5 次通过。此测试在单投票副本上运行，服务重建发生于同一测试进程；没有覆盖三副本切主、HAKeeper 导入许可或实际 TN checkpoint 生成。未发现新缺陷。
+
+## 导出快照后、TN 截断前重启（2026-11-17）
+
+检查 `startReplica` 重新加载导出快照的窗口：快照已落在磁盘，TN 仍未推进 checkpointed DSN。新增 `TestExportedSnapshotSurvivesRestartBeforeWALTruncate`，先导出快照并写入后续 10 条 WAL，然后关闭并重建 LogService；确认快照管理器重新发现原快照且 checkpointed DSN 尚未前进。之后提交 `TRUNCATE_WAL`、导入原快照、再次重建服务，逐条核对后续 WAL、PSN/DSN 水位并继续写入。普通模式连跑 10 次、`-race` 连跑 3 次通过。测试为单副本、同进程服务重建，并直接调用快照导入；未覆盖三副本切主及 HAKeeper 导入许可。未发现新缺陷。
