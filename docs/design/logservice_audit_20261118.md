@@ -23,3 +23,9 @@
 ## 超过 TN 读取批量预算的 WAL
 
 将上一轮的 99 MiB WAL 诊断移到最新代码，并补充 `UserRecord` 分类断言。单条记录超过 TN driver 的 64 MiB 读取预算；在快照导入前后，读取均返回完整记录，下一游标指向后续小记录，内容和类型均正确。普通模式连续 2 轮、`-race` 1 轮通过。此测试为单副本，直接调用快照导入；没有启动真实 TN。
+
+## 三副本 RPC 黑洞与不确定截断结果
+
+新增 `TestThreeReplicaClientRecoversFromBlackholedConnection`：三投票副本保持运行，同一个 TN 客户端的已有 RPC 连接固定到一台的代理，代理在 CONNECT 后丢弃响应。`Read` 三轮均在约 7.00 秒后重新连接并取回已确认 WAL；`GetWALTruncate` 单次约 8.00 秒报错，下一次调用在约 0.8–5.9 毫秒内成功。两票在整个黑洞阶段保持可用，没有一分钟级等待。
+
+同一测试随后让 `TruncateWAL` 经黑洞连接提交，直接从另一个副本确认多数派已有 PSN/DSN，再停止原 leader。三轮中首次截断请求均收到 EOF；新 leader 的 `GetWALTruncate` 返回已提交水位，重复截断返回 `ErrInvalidTruncateLsn`，符合 TN driver 已有的查询水位后确认逻辑。扩展后普通模式连续 3 轮、`-race` 1 轮通过。这里调用了真实 LogService 客户端，未启动 TN driver 实例；它验证了 driver 重试所依赖的服务端状态，但不单独验证 driver 的完整生命周期。
