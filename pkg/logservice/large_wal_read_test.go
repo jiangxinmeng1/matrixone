@@ -1,0 +1,81 @@
+package logservice
+
+import (
+	"bytes"
+	"context"
+	"testing"
+	"time"
+
+	"github.com/lni/dragonboat/v4"
+	"github.com/lni/goutils/leaktest"
+	"github.com/lni/vfs"
+	"github.com/matrixorigin/matrixone/pkg/common/morpc"
+	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
+	"github.com/stretchr/testify/require"
+)
+
+func TestReadLargeWALAcrossSnapshotImportOnLatestMain(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	cfg := getServiceTestConfig()
+	cfg.RPC.MaxMessageSize = 100 << 20
+	defer vfs.ReportLeakedFD(cfg.FS, t)
+	service, err := NewServiceWithRetry(func() Config { return cfg }, newFS(), nil,
+		WithBackendFilter(func(morpc.Message, string) bool { return true }))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, service.Close()) }()
+	require.NoError(t, service.store.startReplica(1, 2,
+		map[uint64]dragonboat.Target{2: service.ID()}, false))
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	c, err := NewClient(ctx, "", ClientConfig{
+		LogShardID: 1, TNReplicaID: 2,
+		ServiceAddresses: []string{cfg.LogServiceServiceAddr()},
+		MaxMessageSize:   defaultMaxMessageSize,
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, c.Close()) }()
+	{
+		for i := 0; i < 10; i++ {
+			_, err := c.Append(ctx, c.GetLogRecord(8))
+			require.NoError(t, err)
+		}
+		require.NoError(t, c.Truncate(ctx, 4))
+		require.NoError(t, service.store.processShardTruncateLog(ctx, 1))
+		snapshotIndex := service.store.snapshotMgr.NewestIndex(1, 2)
+		require.NotZero(t, snapshotIndex)
+		large := c.GetLogRecord(99 << 20)
+		payload := large.Payload()
+		for i := range payload {
+			payload[i] = byte(i)
+		}
+		first, err := c.Append(ctx, large)
+		require.NoError(t, err)
+		small := c.GetLogRecord(16)
+		copy(small.Payload(), []byte("following-record"))
+		second, err := c.Append(ctx, small)
+		require.NoError(t, err)
+		require.Equal(t, first+1, second)
+		verifyRead := func() {
+			batch, next, err := c.Read(ctx, first, 64<<20)
+			require.NoError(t, err)
+			require.Len(t, batch, 1)
+			require.Equal(t, first, batch[0].Lsn)
+			require.Equal(t, pb.UserRecord, batch[0].Type)
+			require.True(t, bytes.Equal(large.Data, batch[0].Data))
+			require.Equal(t, second, next)
+			batch, next, err = c.Read(ctx, next, 64<<20)
+			require.NoError(t, err)
+			require.Len(t, batch, 1)
+			require.Equal(t, second, batch[0].Lsn)
+			require.Equal(t, pb.UserRecord, batch[0].Type)
+			require.True(t, bytes.Equal(small.Data, batch[0].Data))
+			require.Equal(t, second, next)
+		}
+		verifyRead()
+		require.NoError(t, c.TruncateWAL(ctx, snapshotIndex, 10))
+		dir, index := service.store.snapshotMgr.EvalImportSnapshot(1, 2, snapshotIndex)
+		require.Equal(t, snapshotIndex, index)
+		require.NoError(t, service.store.importSnapshot(ctx, 1, 2, index, dir))
+		verifyRead()
+	}
+}
