@@ -23,3 +23,19 @@ plus three `-race` runs of the final restart variant passed. The source stays
 outside the regular suite because it asserts the current faulty behavior.
 
 Related issue: [matrixone#32842](https://github.com/matrixorigin/matrixone/issues/32842).
+
+`orphan_repro_test.go.txt` tests the symmetric partial deletion order: the FS
+wrapper removes `snapshot.metadata` and then reports the `RemoveAll` error.
+Subsequent ticks fail while the process remains up. After restart, the manager
+skips the incomplete directory, but its `.gbsnap` file still exists after a
+normal truncation tick. This diagnostic produced a 1,074-byte orphan in the
+small test fixture. It passed five ordinary and three `-race` runs. Copy it to
+`pkg/logservice/snapshot_orphan_file_repro_test.go` and run:
+
+```sh
+GOWORK=off go test -mod=readonly ./pkg/logservice \
+  -run '^TestPartialSnapshotCleanupLeavesOrphanSnapshotData$' -count=5 -v
+```
+
+The test uses fault injection; it does not establish how often a real
+filesystem operation can fail after deleting only one file.

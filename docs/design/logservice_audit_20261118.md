@@ -35,3 +35,5 @@
 `importSnapshot` 先让 Dragonboat 导入，再调用 `snapshotMgr.Remove` 删除外部快照。若 `RemoveAll` 已删掉 `.gbsnap` 文件后报错，管理器因错误仍保留内存候选；之后正常 `processShardTruncateLog` 再次挑中该不完整目录，返回 `snapshot is incomplete`。故障注入使用包装文件系统模拟“部分删除后报错”，不是实测真实磁盘发生该错误。普通模式先以五轮确认连续两个截断 tick 均失败；增加保留目录重启检查后，普通模式三轮、`-race` 三轮仍稳定复现。首次导入已提交，后续已确认 WAL 可读，继续写入也成功。重启后管理器跳过不完整候选并能继续写入；未验证长期运行时磁盘容量增长幅度。
 
 诊断代码与运行方法见 [snapshot_partial_cleanup](../../test/logservice-chaos/snapshot_partial_cleanup/README.md)。这个时间线与 [matrixone#32842](https://github.com/matrixorigin/matrixone/issues/32842) 的“不可用快照候选反复挡住正常截断”机制相同，作为该缺陷的补充复现，不另建重复 issue。
+
+进一步测试对称的部分删除顺序：先删除 `snapshot.metadata`，再从 `RemoveAll` 返回错误。运行中的进程仍会反复选择坏候选；保留目录重启后，管理器会跳过该不完整目录，但其中的 `.gbsnap` 文件仍在，后续正常截断 tick 也未清除。小测试快照留下 1,074 字节；真实快照大小可能不同，未测量长期累计占用。普通模式五轮、`-race` 三轮通过。复现源文件见同目录的 `orphan_repro_test.go.txt`；这同样属于故障注入，尚未在真实磁盘上观察到部分删除。
