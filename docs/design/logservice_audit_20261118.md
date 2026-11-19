@@ -107,3 +107,11 @@ TN 的 WAL 客户端工厂通过 `logservice.NewClient` 使用 `DiscoveryAddress
 新增 [TestAuditLogHeartbeatDropsUnacknowledgedReplicaCommand](../../pkg/logservice/log_heartbeat_command_loss_audit_test.go)：用实际 `operator.CreateStartReplica` 和 `Controller.Dispatch` 生成 LogStore `StartReplica`，通过正常 checker 屏障启用命令确认投递；注册目标 LogStore 后，第一次心跳返回启动命令，测试丢弃该响应，第二次心跳不再返回命令，读取 HAKeeper 队列也为空。普通模式连续 3 轮、`-race` 连续 3 轮稳定复现，登记为 [matrixone#32933](https://github.com/matrixorigin/matrixone/issues/32933)，指派 `jiangxinmeng1`。
 
 该测试模拟单次 RPC 回包丢失，没有在三节点网络中实际丢包，也没有证明集群会永久不可用；Operator 过期后检查器可能重新生成操作。已确认的是这一轮启动命令在确认投递已启用的情况下仍会丢失，延迟副本恢复。此前 [matrixone#30443](https://github.com/matrixorigin/matrixone/issues/30443) 涉及 TN 在旧协议阶段的同类窗口，本次是 LogStore 在新协议已启用后的独立路径。
+
+## 新缺陷：截断水位只读请求在旧连接黑洞时等待 8–16 秒
+
+`managedClient.GetWALTruncate` 只向当前连接发出一次请求，收到错误后清空连接并把错误返回；TN 驱动的 `getWALTruncateFromBackend` 在这之后才会重试。与同一客户端已实现短尝试加换地址重试的 `Read`、`GetTruncatedLsn` 不同，这条只读水位路径仍受后端 8 秒读超时及可能叠加的空闲读取窗口影响。
+
+新增 [TestAuditThreeVoterGetWALTruncateStallsOnBlackholedPeer](../../pkg/logservice/wal_truncate_blackhole_audit_test.go)：真实三投票副本运行，单个 TN ID 客户端经 TCP 代理连到 leader；先成功读取水位，再让代理只丢回包，同时让该客户端可在重连时使用三个真实地址。旧连接上的第一次读取报 I/O timeout，普通模式两轮等待约 8.002、8.001 秒；`-race` 两轮等待约 8.003、16.002 秒。在其等待期间，另一个直连客户端在 2 秒内成功读取相同水位；原客户端下一次调用也换地址成功。单服务诊断测试另测到约 8.002、16.001 秒。登记为 [matrixone#32934](https://github.com/matrixorigin/matrixone/issues/32934)，指派 `jiangxinmeng1`。
+
+这证明的是当前 LogService 客户端的可避免长尾，未启动完整 TN，也未在物理网络中断包；TN replay 启动和缺口恢复确实调用该驱动方法，但本测试未测量完整 TN 恢复耗时。与已关闭的 `Read` 长尾 [matrixone#32148](https://github.com/matrixorigin/matrixone/issues/32148) 属同类故障模式，遗漏的是不同的 `GetWALTruncate` 只读调用路径。此次已拉取最新 `upstream/main`（`4cec607b57`）；该路径的客户端和 TN 驱动源码与审计分支相比没有变动。
