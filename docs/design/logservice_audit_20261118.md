@@ -61,3 +61,7 @@
 ## 停副本期间导出迟到完成，再用旧目录重启
 
 新增 `TestStoppedReplicaRecoversWALAfterLateSnapshotExport`：单副本先确认 12 条 WAL；包装文件系统在导出快照的最终 rename 处暂停，随后停止副本，使导出请求返回 `ErrShardClosed`；再放行 rename，明确确认完整快照目录已经出现。关闭 store、用同一数据目录重建后，先逐条核对原 WAL，再确认快照管理器加载了迟到候选；继续写入新 WAL、提交旧快照位置的 `TruncateWAL`，通过正常截断循环导入该候选，最终读回新 WAL。普通模式连续 3 轮、`-race` 连续 2 轮通过，未发现新缺陷。测试用文件系统钩子固定时序，关闭后台 worker 并直接调用 store 接口；不代表真实磁盘故障或完整 TN 进程测试。首次诊断因夹具重建时传入空 task service getter 却启动 HAKeeper worker 而 panic；按现有手动测试配置关闭后台 worker 后，目标时序通过，未将该夹具 panic 计为产品缺陷。
+
+## 同一 TN 反复 CONNECT 后的租约历史快照与读取分类
+
+`handleSetLeaseHolderID` 对重复的同一 TN ID 仍记录新的租约位置，因此补测了重连导致的租约历史增多。扩展 `TestImportedSnapshotRetainsLaterWALAcrossServiceRecreation`：快照导出前连续 100 次、导出后再连续 100 次用同一个 TN ID CONNECT；之后写入、提交 `TRUNCATE_WAL`、导入快照并用旧目录重启，核对水位之后 WAL 的字节和 `UserRecord` 分类。普通模式连续 5 轮、`-race` 连续 2 轮通过，未见租约误分类或数据丢失。测试通过服务端 CONNECT 入口构造重复连接，没有模拟 200 次真实 TCP 重建；不证明极大规模历史下的内存上界。

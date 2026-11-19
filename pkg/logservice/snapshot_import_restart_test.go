@@ -47,6 +47,11 @@ func TestImportedSnapshotRetainsLaterWALAcrossServiceRecreation(t *testing.T) {
 	resp := service.handleConnect(ctx, pb.Request{Method: pb.CONNECT,
 		LogRequest: pb.LogRequest{ShardID: 1, TNID: tnID}})
 	require.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+	for i := 0; i < 100; i++ {
+		resp = service.handleConnect(ctx, pb.Request{Method: pb.CONNECT,
+			LogRequest: pb.LogRequest{ShardID: 1, TNID: tnID}})
+		require.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+	}
 	appendOne := func(s *Service, i int) (uint64, []byte) {
 		cmd := getTestAppendCmd(tnID, []byte(fmt.Sprintf("wal-%04d", i)))
 		resp := s.handleAppend(ctx, pb.Request{Method: pb.APPEND_WAL,
@@ -63,6 +68,11 @@ func TestImportedSnapshotRetainsLaterWALAcrossServiceRecreation(t *testing.T) {
 	require.NoError(t, service.store.processShardTruncateLog(ctx, 1))
 	index := service.store.snapshotMgr.NewestIndex(1, 1)
 	require.NotZero(t, index)
+	for i := 0; i < 100; i++ {
+		resp = service.handleConnect(ctx, pb.Request{Method: pb.CONNECT,
+			LogRequest: pb.LogRequest{ShardID: 1, TNID: tnID}})
+		require.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+	}
 	written := make(map[uint64][]byte)
 	var laterPSN uint64
 	for i := 10; i < 20; i++ {
