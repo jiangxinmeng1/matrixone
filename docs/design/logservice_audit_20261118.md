@@ -71,3 +71,9 @@
 TN 的 WAL 客户端工厂通过 `logservice.NewClient` 使用 `DiscoveryAddress`；建连进入 `connectToLogServiceByReverseProxy` 后，`GetShardInfo` 用 `context.Background()` 发起独立的 1 秒发现 RPC，没有继承建连请求的 context。新增 `TestNewClientDiscoveryIgnoresContextDeadline`：真实 RPC 客户端连到只接受连接、不返回发现结果的 TCP 端点，外层 context 在 20ms 过期。普通模式 3 轮的返回时间约 1.0009、1.0006、1.0012 秒；`-race` 2 轮约 1.0016、1.0005 秒，均在外层期限之后才返回 `context deadline exceeded`。测试代码位于 [shardinfo_test.go](../../pkg/logservice/shardinfo_test.go)，问题记录为 [matrixone#32916](https://github.com/matrixorigin/matrixone/issues/32916)，已指派 `jiangxinmeng1`。
 
 这是单次发现 RPC 最多约 1 秒的取消长尾；没有实测完整 TN 关闭、事务写入延迟，也没有证据表明它会单独造成分钟级等待。检查 `SaveSnapshot` 时还发现状态机未显式检查 `io.Writer` 的短写；实际 Dragonboat 快照路径使用文件写入，未构造出真实磁盘上的短写无错误场景，因此未计为产品缺陷。
+
+## 三副本切主后经发现地址重新连接
+
+原切主测试用 `ServiceAddresses` 直连三个副本；TN 生产工厂优先使用 `DiscoveryAddress`，所以新增 `TestThreeReplicaDiscoveryClientReadsAcrossTSOGapAfterLeaderFailure`。测试先等待存活节点的 gossip 发现视图就绪，再确保单 TN 客户端实际连到当前 leader；写入两条由 100 次 TSO 命令隔开的 WAL 后停掉该 leader。原客户端经存活节点的发现地址重新连接，读取并核对两条 WAL，提交 `TruncateWAL`、核对水位、读取保留 WAL，继续追加并读回第三条。普通模式连续 5 轮、`-race` 连续 2 轮通过，未见新缺陷。
+
+首次测试在发现视图尚未同步时直接创建客户端，三轮均返回 `shard not found`；这是启动发现窗口，TN 工厂有建连重试，因此改为等待发现就绪后测试切主。该测试关闭整个 leader 服务，发现端点选用存活副本地址；没有模拟负载均衡器或网络黑洞，也没有启动完整 TN。

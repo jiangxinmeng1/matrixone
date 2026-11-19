@@ -13,6 +13,14 @@ import (
 )
 
 func TestThreeReplicaClientReadsAcrossTSOGapAfterLeaderFailure(t *testing.T) {
+	runThreeReplicaClientReadsAcrossTSOGapAfterLeaderFailure(t, false)
+}
+
+func TestThreeReplicaDiscoveryClientReadsAcrossTSOGapAfterLeaderFailure(t *testing.T) {
+	runThreeReplicaClientReadsAcrossTSOGapAfterLeaderFailure(t, true)
+}
+
+func runThreeReplicaClientReadsAcrossTSOGapAfterLeaderFailure(t *testing.T, discover bool) {
 	defer leaktest.AfterTest(t)()
 	logger, _ := captureLogger()
 	s1, s2, s3, cfg1, cfg2, cfg3 := buildZombieCluster(t, logger)
@@ -41,12 +49,32 @@ func TestThreeReplicaClientReadsAcrossTSOGapAfterLeaderFailure(t *testing.T) {
 	}, 10*time.Second, 20*time.Millisecond)
 	cfg := ClientConfig{
 		LogShardID: 1, TNReplicaID: 100,
-		ServiceAddresses: []string{cfg1.LogServiceServiceAddr(), cfg2.LogServiceServiceAddr(), cfg3.LogServiceServiceAddr()},
-		MaxMessageSize:   defaultMaxMessageSize,
+		MaxMessageSize: defaultMaxMessageSize,
+	}
+	if discover {
+		// The discovery endpoint survives the first leader failure, as a
+		// reverse proxy in the TN deployment would.
+		cfg.DiscoveryAddress = configs[leader%3].LogServiceServiceAddr()
+		require.Eventually(t, func() bool {
+			_, ready, err := GetShardInfo("", cfg.DiscoveryAddress, cfg.LogShardID)
+			return err == nil && ready
+		}, 10*time.Second, 20*time.Millisecond)
+	} else {
+		cfg.ServiceAddresses = []string{cfg1.LogServiceServiceAddr(), cfg2.LogServiceServiceAddr(), cfg3.LogServiceServiceAddr()}
 	}
 	c, err := NewClient(ctx, "", cfg)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, c.Close()) }()
+	if discover {
+		managed := c.(*managedClient)
+		leaderAddress := configs[leader-1].LogServiceServiceAddr()
+		if managed.client.addr != leaderAddress {
+			managed.resetClient()
+			managed.client, err = connectToLogServiceAddress(ctx, "", leaderAddress, cfg)
+			require.NoError(t, err)
+		}
+		require.Equal(t, leaderAddress, managed.client.addr)
+	}
 	appendWAL := func(value string) (uint64, []byte) {
 		record := c.GetLogRecord(len(value))
 		copy(record.Payload(), value)
