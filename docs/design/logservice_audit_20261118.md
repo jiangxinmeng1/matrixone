@@ -53,3 +53,7 @@
 ## TSO 命令造成物理 PSN 间隔时的 TN 回放和截断
 
 `getNextValidPSN` 会逐一检查两个已记录 WAL PSN 之间的物理索引；LogService 的 TSO 命令也提交在第一个 Log shard 上。微测量中，100 万个合成空位约需 8ms，1000 万个约需 76–83ms，尚无足够证据将其归为产品长尾缺陷。随后新增 `TestReplayAcrossTSOEntriesOnSameLogShard` 使用真实 LogService 和单个 TN driver：写入 DSN 1，经同一 shard 提交 200 次 TSO 更新，再写入 DSN 2。测试确认两个 WAL PSN 相隔至少 200；重建 driver 后按顺序回放 1、2，提交 DSN 1 的 `TruncateWAL` 后再重建，只回放 2。普通模式连续 3 轮、`-race` 连续 2 轮通过。该测试是单副本，没有启动完整 TN，也没有强制物理快照导入。
+
+## 三副本切主时跨 TSO 间隔读取、截断和继续写入
+
+检查了三地址客户端在 leader 下线后沿用旧连接的恢复路径。新增 `TestThreeReplicaClientReadsAcrossTSOGapAfterLeaderFailure`：三投票副本、同一个 TN ID 的客户端先写两条 WAL，中间在同一 Log shard 提交 100 条 TSO 命令；核实 WAL 的物理 LSN 间隔至少 100 后停止 leader。剩余两票选主后，原客户端读回两条 WAL，提交 `TruncateWAL` 并核对 PSN/DSN 水位，再读取保留记录、继续追加第三条并读回。普通模式连续 3 轮、`-race` 连续 2 轮通过，未发现新缺陷。测试关闭整个 leader 服务而不是注入网络黑洞；未启动真实 TN driver，也未触发物理快照导入。
