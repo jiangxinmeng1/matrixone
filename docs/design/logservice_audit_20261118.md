@@ -83,3 +83,9 @@ TN 的 WAL 客户端工厂通过 `logservice.NewClient` 使用 `DiscoveryAddress
 检查 `shouldDoImport` 在读取 HAKeeper 失败时跳过物理导入的路径，新增 `TestSnapshotImportResumesAfterHAKeeperReplicaRestarts`。单 TN 先写入 WAL、导出快照、写入较新 WAL 并提交覆盖旧快照位置的 `TruncateWAL`；随后只停止 HAKeeper shard 0 的本地副本，保持 Log shard 1 可用。停机期间继续写入并读取 WAL，截断循环没有导入候选快照。重启同一个 HAKeeper 副本后，截断循环导入原候选；检查原候选不再可选、PSN/DSN 水位正确、停机期间及之前的较新 WAL 内容未变，并可继续写入。普通模式连续 5 轮、`-race` 连续 3 轮通过，未发现新缺陷。
 
 测试期间因为 Log shard 已继续前进，HAKeeper 不可用时还可能导出一份更高索引快照。因此快照管理器在导入旧候选后仍有候选属于预期，不能以列表必须清空作为断言。该测试是单 Log 副本、单 HAKeeper 副本的进程内场景；没有模拟三副本网络分区或长期磁盘增长。
+
+## 同一 TN 频繁重连后的小分页读取与快照导入
+
+`queryLog` 先查询 Raft 日志页，再按租约历史分类；频繁 CONNECT 会插入大量 `LeaseUpdate` 记录，分页可能在任意租约更新处断开。新增 `TestPaginatedWALReadAcrossSameTNReconnectsAndSnapshotImport`：同一个 TN ID 在两个阶段各重建 20 次真实 RPC 连接，每四次连接写一条 WAL；用 `Read(..., maxSize=1)` 逐页检查游标严格前进，核对所有已确认 WAL 的 LSN、字节和 `UserRecord` 类型。两阶段之间导出快照，第二阶段后提交 `TruncateWAL` 并确认物理导入，再从保留水位之后重新逐页核对。普通模式连续 5 轮、`-race` 连续 3 轮通过，未见新缺陷。
+
+测试只有一个 TN ID、一个 Log 副本，没有并发调用同一个客户端；1 字节是读取批次上限，Dragonboat 仍会返回至少一条完整记录。它验证记录分类和分页前进，不代表大规模租约历史的内存上界。
