@@ -49,3 +49,7 @@
 ## 新发现：TN replay 写入 skip command 时忽略取消
 
 `replayer.tryScheduleApply` 在单个 TN 的乱序 WAL 回放中调用 `AppendSkipCmd(ctx, skipMap)`；该函数进入 `wrappedClient.Append`。后者每次失败后直接 `time.Sleep(RetryInterval)`，没有检查 `ctx.Done()`。白盒复现使用真实 replayer 和包装客户端，后端在已取消 context 下返回 `context.Canceled`：将 `MaxTimeout` 缩短为 350ms，连续 3 轮均在约 600ms 后才返回。生产默认 `MaxTimeout` 为 3 分钟；这里没有等待三分钟或启动完整 TN，因此实际 TN 进程级延迟尚未测量。普通事务提交的 Append 使用 background context，本证据只指向 replay skip 写入。复现源文件和命令见 [tn_skip_cancel](../../test/logservice-chaos/tn_skip_cancel/README.md)，缺陷记录为 [matrixone#32912](https://github.com/matrixorigin/matrixone/issues/32912)。
+
+## TSO 命令造成物理 PSN 间隔时的 TN 回放和截断
+
+`getNextValidPSN` 会逐一检查两个已记录 WAL PSN 之间的物理索引；LogService 的 TSO 命令也提交在第一个 Log shard 上。微测量中，100 万个合成空位约需 8ms，1000 万个约需 76–83ms，尚无足够证据将其归为产品长尾缺陷。随后新增 `TestReplayAcrossTSOEntriesOnSameLogShard` 使用真实 LogService 和单个 TN driver：写入 DSN 1，经同一 shard 提交 200 次 TSO 更新，再写入 DSN 2。测试确认两个 WAL PSN 相隔至少 200；重建 driver 后按顺序回放 1、2，提交 DSN 1 的 `TruncateWAL` 后再重建，只回放 2。普通模式连续 3 轮、`-race` 连续 2 轮通过。该测试是单副本，没有启动完整 TN，也没有强制物理快照导入。
