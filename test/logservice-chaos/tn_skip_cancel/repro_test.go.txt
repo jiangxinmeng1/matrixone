@@ -1,0 +1,38 @@
+package logservicedriver
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/matrixorigin/matrixone/pkg/logservice"
+	"github.com/stretchr/testify/require"
+)
+
+type canceledReplayClient struct{ logservice.Client }
+
+func (c *canceledReplayClient) Append(ctx context.Context, _ logservice.LogRecord) (uint64, error) {
+	return 0, ctx.Err()
+}
+
+func TestReplaySkipAppendCanceledContextStillWaitsRetryBudget(t *testing.T) {
+	backend := NewMockBackend()
+	cfg := NewConfig("",
+		WithConfigOptMaxClient(1),
+		WithConfigOptMaxTimeout(350*time.Millisecond),
+		WithConfigOptClientFactory(func() (logservice.Client, error) {
+			return &canceledReplayClient{
+				Client: newMockBackendClient(backend),
+			}, nil
+		}),
+	)
+	d := NewLogServiceDriver(&cfg)
+	defer d.Close()
+	r := newReplayer(nil, d, MaxReadBatchSize)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	err := r.AppendSkipCmd(ctx, map[uint64]uint64{1: 1})
+	require.ErrorIs(t, err, context.Canceled)
+	require.GreaterOrEqual(t, time.Since(started), cfg.MaxTimeout)
+}
