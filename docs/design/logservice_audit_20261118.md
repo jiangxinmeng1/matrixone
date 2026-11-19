@@ -42,6 +42,10 @@
 
 检查 `queryLog` 先读取状态机最新位置、再查询 Dragonboat 物理日志、最后按租约历史分类的三段操作。新增 `TestReadRetainedWALWhileImportingSnapshot`：单 TN 租约下写入第一批 WAL，导出快照；写入第二批、提交覆盖第一批的截断水位，同时启动快照导入和 100 次第二批读取，每次核对所有已确认 WAL 的 LSN、字节及 `UserRecord` 分类。普通模式连续 3 轮、`-race` 连续 2 轮通过，未发现新的读取错误。测试调用服务端 `queryLog` 和快照导入方法，没有运行 TN driver；并发启动不保证读请求一定落在导入内部的特定阶段，不能据此排除更窄的竞态窗口。
 
+继续扩展同一测试：第一次导入后立刻通过正常截断循环导出第二份快照，再写入、提交新的 PSN/DSN 水位、导入第二份快照，最后用原数据目录重启服务。第二次导入前后和重启后，核对水位之后每条已确认 WAL 的内容和 `UserRecord` 类型。普通模式连续 5 轮、`-race` 连续 2 轮通过；这覆盖了候选快照消费后重新导出的状态更新，未发现新缺陷。测试仍为单副本，快照导入由测试直接触发，没有运行真实 TN。
+
+曾尝试从 `latest LSN + 1` 直接调用 `queryLog`，稳定返回 Dragonboat 的 `invalid log range`。核对 TN replayer 的游标推进后，正常回放不会自行发出这个越界请求；该断言已撤销，未计为产品缺陷。
+
 ## 新发现：TN replay 写入 skip command 时忽略取消
 
 `replayer.tryScheduleApply` 在单个 TN 的乱序 WAL 回放中调用 `AppendSkipCmd(ctx, skipMap)`；该函数进入 `wrappedClient.Append`。后者每次失败后直接 `time.Sleep(RetryInterval)`，没有检查 `ctx.Done()`。白盒复现使用真实 replayer 和包装客户端，后端在已取消 context 下返回 `context.Canceled`：将 `MaxTimeout` 缩短为 350ms，连续 3 轮均在约 600ms 后才返回。生产默认 `MaxTimeout` 为 3 分钟；这里没有等待三分钟或启动完整 TN，因此实际 TN 进程级延迟尚未测量。普通事务提交的 Append 使用 background context，本证据只指向 replay skip 写入。复现源文件和命令见 [tn_skip_cancel](../../test/logservice-chaos/tn_skip_cancel/README.md)，缺陷记录为 [matrixone#32912](https://github.com/matrixorigin/matrixone/issues/32912)。

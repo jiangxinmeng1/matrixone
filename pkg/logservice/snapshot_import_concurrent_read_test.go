@@ -19,9 +19,17 @@ import (
 func TestReadRetainedWALWhileImportingSnapshot(t *testing.T) {
 	cfg := getServiceTestConfig()
 	defer vfs.ReportLeakedFD(cfg.FS, t)
-	s, err := NewServiceWithRetry(func() Config { return cfg }, newFS(), nil)
+	files := newFS()
+	newService := func() (*Service, error) {
+		return NewServiceWithRetry(func() Config { return cfg }, files, nil)
+	}
+	s, err := newService()
 	require.NoError(t, err)
-	defer func() { require.NoError(t, s.Close()) }()
+	defer func() {
+		if s != nil {
+			require.NoError(t, s.Close())
+		}
+	}()
 	require.NoError(t, s.store.startReplica(1, 1,
 		map[uint64]dragonboat.Target{1: s.ID()}, false))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -89,4 +97,48 @@ func TestReadRetainedWALWhileImportingSnapshot(t *testing.T) {
 	}
 	wg.Wait()
 	require.NoError(t, importErr)
+
+	// The first imported snapshot must release its quota and allow another
+	// export/import cycle while later acknowledged WAL remains readable.
+	require.NoError(t, s.store.processShardTruncateLog(ctx, 1))
+	secondIndex := s.store.snapshotMgr.NewestIndex(1, 1)
+	require.Greater(t, secondIndex, index)
+	secondWant := make(map[uint64][]byte)
+	var secondFirst uint64
+	for i := 24; i < 36; i++ {
+		lsn, data := appendWAL(i)
+		if secondFirst == 0 {
+			secondFirst = lsn
+		}
+		secondWant[lsn] = data
+	}
+	resp = s.handleTruncateWAL(ctx, pb.Request{Method: pb.TRUNCATE_WAL,
+		LogRequest: pb.LogRequest{ShardID: 1, TNID: tnID, Lsn: secondIndex, CheckpointedDSN: 24}})
+	require.Equal(t, uint32(moerr.Ok), resp.ErrorCode, resp.ErrorMessage)
+	secondDir, selected := s.store.snapshotMgr.EvalImportSnapshot(1, 1, secondIndex)
+	require.Equal(t, secondIndex, selected)
+	require.NoError(t, s.store.importSnapshot(ctx, 1, 1, secondIndex, secondDir))
+	verifySecond := func(service *Service) {
+		records, _, err := service.store.queryLog(ctx, 1, secondFirst, math.MaxUint64)
+		require.NoError(t, err)
+		seen := make(map[uint64]bool)
+		for _, record := range records {
+			if data, ok := secondWant[record.Lsn]; ok {
+				require.Equal(t, pb.UserRecord, record.Type)
+				require.True(t, bytes.Equal(data, record.Data))
+				seen[record.Lsn] = true
+			}
+		}
+		require.Len(t, seen, len(secondWant))
+	}
+	verifySecond(s)
+	require.NoError(t, s.Close())
+	s = nil
+	s, err = newService()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		_, _, ok, err := s.store.nh.GetLeaderID(1)
+		return err == nil && ok
+	}, 5*time.Second, 10*time.Millisecond)
+	verifySecond(s)
 }
