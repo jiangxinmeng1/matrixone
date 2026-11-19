@@ -99,3 +99,11 @@ TN 的 WAL 客户端工厂通过 `logservice.NewClient` 使用 `DiscoveryAddress
 ## 快照导入成功后、候选目录删除前重启
 
 另新增 `TestSnapshotImportCrashBeforeCandidateRemoval`，将服务关闭点固定在 Dragonboat 已完成 `SyncRequestImportSnapshot`，但 LogService 尚未执行 `snapshotMgr.Remove` 和 `forwardTruncate` 之间；原数据目录重启后，候选被重新加载并再次导入。首轮截断 tick 清除旧候选并推进本地物理水位，第二轮仍可继续处理，截断水位之后的已确认 WAL 字节保持不变。普通模式 5 轮、`-race` 2 轮通过，未发现此窗口的新缺陷；这是在两步之间有序关闭服务，未模拟进程被强制杀死或文件系统写入错误。
+
+## 新缺陷：确认投递启用后 LogStore 的启动命令仍会因心跳回包丢失而消失
+
+`pkg/hakeeper/rsm.go` 中，CN/TN 心跳在 `CommandDeliveryPreparing/Enabled` 阶段使用带批次确认的 `getCommandBatchWithAck`；LogStore 心跳仍调用会在首次发送时删除非 bootstrap 命令的 `getCommandBatchFiltered`。LogStore 收到 RPC 回包后才在 `pkg/logservice/service_commands.go` 执行命令，因此“HAKeeper 已提交心跳、回包未送达”会使目标从未执行命令，而 HAKeeper 已没有命令可重发。
+
+新增 [TestAuditLogHeartbeatDropsUnacknowledgedReplicaCommand](../../pkg/logservice/log_heartbeat_command_loss_audit_test.go)：用实际 `operator.CreateStartReplica` 和 `Controller.Dispatch` 生成 LogStore `StartReplica`，通过正常 checker 屏障启用命令确认投递；注册目标 LogStore 后，第一次心跳返回启动命令，测试丢弃该响应，第二次心跳不再返回命令，读取 HAKeeper 队列也为空。普通模式连续 3 轮、`-race` 连续 3 轮稳定复现，登记为 [matrixone#32933](https://github.com/matrixorigin/matrixone/issues/32933)，指派 `jiangxinmeng1`。
+
+该测试模拟单次 RPC 回包丢失，没有在三节点网络中实际丢包，也没有证明集群会永久不可用；Operator 过期后检查器可能重新生成操作。已确认的是这一轮启动命令在确认投递已启用的情况下仍会丢失，延迟副本恢复。此前 [matrixone#30443](https://github.com/matrixorigin/matrixone/issues/30443) 涉及 TN 在旧协议阶段的同类窗口，本次是 LogStore 在新协议已启用后的独立路径。
