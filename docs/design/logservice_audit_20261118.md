@@ -1,6 +1,6 @@
 # LogService 单 TN 路径补测（2026-11-18）
 
-基线：`upstream/main` `517e169538`；随后获取的 `87c44445f8` 未修改本轮涉及的 LogService 和 TN driver 文件。延续[上一轮报告](https://github.com/jiangxinmeng1/matrixone/blob/codex/logservice-audit-20261117/docs/design/logservice_audit_20261117.md)，仅检查单个逻辑 TN 使用的 LogService 写入、截断、快照和读取路径；未运行 datasync，也未启动真实 TN。
+基线：`upstream/main` `517e169538`；随后获取的 `035af99680` 未修改本轮涉及的 LogService 和 TN driver 文件。延续[上一轮报告](https://github.com/jiangxinmeng1/matrixone/blob/codex/logservice-audit-20261117/docs/design/logservice_audit_20261117.md)，仅检查单个逻辑 TN 使用的 LogService 写入、截断、快照和读取路径；未运行 datasync，也未启动真实 TN。
 
 ## 快照导入、后续截断与重启
 
