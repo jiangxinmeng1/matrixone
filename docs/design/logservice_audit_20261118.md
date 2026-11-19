@@ -37,3 +37,7 @@
 诊断代码与运行方法见 [snapshot_partial_cleanup](../../test/logservice-chaos/snapshot_partial_cleanup/README.md)。这个时间线与 [matrixone#32842](https://github.com/matrixorigin/matrixone/issues/32842) 的“不可用快照候选反复挡住正常截断”机制相同，作为该缺陷的补充复现，不另建重复 issue。
 
 进一步测试对称的部分删除顺序：先删除 `snapshot.metadata`，再从 `RemoveAll` 返回错误。运行中的进程仍会反复选择坏候选；保留目录重启后，管理器会跳过该不完整目录，但其中的 `.gbsnap` 文件仍在，后续正常截断 tick 也未清除。小测试快照留下 1,074 字节；真实快照大小可能不同，未测量长期累计占用。普通模式五轮、`-race` 三轮通过。复现源文件见同目录的 `orphan_repro_test.go.txt`；这同样属于故障注入，尚未在真实磁盘上观察到部分删除。
+
+## 快照导入期间读取仍需保留的 WAL
+
+检查 `queryLog` 先读取状态机最新位置、再查询 Dragonboat 物理日志、最后按租约历史分类的三段操作。新增 `TestReadRetainedWALWhileImportingSnapshot`：单 TN 租约下写入第一批 WAL，导出快照；写入第二批、提交覆盖第一批的截断水位，同时启动快照导入和 100 次第二批读取，每次核对所有已确认 WAL 的 LSN、字节及 `UserRecord` 分类。普通模式连续 3 轮、`-race` 连续 2 轮通过，未发现新的读取错误。测试调用服务端 `queryLog` 和快照导入方法，没有运行 TN driver；并发启动不保证读请求一定落在导入内部的特定阶段，不能据此排除更窄的竞态窗口。
