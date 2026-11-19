@@ -77,3 +77,9 @@ TN 的 WAL 客户端工厂通过 `logservice.NewClient` 使用 `DiscoveryAddress
 原切主测试用 `ServiceAddresses` 直连三个副本；TN 生产工厂优先使用 `DiscoveryAddress`，所以新增 `TestThreeReplicaDiscoveryClientReadsAcrossTSOGapAfterLeaderFailure`。测试先等待存活节点的 gossip 发现视图就绪，再确保单 TN 客户端实际连到当前 leader；写入两条由 100 次 TSO 命令隔开的 WAL 后停掉该 leader。原客户端经存活节点的发现地址重新连接，读取并核对两条 WAL，提交 `TruncateWAL`、核对水位、读取保留 WAL，继续追加并读回第三条。普通模式连续 5 轮、`-race` 连续 2 轮通过，未见新缺陷。
 
 首次测试在发现视图尚未同步时直接创建客户端，三轮均返回 `shard not found`；这是启动发现窗口，TN 工厂有建连重试，因此改为等待发现就绪后测试切主。该测试关闭整个 leader 服务，发现端点选用存活副本地址；没有模拟负载均衡器或网络黑洞，也没有启动完整 TN。
+
+## HAKeeper 暂停期间保留候选快照，恢复后继续导入
+
+检查 `shouldDoImport` 在读取 HAKeeper 失败时跳过物理导入的路径，新增 `TestSnapshotImportResumesAfterHAKeeperReplicaRestarts`。单 TN 先写入 WAL、导出快照、写入较新 WAL 并提交覆盖旧快照位置的 `TruncateWAL`；随后只停止 HAKeeper shard 0 的本地副本，保持 Log shard 1 可用。停机期间继续写入并读取 WAL，截断循环没有导入候选快照。重启同一个 HAKeeper 副本后，截断循环导入原候选；检查原候选不再可选、PSN/DSN 水位正确、停机期间及之前的较新 WAL 内容未变，并可继续写入。普通模式连续 5 轮、`-race` 连续 3 轮通过，未发现新缺陷。
+
+测试期间因为 Log shard 已继续前进，HAKeeper 不可用时还可能导出一份更高索引快照。因此快照管理器在导入旧候选后仍有候选属于预期，不能以列表必须清空作为断言。该测试是单 Log 副本、单 HAKeeper 副本的进程内场景；没有模拟三副本网络分区或长期磁盘增长。
