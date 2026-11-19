@@ -44,4 +44,4 @@
 
 ## 新发现：TN replay 写入 skip command 时忽略取消
 
-`replayer.tryScheduleApply` 在单个 TN 的乱序 WAL 回放中调用 `AppendSkipCmd(ctx, skipMap)`；该函数进入 `wrappedClient.Append`。后者每次失败后直接 `time.Sleep(RetryInterval)`，没有检查 `ctx.Done()`。白盒复现使用真实 replayer 和包装客户端，后端在已取消 context 下返回 `context.Canceled`：将 `MaxTimeout` 缩短为 350ms，连续 3 轮均在约 600ms 后才返回。生产默认 `MaxTimeout` 为 3 分钟；这里没有等待三分钟或启动完整 TN，因此实际 TN 进程级延迟尚未测量。普通事务提交的 Append 使用 background context，本证据只指向 replay skip 写入。复现源文件和命令见 [tn_skip_cancel](../../test/logservice-chaos/tn_skip_cancel/README.md)。
+`replayer.tryScheduleApply` 在单个 TN 的乱序 WAL 回放中调用 `AppendSkipCmd(ctx, skipMap)`；该函数进入 `wrappedClient.Append`。后者每次失败后直接 `time.Sleep(RetryInterval)`，没有检查 `ctx.Done()`。白盒复现使用真实 replayer 和包装客户端，后端在已取消 context 下返回 `context.Canceled`：将 `MaxTimeout` 缩短为 350ms，连续 3 轮均在约 600ms 后才返回。生产默认 `MaxTimeout` 为 3 分钟；这里没有等待三分钟或启动完整 TN，因此实际 TN 进程级延迟尚未测量。普通事务提交的 Append 使用 background context，本证据只指向 replay skip 写入。复现源文件和命令见 [tn_skip_cancel](../../test/logservice-chaos/tn_skip_cancel/README.md)，缺陷记录为 [matrixone#32912](https://github.com/matrixorigin/matrixone/issues/32912)。
