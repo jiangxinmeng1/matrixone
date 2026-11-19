@@ -57,3 +57,7 @@
 ## 三副本切主时跨 TSO 间隔读取、截断和继续写入
 
 检查了三地址客户端在 leader 下线后沿用旧连接的恢复路径。新增 `TestThreeReplicaClientReadsAcrossTSOGapAfterLeaderFailure`：三投票副本、同一个 TN ID 的客户端先写两条 WAL，中间在同一 Log shard 提交 100 条 TSO 命令；核实 WAL 的物理 LSN 间隔至少 100 后停止 leader。剩余两票选主后，原客户端读回两条 WAL，提交 `TruncateWAL` 并核对 PSN/DSN 水位，再读取保留记录、继续追加第三条并读回。普通模式连续 3 轮、`-race` 连续 2 轮通过，未发现新缺陷。测试关闭整个 leader 服务而不是注入网络黑洞；未启动真实 TN driver，也未触发物理快照导入。
+
+## 停副本期间导出迟到完成，再用旧目录重启
+
+新增 `TestStoppedReplicaRecoversWALAfterLateSnapshotExport`：单副本先确认 12 条 WAL；包装文件系统在导出快照的最终 rename 处暂停，随后停止副本，使导出请求返回 `ErrShardClosed`；再放行 rename，明确确认完整快照目录已经出现。关闭 store、用同一数据目录重建后，先逐条核对原 WAL，再确认快照管理器加载了迟到候选；继续写入新 WAL、提交旧快照位置的 `TruncateWAL`，通过正常截断循环导入该候选，最终读回新 WAL。普通模式连续 3 轮、`-race` 连续 2 轮通过，未发现新缺陷。测试用文件系统钩子固定时序，关闭后台 worker 并直接调用 store 接口；不代表真实磁盘故障或完整 TN 进程测试。首次诊断因夹具重建时传入空 task service getter 却启动 HAKeeper worker 而 panic；按现有手动测试配置关闭后台 worker 后，目标时序通过，未将该夹具 panic 计为产品缺陷。
