@@ -16,6 +16,7 @@ package logservice
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 
@@ -27,6 +28,39 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/hakeeper"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 )
+
+// This diagnostic test captures the discovery RPC's current cancellation tail.
+func TestNewClientDiscoveryIgnoresContextDeadline(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			<-stop
+			conn.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	client, err := NewClient(ctx, "", ClientConfig{
+		LogShardID:       1,
+		TNReplicaID:      1,
+		DiscoveryAddress: listener.Addr().String(),
+	})
+	if client != nil {
+		defer client.Close()
+	}
+	require.Error(t, err)
+	elapsed := time.Since(start)
+	t.Logf("context deadline=%s, NewClient elapsed=%s, err=%v", 20*time.Millisecond, elapsed, err)
+	require.Greater(t, elapsed, 750*time.Millisecond)
+}
 
 func TestGetShardInfo(t *testing.T) {
 	fn := func(t *testing.T, s *Service) {

@@ -65,3 +65,9 @@
 ## 同一 TN 反复 CONNECT 后的租约历史快照与读取分类
 
 `handleSetLeaseHolderID` 对重复的同一 TN ID 仍记录新的租约位置，因此补测了重连导致的租约历史增多。扩展 `TestImportedSnapshotRetainsLaterWALAcrossServiceRecreation`：快照导出前连续 100 次、导出后再连续 100 次用同一个 TN ID CONNECT；之后写入、提交 `TRUNCATE_WAL`、导入快照并用旧目录重启，核对水位之后 WAL 的字节和 `UserRecord` 分类。普通模式连续 5 轮、`-race` 连续 2 轮通过，未见租约误分类或数据丢失。测试通过服务端 CONNECT 入口构造重复连接，没有模拟 200 次真实 TCP 重建；不证明极大规模历史下的内存上界。
+
+## 新发现：发现地址无响应时客户端建连忽略取消约 1 秒
+
+TN 的 WAL 客户端工厂通过 `logservice.NewClient` 使用 `DiscoveryAddress`；建连进入 `connectToLogServiceByReverseProxy` 后，`GetShardInfo` 用 `context.Background()` 发起独立的 1 秒发现 RPC，没有继承建连请求的 context。新增 `TestNewClientDiscoveryIgnoresContextDeadline`：真实 RPC 客户端连到只接受连接、不返回发现结果的 TCP 端点，外层 context 在 20ms 过期。普通模式 3 轮的返回时间约 1.0009、1.0006、1.0012 秒；`-race` 2 轮约 1.0016、1.0005 秒，均在外层期限之后才返回 `context deadline exceeded`。测试代码位于 [shardinfo_test.go](../../pkg/logservice/shardinfo_test.go)，问题记录为 [matrixone#32916](https://github.com/matrixorigin/matrixone/issues/32916)，已指派 `jiangxinmeng1`。
+
+这是单次发现 RPC 最多约 1 秒的取消长尾；没有实测完整 TN 关闭、事务写入延迟，也没有证据表明它会单独造成分钟级等待。检查 `SaveSnapshot` 时还发现状态机未显式检查 `io.Writer` 的短写；实际 Dragonboat 快照路径使用文件写入，未构造出真实磁盘上的短写无错误场景，因此未计为产品缺陷。
