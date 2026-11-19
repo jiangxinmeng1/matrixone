@@ -89,3 +89,13 @@ TN 的 WAL 客户端工厂通过 `logservice.NewClient` 使用 `DiscoveryAddress
 `queryLog` 先查询 Raft 日志页，再按租约历史分类；频繁 CONNECT 会插入大量 `LeaseUpdate` 记录，分页可能在任意租约更新处断开。新增 `TestPaginatedWALReadAcrossSameTNReconnectsAndSnapshotImport`：同一个 TN ID 在两个阶段各重建 20 次真实 RPC 连接，每四次连接写一条 WAL；用 `Read(..., maxSize=1)` 逐页检查游标严格前进，核对所有已确认 WAL 的 LSN、字节和 `UserRecord` 类型。两阶段之间导出快照，第二阶段后提交 `TruncateWAL` 并确认物理导入，再从保留水位之后重新逐页核对。普通模式连续 5 轮、`-race` 连续 3 轮通过，未见新缺陷。
 
 测试只有一个 TN ID、一个 Log 副本，没有并发调用同一个客户端；1 字节是读取批次上限，Dragonboat 仍会返回至少一条完整记录。它验证记录分类和分页前进，不代表大规模租约历史的内存上界。
+
+## 新缺陷：单个旧 gossip 答复可让合法 Log 副本启动时被跳过
+
+`checkZombieReplicas` 在重启时逐个探测 peer 的 gossip 成员视图，只要至少一个 peer 成功答复且所有成功答复都不包含本地副本 ID，就将其标成 zombie；未要求其他配置的 peer 可达。新增 `TestRestartSkipsLiveReplicaWhenOnlyStaleGossipPeerAnswers`：真实三投票副本 Log shard 已提交成员 `{1,2,3}`，关闭副本 3 并保留本地数据；在它重启时，让 peer 1 的成员发现答复暂时只包含 `{1,2}`，peer 2 的发现 RPC 不可达。启动自检将仍在 Raft 成员表中的副本 3 标成 zombie，`startReplicas` 跳过它。同一数据目录再次重启，在使用真实且已同步的 peer 发现结果后，副本 3 正常启动。普通模式 3 轮、`-race` 3 轮稳定重现。缺陷已登记为 [matrixone#32919](https://github.com/matrixorigin/matrixone/issues/32919)，指派 `jiangxinmeng1`。
+
+错误影响是 Log shard 虽仍有剩余两票，但失去一票冗余；再损失任一存活投票副本可能失去多数派。测试注入了旧 gossip 答复与另一个 peer 不可达，证明该故障状态下的真实启动决策；尚未捕获自然发生的 gossip 延迟时间线，也没有在本轮测试中停第二个存活投票副本。代码里的 gossip 视图本身是最终一致的，因此单个成功答复的“缺席”不能证明 Raft 已移除本地副本。
+
+## 快照导入成功后、候选目录删除前重启
+
+另新增 `TestSnapshotImportCrashBeforeCandidateRemoval`，将服务关闭点固定在 Dragonboat 已完成 `SyncRequestImportSnapshot`，但 LogService 尚未执行 `snapshotMgr.Remove` 和 `forwardTruncate` 之间；原数据目录重启后，候选被重新加载并再次导入。首轮截断 tick 清除旧候选并推进本地物理水位，第二轮仍可继续处理，截断水位之后的已确认 WAL 字节保持不变。普通模式 5 轮、`-race` 2 轮通过，未发现此窗口的新缺陷；这是在两步之间有序关闭服务，未模拟进程被强制杀死或文件系统写入错误。
