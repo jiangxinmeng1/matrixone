@@ -115,3 +115,11 @@ TN 的 WAL 客户端工厂通过 `logservice.NewClient` 使用 `DiscoveryAddress
 新增 [TestAuditThreeVoterGetWALTruncateStallsOnBlackholedPeer](../../pkg/logservice/wal_truncate_blackhole_audit_test.go)：真实三投票副本运行，单个 TN ID 客户端经 TCP 代理连到 leader；先成功读取水位，再让代理只丢回包，同时让该客户端可在重连时使用三个真实地址。旧连接上的第一次读取报 I/O timeout，普通模式两轮等待约 8.002、8.001 秒；`-race` 两轮等待约 8.003、16.002 秒。在其等待期间，另一个直连客户端在 2 秒内成功读取相同水位；原客户端下一次调用也换地址成功。单服务诊断测试另测到约 8.002、16.001 秒。登记为 [matrixone#32934](https://github.com/matrixorigin/matrixone/issues/32934)，指派 `jiangxinmeng1`。
 
 这证明的是当前 LogService 客户端的可避免长尾，未启动完整 TN，也未在物理网络中断包；TN replay 启动和缺口恢复确实调用该驱动方法，但本测试未测量完整 TN 恢复耗时。与已关闭的 `Read` 长尾 [matrixone#32148](https://github.com/matrixorigin/matrixone/issues/32148) 属同类故障模式，遗漏的是不同的 `GetWALTruncate` 只读调用路径。此次已拉取最新 `upstream/main`（`4cec607b57`）；该路径的客户端和 TN 驱动源码与审计分支相比没有变动。
+
+## 新缺陷：三副本目标修复时把两个新投票副本派到同一 store
+
+LogService 检查器的 `checkToAdd` 在一次检查中需要添加两个副本时，复制 `workingStores` 并在每轮删除已选 store；但 `selectStore` 实际读取原始 `ca.lc.workingStores`，所以第二轮再次选中同一目标。新增 [TestAuditThreeVoterShardRepairChoosesSameStoreTwice](../../pkg/hakeeper/checkers/logservice/duplicate_add_target_audit_test.go)：目标三副本，当前 Raft 成员只剩 store `a`，空闲健康 store 为 `b`、`c`。完整检查器与 `Controller.Dispatch` 都生成两个目标为 `b` 的新增副本命令；普通模式 5 轮、`-race` 3 轮一致。
+
+另新增 [TestAuditRaftDuplicateTargetAfterSingletonRepair](../../pkg/logservice/duplicate_target_raft_audit_test.go) 使用三个真实 LogService 进程和 Dragonboat NodeHost：Log shard 先以合法单成员组运行，添加第一个新成员到 `b` 成功；再把第二个新成员加到 `b`，Dragonboat 返回 `ErrRejected`；改加到空闲的 `c` 成功，成员数达到三。普通模式多轮及 `-race` 两轮复现。这确认了错误调度会造成一条恢复命令失败和额外恢复等待；未发现两个实际投票副本同驻一台 store，也没有观测到 WAL 丢失。缺陷登记为 [matrixone#32967](https://github.com/matrixorigin/matrixone/issues/32967)，指派 `jiangxinmeng1`。
+
+白盒检查器测试从“三副本目标、当前只剩一票”的状态开始，真实 Raft 测试也从单成员组开始；本轮没有在完整 HAKeeper 生命周期中稳定走出从三票逐步移除两票的时间线，因此不宣称这种状态的生产发生频率。审计分支已合入 `upstream/main` 的 `17df10b1b3`；随后更新的 `43fa9f4329` 未改动这次检查的检查器与 Raft 调用路径。
