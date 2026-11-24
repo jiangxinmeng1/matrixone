@@ -123,3 +123,9 @@ LogService 检查器的 `checkToAdd` 在一次检查中需要添加两个副本�
 另新增 [TestAuditRaftDuplicateTargetAfterSingletonRepair](../../pkg/logservice/duplicate_target_raft_audit_test.go) 使用三个真实 LogService 进程和 Dragonboat NodeHost：Log shard 先以合法单成员组运行，添加第一个新成员到 `b` 成功；再把第二个新成员加到 `b`，Dragonboat 返回 `ErrRejected`；改加到空闲的 `c` 成功，成员数达到三。普通模式多轮及 `-race` 两轮复现。这确认了错误调度会造成一条恢复命令失败和额外恢复等待；未发现两个实际投票副本同驻一台 store，也没有观测到 WAL 丢失。缺陷登记为 [matrixone#32967](https://github.com/matrixorigin/matrixone/issues/32967)，指派 `jiangxinmeng1`。
 
 白盒检查器测试从“三副本目标、当前只剩一票”的状态开始，真实 Raft 测试也从单成员组开始；本轮没有在完整 HAKeeper 生命周期中稳定走出从三票逐步移除两票的时间线，因此不宣称这种状态的生产发生频率。审计分支已合入 `upstream/main` 的 `17df10b1b3`；随后更新的 `43fa9f4329` 未改动这次检查的检查器与 Raft 调用路径。
+
+## 新缺陷：过期 LogStore 被同时排入 Start 与 Remove，移除后仍收到旧 Start
+
+在三副本 Log shard `{1:a, 2:b, 3:c}` 中，a 心跳过期且最后一次心跳未报告本地 shard 时，`parseLogShards` 会因为其副本未运行生成 Start，同时把该过期成员列为 Remove。检查器实际生成两条操作：对 a/1 的 StartReplica，以及由存活节点执行的 RemoveReplica。HAKeeper 的普通 Log shard 命令投递在重新读取队列时不按当前成员关系过滤 Start；因此即使 b、c 已提交新 epoch 并移除 replica 1，a 恢复心跳仍会收到旧 Start。
+
+新增 `expired_start_remove_audit_test.go` 和 `log_heartbeat_stale_start_audit_test.go`。检查器及 HAKeeper 状态机各运行 10 次：每次都产生冲突调度，且成员关系更新后仍返回旧 Start。新增三节点 Dragonboat 测试 `stale_start_after_remove_audit_test.go`，先停止 a 的 shard，再由 b、c 移除 replica 11；模拟旧 Start 到达 a 后，Dragonboat 每次均以 `shard settings are invalid` 拒绝，存活两票保持领导和成员关系。运行时测试连续 3 次通过。没有观察到数据丢失、旧副本重新取得投票权或多数派中断；已确认影响是对恢复节点投递过期操作并产生失败启动日志。缺陷登记为 [matrixone#33116](https://github.com/matrixorigin/matrixone/issues/33116)，已指派 `jiangxinmeng1`。
